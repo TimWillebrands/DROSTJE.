@@ -6,4 +6,5 @@ pub mod factory_form;
 pub mod overlays;
 pub mod settings;
 pub mod sidebar;
+pub mod theme;
 pub mod workspace;

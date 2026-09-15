@@ -2,6 +2,11 @@ use super::grid::{GridSnapshot, Highlight, HighlightedChunk};
 use super::{
     ClipboardContent, DraftKey, DraftRevision, DraftSnapshot, NvimCommand, NvimEditor, NvimEvent,
 };
+use crate::model::PaneDirection;
+use gpui_kit::component::{
+    ActiveTheme, Sizable, Theme,
+    button::{Button, ButtonVariants},
+};
 use gpui_kit::{prelude::*, *};
 use std::{collections::VecDeque, ops::Range, sync::Arc, time::Instant};
 
@@ -10,6 +15,11 @@ pub enum NvimViewEvent {
     Ready,
     DraftChanged(DraftSnapshot),
     DraftActivated(DraftSnapshot),
+    FocusPane {
+        key: DraftKey,
+        generation: uuid::Uuid,
+        direction: PaneDirection,
+    },
     Failed(String),
     InputRejected(String),
     CompositionChanged(bool),
@@ -68,7 +78,9 @@ pub struct NvimView {
     recovery: String,
     bounds: Option<Bounds<Pixels>>,
     cell: Size<Pixels>,
+    font: Font,
     font_size: Pixels,
+    scale_factor: f32,
     frame: Option<Frame>,
     requested_size: Option<(u32, u32)>,
     blink_epoch: Instant,
@@ -84,6 +96,7 @@ impl NvimView {
     pub fn new(editor: NvimEditor, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let subscriptions = vec![
+            cx.observe_global::<Theme>(|_, cx| cx.notify()),
             cx.on_focus(&focus_handle, window, |this, _, cx| {
                 this.blink_epoch = Instant::now();
                 this.send(NvimCommand::Focus(true), cx);
@@ -132,8 +145,10 @@ impl NvimView {
             pending_compositions: VecDeque::new(),
             recovery: String::new(),
             bounds: None,
-            cell: size(px(8.), px(20.)),
-            font_size: px(14.),
+            cell: size(px(1.), px(1.)),
+            font: font(cx.theme().mono_font_family.clone()),
+            font_size: cx.theme().mono_font_size,
+            scale_factor: 0.,
             frame: None,
             requested_size: None,
             blink_epoch: Instant::now(),
@@ -291,6 +306,26 @@ impl NvimView {
                 self.draft = Some(draft.clone());
                 self.blink_epoch = Instant::now();
                 cx.emit(NvimViewEvent::DraftActivated(draft));
+            }
+            NvimEvent::FocusPane {
+                key,
+                generation,
+                direction,
+            } => {
+                if self.ready
+                    && self.error.is_none()
+                    && !self.has_composition()
+                    && self
+                        .draft
+                        .as_ref()
+                        .is_some_and(|draft| draft.key == key && draft.generation == generation)
+                {
+                    cx.emit(NvimViewEvent::FocusPane {
+                        key,
+                        generation,
+                        direction,
+                    });
+                }
             }
             NvimEvent::ClipboardGet { reply } => {
                 let content = cx
@@ -634,25 +669,36 @@ impl NvimView {
     }
 
     fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-        let cell_height = window.line_height();
+        let font = font(cx.theme().mono_font_family.clone());
+        let font_size = cx.theme().mono_font_size;
+        let scale = window.scale_factor();
+        if font != self.font || font_size != self.font_size || scale != self.scale_factor {
+            let text_system = window.text_system();
+            let font_id = text_system.resolve_font(&font);
+            // The canvas is a raster cell grid: round metrics to physical pixels,
+            // independently of UI control typography and inherited line height.
+            let height = ((text_system.ascent(font_id, font_size)
+                + text_system.descent(font_id, font_size))
+            .max(font_size)
+                * scale)
+                .ceil()
+                / scale;
+            let width = (text_system.layout_width(font_id, font_size, 'M') * scale).ceil() / scale;
+            self.font = font;
+            self.font_size = font_size;
+            self.scale_factor = scale;
+            self.cell = size(width.max(px(1.)), height.max(px(1.)));
+            self.frame = None;
+        }
         if self.frame.is_none()
-            || font_size != self.font_size
-            || cell_height != self.cell.height
             || self
                 .bounds
                 .is_none_or(|previous| previous.size != bounds.size)
         {
-            self.font_size = font_size;
-            let run = text_run(&self.grid, 0, 1);
-            let width = window
-                .text_system()
-                .shape_line("M".into(), font_size, &[run], None)
-                .width();
-            self.cell = size(width.max(px(1.)), cell_height.max(px(1.)));
             let visible_rows = (bounds.size.height / self.cell.height).floor().max(1.) as usize;
             self.frame = Some(make_frame(
                 &self.grid,
+                &self.font,
                 self.cell,
                 font_size,
                 visible_rows,
@@ -768,7 +814,7 @@ impl NvimView {
                     .unwrap_or(composition.text.len());
                 let mut offset = 0;
                 for (row, text) in composition.text.split('\n').enumerate() {
-                    let mut run = text_run(&self.grid, 0, text.len());
+                    let mut run = text_run(&self.grid, &self.font, 0, text.len());
                     run.underline = Some(UnderlineStyle {
                         thickness: px(1.),
                         color: Some(run.color),
@@ -864,7 +910,7 @@ impl NvimView {
                 .and_then(|row| row.get(self.grid.cursor.1))
             {
                 if !cell.text.is_empty() {
-                    let mut run = text_run(&self.grid, cell.hl_id, cell.text.len());
+                    let mut run = text_run(&self.grid, &self.font, cell.hl_id, cell.text.len());
                     run.color = if style.is_some_and(|style| style.attr_id != 0) {
                         fg
                     } else {
@@ -895,7 +941,7 @@ impl NvimView {
                     })
             });
             if let Some((line, position)) = layout {
-                let mut run = text_run(&self.grid, 0, line.text.len());
+                let mut run = text_run(&self.grid, &self.font, 0, line.text.len());
                 run.color = if style.is_some_and(|style| style.attr_id != 0) {
                     fg
                 } else {
@@ -1105,7 +1151,7 @@ impl EntityInputHandler for NvimView {
             let line = window.text_system().shape_line(
                 text.to_owned().into(),
                 self.font_size,
-                &[text_run(&self.grid, 0, text.len())],
+                &[text_run(&self.grid, &self.font, 0, text.len())],
                 None,
             );
             let start_x = line.x_for_index(start - line_start);
@@ -1158,7 +1204,7 @@ impl EntityInputHandler for NvimView {
             let line = window.text_system().shape_line(
                 text.to_owned().into(),
                 self.font_size,
-                &[text_run(&self.grid, 0, text.len())],
+                &[text_run(&self.grid, &self.font, 0, text.len())],
                 None,
             );
             let byte = line.closest_index_for_x(position.x - bounds.left() - composition.anchor.x);
@@ -1234,9 +1280,8 @@ impl Render for NvimView {
             .overflow_hidden()
             .key_context("NvimEditor")
             .track_focus(&self.focus_handle)
-            .font_family("Menlo")
-            .text_size(px(14.))
-            .line_height(px(20.))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(cx.theme().mono_font_size)
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
@@ -1273,13 +1318,13 @@ impl Render for NvimView {
             surface = surface.child(
                 div()
                     .p_2()
-                    .text_color(rgb(0xFFA7A7))
+                    .text_color(cx.theme().danger)
                     .child(error.clone())
                     .child(
-                        div()
-                            .id("nvim-restart")
-                            .cursor_pointer()
-                            .child("Restart Editor")
+                        Button::new("nvim-restart")
+                            .small()
+                            .ghost()
+                            .label("Restart editor")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let editor = this.editor.clone();
                                 cx.spawn(async move |this, cx| {
@@ -1297,7 +1342,7 @@ impl Render for NvimView {
             surface = surface.child(
                 div()
                     .p_2()
-                    .text_color(rgb(0xAAB2C0))
+                    .text_color(cx.theme().muted_foreground)
                     .child("Waiting for Neovim's initial grid…"),
             );
         }
@@ -1305,13 +1350,13 @@ impl Render for NvimView {
             surface = surface.child(
                 div()
                     .p_2()
-                    .text_color(rgb(0xFFD080))
+                    .text_color(cx.theme().warning)
                     .child(diagnostic.clone())
                     .child(
-                        div()
-                            .id("nvim-dismiss-diagnostic")
-                            .cursor_pointer()
-                            .child("Dismiss")
+                        Button::new("nvim-dismiss-diagnostic")
+                            .small()
+                            .ghost()
+                            .label("Dismiss")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.diagnostic = None;
                                 cx.notify();
@@ -1334,13 +1379,13 @@ impl Render for NvimView {
                 surface = surface.child(
                     div()
                         .p_2()
-                        .text_color(rgb(0xFFD080))
+                        .text_color(cx.theme().warning)
                         .child("Uncommitted composition retained")
                         .child(
-                            div()
-                                .id("nvim-copy-composition")
-                                .cursor_pointer()
-                                .child("Copy Composition")
+                            Button::new("nvim-copy-composition")
+                                .small()
+                                .ghost()
+                                .label("Copy composition")
                                 .on_click(move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
                                         recovery.clone(),
@@ -1348,10 +1393,10 @@ impl Render for NvimView {
                                 }),
                         )
                         .child(
-                            div()
-                                .id("nvim-cancel-composition")
-                                .cursor_pointer()
-                                .child("Cancel Composition")
+                            Button::new("nvim-cancel-composition")
+                                .small()
+                                .ghost()
+                                .label("Cancel composition")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.cancel_composition(window, cx)
                                 })),
@@ -1587,11 +1632,11 @@ fn colors(grid: &GridSnapshot, id: u64) -> (Hsla, Hsla, Hsla) {
     )
 }
 
-fn text_run(grid: &GridSnapshot, id: u64, len: usize) -> TextRun {
+fn text_run(grid: &GridSnapshot, font: &Font, id: u64, len: usize) -> TextRun {
     let default = Highlight::default();
     let highlight = grid.highlights.get(&id).unwrap_or(&default);
     let (color, _, special) = colors(grid, id);
-    let mut font = font("Menlo");
+    let mut font = font.clone();
     if highlight.bold {
         font = font.bold();
     }
@@ -1617,6 +1662,7 @@ fn text_run(grid: &GridSnapshot, id: u64, len: usize) -> TextRun {
 
 fn shape_chunks(
     grid: &GridSnapshot,
+    font: &Font,
     chunks: &[HighlightedChunk],
     prefix: &str,
     font_size: Pixels,
@@ -1625,14 +1671,14 @@ fn shape_chunks(
     let mut text = prefix.to_owned();
     let mut runs = Vec::with_capacity(chunks.len() + 1);
     if !prefix.is_empty() {
-        runs.push(text_run(grid, 0, prefix.len()));
+        runs.push(text_run(grid, font, 0, prefix.len()));
     }
     for chunk in chunks {
         if chunk.text.is_empty() {
             continue;
         }
         text.push_str(&chunk.text);
-        let mut run = text_run(grid, chunk.hl_id, chunk.text.len());
+        let mut run = text_run(grid, font, chunk.hl_id, chunk.text.len());
         run.background_color = Some(colors(grid, chunk.hl_id).1);
         runs.push(run);
     }
@@ -1643,6 +1689,7 @@ fn shape_chunks(
 
 fn make_frame(
     grid: &GridSnapshot,
+    font: &Font,
     cell: Size<Pixels>,
     font_size: Pixels,
     visible_rows: usize,
@@ -1667,7 +1714,7 @@ fn make_frame(
             }
             // One Neovim cell can contain a base character plus combining marks;
             // wide continuation cells never contribute independent glyphs or columns.
-            let run = text_run(grid, value.hl_id, value.text.len());
+            let run = text_run(grid, font, value.hl_id, value.text.len());
             let line =
                 window
                     .text_system()
@@ -1681,7 +1728,7 @@ fn make_frame(
     for chunks in grid.cmdline_block.iter().skip(skip) {
         frame.texts.push(PaintedText {
             origin: point(px(0.), cell.height * row as f32),
-            line: shape_chunks(grid, chunks, "", font_size, window),
+            line: shape_chunks(grid, font, chunks, "", font_size, window),
         });
         row += 1;
     }
@@ -1691,7 +1738,7 @@ fn make_frame(
         .skip(skip.saturating_sub(grid.cmdline_block.len()))
     {
         let prefix = format!("{}{}{}", cmd.firstc, cmd.prompt, " ".repeat(cmd.indent));
-        let line = shape_chunks(grid, &cmd.content, &prefix, font_size, window);
+        let line = shape_chunks(grid, font, &cmd.content, &prefix, font_size, window);
         let text: String = cmd
             .content
             .iter()
@@ -1699,7 +1746,7 @@ fn make_frame(
             .collect();
         let byte = byte_floor(&text, cmd.pos);
         let before = chunk_range(&cmd.content, 0..byte);
-        let prefix_line = shape_chunks(grid, &before, &prefix, font_size, window);
+        let prefix_line = shape_chunks(grid, font, &before, &prefix, font_size, window);
         let horizontal_scroll = (prefix_line.width() + cell.width - visible_width).max(px(0.));
         let origin = point(-horizontal_scroll, cell.height * row as f32);
         let cursor = origin + point(prefix_line.width(), px(0.));
@@ -1715,7 +1762,7 @@ fn make_frame(
             let special_line = window.text_system().shape_line(
                 special.clone().into(),
                 font_size,
-                &[text_run(grid, 0, special.len())],
+                &[text_run(grid, font, 0, special.len())],
                 None,
             );
             if *shift {
@@ -1726,7 +1773,7 @@ fn make_frame(
                 });
                 frame.texts.push(PaintedText {
                     origin: cursor + point(special_line.width(), px(0.)),
-                    line: shape_chunks(grid, &suffix, "", font_size, window),
+                    line: shape_chunks(grid, font, &suffix, "", font_size, window),
                 });
             } else {
                 frame.texts.push(PaintedText { origin, line });

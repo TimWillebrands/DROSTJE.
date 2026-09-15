@@ -150,6 +150,20 @@ enum Write {
     Flush(async_channel::Sender<Result<(), String>>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Diagnostic,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceNotice {
+    pub level: NoticeLevel,
+    pub text: String,
+}
+
 /// Events arrive on one bounded channel; backend integrations can extend this owner
 /// without putting process work or provider state into panel render functions.
 pub enum AppEvent {
@@ -162,7 +176,7 @@ pub enum AppEvent {
     FactorySnapshot(Box<crate::factory::FactorySnapshot>),
     HarnessOpened(ThreadId, Uuid, Result<ConversationHandle, String>),
     Harness(ThreadId, Uuid, ConversationEvent),
-    Notice(String),
+    Notice(WorkspaceNotice),
     HarnessDrained(async_channel::Sender<()>),
 }
 
@@ -173,12 +187,12 @@ pub struct AppState {
     pub selected_project: Option<ProjectId>,
     pub selected_thread: Option<ThreadId>,
     pub selected_launch: Option<LaunchId>,
-    pub open_threads: Vec<ThreadId>,
     pub show_archived: bool,
     pub collapsed: HashSet<ProjectId>,
     pub repositories: BTreeMap<ProjectId, Result<platform::RepositoryInfo, String>>,
     pub diagnostics: BTreeMap<String, String>,
-    pub notices: VecDeque<String>,
+    pub notices: VecDeque<WorkspaceNotice>,
+    pub notice_sequence: u64,
     pub storage_error: Option<String>,
     pub pending_writes: usize,
     pub registering: bool,
@@ -197,7 +211,7 @@ pub struct AppState {
     pub factory_text: Option<Result<crate::factory::TextPage, String>>,
     pub factory_text_path: Option<PathBuf>,
     pub factory_text_generation: Uuid,
-    pub pending_factory: HashSet<ProjectId>,
+    pub pending_factory: HashSet<ThreadId>,
     writes: async_channel::Sender<Write>,
 }
 
@@ -215,7 +229,27 @@ impl AppState {
             .get("selected_thread")
             .and_then(Value::as_str)
             .and_then(|s| Uuid::parse_str(s).ok())
-            .filter(|id| snapshot.threads.iter().any(|t| t.id == *id));
+            .filter(|id| snapshot.threads.iter().any(|t| t.id == *id))
+            .or_else(|| {
+                let launch_id = snapshot
+                    .settings
+                    .get("selected_launch")
+                    .and_then(Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok())?;
+                let launch = snapshot
+                    .launches
+                    .iter()
+                    .find(|launch| launch.id == launch_id)?;
+                snapshot
+                    .threads
+                    .iter()
+                    .find(|thread| {
+                        thread.id == launch.factory_thread_id
+                            && thread.kind == ThreadKind::Factory
+                            && thread.project_id == launch.project_id
+                    })
+                    .map(|thread| thread.id)
+            });
         let selected_project = selected_thread
             .and_then(|id| {
                 snapshot
@@ -233,28 +267,24 @@ impl AppState {
                     .filter(|id| snapshot.projects.iter().any(|p| p.id == *id))
             })
             .or_else(|| snapshot.projects.iter().find(|p| !p.archived).map(|p| p.id));
-        let selected_launch = snapshot
-            .settings
-            .get("selected_launch")
-            .and_then(Value::as_str)
-            .and_then(|id| Uuid::parse_str(id).ok())
-            .filter(|id| snapshot.launches.iter().any(|l| l.id == *id));
+        let selected_launch = selected_thread.and_then(|id| {
+            snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.id == id && thread.kind == ThreadKind::Factory)
+                .and_then(|thread| {
+                    snapshot
+                        .launches
+                        .iter()
+                        .find(|launch| launch.factory_thread_id == thread.id)
+                        .map(|launch| launch.id)
+                })
+        });
         let show_archived = snapshot
             .settings
             .get("show_archived")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let mut open_threads: Vec<ThreadId> = snapshot
-            .settings
-            .get("open_threads")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        open_threads.retain(|id| snapshot.threads.iter().any(|t| t.id == *id));
-        if let Some(id) = selected_thread {
-            if !open_threads.contains(&id) {
-                open_threads.push(id);
-            }
-        }
         let (events, receiver) = async_channel::bounded(256);
         let (writes, requests) = async_channel::unbounded();
         let completed = events.clone();
@@ -284,7 +314,10 @@ impl AppState {
                 Some(manager)
             }
             Err(error) => {
-                notices.push_back(format!("Factory tracking is unavailable: {error:#}"));
+                notices.push_back(WorkspaceNotice {
+                    level: NoticeLevel::Error,
+                    text: format!("Factory tracking is unavailable: {error:#}"),
+                });
                 None
             }
         };
@@ -371,11 +404,11 @@ impl AppState {
             selected_project,
             selected_thread,
             selected_launch,
-            open_threads,
             show_archived,
             collapsed: HashSet::new(),
             repositories,
             diagnostics,
+            notice_sequence: notices.len() as u64,
             notices,
             storage_error: None,
             pending_writes: 0,
@@ -406,12 +439,12 @@ impl AppState {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
                 if let Err(error) = result {
                     self.storage_error = Some(error.clone());
-                    self.notice(error);
+                    self.notice(NoticeLevel::Error, error);
                 }
             }
             AppEvent::StorageFailed(error) => {
                 self.storage_error = Some(error.clone());
-                self.notice(error);
+                self.notice(NoticeLevel::Error, error);
             }
             AppEvent::RepositoryChecked(id, info) => {
                 self.repositories.insert(id, info);
@@ -433,7 +466,7 @@ impl AppState {
                                 self.show_archived = true;
                                 self.set_setting("show_archived", json!(true));
                             }
-                            self.notice("This working tree is already registered; selected the existing project.");
+                            self.notice(NoticeLevel::Info, "This working tree is already registered; selected the existing project.");
                         } else if self.storage_error.is_none() {
                             let project = Project {
                                 id: Uuid::new_v4(),
@@ -451,24 +484,25 @@ impl AppState {
                             self.save_project(project);
                         }
                     }
-                    Err(error) => self.notice(error),
+                    Err(error) => self.notice(NoticeLevel::Error, error),
                 }
             }
             AppEvent::Diagnostics(diagnostics) => self.diagnostics = diagnostics,
             AppEvent::InteractiveActivity { thread_id, active } => {
-                if active {
+                if active && self.is_conversation(thread_id) {
                     self.active_threads.insert(thread_id);
                 } else {
                     self.active_threads.remove(&thread_id);
                 }
             }
             AppEvent::FactorySnapshot(snapshot) => self.receive_factory(*snapshot),
-            AppEvent::Notice(message) => self.notice(message),
+            AppEvent::Notice(notice) => self.notice(notice.level, notice.text),
             AppEvent::HarnessOpened(id, generation, result) => {
-                if self.shutting_down {
+                if self.shutting_down || !self.is_conversation(id) {
                     if let Ok(handle) = &result {
                         let _ = handle.commands.try_send(ConversationCommand::Close);
                     }
+                    return;
                 }
                 match (
                     self.conversations
@@ -505,11 +539,15 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn notice(&mut self, message: impl Into<String>) {
+    pub fn notice(&mut self, level: NoticeLevel, text: impl Into<String>) {
+        self.notice_sequence = self.notice_sequence.wrapping_add(1);
         if self.notices.len() == 200 {
             self.notices.pop_front();
         }
-        self.notices.push_back(message.into());
+        self.notices.push_back(WorkspaceNotice {
+            level,
+            text: text.into(),
+        });
     }
 
     fn enqueue(&mut self, request: Write) {
@@ -580,6 +618,20 @@ impl AppState {
         self.selected_thread
             .and_then(|id| self.snapshot.threads.iter().find(|t| t.id == id))
     }
+    pub fn conversation_thread(&self) -> Option<&Thread> {
+        self.thread()
+            .filter(|thread| thread.kind == ThreadKind::Conversation)
+    }
+    pub fn factory_thread(&self) -> Option<&Thread> {
+        self.thread()
+            .filter(|thread| thread.kind == ThreadKind::Factory)
+    }
+    fn is_conversation(&self, id: ThreadId) -> bool {
+        self.snapshot
+            .threads
+            .iter()
+            .any(|thread| thread.id == id && thread.kind == ThreadKind::Conversation)
+    }
     pub fn mutable_project_reason(&self) -> Option<String> {
         if self.shutting_down {
             return Some("Application is shutting down".into());
@@ -598,17 +650,14 @@ impl AppState {
             return Some(reason);
         }
         let id = self.selected_project?;
-        if self.pending_factory.contains(&id)
-            || self
-                .snapshot
-                .threads
-                .iter()
-                .any(|t| t.project_id == id && self.active_threads.contains(&t.id))
-            || self
-                .snapshot
-                .launches
-                .iter()
-                .any(|l| l.project_id == id && self.owned_launches.contains(&l.id))
+        if self.snapshot.threads.iter().any(|t| {
+            t.project_id == id
+                && (self.active_threads.contains(&t.id) || self.pending_factory.contains(&t.id))
+        }) || self
+            .snapshot
+            .launches
+            .iter()
+            .any(|l| l.project_id == id && self.owned_launches.contains(&l.id))
         {
             Some("Stop active interactive turns and wait for owned Factory processes before archiving.".into())
         } else {
@@ -620,19 +669,23 @@ impl AppState {
             return Some(reason);
         }
         let Some(thread) = self.thread() else {
-            return Some("Select a conversation first.".into());
+            return Some("Select a thread first.".into());
         };
         if thread.archived {
-            return Some("This conversation is already archived.".into());
+            return Some("This thread is already archived.".into());
         }
         if self.active_threads.contains(&thread.id)
+            || self.pending_factory.contains(&thread.id)
             || self
                 .snapshot
                 .launches
                 .iter()
-                .any(|l| l.thread_id == Some(thread.id) && self.owned_launches.contains(&l.id))
+                .any(|l| l.factory_thread_id == thread.id && self.owned_launches.contains(&l.id))
         {
-            Some("This conversation has an active turn or owned Factory process.".into())
+            Some(
+                "This thread has an active turn, pending Factory start, or owned Factory process."
+                    .into(),
+            )
         } else {
             None
         }
@@ -644,52 +697,92 @@ impl AppState {
         if self.thread().is_some_and(|t| t.project_id != id) {
             self.selected_thread = None;
             self.set_setting("selected_thread", Value::Null);
+            self.select_launch_output(None);
         }
     }
     pub fn select_thread(&mut self, id: ThreadId) {
-        if let Some(thread) = self.snapshot.threads.iter().find(|t| t.id == id) {
-            self.selected_project = Some(thread.project_id);
-            self.selected_thread = Some(id);
-            if !self.open_threads.contains(&id) {
-                self.open_threads.push(id);
-            }
-            self.set_setting("selected_thread", json!(id));
-            self.set_setting("open_threads", json!(self.open_threads));
-            self.set_setting("selected_project", json!(self.selected_project));
-        }
+        let Some(thread) = self.snapshot.threads.iter().find(|thread| thread.id == id) else {
+            return;
+        };
+        let launch_id = (thread.kind == ThreadKind::Factory)
+            .then(|| {
+                self.snapshot
+                    .launches
+                    .iter()
+                    .find(|launch| launch.factory_thread_id == id)
+                    .map(|launch| launch.id)
+            })
+            .flatten();
+        self.selected_project = Some(thread.project_id);
+        self.selected_thread = Some(id);
+        self.set_setting("selected_thread", json!(id));
+        self.set_setting("selected_project", json!(self.selected_project));
+        self.select_launch_output(launch_id);
     }
     pub fn close_thread(&mut self, id: ThreadId) {
-        if !self.active_threads.contains(&id) {
+        if self.is_conversation(id) && !self.active_threads.contains(&id) {
             if let Some(session) = self.conversations.remove(&id) {
                 if let Some(commands) = session.commands {
                     let _ = commands.try_send(ConversationCommand::Close);
                 }
             }
         }
-        self.open_threads.retain(|other| *other != id);
         if self.selected_thread == Some(id) {
             self.selected_thread = None;
-            if let Some(next) = self.open_threads.last().copied() {
-                self.select_thread(next);
-            } else {
-                self.set_setting("selected_thread", Value::Null);
-            }
+            self.set_setting("selected_thread", Value::Null);
+            self.select_launch_output(None);
         }
-        self.set_setting("open_threads", json!(self.open_threads));
     }
-    pub fn new_thread(&mut self) -> Result<()> {
+    pub fn new_thread(&mut self, kind: ThreadKind) -> Result<()> {
         if let Some(reason) = self.mutable_project_reason() {
             anyhow::bail!(reason);
         }
         let project = self.project().context("Select a project")?;
         let timestamp = platform::now();
+        let (title, harness, model, factory) = match kind {
+            ThreadKind::Conversation => (
+                "New conversation",
+                "omp".into(),
+                project.defaults.interactive_model.clone(),
+                None,
+            ),
+            ThreadKind::Factory => (
+                "New Factory thread",
+                String::new(),
+                None,
+                Some(FactoryThreadConfig {
+                    source_kind: FactorySourceKind::WorkItem,
+                    source: String::new(),
+                    harness: if project.defaults.factory_harness.trim().is_empty() {
+                        "opencode".into()
+                    } else {
+                        project.defaults.factory_harness.clone()
+                    },
+                    model: String::new(),
+                    thought_level: String::new(),
+                    target_branch: project
+                        .defaults
+                        .factory_target_branch
+                        .clone()
+                        .unwrap_or_else(|| {
+                            self.repositories
+                                .get(&project.id)
+                                .and_then(|repository| repository.as_ref().ok())
+                                .and_then(|repository| repository.branch.clone())
+                                .unwrap_or_default()
+                        }),
+                }),
+            ),
+        };
         let thread = Thread {
             id: Uuid::new_v4(),
             project_id: project.id,
-            title: "New Conversation".into(),
-            harness: "omp".into(),
+            kind,
+            factory,
+            title: title.into(),
+            harness,
             session_ref: None,
-            model: project.defaults.interactive_model.clone(),
+            model,
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,

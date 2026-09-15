@@ -4,17 +4,23 @@ use super::{
     settings::{Dialog, DialogKind},
     sidebar::{self, Row},
 };
-use crate::app::AppState;
+use crate::{
+    app::{AppState, NoticeLevel},
+    model::PaneDirection,
+};
 use gpui_kit::{
     component::{
-        Sizable,
+        ActiveTheme, Root, Sizable, TitleBar, WindowExt,
         button::{Button, ButtonVariants},
         dock::{
-            BasePanel, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSkin,
-            Panel, PanelEvent, PanelInfo, PanelState, TabGroup, panel_handle, register_panel,
+            BasePanel, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSizing,
+            DockSkin, Panel, PanelEvent, PanelInfo, PanelState, TabGroup, panel_handle,
+            register_panel,
         },
         h_flex,
-        input::{InputEvent, InputState},
+        menu::{DropdownMenu, PopupMenu, PopupMenuItem},
+        notification::Notification,
+        status_bar::StatusBar,
         v_flex,
     },
     prelude::FluentBuilder,
@@ -26,23 +32,16 @@ use std::{cell::Cell, rc::Rc};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
     Projects,
-    Conversation,
-    Factory,
+    Thread,
     Output,
 }
 impl Region {
-    pub const ALL: [Self; 4] = [
-        Self::Projects,
-        Self::Conversation,
-        Self::Factory,
-        Self::Output,
-    ];
+    pub const ALL: [Self; 3] = [Self::Projects, Self::Thread, Self::Output];
     pub fn index(self) -> usize {
         match self {
             Self::Projects => 0,
-            Self::Conversation => 1,
-            Self::Factory => 2,
-            Self::Output => 3,
+            Self::Thread => 1,
+            Self::Output => 2,
         }
     }
     pub fn name(self) -> &'static str {
@@ -51,8 +50,8 @@ impl Region {
     fn context(self) -> &'static str {
         match self {
             Self::Projects => "List ProjectsList",
-            Self::Factory | Self::Output => "List",
-            Self::Conversation => "Conversation",
+            Self::Thread => "Thread",
+            Self::Output => "List",
         }
     }
 }
@@ -64,7 +63,7 @@ pub struct Workspace {
     panels: Vec<Entity<WorkspacePanel>>,
     focus: FocusHandle,
     pub cursor: Option<Row>,
-    pub palette: Option<Palette>,
+    pub palette: Option<Entity<Palette>>,
     pub dialog: Option<Dialog>,
     pub editor: Option<Entity<crate::neovim::NvimView>>,
     pub(super) opening_editor: bool,
@@ -73,12 +72,18 @@ pub struct Workspace {
     pub(super) editor_override: Option<(crate::neovim::DraftKey, String)>,
     pub image_preview: Option<crate::model::ImageAttachment>,
     pub expanded: std::collections::HashSet<String>,
-    pub handoff_message: Option<(crate::model::ThreadId, usize, String)>,
     pub extension: Option<super::overlays::ExtensionForm>,
     pub tool_detail: Option<(crate::model::ThreadId, String)>,
-    pub factory_form: Option<super::factory_form::FactoryForm>,
+    pub factory_form: Option<super::factory_form::FactoryThreadForm>,
+    pub(super) model_picker: Option<conversation::ModelPicker>,
+    pub(super) detail_surface: Option<super::overlays::SurfaceKey>,
+    pub(super) editor_theme: Option<crate::neovim::NvimTheme>,
     pub(super) quit_requested: bool,
-    scrolls: [ScrollHandle; 4],
+    scrolls: [ScrollHandle; 3],
+    layout_save: Option<Task<()>>,
+    seen_notice_sequence: u64,
+    reopening: Option<Region>,
+    dock_measurement: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub(super) _subscriptions: Vec<Subscription>,
 }
 impl Workspace {
@@ -100,7 +105,7 @@ impl Workspace {
                 panel_handle(panel.clone())
             });
         }
-        let (dock, skin) = DockSkin::dock_area("drost-workspace", Some(1), window, cx);
+        let (dock, skin) = DockSkin::dock_area("drost-workspace", Some(2), window, cx);
         let saved = state.read(cx).snapshot.settings.get("layout").cloned();
         let mut workspace = Self {
             state,
@@ -115,15 +120,21 @@ impl Workspace {
             editor_override: None,
             image_preview: None,
             expanded: std::collections::HashSet::new(),
-            handoff_message: None,
             extension: None,
             tool_detail: None,
             factory_form: None,
             quit_requested: false,
             cursor: None,
+            model_picker: None,
+            detail_surface: None,
+            editor_theme: None,
             palette: None,
             dialog: None,
             scrolls: std::array::from_fn(|_| ScrollHandle::new()),
+            layout_save: None,
+            seen_notice_sequence: 0,
+            reopening: None,
+            dock_measurement: Rc::new(Cell::new(None)),
             _subscriptions: Vec::new(),
         };
         let restored = saved.map(|saved| {
@@ -139,7 +150,10 @@ impl Workspace {
                 workspace.reset_layout(window, cx);
                 if let Some(Err(error)) = other {
                     workspace.state.update(cx, |state, cx| {
-                        state.notice(format!("Only the saved layout was reset: {error:#}"));
+                        state.notice(
+                            crate::app::NoticeLevel::Error,
+                            format!("Only the saved layout was reset: {error:#}"),
+                        );
                         cx.notify();
                     });
                 }
@@ -162,26 +176,71 @@ impl Workspace {
                     workspace.quit_requested = false;
                 }
                 workspace.sync_session(window, cx);
+                workspace.sync_factory_form(window, cx);
+                workspace.sync_model_picker(window, cx);
+                workspace.sync_detail_surface(window, cx);
+                workspace.show_notices(window, cx);
                 cx.notify();
             },
         ));
         workspace._subscriptions.push(cx.subscribe_in(
             &workspace.dock,
             window,
-            |workspace, dock, event: &DockEvent, _, cx| {
+            |workspace, _, event: &DockEvent, window, cx| {
                 if matches!(event, DockEvent::LayoutChanged)
                     && !workspace.state.read(cx).shutting_down
                 {
-                    let layout = dock.read(cx).dump(cx);
-                    workspace.state.update(cx, |state, cx| {
-                        state.set_setting("layout", json!(layout));
-                        cx.notify();
-                    });
+                    workspace.invalidate_panel_bounds(cx);
+                    workspace.normalize_layout(workspace.reopening, window, cx);
+                    workspace.schedule_layout_save(window, cx);
                 }
             },
         ));
-        workspace.focus_region(Region::Projects, window, cx);
+        workspace
+            ._subscriptions
+            .push(cx.observe_window_bounds(window, |workspace, window, cx| {
+                workspace.reopening = None;
+                workspace.invalidate_panel_bounds(cx);
+                workspace.normalize_layout(None, window, cx);
+                workspace.schedule_layout_save(window, cx);
+            }));
+        workspace
+            ._subscriptions
+            .push(cx.observe_global_in::<gpui_kit::component::Theme>(
+                window,
+                |workspace, window, cx| {
+                    workspace.reopening = None;
+                    workspace.sync_editor_theme(window, cx);
+                    workspace.invalidate_panel_bounds(cx);
+                    workspace.normalize_layout(None, window, cx);
+                    workspace.schedule_layout_save(window, cx);
+                },
+            ));
+        workspace
+            ._subscriptions
+            .extend(super::theme::attach(workspace.state.clone(), window, cx));
+        workspace.normalize_layout(None, window, cx);
+        workspace.sync_factory_form(window, cx);
+        workspace.sync_model_picker(window, cx);
+        cx.defer_in(window, |workspace, window, cx| {
+            workspace.show_notices(window, cx)
+        });
+        let projects_focus = workspace.panels[Region::Projects.index()]
+            .read(cx)
+            .focus
+            .clone();
+        projects_focus.focus(window, cx);
         workspace.start_editor(window, cx);
+        let quit_owner = cx.entity().downgrade();
+        let quit_window = window.window_handle();
+        App::on_action(cx, move |_: &Quit, cx| {
+            let owner = quit_owner.clone();
+            cx.defer(move |cx| {
+                let _ = cx.update_window(quit_window, |_, window, cx| {
+                    let _ = owner.update(cx, |workspace, cx| workspace.quit_review(window, cx));
+                });
+            });
+        });
         let closing = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             let _ = closing.update(cx, |workspace, cx| workspace.quit_review(window, cx));
@@ -191,35 +250,246 @@ impl Workspace {
     }
 
     pub fn reset_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reopening = None;
         let tabs = |index: usize, cx: &App| {
             DockLayout::tabs().panel_view(panel_handle(self.panels[index].clone()), cx)
         };
         let center = tabs(1, cx);
         let left = tabs(0, cx);
-        let right = tabs(2, cx);
-        let bottom = tabs(3, cx);
+        let bottom = tabs(2, cx);
+        // Dock APIs consume pixels; application geometry is resolved from rem here.
+        let rem = window.rem_size();
         self.dock.update(cx, |dock, cx| {
-            dock.set_version(Some(1), cx);
+            dock.set_version(Some(2), cx);
+            dock.remove_dock(DockPlacement::Right, window, cx);
             dock.set_center(center, window, cx);
-            for (placement, layout, width) in [
-                (DockPlacement::Left, left, 260.),
-                (DockPlacement::Right, right, 340.),
-                (DockPlacement::Bottom, bottom, 240.),
+            for (placement, layout, size) in [
+                (DockPlacement::Left, left, rem * 16.),
+                (DockPlacement::Bottom, bottom, rem * 12.),
             ] {
                 dock.set_dock(placement, layout, window, cx);
-                dock.set_dock_size(placement, px(width), window, cx);
+                dock.set_dock_size(placement, size, window, cx);
                 dock.set_dock_collapsible(placement, true, window, cx);
             }
             if dock.is_dock_open(DockPlacement::Bottom) {
                 dock.toggle_dock(DockPlacement::Bottom, window, cx);
             }
         });
-        let layout = self.dock.read(cx).dump(cx);
-        self.state.update(cx, |state, cx| {
-            state.set_setting("layout", json!(layout));
-            cx.notify();
-        });
+        self.invalidate_panel_bounds(cx);
+        self.normalize_layout(None, window, cx);
+        self.flush_layout(cx);
         cx.notify();
+    }
+
+    fn navigation_blocked(&self, window: &mut Window, cx: &mut App) -> bool {
+        self.quit_requested
+            || self.editor_switching
+            || self.state.read(cx).shutting_down
+            || self.palette.is_some()
+            || self.dialog.is_some()
+            || self.extension.is_some()
+            || self.image_preview.is_some()
+            || self.tool_detail.is_some()
+            || window.has_active_dialog(cx)
+            || window.has_active_sheet(cx)
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).has_composition())
+    }
+
+    fn invalidate_panel_bounds(&self, cx: &App) {
+        for panel in &self.panels {
+            panel.read(cx).bounds.set(None);
+        }
+    }
+
+    fn toggle_region(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        let layout = self.dock.read(cx).dump(cx);
+        for (placement, dock) in [
+            (DockPlacement::Left, &layout.left_dock),
+            (DockPlacement::Right, &layout.right_dock),
+            (DockPlacement::Bottom, &layout.bottom_dock),
+        ] {
+            if dock
+                .as_ref()
+                .is_some_and(|dock| contains_panel(dock.panel(), region.name()))
+            {
+                let opening = !self.dock.read(cx).is_dock_open(placement);
+                self.dock
+                    .update(cx, |dock, cx| dock.toggle_dock(placement, window, cx));
+                self.invalidate_panel_bounds(cx);
+                self.normalize_layout(opening.then_some(region), window, cx);
+                return;
+            }
+        }
+        // A panel moved into the center is a native tab, not an auxiliary dock.
+        self.focus_region(region, window, cx);
+    }
+
+    fn normalize_layout(
+        &mut self,
+        priority: Option<Region>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if priority.is_some() {
+            self.reopening = priority;
+        }
+        let dock = self.dock.read(cx);
+        let layout = dock.dump(cx);
+        let rem = window.rem_size();
+        let mut area = dock.bounds();
+        if area.size.width <= px(0.) || area.size.height <= px(0.) {
+            area = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+            // First layout has no dock measurement: native title/status chrome allowance.
+            area.size.height = (area.size.height - rem * 4.).max(px(0.));
+        }
+        let edges = [
+            (DockPlacement::Left, layout.left_dock.as_ref()),
+            (DockPlacement::Right, layout.right_dock.as_ref()),
+            (DockPlacement::Bottom, layout.bottom_dock.as_ref()),
+        ];
+        let minima = [rem * 12., rem * 12., rem * 8.];
+        let mut sizes = [px(0.); 3];
+        let mut open = [false; 3];
+        for (i, (_, edge)) in edges.iter().enumerate() {
+            if let Some(edge) = edge {
+                sizes[i] = edge.size().max(minima[i]).min(rem * 24.);
+                open[i] = edge.open();
+            }
+        }
+        let available = [area.size.width - rem * 28., area.size.height - rem * 16.];
+        let fits = |open: &[bool; 3], sizes: &[Pixels; 3]| {
+            (if open[0] { sizes[0] } else { px(0.) }) + (if open[1] { sizes[1] } else { px(0.) })
+                <= available[0]
+                && (!open[2] || sizes[2] <= available[1])
+        };
+        if !fits(&open, &sizes) {
+            // Shrink allocations before collapsing either auxiliary pane.
+            for i in 0..3 {
+                if open[i] {
+                    sizes[i] = minima[i];
+                }
+            }
+        }
+        let order = if priority == Some(Region::Output) {
+            [Region::Projects, Region::Output]
+        } else {
+            [Region::Output, Region::Projects]
+        };
+        for region in order {
+            if fits(&open, &sizes) {
+                break;
+            }
+            if priority == Some(region) {
+                continue;
+            }
+            for (i, (_, edge)) in edges.iter().enumerate() {
+                if edge.is_some_and(|edge| {
+                    contains_panel(edge.panel(), region.name())
+                        && !contains_panel(edge.panel(), Region::Thread.name())
+                        && priority
+                            .is_none_or(|priority| !contains_panel(edge.panel(), priority.name()))
+                }) {
+                    open[i] = false;
+                }
+            }
+        }
+        for (i, (placement, edge)) in edges.iter().enumerate() {
+            let Some(edge) = edge else { continue };
+            let opposite = match i {
+                0 if open[1] => sizes[1],
+                1 if open[0] => sizes[0],
+                _ => px(0.),
+            };
+            let sizing = DockSizing::new(*placement)
+                .with_area_bounds(area)
+                .with_opposite_dock_size(opposite);
+            let reserve_cap = if i == 2 {
+                available[1]
+            } else {
+                available[0] - opposite
+            };
+            sizes[i] = sizing.clamp(sizes[i].min(reserve_cap.max(minima[i])));
+            if sizes[i] != edge.size() || open[i] != edge.open() {
+                self.dock.update(cx, |dock, cx| {
+                    if sizes[i] != edge.size() {
+                        dock.set_dock_size(*placement, sizes[i], window, cx);
+                    }
+                    if open[i] != edge.open() {
+                        dock.toggle_dock(*placement, window, cx);
+                    }
+                });
+            }
+        }
+    }
+
+    fn schedule_layout_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.layout_save = Some(cx.spawn_in(window, async move |workspace, window| {
+            smol::Timer::after(std::time::Duration::from_millis(250)).await;
+            let _ = workspace.update_in(window, |workspace, _, cx| workspace.flush_layout(cx));
+        }));
+    }
+
+    pub(super) fn flush_layout(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).shutting_down {
+            return;
+        }
+        let layout = json!(self.dock.read(cx).dump(cx));
+        if self.state.read(cx).snapshot.settings.get("layout") != Some(&layout) {
+            self.state.update(cx, |state, cx| {
+                state.set_setting("layout", layout);
+                cx.notify();
+            });
+        }
+    }
+
+    fn show_notices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let count = state
+            .notice_sequence
+            .wrapping_sub(self.seen_notice_sequence) as usize;
+        self.seen_notice_sequence = state.notice_sequence;
+        if count == 0 {
+            return;
+        }
+        let notes: Vec<_> = state
+            .notices
+            .iter()
+            .skip(state.notices.len().saturating_sub(count))
+            .filter(|notice| matches!(notice.level, NoticeLevel::Warning | NoticeLevel::Error))
+            .filter(|notice| {
+                ![
+                    state.storage_error.as_deref(),
+                    state.editor_error.as_deref(),
+                    state.shutdown_error.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|error| notice.text.contains(error))
+            })
+            .filter(|notice| {
+                !state
+                    .conversation_thread()
+                    .and_then(|thread| state.conversations.get(&thread.id))
+                    .and_then(|session| session.error.as_deref())
+                    .is_some_and(|error| notice.text.contains(error))
+            })
+            .cloned()
+            .collect();
+        for notice in notes {
+            window.push_notification(
+                match notice.level {
+                    NoticeLevel::Warning => Notification::warning(notice.text),
+                    _ => Notification::error(notice.text),
+                },
+                cx,
+            );
+        }
     }
 
     pub fn focused_region(&self, window: &Window, cx: &App) -> Region {
@@ -231,17 +501,14 @@ impl Workspace {
                     .focus
                     .contains_focused(window, cx)
             })
-            .unwrap_or(Region::Conversation)
+            .unwrap_or(Region::Thread)
     }
     pub fn focus_region(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(form) = &self.factory_form {
-            form.focus.focus(window, cx);
+        if self.navigation_blocked(window, cx) {
             return;
         }
-        if self.dialog.is_some() || self.palette.is_some() {
-            self.dismiss(window, cx);
-        }
         let layout = self.dock.read(cx).dump(cx);
+        let mut opened = false;
         for (placement, dock) in [
             (DockPlacement::Left, layout.left_dock),
             (DockPlacement::Right, layout.right_dock),
@@ -251,14 +518,31 @@ impl Workspace {
                 .as_ref()
                 .is_some_and(|dock| contains_panel(dock.panel(), region.name()) && !dock.open())
             {
+                opened = true;
                 self.dock
                     .update(cx, |dock, cx| dock.toggle_dock(placement, window, cx));
             }
+        }
+        if opened {
+            self.invalidate_panel_bounds(cx);
+            self.normalize_layout(Some(region), window, cx);
         }
         let panel = self.panels[region.index()].read(cx);
         let group = panel.group.clone();
         let focus = panel.focus.clone();
         if let Some(group) = group {
+            if let Some(group) = group.upgrade() {
+                let node = group.read(cx).node();
+                if self
+                    .dock
+                    .read(cx)
+                    .zoomed_group()
+                    .is_some_and(|zoomed| zoomed != node)
+                {
+                    self.dock
+                        .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
+                }
+            }
             let _ = group.update(cx, |group, cx| {
                 if let Some(index) = group
                     .panels()
@@ -272,37 +556,57 @@ impl Workspace {
         focus.focus(window, cx);
         cx.notify();
     }
-    fn spatial_focus(&mut self, direction: Region, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn spatial_focus(
+        &mut self,
+        direction: PaneDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
         let current = self.focused_region(window, cx);
-        let Some(origin) = self.panels[current.index()].read(cx).bounds.get() else {
+        let dock = self.dock.read(cx);
+        let layout = dock.dump(cx);
+        let zoomed = dock.zoomed_group();
+        let visible_bounds = |region: Region| {
+            if [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
+                .into_iter()
+                .flatten()
+                .any(|dock| !dock.open() && contains_panel(dock.panel(), region.name()))
+            {
+                return None;
+            }
+            let panel = self.panels[region.index()].read(cx);
+            let group = panel.group.as_ref()?.upgrade()?;
+            let group = group.read(cx);
+            if group.is_collapsed()
+                || zoomed.is_some_and(|node| node != group.node())
+                || group.active_panel(cx)?.panel_name(cx) != region.name()
+            {
+                return None;
+            }
+            let bounds = panel.bounds.get()?;
+            (bounds.size.width > px(0.)
+                && bounds.size.height > px(0.)
+                && dock.bounds().contains(&bounds.center()))
+            .then_some(bounds)
+        };
+        let Some(origin) = visible_bounds(current).map(|bounds| bounds.center()) else {
             return;
         };
-        let origin = origin.center();
-        let layout = self.dock.read(cx).dump(cx);
         let next = Region::ALL
             .into_iter()
             .filter(|region| *region != current)
             .filter_map(|region| {
-                if [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
-                    .into_iter()
-                    .flatten()
-                    .any(|dock| !dock.open() && contains_panel(dock.panel(), region.name()))
-                {
-                    return None;
-                }
-                let panel = self.panels[region.index()].read(cx);
-                let group = panel.group.as_ref()?.upgrade()?;
-                if group.read(cx).active_panel(cx)?.panel_name(cx) != region.name() {
-                    return None;
-                }
-                let center = panel.bounds.get()?.center();
+                let center = visible_bounds(region)?.center();
                 let dx = f32::from(center.x - origin.x);
                 let dy = f32::from(center.y - origin.y);
                 let (forward, cross) = match direction {
-                    Region::Projects => (-dx, dy),
-                    Region::Factory => (dx, dy),
-                    Region::Conversation => (-dy, dx),
-                    Region::Output => (dy, dx),
+                    PaneDirection::Left => (-dx, dy),
+                    PaneDirection::Right => (dx, dy),
+                    PaneDirection::Up => (-dy, dx),
+                    PaneDirection::Down => (dy, dx),
                 };
                 (forward > 1.).then_some((region, forward + cross.abs() * 2.))
             })
@@ -312,15 +616,6 @@ impl Workspace {
             self.focus_region(next, window, cx);
         }
     }
-    fn toggle_dock(
-        &mut self,
-        placement: DockPlacement,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.dock
-            .update(cx, |dock, cx| dock.toggle_dock(placement, window, cx));
-    }
 
     pub fn execute(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.read(cx).shutting_down {
@@ -328,7 +623,7 @@ impl Workspace {
         }
         if let Some(reason) = command.disabled_reason(self.state.read(cx)) {
             self.state.update(cx, |state, cx| {
-                state.notice(reason);
+                state.notice(crate::app::NoticeLevel::Warning, reason);
                 cx.notify();
             });
             return;
@@ -345,25 +640,30 @@ impl Workspace {
                 .read(cx)
                 .selected_project
                 .map(DialogKind::ArchiveProject),
-            Command::RenameConversation => self
+            Command::RenameThread => self
                 .state
                 .read(cx)
                 .selected_thread
                 .map(DialogKind::RenameThread),
-            Command::ArchiveConversation => self
+            Command::ArchiveThread => self
                 .state
                 .read(cx)
                 .selected_thread
                 .map(DialogKind::ArchiveThread),
             Command::Settings => Some(DialogKind::Settings(self.state.read(cx).selected_project)),
-            Command::NewConversation => {
+            Command::NewConversation | Command::NewFactoryThread => {
+                let kind = if command == Command::NewConversation {
+                    crate::model::ThreadKind::Conversation
+                } else {
+                    crate::model::ThreadKind::Factory
+                };
                 self.state.update(cx, |state, cx| {
-                    if let Err(error) = state.new_thread() {
-                        state.notice(format!("{error:#}"));
+                    if let Err(error) = state.new_thread(kind) {
+                        state.notice(crate::app::NoticeLevel::Error, format!("{error:#}"));
                     }
                     cx.notify();
                 });
-                self.focus_region(Region::Conversation, window, cx);
+                self.focus_region(Region::Thread, window, cx);
                 None
             }
             Command::ShowArchived => {
@@ -378,23 +678,40 @@ impl Workspace {
                 self.reset_layout(window, cx);
                 None
             }
-            Command::SendToFactory => {
-                self.open_factory_form(super::factory_form::FactoryFormKind::Task, window, cx);
-                None
-            }
-            Command::OpenFactoryFolder => {
-                self.open_factory_form(super::factory_form::FactoryFormKind::Folder, window, cx);
-                None
-            }
-            Command::DispatchAzureWorkItem => {
-                self.open_factory_form(super::factory_form::FactoryFormKind::Azure, window, cx);
-                None
-            }
             Command::RefreshFactoryRuns => {
                 self.state.update(cx, |state, cx| {
                     state.refresh_factory_runs();
                     cx.notify();
                 });
+                None
+            }
+            Command::CloseThread => {
+                self.state.update(cx, |state, cx| {
+                    if let Some(id) = state.selected_thread {
+                        state.close_thread(id);
+                    }
+                    cx.notify();
+                });
+                None
+            }
+            Command::FocusProjects | Command::FocusThread | Command::FocusOutput => {
+                self.focus_region(
+                    match command {
+                        Command::FocusProjects => Region::Projects,
+                        Command::FocusOutput => Region::Output,
+                        _ => Region::Thread,
+                    },
+                    window,
+                    cx,
+                );
+                None
+            }
+            Command::ToggleProjects => {
+                self.toggle_region(Region::Projects, window, cx);
+                None
+            }
+            Command::ToggleOutput => {
+                self.toggle_region(Region::Output, window, cx);
                 None
             }
         };
@@ -404,39 +721,60 @@ impl Workspace {
         cx.notify();
     }
     fn open_dialog(&mut self, kind: DialogKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_switching
+            || self.extension.is_some()
+            || self.state.read(cx).shutting_down
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).has_composition())
+        {
+            return;
+        }
         self.dismiss(window, cx);
+        if self.detail_surface.is_some() || self.dialog.is_some() || self.palette.is_some() {
+            return;
+        }
         self.dialog = Some(
             self.state
                 .update(cx, |state, cx| Dialog::new(kind, state, window, cx)),
         );
+        super::settings::open_surface(cx.entity().downgrade(), window, cx);
         cx.notify();
     }
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.image_preview = None;
-        self.tool_detail = None;
-        if self.factory_form.is_some() {
-            self.close_factory_form(window, cx);
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).has_composition())
+        {
+            return;
+        }
+        if self.extension.as_ref().is_some_and(|form| form.pending) {
+            return;
         }
         if self.extension.is_some() {
             self.close_extension(true, window, cx);
+            if self.extension.is_some() {
+                return;
+            }
         }
-        let focus = self
-            .palette
-            .take()
-            .and_then(|palette| palette.previous_focus)
-            .or_else(|| self.dialog.take().and_then(|dialog| dialog.previous_focus));
-        if let Some(focus) = focus {
-            focus.focus(window, cx);
+        if !self.close_detail_surface(window, cx) {
+            return;
+        }
+        self.image_preview = None;
+        self.tool_detail = None;
+        if let Some(palette) = self.palette.take() {
+            palette.update(cx, |palette, cx| palette.dismiss(window, cx));
+        }
+        if let Some(dialog) = self.dialog.take() {
+            super::settings::close_surface(&dialog.kind, window, cx);
         }
         cx.notify();
     }
     pub fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.extension.is_some() {
             self.confirm_extension(window, cx);
-            return;
-        }
-        if self.factory_form.is_some() {
-            self.review_factory_task(window, cx);
             return;
         }
         let Some(dialog) = self.dialog.take() else {
@@ -449,14 +787,12 @@ impl Workspace {
         });
         match result {
             Ok(true) => {
-                if let Some(focus) = dialog.previous_focus {
-                    focus.focus(window, cx);
-                }
+                super::settings::close_surface(&dialog.kind, window, cx);
             }
             Ok(false) => self.dialog = Some(dialog),
             Err(error) => {
                 let mut dialog = dialog;
-                dialog.error = Some(format!("{error:#}"));
+                dialog.set_error(&error);
                 self.dialog = Some(dialog);
             }
         }
@@ -474,20 +810,14 @@ impl Workspace {
             let _ = workspace.update_in(window, |workspace, window, cx| {
                 match result {
                     Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.into_iter().next() {
-                            if let Some(dialog) = &workspace.dialog {
-                                if let Some(field) =
-                                    dialog.fields.iter().find(|field| field.key == "path")
-                                {
-                                    field.input.update(cx, |input, cx| {
-                                        input.set_value(
-                                            path.to_string_lossy().into_owned(),
-                                            window,
-                                            cx,
-                                        )
-                                    });
-                                }
-                            }
+                        if let Some(path) = paths.into_iter().next()
+                            && let Some(dialog) = &workspace.dialog
+                            && let Some(field) =
+                                dialog.fields.iter().find(|field| field.key == "path")
+                        {
+                            field.input.update(cx, |input, cx| {
+                                input.set_value(path.to_string_lossy().into_owned(), window, cx)
+                            });
                         }
                     }
                     Ok(Ok(None)) => {}
@@ -527,15 +857,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(palette) = &mut self.palette {
-            let count = palette.items(self.state.read(cx), cx).len();
-            palette.selected = (palette.selected as isize + delta)
-                .clamp(0, count.saturating_sub(1) as isize) as usize;
-            cx.notify();
+        if self.navigation_blocked(window, cx) {
             return;
         }
         let region = self.focused_region(window, cx);
-        if region == Region::Conversation {
+        if region == Region::Thread {
             let state = self.state.read(cx);
             if let Some(session) = state
                 .selected_thread
@@ -548,35 +874,10 @@ impl Workspace {
                         session.list.scroll_to_end();
                     }
                 } else {
-                    session.list.scroll_by(px(delta as f32 * 36.));
+                    session
+                        .list
+                        .scroll_by(window.rem_size() * (delta as f32 * 2.25));
                 }
-                cx.notify();
-                return;
-            }
-        }
-        if region == Region::Factory {
-            let state = self.state.read(cx);
-            let launches: Vec<_> = state
-                .snapshot
-                .launches
-                .iter()
-                .filter(|launch| Some(launch.project_id) == state.selected_project)
-                .map(|launch| launch.id)
-                .collect();
-            if !launches.is_empty() {
-                let index = launches
-                    .iter()
-                    .position(|id| Some(*id) == state.selected_launch)
-                    .unwrap_or(0);
-                let next = if endpoint {
-                    if delta < 0 { 0 } else { launches.len() - 1 }
-                } else {
-                    (index as isize + delta).clamp(0, launches.len() as isize - 1) as usize
-                };
-                self.state.update(cx, |state, cx| {
-                    state.select_factory_launch(launches[next], cx)
-                });
-                self.scrolls[region.index()].scroll_to_item(next);
                 cx.notify();
                 return;
             }
@@ -593,7 +894,7 @@ impl Workspace {
                 let offset = scroll.offset();
                 scroll.set_offset(point(
                     offset.x,
-                    (offset.y - px(delta as f32 * 36.)).min(px(0.)),
+                    (offset.y - window.rem_size() * (delta as f32 * 2.25)).min(px(0.)),
                 ));
             }
             cx.notify();
@@ -643,14 +944,7 @@ impl Workspace {
         cx.notify();
     }
     fn open_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() {
-            self.confirm_palette(window, cx);
-            return;
-        }
-        if self.focused_region(window, cx) == Region::Factory {
-            if self.state.read(cx).selected_launch.is_some() {
-                self.focus_region(Region::Output, window, cx);
-            }
+        if self.navigation_blocked(window, cx) {
             return;
         }
         if self.focused_region(window, cx) != Region::Projects {
@@ -659,51 +953,32 @@ impl Workspace {
         if let Some(row) = self.cursor {
             self.select_row(row, true, window, cx);
             if matches!(row, Row::Thread(_)) {
-                self.focus_region(Region::Conversation, window, cx);
+                self.focus_region(Region::Thread, window, cx);
             }
         }
     }
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dismiss(window, cx);
-        let previous_focus = window.focused(cx);
-        let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Commands, projects, conversations…")
-        });
-        let subscription = cx.subscribe_in(
-            &input,
-            window,
-            |workspace, _, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => {
-                    if let Some(palette) = &mut workspace.palette {
-                        palette.selected = 0;
-                    }
-                    cx.notify();
-                }
-                InputEvent::PressEnter { .. } => workspace.confirm_palette(window, cx),
-                _ => {}
-            },
-        );
-        input.focus_handle(cx).focus(window, cx);
-        self.palette = Some(Palette {
-            input,
-            selected: 0,
-            previous_focus,
-            subscription,
-        });
-        cx.notify();
-    }
-    fn confirm_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let item = self.palette.as_ref().and_then(|palette| {
-            palette
-                .items(self.state.read(cx), cx)
-                .get(palette.selected)
-                .cloned()
-        });
-        if let Some(item) = item {
-            if item.disabled.is_none() {
-                self.run_palette_target(item.target, window, cx);
-            }
+        if self.editor_switching
+            || self.state.read(cx).shutting_down
+            || self.extension.is_some()
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).has_composition())
+        {
+            return;
         }
+        self.dismiss(window, cx);
+        if self.detail_surface.is_some() || self.dialog.is_some() || self.palette.is_some() {
+            return;
+        }
+        self.palette = Some(Palette::open(
+            cx.entity().downgrade(),
+            self.state.clone(),
+            window,
+            cx,
+        ));
+        cx.notify();
     }
     pub fn run_palette_target(
         &mut self,
@@ -711,15 +986,38 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dismiss(window, cx);
         match target {
             PaletteTarget::Command(command) => self.execute(command, window, cx),
             PaletteTarget::Project(id) => self.select_row(Row::Project(id), true, window, cx),
             PaletteTarget::Thread(id) => {
                 self.select_row(Row::Thread(id), true, window, cx);
-                self.focus_region(Region::Conversation, window, cx);
+                self.focus_region(Region::Thread, window, cx);
             }
         }
+    }
+}
+
+/// Native overlay layers are siblings of Workspace, so their callbacks never lease
+/// Workspace while its render is running and actions route through their own hosts.
+pub struct WorkspaceRoot {
+    pub workspace: Entity<Workspace>,
+}
+
+impl Render for WorkspaceRoot {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let show_layers = !self.workspace.read(cx).state.read(cx).shutting_down;
+        let sheet = Root::render_sheet_layer(window, cx);
+        let dialog = Root::render_dialog_layer(window, cx);
+        let notifications = Root::render_notification_layer(window, cx);
+        div()
+            .relative()
+            .size_full()
+            .child(self.workspace.clone())
+            .when(show_layers, |view| {
+                view.children(sheet)
+                    .children(dialog)
+                    .children(notifications)
+            })
     }
 }
 
@@ -727,35 +1025,25 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let owner = cx.entity().downgrade();
         let state = self.state.read(cx);
-        let region = if self.palette.is_some() {
-            "CommandPalette"
-        } else if self.dialog.is_some() || self.factory_form.is_some() {
-            "Dialog / NativeInput"
-        } else {
-            self.focused_region(window, cx).name()
-        };
-        let branch = state
-            .selected_project
-            .and_then(|id| state.repositories.get(&id))
-            .map(|result| match result {
-                Ok(info) => format!(
-                    "{}{}",
-                    info.branch.as_deref().unwrap_or("Detached HEAD"),
-                    if info.dirty { " · dirty" } else { "" }
-                ),
-                Err(_) => "Root unavailable".into(),
-            })
-            .unwrap_or_else(|| "No project".into());
-        let pending = if state.pending_writes > 0 {
-            format!("Saving {} changes", state.pending_writes)
-        } else {
-            "Saved".into()
-        };
+        let project_name = state
+            .project()
+            .map(|project| project.name.clone())
+            .unwrap_or_else(|| "Drost".into());
+        let editor_mode = self
+            .editor
+            .as_ref()
+            .filter(|editor| editor.focus_handle(cx).contains_focused(window, cx))
+            .filter(|_| state.conversation_thread().is_some())
+            .map(|editor| editor.read(cx).mode().to_owned());
+        let pending =
+            (state.pending_writes > 0).then(|| format!("Saving {} changes", state.pending_writes));
         let palette_owner = owner.clone();
-        let factory_owner = owner.clone();
         let output_owner = owner.clone();
         let recovery_owner = owner.clone();
         let dismiss_recovery = owner.clone();
+        let dock_measurement = self.dock_measurement.clone();
+        let geometry_owner = owner.clone();
+        let close_owner = owner.clone();
         let has_saved_recovery = state
             .snapshot
             .settings
@@ -768,8 +1056,8 @@ impl Render for Workspace {
                 .track_focus(&self.focus)
                 .size_full()
                 .relative()
-                .bg(rgb(0x181B20))
-                .text_color(rgb(0xD8DEE9))
+                .bg(cx.theme().background)
+                .text_color(cx.theme().foreground)
                 .on_action(cx.listener(|this, _: &AddProject, w, cx| {
                     this.execute(Command::AddProject, w, cx)
                 }))
@@ -782,23 +1070,20 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &ArchiveProject, w, cx| {
                     this.execute(Command::ArchiveProject, w, cx)
                 }))
-                .on_action(cx.listener(|this, _: &RenameConversation, w, cx| {
-                    this.execute(Command::RenameConversation, w, cx)
+                .on_action(cx.listener(|this, _: &RenameThread, w, cx| {
+                    this.execute(Command::RenameThread, w, cx)
                 }))
-                .on_action(cx.listener(|this, _: &ArchiveConversation, w, cx| {
-                    this.execute(Command::ArchiveConversation, w, cx)
+                .on_action(cx.listener(|this, _: &ArchiveThread, w, cx| {
+                    this.execute(Command::ArchiveThread, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &CloseThread, w, cx| {
+                    this.execute(Command::CloseThread, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &ShowArchived, w, cx| {
                     this.execute(Command::ShowArchived, w, cx)
                 }))
-                .on_action(cx.listener(|this, _: &SendToFactory, w, cx| {
-                    this.execute(Command::SendToFactory, w, cx)
-                }))
-                .on_action(cx.listener(|this, _: &OpenFactoryFolder, w, cx| {
-                    this.execute(Command::OpenFactoryFolder, w, cx)
-                }))
-                .on_action(cx.listener(|this, _: &DispatchAzureWorkItem, w, cx| {
-                    this.execute(Command::DispatchAzureWorkItem, w, cx)
+                .on_action(cx.listener(|this, _: &NewFactoryThread, w, cx| {
+                    this.execute(Command::NewFactoryThread, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &RefreshFactoryRuns, w, cx| {
                     this.execute(Command::RefreshFactoryRuns, w, cx)
@@ -813,26 +1098,23 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &FocusProjects, w, cx| {
                     this.focus_region(Region::Projects, w, cx)
                 }))
-                .on_action(cx.listener(|this, _: &FocusConversation, w, cx| {
-                    this.focus_region(Region::Conversation, w, cx)
-                }))
-                .on_action(cx.listener(|this, _: &FocusFactory, w, cx| {
-                    this.focus_region(Region::Factory, w, cx)
+                .on_action(cx.listener(|this, _: &FocusThread, w, cx| {
+                    this.focus_region(Region::Thread, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &FocusOutput, w, cx| {
                     this.focus_region(Region::Output, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &FocusLeft, w, cx| {
-                    this.spatial_focus(Region::Projects, w, cx)
+                    this.spatial_focus(PaneDirection::Left, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &FocusRight, w, cx| {
-                    this.spatial_focus(Region::Factory, w, cx)
+                    this.spatial_focus(PaneDirection::Right, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &FocusUp, w, cx| {
-                    this.spatial_focus(Region::Conversation, w, cx)
+                    this.spatial_focus(PaneDirection::Up, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &FocusDown, w, cx| {
-                    this.spatial_focus(Region::Output, w, cx)
+                    this.spatial_focus(PaneDirection::Down, w, cx)
                 }))
                 .on_action(
                     cx.listener(|this, _: &SelectNext, w, cx| this.navigate(1, false, w, cx)),
@@ -849,9 +1131,15 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &OpenSelection, w, cx| this.open_selection(w, cx)))
                 .on_action(cx.listener(|this, _: &FocusComposer, w, cx| this.focus_composer(w, cx)))
                 .on_action(cx.listener(|this, _: &LeaveEditor, w, cx| {
-                    this.focus_region(Region::Conversation, w, cx)
+                    this.focus_region(Region::Thread, w, cx)
                 }))
-                .on_action(cx.listener(|this, _: &Submit, w, cx| this.submit_prompt(w, cx)))
+                .on_action(cx.listener(|this, _: &Submit, w, cx| {
+                    if this.state.read(cx).factory_thread().is_some() {
+                        this.start_factory_run(w, cx);
+                    } else {
+                        this.submit_prompt(w, cx);
+                    }
+                }))
                 .on_action(cx.listener(|this, _: &Interrupt, _, cx| {
                     this.state.update(cx, |state, cx| {
                         if let Some(id) = state.selected_thread {
@@ -863,62 +1151,62 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &Dismiss, w, cx| this.dismiss(w, cx)))
                 .on_action(cx.listener(|this, _: &Confirm, w, cx| this.confirm_dialog(w, cx)))
                 .on_action(cx.listener(|this, _: &Quit, w, cx| this.quit_review(w, cx)))
-                .on_action(cx.listener(|this, _: &ToggleFactory, w, cx| {
-                    this.toggle_dock(DockPlacement::Right, w, cx)
+                .on_action(cx.listener(|this, _: &ToggleProjects, w, cx| {
+                    this.execute(Command::ToggleProjects, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &ToggleOutput, w, cx| {
-                    this.toggle_dock(DockPlacement::Bottom, w, cx)
+                    this.execute(Command::ToggleOutput, w, cx)
                 }))
                 .child(
-                    h_flex()
-                        .h(px(38.))
-                        .px_3()
-                        .items_center()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(rgb(0x343A46))
-                        .child(div().flex_1().child("Drost"))
+                    TitleBar::new()
+                        .on_close_window(move |_, window, cx| {
+                            let _ = close_owner
+                                .update(cx, |workspace, cx| workspace.quit_review(window, cx));
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_sm()
+                                .text_ellipsis()
+                                .child(project_name),
+                        )
                         .child(
                             Button::new("workspace-palette")
                                 .small()
                                 .ghost()
-                                .label("Commands  ⌘⇧P")
+                                .cursor_default()
+                                .icon(gpui_kit::component::IconName::Search)
+                                .label("Search")
+                                .tooltip("Search commands, projects and threads")
                                 .on_click(move |_, w, cx| {
                                     let _ = palette_owner
                                         .update(cx, |this, cx| this.open_palette(w, cx));
                                 }),
                         )
                         .child(
-                            Button::new("workspace-factory")
+                            Button::new("workspace-menu")
                                 .small()
                                 .ghost()
-                                .label("Factory")
-                                .on_click(move |_, w, cx| {
-                                    let _ = factory_owner.update(cx, |this, cx| {
-                                        this.toggle_dock(DockPlacement::Right, w, cx)
-                                    });
+                                .cursor_default()
+                                .icon(gpui_kit::component::IconName::Ellipsis)
+                                .tooltip("Workspace menu")
+                                .dropdown_menu(|menu, _, _| {
+                                    menu.menu("Add project…", Box::new(AddProject))
+                                        .menu("New conversation", Box::new(NewConversation))
+                                        .menu("New Factory thread", Box::new(NewFactoryThread))
+                                        .separator()
+                                        .menu("Toggle projects", Box::new(ToggleProjects))
+                                        .menu("Toggle output", Box::new(ToggleOutput))
+                                        .menu("Show archived", Box::new(ShowArchived))
+                                        .separator()
+                                        .menu("Settings…", Box::new(Settings))
+                                        .menu("Reset layout", Box::new(ResetLayout))
                                 }),
-                        )
-                        .child(
-                            Button::new("workspace-output")
-                                .small()
-                                .ghost()
-                                .label("Output")
-                                .on_click(move |_, w, cx| {
-                                    let _ = output_owner.update(cx, |this, cx| {
-                                        this.toggle_dock(DockPlacement::Bottom, w, cx)
-                                    });
-                                }),
-                        )
-                        .child(button(
-                            "workspace-settings",
-                            Command::Settings,
-                            &owner,
-                            state,
-                        )),
+                        ),
                 )
                 .when_some(state.storage_error.clone(), |view, error| {
-                    view.child(div().px_3().py_2().bg(rgb(0x4A292C)).child(format!(
+                    view.child(div().px_3().py_2().text_color(cx.theme().danger).child(format!(
                         "Storage failure — new work is disabled. In-memory drafts retained. {error}"
                     )))
                 })
@@ -968,83 +1256,71 @@ impl Render for Workspace {
                         )
                     },
                 )
-                .when_some(state.notices.back().cloned(), |view, notice| {
-                    view.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .text_xs()
-                            .border_b_1()
-                            .border_color(rgb(0x343A46))
-                            .child(notice),
-                    )
-                })
-                .child(div().flex_1().min_h_0().child(self.dock.clone()))
                 .child(
-                    h_flex()
-                        .h(px(26.))
-                        .px_3()
-                        .gap_4()
-                        .items_center()
-                        .text_xs()
-                        .text_color(rgb(0x8B95A5))
-                        .border_t_1()
-                        .border_color(rgb(0x343A46))
-                        .child(region)
-                        .child(format!(
-                            "Neovim: {}",
-                            self.editor
-                                .as_ref()
-                                .map(|view| view.read(cx).mode())
-                                .unwrap_or("not connected")
-                        ))
-                        .child(branch)
-                        .child(div().flex_1())
-                        .child(format!(
-                            "{} interactive · {} Factory",
-                            state.active_threads.len(),
-                            state.owned_launches.len()
-                        ))
-                        .child(pending),
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.dock.clone())
+                        .child(
+                            canvas(
+                                move |bounds, window, cx| {
+                                    if dock_measurement.replace(Some(bounds)) != Some(bounds) {
+                                        let owner = geometry_owner.clone();
+                                        window.defer(cx, move |window, cx| {
+                                            let _ = owner.update(cx, |workspace, cx| {
+                                                workspace.normalize_layout(
+                                                    workspace.reopening,
+                                                    window,
+                                                    cx,
+                                                );
+                                                workspace.schedule_layout_save(window, cx);
+                                            });
+                                        });
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .inset_0()
+                            .size_full(),
+                        ),
+                )
+                .child(
+                    StatusBar::new()
+                        .when_some(editor_mode, |bar, mode| bar.left(mode))
+                        .when_some(pending, |bar, pending| bar.right(pending))
+                        .when(
+                            state.storage_error.is_some() || state.shutdown_error.is_some(),
+                            |bar| {
+                                bar.right(
+                                    div()
+                                        .text_color(cx.theme().danger)
+                                        .child("Changes could not be saved"),
+                                )
+                            },
+                        )
+                        .right(
+                            Button::new("workspace-output")
+                                .small()
+                                .ghost()
+                                .cursor_default()
+                                .label("Output")
+                                .tooltip("Toggle output")
+                                .on_click(move |_, window, cx| {
+                                    let _ = output_owner.update(cx, |workspace, cx| {
+                                        workspace.execute(Command::ToggleOutput, window, cx)
+                                    });
+                                }),
+                        ),
                 );
-        let overlay = self
-            .render_detail_overlay(&owner, cx)
-            .or_else(|| {
-                self.factory_form
-                    .as_ref()
-                    .map(|form| super::factory_form::render(form, self, &owner, window, cx))
-            })
-            .or_else(|| {
-                self.palette
-                    .as_ref()
-                    .map(|palette| palette.render(state, &owner, cx))
-            })
-            .or_else(|| {
-                self.dialog
-                    .as_ref()
-                    .map(|dialog| dialog.render(state, &owner, window))
-            });
-        if let Some(overlay) = overlay {
-            root = root.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .occlude()
-                    .bg(rgba(0x00000088))
-                    .flex()
-                    .justify_center()
-                    .items_start()
-                    .pt(px(68.))
-                    .child(overlay),
-            );
-        }
         if state.shutting_down {
             root = root.child(
                 div()
                     .absolute()
                     .inset_0()
                     .occlude()
-                    .bg(rgba(0x181B20EE))
+                    .bg(cx.theme().background)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1091,6 +1367,22 @@ impl WorkspacePanel {
             _subscriptions: subscriptions,
         }
     }
+    fn panel_title(&self, cx: &App) -> String {
+        if self.region != Region::Thread {
+            return self.region.name().into();
+        }
+        self.state
+            .read(cx)
+            .thread()
+            .map(|thread| {
+                let kind = match thread.kind {
+                    crate::model::ThreadKind::Conversation => "Conversation",
+                    crate::model::ThreadKind::Factory => "Factory",
+                };
+                format!("{} · {kind}", thread.title)
+            })
+            .unwrap_or_else(|| "Threads".into())
+    }
 }
 impl BasePanel for WorkspacePanel {
     fn panel_name(&self) -> &'static str {
@@ -1101,20 +1393,68 @@ impl BasePanel for WorkspacePanel {
     }
     fn on_added_to(&mut self, group: WeakEntity<TabGroup>, _: &mut Window, _: &mut Context<Self>) {
         self.group = Some(group);
+        self.bounds.set(None);
     }
     fn on_removed(&mut self, _: &mut Window, _: &mut Context<Self>) {
         self.group = None;
+        self.bounds.set(None);
     }
 }
 impl Panel for WorkspacePanel {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.region.name()
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.panel_title(cx)
     }
-    fn tab_name(&self, _: &App) -> Option<SharedString> {
-        Some(self.region.name().into())
+    fn tab_name(&self, cx: &App) -> Option<SharedString> {
+        Some(self.panel_title(cx).into())
     }
     fn inner_padding(&self, _: &App) -> bool {
         false
+    }
+    fn dropdown_menu(
+        &mut self,
+        menu: PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PopupMenu {
+        let state = self.state.read(cx);
+        let owner = self.workspace.clone();
+        let thread_id = state.selected_thread;
+        match self.region {
+            Region::Thread => menu
+                .menu_with_disabled(
+                    "Rename thread…",
+                    Box::new(RenameThread),
+                    Command::RenameThread.disabled_reason(state).is_some(),
+                )
+                .menu_with_disabled(
+                    "Archive thread…",
+                    Box::new(ArchiveThread),
+                    Command::ArchiveThread.disabled_reason(state).is_some(),
+                )
+                .menu_with_disabled(
+                    "Close thread",
+                    Box::new(CloseThread),
+                    Command::CloseThread.disabled_reason(state).is_some(),
+                )
+                .item(
+                    PopupMenuItem::new("Thread details")
+                        .disabled(thread_id.is_none())
+                        .on_click(move |_, window, cx| {
+                            if let Some(id) = thread_id {
+                                let _ = owner.update(cx, |workspace, cx| {
+                                    workspace.toggle_thread_details(id, window, cx)
+                                });
+                            }
+                        }),
+                )
+                .separator()
+                .menu("New conversation", Box::new(NewConversation))
+                .menu("New Factory thread", Box::new(NewFactoryThread)),
+            Region::Projects => menu
+                .menu("Add project…", Box::new(AddProject))
+                .menu("Show archived", Box::new(ShowArchived)),
+            Region::Output => menu.menu("Refresh Factory runs", Box::new(RefreshFactoryRuns)),
+        }
     }
 }
 impl Focusable for WorkspacePanel {
@@ -1124,18 +1464,38 @@ impl Focusable for WorkspacePanel {
 }
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
 impl Render for WorkspacePanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = self.workspace.upgrade().map(|owner| {
             let workspace = owner.read(cx);
             let state = self.state.read(cx);
             let scroll = &workspace.scrolls[self.region.index()];
             match self.region {
                 Region::Projects => {
-                    sidebar::render(state, &self.workspace, workspace.cursor, scroll)
+                    sidebar::render(state, &self.workspace, workspace.cursor, scroll, cx)
                 }
-                Region::Conversation => conversation::render(state, &self.workspace, scroll, cx),
-                Region::Factory => factory::render(state, &self.workspace, scroll),
-                Region::Output => factory::output(state, &self.workspace, scroll),
+                Region::Thread => {
+                    if state.factory_thread().is_some() {
+                        if state.selected_launch.is_some() {
+                            factory::render(state, &self.workspace, scroll, cx)
+                        } else if let Some(form) = &workspace.factory_form {
+                            super::factory_form::render(
+                                form,
+                                workspace,
+                                &self.workspace,
+                                window,
+                                cx,
+                            )
+                        } else {
+                            div()
+                                .p_3()
+                                .child("Loading Factory configuration…")
+                                .into_any_element()
+                        }
+                    } else {
+                        conversation::render(state, &self.workspace, scroll, cx)
+                    }
+                }
+                Region::Output => factory::output(state, &self.workspace, scroll, cx),
             }
         });
         let focus = self.focus.clone();
@@ -1145,9 +1505,15 @@ impl Render for WorkspacePanel {
             .size_full()
             .min_w_0()
             .min_h_0()
+            .id(self.region.name())
+            .debug_selector(|| self.region.name().to_owned())
             .key_context(self.region.context())
             .track_focus(&self.focus)
-            .bg(rgb(0x20242B))
+            .bg(if self.region == Region::Projects {
+                cx.theme().sidebar
+            } else {
+                cx.theme().background
+            })
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 if !focus.contains_focused(window, cx) {
                     focus.focus(window, cx);
@@ -1160,6 +1526,8 @@ impl Render for WorkspacePanel {
                     |_, _, _, _| {},
                 )
                 .absolute()
+                // Measure the pane, not the static position after its content.
+                .inset_0()
                 .size_full(),
             )
     }
@@ -1173,7 +1541,7 @@ fn contains_panel(panel: &PanelState, name: &str) -> bool {
             .any(|child| contains_panel(child, name))
 }
 fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
-    anyhow::ensure!(layout.version == Some(1), "Unsupported layout version");
+    anyhow::ensure!(layout.version == Some(2), "Unsupported layout version");
     let mut names = Vec::new();
     fn visit<'a>(
         panel: &'a PanelState,
@@ -1188,13 +1556,24 @@ fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
             }
             PanelInfo::Tabs { active_index } => {
                 anyhow::ensure!(
+                    panel.panel_name == "TabPanel"
+                        && panel
+                            .children
+                            .iter()
+                            .all(|child| matches!(child.info, PanelInfo::Panel(_))),
+                    "Invalid tab group"
+                );
+                anyhow::ensure!(
                     !panel.children.is_empty() && *active_index < panel.children.len(),
                     "Invalid active layout tab"
                 );
             }
             PanelInfo::Stack { sizes, axis } => {
+                anyhow::ensure!(panel.panel_name == "StackPanel", "Invalid split container");
                 anyhow::ensure!(
                     *axis <= 1
+                        && !panel.children.is_empty()
+                        && (sizes.is_empty() || sizes.len() == panel.children.len())
                         && sizes
                             .iter()
                             .all(|size| f32::from(*size).is_finite() && *size >= px(0.)),
@@ -1211,10 +1590,13 @@ fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
         Ok(())
     }
     visit(&layout.center, &mut names, 0)?;
-    for dock in [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
-        .into_iter()
-        .flatten()
-    {
+    for (placement, dock) in [
+        (DockPlacement::Left, &layout.left_dock),
+        (DockPlacement::Right, &layout.right_dock),
+        (DockPlacement::Bottom, &layout.bottom_dock),
+    ] {
+        let Some(dock) = dock else { continue };
+        anyhow::ensure!(dock.placement() == placement, "Mismatched dock placement");
         anyhow::ensure!(
             f32::from(dock.size()).is_finite() && dock.size() > px(0.),
             "Invalid dock size"
@@ -1222,13 +1604,13 @@ fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
         visit(dock.panel(), &mut names, 0)?;
     }
     anyhow::ensure!(
-        names.len() == 4
+        names.len() == 3
             && Region::ALL.into_iter().all(|region| names
                 .iter()
                 .filter(|name| **name == region.name())
                 .count()
                 == 1),
-        "Layout must contain exactly one Projects, Conversation, Factory and Output panel"
+        "Layout must contain exactly one Projects, Thread and Output panel"
     );
     Ok(())
 }
@@ -1237,13 +1619,15 @@ pub struct Recovery {
     pub error: String,
 }
 impl Render for Recovery {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let copy = self.error.clone();
-        v_flex().size_full().p_8().gap_4().bg(rgb(0x181B20)).text_color(rgb(0xD8DEE9))
-            .child(div().text_xl().child("Drost could not open its workspace"))
-            .child("The database has not been replaced or reset. Quit Drost before inspecting or restoring a backup. A newer schema requires a compatible Drost version; a corrupt database requires recovery from a known-good backup.")
-            .child(div().font_family("Menlo").text_color(rgb(0xE6A0A0)).child(self.error.clone()))
-            .child(h_flex().gap_2().child(Button::new("copy-recovery-error").label("Copy Error").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))))
-                .child(Button::new("quit-recovery").label("Quit Drost").on_click(|_, _, cx| cx.quit())))
+        v_flex().size_full().bg(cx.theme().background).text_color(cx.theme().foreground)
+            .child(TitleBar::new().child("Drost"))
+            .child(v_flex().flex_1().p_8().gap_4()
+                .child(div().text_xl().child("Drost could not open its workspace"))
+                .child("The database has not been replaced or reset. Quit Drost before inspecting or restoring a backup. A newer schema requires a compatible Drost version; a corrupt database requires recovery from a known-good backup.")
+                .child(div().font_family(cx.theme().mono_font_family.clone()).text_color(cx.theme().danger).child(self.error.clone()))
+                .child(h_flex().gap_2().child(Button::new("copy-recovery-error").label("Copy error").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))))
+                    .child(Button::new("quit-recovery").label("Quit Drost").on_click(|_, _, cx| cx.quit()))))
     }
 }

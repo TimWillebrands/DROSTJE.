@@ -1,6 +1,6 @@
 use super::{FactoryLaunchSpec, FactorySnapshot, FactorySource, Liveness, events::EventTracker};
 use crate::{
-    model::{FactoryLaunch, LaunchId, ProjectId},
+    model::{FactoryLaunch, LaunchId, ProjectId, ThreadId},
     platform,
     store::Store,
 };
@@ -26,7 +26,7 @@ const ERROR_LIMIT: usize = 16 * 1024;
 type Reply<T> = Sender<Result<T>>;
 
 enum Request {
-    Dispatch(FactoryLaunchSpec, Reply<LaunchId>),
+    Dispatch(ThreadId, FactoryLaunchSpec, Reply<LaunchId>),
     Prepared(LaunchId, Result<String>),
     Refresh(LaunchId, Reply<FactorySnapshot>),
     List(ProjectId, Sender<Vec<FactorySnapshot>>),
@@ -68,9 +68,14 @@ impl FactoryManager {
         })
     }
 
-    pub async fn dispatch(&self, spec: FactoryLaunchSpec) -> Result<LaunchId> {
+    pub async fn dispatch(
+        &self,
+        factory_thread_id: ThreadId,
+        spec: FactoryLaunchSpec,
+    ) -> Result<LaunchId> {
         let (reply, response) = async_channel::bounded(1);
-        self.send(Request::Dispatch(spec, reply)).await?;
+        self.send(Request::Dispatch(factory_thread_id, spec, reply))
+            .await?;
         response
             .recv()
             .await
@@ -194,8 +199,10 @@ impl Actor {
                 continue;
             };
             match request {
-                Request::Dispatch(spec, reply) => {
-                    if let Err(error) = self.begin(spec, reply.clone(), &commands) {
+                Request::Dispatch(factory_thread_id, spec, reply) => {
+                    if let Err(error) =
+                        self.begin(factory_thread_id, spec, reply.clone(), &commands)
+                    {
                         let _ = reply.try_send(Err(error));
                     }
                 }
@@ -256,6 +263,7 @@ impl Actor {
 
     fn begin(
         &mut self,
+        factory_thread_id: ThreadId,
         spec: FactoryLaunchSpec,
         reply: Reply<LaunchId>,
         commands: &Sender<Request>,
@@ -274,7 +282,7 @@ impl Actor {
         let launch = FactoryLaunch {
             id: spec.id,
             project_id: spec.project_id,
-            thread_id: spec.thread_id,
+            factory_thread_id,
             descriptor: serde_json::to_value(&spec).context("Encode Factory launch descriptor")?,
             event_path: None,
             work_item_id: match &spec.source {
@@ -368,9 +376,7 @@ impl Actor {
         let result = (|| {
             // Recheck the selected local inputs after a potentially long doctor.
             platform::validate_branch(&spec.target_repo, &spec.target_branch)?;
-            if spec.packet.is_some() {
-                create_packet(&self.data_dir, &spec)?;
-            } else if let FactorySource::LocalFolder(folder) = &spec.source {
+            if let FactorySource::LocalFolder(folder) = &spec.source {
                 read_prd(folder)?;
             }
             let stdout = append_log(&launch_dir(&spec).join("stdout.log"))?;
@@ -568,8 +574,8 @@ fn doctor(
 
 fn validate_harness(harness: &str) -> Result<()> {
     ensure!(
-        matches!(harness, "omp" | "opencode" | "codex" | "claude-code"),
-        "Unsupported Factory harness {harness:?}; choose omp, opencode, codex, or claude-code"
+        matches!(harness, "opencode" | "codex" | "claude-code"),
+        "Unsupported Factory harness {harness:?}; choose opencode, codex, or claude-code"
     );
     Ok(())
 }
@@ -619,49 +625,31 @@ fn normalize_spec(mut spec: FactoryLaunchSpec, data_dir: &Path) -> Result<Factor
     spec.log_dir = expected_log_dir;
     spec.model = spec.model.filter(|value| !value.trim().is_empty());
     spec.thought_level = spec.thought_level.filter(|value| !value.trim().is_empty());
-    match (&mut spec.source, &spec.packet) {
-        (FactorySource::LocalFolder(folder), Some(packet)) => {
-            ensure!(
-                !packet.title.trim().is_empty() && !packet.task.trim().is_empty(),
-                "Factory packet title and task must not be empty"
-            );
-            let packets = data_dir.join("work-packets");
-            check_directory_if_present(&packets)?;
-            let expected = packets.join(spec.id.to_string());
-            ensure!(
-                prospective_path(folder)? == expected,
-                "Generated Factory packet must be in {}",
-                expected.display()
-            );
-            ensure!(
-                !path_exists(&expected)?,
-                "Factory work packet already exists; it will not be rewritten"
-            );
-            *folder = expected;
-        }
-        (FactorySource::LocalFolder(folder), None) => {
+    match &mut spec.source {
+        FactorySource::LocalFolder(folder) => {
             *folder = fs::canonicalize(&*folder)
                 .with_context(|| format!("Resolve Factory folder {}", folder.display()))?;
             read_prd(folder)?;
         }
-        (FactorySource::AzureWorkItem(id), None) => {
+        FactorySource::AzureWorkItem(id) => {
             ensure!(*id > 0, "Azure work-item ID must be a positive integer")
-        }
-        (FactorySource::AzureWorkItem(_), Some(_)) => {
-            bail!("Generated work packets require a local-folder source")
         }
     }
     Ok(spec)
 }
 
-fn same_source(left: &FactoryLaunchSpec, right: &FactoryLaunchSpec) -> bool {
+pub(crate) fn same_source(left: &FactoryLaunchSpec, right: &FactoryLaunchSpec) -> bool {
     match (&left.source, &right.source) {
         (FactorySource::LocalFolder(left), FactorySource::LocalFolder(right)) => {
-            fs::canonicalize(left).unwrap_or_else(|_| left.clone()) == *right
+            fs::canonicalize(left).unwrap_or_else(|_| left.clone())
+                == fs::canonicalize(right).unwrap_or_else(|_| right.clone())
         }
         (FactorySource::AzureWorkItem(left_id), FactorySource::AzureWorkItem(right_id)) => {
             left_id == right_id
-                && prospective_path(&left.data_root).is_ok_and(|root| root == right.data_root)
+                && prospective_path(&left.data_root).is_ok_and(|left_root| {
+                    prospective_path(&right.data_root)
+                        .is_ok_and(|right_root| left_root == right_root)
+                })
         }
         _ => false,
     }
@@ -796,45 +784,6 @@ fn prepare_launch_files(data_dir: &Path, spec: &FactoryLaunchSpec) -> Result<()>
     File::open(launch_dir(spec))?
         .sync_all()
         .context("Persist Factory launch directory")?;
-    Ok(())
-}
-
-fn create_packet(data_dir: &Path, spec: &FactoryLaunchSpec) -> Result<()> {
-    let data_dir = fs::canonicalize(data_dir).context("Resolve packet data directory")?;
-    let packet = spec.packet.as_ref().context("No reviewed work packet")?;
-    let FactorySource::LocalFolder(folder) = &spec.source else {
-        bail!("A work packet must use a local folder");
-    };
-    ensure!(
-        *folder == data_dir.join("work-packets").join(spec.id.to_string()),
-        "Work packet path escaped its app-owned directory"
-    );
-    create_owned_parent(&data_dir.join("work-packets"))?;
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(folder)
-        .context("Reserve a new Factory work packet; existing packets are never rewritten")?;
-    fs::create_dir(folder.join("issues"))?;
-    let title = serde_json::to_string(&packet.title)?;
-    create_file(
-        &folder.join("PRD.md"),
-        format!(
-            "---\ntype: User Story\nstate: New\ntitle: {title}\ntags: [ready-for-agent]\n---\n{}",
-            packet.task
-        )
-        .as_bytes(),
-    )?;
-    create_file(
-        &folder.join("issues/001.md"),
-        format!(
-            "---\ntype: Task\nstate: New\ntitle: {title}\ntags: []\npredecessors:\n---\n{}",
-            packet.task
-        )
-        .as_bytes(),
-    )?;
-    File::open(folder.join("issues"))?.sync_all()?;
-    File::open(folder)?.sync_all()?;
-    sync_parent(folder)?;
     Ok(())
 }
 

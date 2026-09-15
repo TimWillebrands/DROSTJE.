@@ -26,6 +26,15 @@ function bridge.attach(buf)
     vim.keymap.set(mode, '<F24>', '<Cmd>lua drost.snapshot()<CR>',
       { buffer = buf, silent = true, nowait = true })
   end
+  for key, direction in pairs({ h = 'left', j = 'down', k = 'up', l = 'right' }) do
+    local function focus_pane()
+      notify('drost_focus_pane', api.nvim_get_current_buf(), direction)
+    end
+    for _, chord in ipairs({ '<C-w>' .. key, '<C-w><C-' .. key .. '>' }) do
+      vim.keymap.set('n', chord, focus_pane,
+        { buffer = buf, silent = true, nowait = true })
+    end
+  end
 end
 for _, mode in ipairs({ 'n', 'i', 'x', 's', 'o' }) do
   vim.keymap.set(mode, '<F23>', '<Cmd>lua drost.drain()<CR>', { silent = true, nowait = true })
@@ -56,18 +65,24 @@ vim.opt.number = false
 vim.opt.relativenumber = false
 vim.opt.showtabline = 0
 vim.opt.laststatus = 0
+vim.opt.showmode = false
+vim.opt.ruler = false
+vim.opt.fillchars:append({ eob = ' ' })
 vim.opt.mouse = 'a'
 vim.opt.termguicolors = true
 vim.opt.swapfile = false
 vim.opt.undofile = false
 vim.opt.hidden = true
 vim.opt.shortmess:append('I')
-vim.opt.guicursor = 'n-v-c:block,i-ci-ve:ver25,r-cr:hor20,o:hor50,a:blinkwait700-blinkoff400-blinkon250'
-api.nvim_set_hl(0, 'Normal', { fg = '#D8DEE9', bg = '#20242B' })
-api.nvim_set_hl(0, 'NormalFloat', { fg = '#D8DEE9', bg = '#20242B' })
-api.nvim_set_hl(0, 'Visual', { bg = '#343A46' })
-api.nvim_set_hl(0, 'Cursor', { fg = '#20242B', bg = '#7AA2F7' })
-api.nvim_set_hl(0, 'Search', { fg = '#181B20', bg = '#7AA2F7' })
+vim.opt.guicursor = 'n-v-c:block,i-ci-ve:ver25,r-cr:hor20,o:hor50,a:Cursor-blinkwait700-blinkoff400-blinkon250'
+function bridge.apply_theme(theme)
+  vim.opt.background = theme.dark and 'dark' or 'light'
+  api.nvim_set_hl(0, 'Normal', { fg = theme.foreground, bg = theme.background })
+  api.nvim_set_hl(0, 'NormalFloat', { fg = theme.popover_foreground, bg = theme.popover })
+  api.nvim_set_hl(0, 'Visual', { bg = theme.selection })
+  api.nvim_set_hl(0, 'Cursor', { fg = theme.background, bg = theme.caret })
+  api.nvim_set_hl(0, 'Search', { fg = theme.primary_foreground, bg = theme.primary })
+end
 api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI', 'BufEnter' }, {
   callback = function()
     local buf = api.nvim_get_current_buf()

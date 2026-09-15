@@ -4,8 +4,8 @@ Drost is a macOS desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.1"`) that
 drives local coding agents (OMP over native RPC), edits prompts in an embedded
 Neovim, and dispatches work to the Compliance Software Factory CLI. The README
 is Dutch and user-facing; code, comments, commits, docs and UI strings are
-English. The product spec is `DROST_APPLICATION_PLAN.md`; when this file and the
-plan disagree on behaviour, the plan wins and this file is wrong.
+English. `DROST_APPLICATION_PLAN.md` records the original scope; the README
+documents the current thread workflow and shortcuts.
 
 This is a normative file. **Must** is a correctness or ecosystem constraint,
 **should** is the default that needs a stated reason to override, **may** is
@@ -117,9 +117,9 @@ behaviour, `<X>State` owns interaction state, the owning view owns the data.
 ### Commands, keyboard, focus
 
 - One logical command = one `Action`. Palette item, menu item, button and key binding dispatch the same Action; label, enabled state and reason come from one place.
-- Every command is reachable from the command palette and by keyboard. Bindings are context-scoped (`Workspace`, `List`, `Conversation`, `NvimEditor`, `NativeInput`, `CommandPalette`, `Dialog`); `key_context` and `on_action` sit on the same focused region.
-- Existing bindings, do not reassign: `Cmd-Shift-P` palette; `Cmd-1`..`Cmd-4` focus Projects / Conversation / Factory / Output; `Cmd-N` new conversation; `Cmd-,` settings; `Cmd-Return` submit prompt or confirm factory form; `Cmd-.` interrupt turn; `i` from Conversation focuses the Neovim composer; `Ctrl-H/J/K/L` spatial pane focus from Workspace, List or Conversation. In lists: `j`/`k`/arrows move, `gg`/`G` jump, `h`/`l` collapse/expand, Return opens.
-- Do not bind `Ctrl-w` globally (Neovim owns it); do not intercept typing inside `NativeInput` or `NvimEditor`; Return inside an editor is always newline.
+- Every command is reachable from the command palette and by keyboard. Bindings are context-scoped (`Workspace`, `List`, `Thread`, `NvimEditor`, `NativeInput`, `Command`, `Dialog`, `Sheet`); `key_context` and `on_action` sit on the same focused region.
+- Existing bindings, do not reassign: `Cmd-Shift-P` palette; `Cmd-1/2/3` focus Projects / Thread / Output; `Cmd-B/J` toggle Projects / Output; `Cmd-N` new Conversation; `Cmd-Shift-N` new Factory thread; `Cmd-,` settings; `Cmd-Return` submit prompt, start editable Factory configuration, or confirm a form; `Cmd-.` interrupt interactive turn; `i` from a Conversation focuses its composer. In lists: `j`/`k`/arrows move, `gg`/`G` jump, `h`/`l` collapse/expand, Return opens.
+- `Ctrl-W` then `h/j/k/l` (also held-Control variants) moves to a visible neighboring pane. App chords exclude native inputs and overlays; Neovim owns normal-mode buffer-local mappings and keeps insert/command-line word deletion. Do not intercept typing inside `NativeInput` or `NvimEditor`; Return inside an editor is always newline.
 - Escape dismisses the topmost layer and restores previous focus. Inside Neovim, Escape is Neovim's; `Cmd-Escape` leaves the editor.
 - Overlays trap focus and restore it on dismiss. Nested overlays dismiss from the top.
 
@@ -137,11 +137,11 @@ conflict, the kit rule wins, in particular: hover may reveal a shortcut to an
 action, never the only copy of it.
 
 - Usable without a mouse; every shortcut discoverable in tooltips, menus or the palette. Command palette (`Cmd-Shift-P`) is the discoverability backstop.
-- Workspace shell: three docks (left Projects, right Factory, bottom Output), centre pane with tabs, status bar with region/mode/branch/counts, native macOS title bar and menu bar. Persist user-controlled layout; clamp restored values to the window.
+- Workspace shell: Projects left, selected Thread center, optional Output below; no permanent Factory sidebar or duplicate conversation tabs. Use native TitleBar, StatusBar and dock headers. Persist user-controlled layout; clamp restored values to preserve usable Thread space.
 - Pick an elevation layer, not a colour: window background → panel surface → editor surface → popover/menu → modal.
 - Transient, centred, keyboard-driven pickers instead of OS dialogs; toasts for non-blocking info; alert modal only for consequential confirmation.
 - `Tooltip`/menu items show the bound key automatically; never format shortcuts by hand.
-- Terminology is stable across palette, menu, tooltip, dialog and docs: Project, Conversation, Draft, Turn, Launch, Run, Attempt, Task, Region.
+- Terminology is stable across palette, menu, tooltip, dialog and docs: Project, Thread, Conversation, Factory thread, Draft, Turn, Launch, Run, Attempt, Task, Region.
 - Instant feedback; keep frames cheap: virtualise history and logs, deliver bounded event batches, never rebuild the whole conversation per token.
 
 ## Rust conventions
@@ -164,15 +164,6 @@ Test at the lowest layer that proves the behaviour:
 4. Real-process tests (`--ignored`, `runtime-qa`) for Neovim barriers and OMP protocol; never in default `cargo test`, never with provider credentials from fixtures.
 
 Add a regression test before fixing a deterministic bug. "Compiles" and "screenshot looks right" are not evidence for UI work; keyboard, focus, resize, both themes and failure states are.
-
-## Known debt: do not copy
-
-`src/ui` predates these rules. When you touch a region, migrate that region;
-do not extend the old pattern.
-
-- 56 raw `rgb(0x..)` literals across `src/ui/*` and zero `cx.theme()` calls.
-- Hand-rolled dialog backdrop, notice banner and footer bar in `workspace.rs`; command palette in `commands.rs`; dialog/form frames in `settings.rs` and `factory_form.rs`; overlays in `overlays.rs`; sidebar rows built from ghost buttons with text chevrons in `sidebar.rs`. Kit equivalents are in the table above.
-- `runtime_qa.rs` aliases `gpui_kit as gpui` and simulates pointer events directly.
 
 ## Never
 

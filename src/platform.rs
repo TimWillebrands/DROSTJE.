@@ -6,6 +6,30 @@ use std::{
     process::Command,
 };
 
+const APPLICATION_ICON: &[u8] = include_bytes!("../assets/drost-app-icon.png");
+
+#[cfg(target_os = "macos")]
+pub fn set_application_icon() -> Result<()> {
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let main_thread =
+        MainThreadMarker::new().context("Set the application icon on the main thread")?;
+    let data = NSData::with_bytes(APPLICATION_ICON);
+    let icon = NSImage::initWithData(NSImage::alloc(), &data)
+        .context("Decode the bundled application icon")?;
+    let application = NSApplication::sharedApplication(main_thread);
+    // SAFETY: AppKit accepts a valid, non-null NSImage here and retains it for the application.
+    unsafe { application.setApplicationIconImage(Some(&icon)) };
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_application_icon() -> Result<()> {
+    Ok(())
+}
+
 pub fn home() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -152,4 +176,27 @@ pub fn now() -> String {
         tm.tm_min,
         tm.tm_sec
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::APPLICATION_ICON;
+
+    #[test]
+    fn application_icon_is_a_filled_rounded_square() {
+        let icon = image::load_from_memory(APPLICATION_ICON)
+            .expect("application icon should decode")
+            .into_rgba8();
+
+        assert_eq!(icon.dimensions(), (1024, 1024));
+        for corner in [(0, 0), (1023, 0), (0, 1023), (1023, 1023)] {
+            assert_eq!(icon.get_pixel(corner.0, corner.1).0[3], 0);
+        }
+        assert!(icon.get_pixel(512, 512).0[3] >= 250);
+        let filled_pixels = icon
+            .pixels()
+            .filter(|pixel| pixel.0[3] >= 250)
+            .count();
+        assert!(filled_pixels * 100 / (1024 * 1024) >= 80);
+    }
 }

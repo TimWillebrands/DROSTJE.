@@ -14,7 +14,6 @@ use uuid::Uuid;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DraftKey {
     Thread(Uuid),
-    Factory(Uuid),
     Extension { thread: Uuid, request: String },
 }
 
@@ -58,11 +57,26 @@ impl ClipboardContent {
     }
 }
 
+/// Opaque RGB colors resolved from the workspace's active theme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NvimTheme {
+    pub dark: bool,
+    pub background: u32,
+    pub foreground: u32,
+    pub popover: u32,
+    pub popover_foreground: u32,
+    pub selection: u32,
+    pub caret: u32,
+    pub primary: u32,
+    pub primary_foreground: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct NvimConfig {
     pub executable: PathBuf,
     pub cols: u32,
     pub rows: u32,
+    pub initial_theme: Option<NvimTheme>,
 }
 impl NvimConfig {
     pub fn new(executable: PathBuf) -> Self {
@@ -70,6 +84,7 @@ impl NvimConfig {
             executable,
             cols: 80,
             rows: 12,
+            initial_theme: None,
         }
     }
 }
@@ -78,6 +93,11 @@ pub enum NvimEvent {
     Grid(Arc<grid::GridSnapshot>),
     DraftChanged(DraftSnapshot),
     DraftActivated(DraftSnapshot),
+    FocusPane {
+        key: DraftKey,
+        generation: Uuid,
+        direction: crate::model::PaneDirection,
+    },
     ClipboardGet {
         reply: Sender<std::result::Result<ClipboardContent, String>>,
     },
@@ -105,6 +125,7 @@ pub enum NvimCommand {
         rows: u32,
     },
     Focus(bool),
+    SetTheme(NvimTheme),
     SetComposition(bool),
     Replace {
         key: DraftKey,

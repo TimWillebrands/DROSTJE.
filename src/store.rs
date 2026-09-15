@@ -1,5 +1,7 @@
-use crate::model::{FactoryLaunch, Project, Thread, WorkspaceSnapshot};
-use anyhow::{Context, Result, anyhow, bail};
+use crate::model::{
+    FactoryLaunch, FactoryThreadConfig, Project, Thread, ThreadKind, WorkspaceSnapshot,
+};
+use anyhow::{Context, Result, bail};
 use async_channel::{Receiver, Sender};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params, types::Type,
@@ -17,7 +19,7 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SCHEMA: &str = "
 CREATE TABLE settings(key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
 CREATE TABLE projects(
@@ -29,14 +31,16 @@ CREATE TABLE threads(
     title TEXT NOT NULL, harness TEXT NOT NULL, session_ref TEXT, model_json TEXT,
     draft TEXT NOT NULL DEFAULT '', attachments_json TEXT NOT NULL DEFAULT '[]',
     submission_json TEXT, archived INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'conversation', factory_config_json TEXT
 );
 CREATE TABLE factory_launches(
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
-    thread_id TEXT REFERENCES threads(id), descriptor_json TEXT NOT NULL,
+    factory_thread_id TEXT NOT NULL REFERENCES threads(id), descriptor_json TEXT NOT NULL,
     event_path TEXT UNIQUE, work_item_id INTEGER, attempt_id TEXT,
     process_exit INTEGER, launch_error TEXT, created_at TEXT NOT NULL
-);";
+);
+CREATE UNIQUE INDEX factory_launches_factory_thread ON factory_launches(factory_thread_id);";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -223,20 +227,31 @@ fn open_database(path: &Path) -> Result<Connection> {
         "PRAGMA foreign_keys = ON; PRAGMA trusted_schema = OFF;
         PRAGMA synchronous = FULL; PRAGMA fullfsync = ON; PRAGMA checkpoint_fullfsync = ON;",
     )?;
+    let prepare = (|| -> Result<()> {
+        if version == 0 {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Never merge a partial/unversioned schema or use IF NOT EXISTS to mask one.
+            ensure_empty(&transaction)?;
+            transaction.execute_batch(SCHEMA)?;
+            validate_schema(&transaction)?;
+            read_snapshot(&transaction)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction
+                .commit()
+                .context("Commit initial workspace schema")?;
+        }
+        Ok(())
+    })();
+    prepare.map_err(|error| StoreError::RecoveryRequired {
+        path: path.to_path_buf(),
+        reason: format!("{error:#}"),
+    })?;
+    // Existing schemas pass read-only preflight before any journal-mode change.
     let journal: String =
         connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     if !journal.eq_ignore_ascii_case("wal") {
         bail!("SQLite could not enable WAL journaling: {journal}");
-    }
-    if version == 0 {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Never merge a partial/unversioned schema or use IF NOT EXISTS to mask one.
-        ensure_empty(&transaction)?;
-        transaction.execute_batch(SCHEMA)?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        transaction
-            .commit()
-            .context("Commit initial workspace schema")?;
     }
     Ok(connection)
 }
@@ -265,11 +280,7 @@ fn inspect_existing(path: &Path) -> Result<i64> {
         ensure_empty(&transaction)?;
     } else {
         validate_schema(&transaction)?;
-        let mut statement = transaction.prepare("PRAGMA foreign_key_check")?;
-        if statement.query([])?.next()?.is_some() {
-            bail!("Stored records have broken foreign-key associations");
-        }
-        drop(statement);
+        validate_foreign_keys(&transaction)?;
         read_snapshot(&transaction).context("Decode existing workspace records")?;
     }
     transaction.commit()?;
@@ -288,8 +299,8 @@ fn ensure_empty(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-// Validate the public v1 shape, including nullable/defaulted columns and the constraints
-// on which updates rely. Whitespace or index names in equivalent CREATE SQL do not matter.
+// Validate the current shape and constraints on which updates rely. Equivalent SQL
+// whitespace and index names do not matter; incompatible schemas are never upgraded.
 fn validate_schema(connection: &Connection) -> Result<()> {
     type Column<'a> = (&'a str, &'a str, bool, Option<&'a str>, bool);
     let tables: &[(&str, &[Column<'_>])] = &[
@@ -325,6 +336,8 @@ fn validate_schema(connection: &Connection) -> Result<()> {
                 ("archived", "INTEGER", true, Some("0"), false),
                 ("created_at", "TEXT", true, None, false),
                 ("updated_at", "TEXT", true, None, false),
+                ("kind", "TEXT", true, Some("'conversation'"), false),
+                ("factory_config_json", "TEXT", false, None, false),
             ],
         ),
         (
@@ -332,7 +345,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
             &[
                 ("id", "TEXT", false, None, true),
                 ("project_id", "TEXT", true, None, false),
-                ("thread_id", "TEXT", false, None, false),
+                ("factory_thread_id", "TEXT", true, None, false),
                 ("descriptor_json", "TEXT", true, None, false),
                 ("event_path", "TEXT", false, None, false),
                 ("work_item_id", "INTEGER", false, None, false),
@@ -356,7 +369,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
             kind != "table" || !tables.iter().any(|(table, _)| *table == name.as_str())
         })
     {
-        bail!("Database objects do not match workspace schema v1");
+        bail!("Database objects do not match workspace schema v{SCHEMA_VERSION}");
     }
     for (table, expected) in tables {
         let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -380,20 +393,21 @@ fn validate_schema(connection: &Connection) -> Result<()> {
                     || actual.4 != expected.4
             })
         {
-            bail!("Table {table} does not match workspace schema v1");
+            bail!("Table {table} does not match workspace schema v{SCHEMA_VERSION}");
         }
         let key = if *table == "settings" { "key" } else { "id" };
         require_unique(connection, table, key)?;
     }
     require_unique(connection, "projects", "root")?;
     require_unique(connection, "factory_launches", "event_path")?;
+    require_unique(connection, "factory_launches", "factory_thread_id")?;
     for (table, expected) in [
         ("settings", Vec::new()),
         ("projects", Vec::new()),
         ("threads", vec![("project_id", "projects")]),
         (
             "factory_launches",
-            vec![("project_id", "projects"), ("thread_id", "threads")],
+            vec![("project_id", "projects"), ("factory_thread_id", "threads")],
         ),
     ] {
         let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
@@ -423,6 +437,14 @@ fn validate_schema(connection: &Connection) -> Result<()> {
         {
             bail!("Table {table} has incompatible foreign keys");
         }
+    }
+    Ok(())
+}
+
+fn validate_foreign_keys(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+    if statement.query([])?.next()?.is_some() {
+        bail!("Stored records have broken foreign-key associations");
     }
     Ok(())
 }
@@ -644,77 +666,113 @@ fn save_project(connection: &mut Connection, project: Project) -> Result<()> {
 }
 
 fn save_thread(connection: &mut Connection, thread: Thread) -> Result<()> {
+    validate_thread_shape(&thread)?;
+    let id = thread.id.to_string();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_project(&transaction, thread.project_id)?;
+    let previous = transaction
+        .query_row(
+            "SELECT project_id, kind, factory_config_json FROM threads WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok((
+                    uuid(row, 0)?,
+                    thread_kind(row, 1)?,
+                    decode_optional::<FactoryThreadConfig>(row, 2)?,
+                ))
+            },
+        )
+        .optional()?;
+    if previous
+        .as_ref()
+        .is_some_and(|(project, kind, _)| *project != thread.project_id || kind != &thread.kind)
+    {
+        return Err(invalid("A thread's project and kind cannot be reassigned"));
+    }
+    let owns_launch: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM factory_launches WHERE factory_thread_id = ?1)",
+        [&id],
+        |row| row.get(0),
+    )?;
+    if owns_launch
+        && previous
+            .as_ref()
+            .is_some_and(|(_, _, config)| config != &thread.factory)
+    {
+        return Err(invalid(
+            "A launched Factory thread's configuration is read-only",
+        ));
+    }
     let attachments = encode(&thread.attachments)?;
     let model = thread.model.as_ref().map(encode).transpose()?;
     let submission = thread.submission.as_ref().map(encode).transpose()?;
-    let id = thread.id.to_string();
-    let project_id = thread.project_id.to_string();
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    require_project(&transaction, thread.project_id)?;
-    let previous: Option<String> = transaction
-        .query_row(
-            "SELECT project_id FROM threads WHERE id = ?1",
-            [&id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if previous
-        .as_ref()
-        .is_some_and(|parent| parent != &project_id)
-    {
-        return Err(invalid(
-            "A conversation cannot be reassigned to another project",
-        ));
-    }
+    let factory = thread.factory.as_ref().map(encode).transpose()?;
     transaction.execute("INSERT INTO threads(id, project_id, title, harness, session_ref, model_json, draft,
-        attachments_json, submission_json, archived, created_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         ON CONFLICT(id) DO UPDATE SET title = excluded.title, harness = excluded.harness,
         session_ref = excluded.session_ref, model_json = excluded.model_json, draft = excluded.draft,
         attachments_json = excluded.attachments_json, submission_json = excluded.submission_json,
-        archived = excluded.archived, updated_at = excluded.updated_at",
-        params![id, project_id, thread.title, thread.harness, thread.session_ref, model, thread.draft,
-            attachments, submission, thread.archived, thread.created_at, thread.updated_at])?;
-    transaction
-        .commit()
-        .context("Persist conversation and draft")
+        archived = excluded.archived, updated_at = excluded.updated_at,
+        factory_config_json = excluded.factory_config_json",
+        params![id, thread.project_id.to_string(), thread.title, thread.harness, thread.session_ref,
+            model, thread.draft, attachments, submission, thread.archived, thread.created_at,
+            thread.updated_at, kind_text(&thread.kind), factory])?;
+    transaction.commit().context("Persist thread and draft")
 }
 
 fn save_launch(connection: &mut Connection, launch: FactoryLaunch) -> Result<()> {
-    let descriptor = encode(&launch.descriptor)?;
     let event_path = launch.event_path.as_deref().map(path_text).transpose()?;
     let id = launch.id.to_string();
-    let project_id = launch.project_id.to_string();
-    let thread_id = launch.thread_id.map(|id| id.to_string());
+    let factory_thread_id = launch.factory_thread_id.to_string();
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_project(&transaction, launch.project_id)?;
-    if let Some(thread_id) = &thread_id {
-        let parent: Option<String> = transaction
-            .query_row(
-                "SELECT project_id FROM threads WHERE id = ?1",
-                [thread_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if parent.as_ref() != Some(&project_id) {
-            return Err(invalid(
-                "Factory launch conversation must exist in the launch's project",
-            ));
-        }
-    }
-    let previous: Option<(String, Option<String>)> = transaction
+    let owner = transaction
         .query_row(
-            "SELECT project_id, thread_id FROM factory_launches WHERE id = ?1",
-            [&id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            "SELECT project_id, kind, factory_config_json FROM threads WHERE id = ?1",
+            [&factory_thread_id],
+            |row| {
+                Ok((
+                    uuid(row, 0)?,
+                    thread_kind(row, 1)?,
+                    decode_optional::<FactoryThreadConfig>(row, 2)?,
+                ))
+            },
         )
         .optional()?;
-    if previous
-        .as_ref()
-        .is_some_and(|(project, thread)| project != &project_id || thread != &thread_id)
-    {
+    if !owner.as_ref().is_some_and(|(project, kind, config)| {
+        *project == launch.project_id && *kind == ThreadKind::Factory && config.is_some()
+    }) {
         return Err(invalid(
-            "A Factory launch cannot be reassigned to a different project or conversation",
+            "Factory launch owner must be a Factory thread in the launch's project",
+        ));
+    }
+    let previous = transaction
+        .query_row(
+            "SELECT project_id, factory_thread_id, descriptor_json
+             FROM factory_launches WHERE id = ?1",
+            [&id],
+            |row| Ok((uuid(row, 0)?, uuid(row, 1)?, decode::<Value>(row, 2)?)),
+        )
+        .optional()?;
+    if let Some((project, owner, descriptor)) = &previous {
+        if *project != launch.project_id || *owner != launch.factory_thread_id {
+            return Err(invalid(
+                "A Factory launch's project and owner cannot be reassigned",
+            ));
+        }
+        if descriptor != &launch.descriptor {
+            return Err(invalid("A Factory launch's descriptor is read-only"));
+        }
+    }
+    let duplicate_owner: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM factory_launches WHERE factory_thread_id = ?1 AND id != ?2)",
+        params![factory_thread_id, id],
+        |row| row.get(0),
+    )?;
+    if duplicate_owner {
+        return Err(invalid(
+            "A Factory thread can own only one launch; create a new Factory thread",
         ));
     }
     if let Some(event_path) = event_path {
@@ -729,14 +787,30 @@ fn save_launch(connection: &mut Connection, launch: FactoryLaunch) -> Result<()>
             ));
         }
     }
-    transaction.execute("INSERT INTO factory_launches(id, project_id, thread_id, descriptor_json,
-        event_path, work_item_id, attempt_id, process_exit, launch_error, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-        ON CONFLICT(id) DO UPDATE SET descriptor_json = excluded.descriptor_json,
-        event_path = excluded.event_path, work_item_id = excluded.work_item_id, attempt_id = excluded.attempt_id,
-        process_exit = excluded.process_exit, launch_error = excluded.launch_error",
-        params![id, project_id, thread_id, descriptor, event_path, launch.work_item_id,
-            launch.attempt_id, launch.process_exit, launch.launch_error, launch.created_at])?;
+    if previous.is_some() {
+        // Observations never re-encode descriptors or rewrite launch parameters.
+        transaction.execute(
+            "UPDATE factory_launches SET event_path = ?2, work_item_id = ?3, attempt_id = ?4,
+             process_exit = ?5, launch_error = ?6 WHERE id = ?1",
+            params![
+                id,
+                event_path,
+                launch.work_item_id,
+                launch.attempt_id,
+                launch.process_exit,
+                launch.launch_error
+            ],
+        )?;
+    } else {
+        transaction.execute(
+            "INSERT INTO factory_launches(id, project_id, factory_thread_id,
+             descriptor_json, event_path, work_item_id, attempt_id, process_exit, launch_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, launch.project_id.to_string(), factory_thread_id, encode(&launch.descriptor)?,
+                event_path, launch.work_item_id, launch.attempt_id, launch.process_exit,
+                launch.launch_error, launch.created_at],
+        )?;
+    }
     transaction.commit().context("Persist Factory launch")
 }
 
@@ -767,16 +841,6 @@ fn uuid(row: &Row<'_>, column: usize) -> rusqlite::Result<Uuid> {
     })
 }
 
-fn optional_uuid(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<Uuid>> {
-    let text: Option<String> = row.get(column)?;
-    text.map(|text| {
-        Uuid::parse_str(&text).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
-        })
-    })
-    .transpose()
-}
-
 fn archived(row: &Row<'_>, column: usize) -> rusqlite::Result<bool> {
     match row.get::<_, i64>(column)? {
         0 => Ok(false),
@@ -792,7 +856,7 @@ fn archived(row: &Row<'_>, column: usize) -> rusqlite::Result<bool> {
     }
 }
 
-fn read_snapshot(connection: &Connection) -> Result<WorkspaceSnapshot> {
+fn read_projects(connection: &Connection) -> Result<Vec<Project>> {
     let projects = connection
         .prepare("SELECT id, name, root, archived, defaults_json FROM projects ORDER BY name, id")?
         .query_map([], |row| {
@@ -805,49 +869,146 @@ fn read_snapshot(connection: &Connection) -> Result<WorkspaceSnapshot> {
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    if projects.iter().any(|project| !project.root.is_absolute()) {
+        bail!("Stored project root is not absolute");
+    }
+    if projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<HashSet<_>>()
+        .len()
+        != projects.len()
+    {
+        bail!("Stored projects contain duplicate UUID identities");
+    }
+    Ok(projects)
+}
+
+fn read_settings(connection: &Connection) -> Result<std::collections::BTreeMap<String, Value>> {
+    Ok(connection
+        .prepare("SELECT key, value_json FROM settings ORDER BY key")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, decode::<Value>(row, 1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn kind_text(kind: &ThreadKind) -> &'static str {
+    match kind {
+        ThreadKind::Conversation => "conversation",
+        ThreadKind::Factory => "factory",
+    }
+}
+
+fn thread_kind(row: &Row<'_>, column: usize) -> rusqlite::Result<ThreadKind> {
+    match row.get::<_, String>(column)?.as_str() {
+        "conversation" => Ok(ThreadKind::Conversation),
+        "factory" => Ok(ThreadKind::Factory),
+        kind => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid thread kind: {kind}"),
+            )),
+        )),
+    }
+}
+
+fn validate_thread_shape(thread: &Thread) -> Result<()> {
+    match thread.kind {
+        ThreadKind::Conversation => {
+            if thread.factory.is_some() {
+                return Err(invalid(
+                    "Conversation threads cannot have Factory configuration",
+                ));
+            }
+        }
+        ThreadKind::Factory => {
+            if !thread.harness.is_empty()
+                || !thread.draft.is_empty()
+                || thread.session_ref.is_some()
+                || thread.model.is_some()
+                || thread.submission.is_some()
+                || !thread.attachments.is_empty()
+            {
+                return Err(invalid(
+                    "Factory threads cannot contain interactive conversation state",
+                ));
+            }
+            if thread.factory.is_none() {
+                return Err(invalid("Factory threads require configuration"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_snapshot(connection: &Connection) -> Result<WorkspaceSnapshot> {
+    let projects = read_projects(connection)?;
     let threads = connection.prepare("SELECT id, project_id, title, harness, session_ref, model_json, draft,
-        attachments_json, submission_json, archived, created_at, updated_at FROM threads ORDER BY created_at, id")?
+        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json
+        FROM threads ORDER BY created_at, id")?
         .query_map([], |row| Ok(Thread {
             id: uuid(row, 0)?, project_id: uuid(row, 1)?, title: row.get(2)?, harness: row.get(3)?,
             session_ref: row.get(4)?, model: decode_optional(row, 5)?, draft: row.get(6)?,
             attachments: decode(row, 7)?, submission: decode_optional(row, 8)?, archived: archived(row, 9)?,
             created_at: row.get(10)?, updated_at: row.get(11)?,
+            kind: thread_kind(row, 12)?, factory: decode_optional(row, 13)?,
         }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let launches = connection.prepare("SELECT id, project_id, thread_id, descriptor_json, event_path, work_item_id,
-        attempt_id, process_exit, launch_error, created_at FROM factory_launches ORDER BY created_at, id")?
-        .query_map([], |row| Ok(FactoryLaunch {
-            id: uuid(row, 0)?, project_id: uuid(row, 1)?, thread_id: optional_uuid(row, 2)?,
-            descriptor: decode(row, 3)?, event_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
-            work_item_id: row.get(5)?, attempt_id: row.get(6)?, process_exit: row.get(7)?,
-            launch_error: row.get(8)?, created_at: row.get(9)?,
-        }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let settings = connection
-        .prepare("SELECT key, value_json FROM settings ORDER BY key")?
+    let launches = connection
+        .prepare(
+            "SELECT id, project_id, factory_thread_id, descriptor_json, event_path,
+        work_item_id, attempt_id, process_exit, launch_error, created_at
+        FROM factory_launches ORDER BY created_at, id",
+        )?
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, decode::<Value>(row, 1)?))
+            Ok(FactoryLaunch {
+                id: uuid(row, 0)?,
+                project_id: uuid(row, 1)?,
+                factory_thread_id: uuid(row, 2)?,
+                descriptor: decode(row, 3)?,
+                event_path: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                work_item_id: row.get(5)?,
+                attempt_id: row.get(6)?,
+                process_exit: row.get(7)?,
+                launch_error: row.get(8)?,
+                created_at: row.get(9)?,
+            })
         })?
-        .collect::<rusqlite::Result<_>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let settings = read_settings(connection)?;
     let project_ids: HashSet<_> = projects.iter().map(|project| project.id).collect();
-    let thread_projects: HashMap<_, _> = threads
-        .iter()
-        .map(|thread| (thread.id, thread.project_id))
-        .collect();
-    if projects.iter().any(|project| !project.root.is_absolute()) {
-        bail!("Stored project root is not absolute");
-    }
-    if threads
-        .iter()
-        .any(|thread| !project_ids.contains(&thread.project_id))
-        || launches.iter().any(|launch| {
-            !project_ids.contains(&launch.project_id)
-                || launch
-                    .thread_id
-                    .is_some_and(|thread| thread_projects.get(&thread) != Some(&launch.project_id))
-        })
+    let thread_by_id: HashMap<_, _> = threads.iter().map(|thread| (thread.id, thread)).collect();
+    if thread_by_id.len() != threads.len()
+        || launches
+            .iter()
+            .map(|launch| launch.id)
+            .collect::<HashSet<_>>()
+            .len()
+            != launches.len()
     {
-        return Err(anyhow!(
-            "Stored project/conversation/Factory associations are inconsistent"
-        ));
+        bail!("Stored threads or launches contain duplicate UUID identities");
+    }
+    let mut owned_threads = HashSet::new();
+    for launch in &launches {
+        let owner = thread_by_id.get(&launch.factory_thread_id);
+        if !project_ids.contains(&launch.project_id)
+            || !owner.is_some_and(|thread| {
+                thread.kind == ThreadKind::Factory && thread.project_id == launch.project_id
+            })
+        {
+            bail!("Stored project/thread/Factory associations are inconsistent");
+        }
+        if !owned_threads.insert(launch.factory_thread_id) {
+            bail!("A stored Factory thread owns more than one launch");
+        }
+    }
+    for thread in &threads {
+        if !project_ids.contains(&thread.project_id) {
+            bail!("Stored thread belongs to a missing project");
+        }
+        validate_thread_shape(thread)?;
     }
     Ok(WorkspaceSnapshot {
         projects,

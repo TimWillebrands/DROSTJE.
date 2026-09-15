@@ -1,6 +1,9 @@
 use anyhow::Result;
 use drost::{
-    model::{FactoryLaunch, ImageAttachment, ModelKey, Project, ProjectDefaults, Thread},
+    model::{
+        FactoryLaunch, FactorySourceKind, FactoryThreadConfig, ImageAttachment, ModelKey, Project,
+        ProjectDefaults, Thread, ThreadKind,
+    },
     store::{Store, StoreError},
 };
 use rusqlite::Connection;
@@ -44,6 +47,8 @@ fn conversation(project: &Project) -> Thread {
     Thread {
         id: Uuid::new_v4(),
         project_id: project.id,
+        kind: ThreadKind::Conversation,
+        factory: None,
         title: "Conversation".into(),
         harness: "omp".into(),
         session_ref: None,
@@ -57,11 +62,29 @@ fn conversation(project: &Project) -> Thread {
     }
 }
 
-fn launch(project: &Project, thread: &Thread) -> FactoryLaunch {
+fn factory_thread(project: &Project) -> Thread {
+    Thread {
+        kind: ThreadKind::Factory,
+        factory: Some(FactoryThreadConfig {
+            source_kind: FactorySourceKind::WorkItem,
+            source: String::new(),
+            harness: "opencode".into(),
+            model: String::new(),
+            thought_level: String::new(),
+            target_branch: "main".into(),
+        }),
+        title: "Factory".into(),
+        harness: String::new(),
+        draft: String::new(),
+        ..conversation(project)
+    }
+}
+
+fn launch(project: &Project, owner: &Thread) -> FactoryLaunch {
     FactoryLaunch {
         id: Uuid::new_v4(),
         project_id: project.id,
-        thread_id: Some(thread.id),
+        factory_thread_id: owner.id,
         descriptor: json!({"source": {"azure_work_item": 42}, "target_repository": project.root}),
         event_path: None,
         work_item_id: Some(42),
@@ -139,7 +162,9 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
             json!({"request_id": Uuid::new_v4(), "text": "not automatically resent", "state": "pending"}),
         );
         store.save_thread(thread.clone()).await.unwrap();
-        let mut launch = launch(&project, &thread);
+        let owner = factory_thread(&project);
+        store.save_thread(owner.clone()).await.unwrap();
+        let mut launch = launch(&project, &owner);
         launch.event_path = Some(events_file.clone());
         store.save_launch(launch.clone()).await.unwrap();
         store
@@ -165,10 +190,14 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
         let reopened = reopen(&directory.0);
         let snapshot = reopened.snapshot().await.unwrap();
         assert_eq!(snapshot.projects.len(), 1);
-        assert_eq!(snapshot.threads.len(), 1);
+        assert_eq!(snapshot.threads.len(), 2);
         assert_eq!(snapshot.launches.len(), 1);
         let saved_project = &snapshot.projects[0];
-        let saved_thread = &snapshot.threads[0];
+        let saved_thread = snapshot
+            .threads
+            .iter()
+            .find(|saved| saved.id == thread.id)
+            .unwrap();
         let saved_launch = &snapshot.launches[0];
         assert!(saved_project.archived && saved_thread.archived);
         assert_eq!(saved_project.name, "Renamed project");
@@ -183,7 +212,7 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
         assert_eq!(saved_thread.attachments[0].path, attachment_file);
         assert_eq!(saved_thread.submission, thread.submission);
         assert_eq!(saved_launch.project_id, saved_project.id);
-        assert_eq!(saved_launch.thread_id, Some(saved_thread.id));
+        assert_eq!(saved_launch.factory_thread_id, owner.id);
         assert_eq!(saved_launch.descriptor, launch.descriptor);
         assert_eq!(saved_launch.event_path, Some(events_file.clone()));
         assert_eq!(saved_launch.work_item_id, Some(42));
@@ -203,26 +232,35 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            2
         );
     });
 }
 
 #[test]
-fn newer_schema_is_refused_without_changing_database_bytes() {
-    let directory = TempDirectory::new();
-    let path = directory.0.join("drost.sqlite3");
-    let connection = Connection::open(&path).unwrap();
-    connection.execute_batch("CREATE TABLE future_data(payload TEXT NOT NULL);
-        INSERT INTO future_data VALUES ('must survive an older application'); PRAGMA user_version = 2;").unwrap();
-    drop(connection);
-    let before = fs::read(&path).unwrap();
-    let error = open_error(&directory.0);
-    assert!(matches!(
-        error.downcast_ref::<StoreError>(),
-        Some(StoreError::UnsupportedSchema { found: 2, .. })
-    ));
-    assert_eq!(fs::read(&path).unwrap(), before);
+fn incompatible_schema_is_refused_without_changing_database_bytes() {
+    for version in [1, 3] {
+        let directory = TempDirectory::new();
+        let path = directory.0.join("drost.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE incompatible_data(payload TEXT NOT NULL);
+            INSERT INTO incompatible_data VALUES ('must survive an incompatible application');",
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&path).unwrap();
+        let error = open_error(&directory.0);
+        assert!(matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::UnsupportedSchema { found, .. }) if *found == version
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
 }
 
 #[test]
@@ -314,7 +352,12 @@ fn write_failure_is_sticky_preserves_durable_draft_and_blocks_side_effects() {
         ));
         assert!(!marker.exists());
         assert!(store.save_thread(thread.clone()).await.is_err());
-        assert!(store.save_launch(launch(&project, &thread)).await.is_err());
+        assert!(
+            store
+                .save_launch(launch(&project, &factory_thread(&project)))
+                .await
+                .is_err()
+        );
         assert!(store.flush().await.is_err());
         let snapshot = store.snapshot().await.unwrap();
         assert_eq!(snapshot.threads[0].draft, durable_draft);
@@ -347,21 +390,166 @@ fn invalid_associations_are_rejected_without_poisoning_healthy_storage() {
         store.save_project(first.clone()).await.unwrap();
         store.save_project(second.clone()).await.unwrap();
         store.save_thread(thread.clone()).await.unwrap();
-        let incorrect_launch = launch(&second, &thread);
-        assert!(store.save_launch(incorrect_launch).await.is_err());
-        let correct_launch = launch(&first, &thread);
+        let owner = factory_thread(&first);
+        let other_owner = factory_thread(&first);
+        let foreign_owner = factory_thread(&second);
+        for factory in [&owner, &other_owner, &foreign_owner] {
+            store.save_thread(factory.clone()).await.unwrap();
+        }
+        for invalid in [
+            launch(&second, &owner),
+            launch(&first, &thread),
+            launch(&first, &factory_thread(&first)),
+        ] {
+            assert!(matches!(
+                store
+                    .save_launch(invalid)
+                    .await
+                    .unwrap_err()
+                    .downcast_ref::<StoreError>(),
+                Some(StoreError::InvalidData(_))
+            ));
+        }
+        let mut correct_launch = launch(&first, &owner);
         store.save_launch(correct_launch.clone()).await.unwrap();
+        assert!(store.save_launch(launch(&first, &owner)).await.is_err());
         thread.project_id = second.id;
-        assert!(store.save_thread(thread).await.is_err());
-        let mut reassigned_launch = correct_launch;
-        reassigned_launch.project_id = second.id;
-        reassigned_launch.thread_id = None;
-        assert!(store.save_launch(reassigned_launch).await.is_err());
+        assert!(store.save_thread(thread.clone()).await.is_err());
+        thread.project_id = first.id;
+        let mut changed_kind = factory_thread(&first);
+        changed_kind.id = thread.id;
+        assert!(store.save_thread(changed_kind).await.is_err());
+        let mut changed_kind = conversation(&first);
+        changed_kind.id = other_owner.id;
+        assert!(store.save_thread(changed_kind).await.is_err());
+        let mut moved_owner = owner.clone();
+        moved_owner.project_id = second.id;
+        assert!(store.save_thread(moved_owner).await.is_err());
+        for (project_id, factory_thread_id) in
+            [(second.id, foreign_owner.id), (first.id, other_owner.id)]
+        {
+            let mut reassigned = correct_launch.clone();
+            reassigned.project_id = project_id;
+            reassigned.factory_thread_id = factory_thread_id;
+            assert!(store.save_launch(reassigned).await.is_err());
+        }
+        correct_launch.process_exit = Some(7);
+        correct_launch.launch_error = Some("Observed process failure".into());
+        store.save_launch(correct_launch.clone()).await.unwrap();
         store.writable().await.unwrap();
         let snapshot = store.snapshot().await.unwrap();
-        assert_eq!(snapshot.threads[0].project_id, first.id);
-        assert_eq!(snapshot.launches.len(), 1);
-        assert_eq!(snapshot.launches[0].project_id, first.id);
-        assert_eq!(snapshot.launches[0].thread_id, Some(snapshot.threads[0].id));
+        assert_eq!(
+            snapshot
+                .threads
+                .iter()
+                .find(|saved| saved.id == thread.id)
+                .unwrap()
+                .project_id,
+            first.id
+        );
+        assert_eq!(snapshot.launches, vec![correct_launch]);
+    });
+}
+
+fn assert_recovery_unchanged(directory: &Path) {
+    let path = directory.join("drost.sqlite3");
+    let before = fs::read(&path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let error = loop {
+        let error = open_error(directory);
+        if matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::InstanceInUse(_))
+        ) && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        }
+        break error;
+    };
+    assert!(
+        matches!(
+            error.downcast_ref::<StoreError>(),
+            Some(StoreError::RecoveryRequired { .. })
+        ),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn incomplete_factory_config_survives_restart_without_interactive_state() {
+    smol::block_on(async {
+        let directory = TempDirectory::new();
+        let store = Store::open(directory.0.clone()).unwrap();
+        let project = project(directory.0.join("checkout"));
+        store.save_project(project.clone()).await.unwrap();
+        let mut factory = factory_thread(&project);
+        factory.factory.as_mut().unwrap().harness = "omp".into();
+        factory.factory.as_mut().unwrap().source = "not yet a work-item ID 日本語".into();
+        factory.factory.as_mut().unwrap().target_branch.clear();
+        store.save_thread(factory.clone()).await.unwrap();
+        drop(store);
+        let reopened = reopen(&directory.0);
+        let snapshot = reopened.snapshot().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&snapshot.threads[0]).unwrap(),
+            serde_json::to_value(&factory).unwrap()
+        );
+        assert!(snapshot.launches.is_empty());
+        let mut missing_config = factory_thread(&project);
+        missing_config.factory = None;
+        assert!(reopened.save_thread(missing_config).await.is_err());
+        let mut conversation = conversation(&project);
+        conversation.factory = factory.factory.clone();
+        assert!(reopened.save_thread(conversation).await.is_err());
+        let mut interactive_factory = factory.clone();
+        interactive_factory.draft = "Must not lose this input silently".into();
+        assert!(reopened.save_thread(interactive_factory).await.is_err());
+        reopened.writable().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&reopened.snapshot().await.unwrap().threads[0]).unwrap(),
+            serde_json::to_value(&factory).unwrap()
+        );
+    });
+}
+
+#[test]
+fn malformed_v2_shapes_and_ownership_are_refused_without_repairing_data() {
+    smol::block_on(async {
+        for corruption in [
+            "UPDATE threads SET kind = 'unknown'",
+            "UPDATE threads SET factory_config_json = '{' WHERE kind = 'factory'",
+            "UPDATE threads SET factory_config_json = NULL WHERE kind = 'factory'",
+            "UPDATE threads SET draft = 'hidden draft' WHERE kind = 'factory'",
+            "UPDATE factory_launches SET factory_thread_id = (SELECT id FROM threads WHERE kind = 'conversation')",
+            "UPDATE factory_launches SET project_id = (SELECT id FROM projects WHERE name = 'Other project')",
+            "DROP INDEX factory_launches_factory_thread",
+            "ALTER TABLE factory_launches RENAME COLUMN factory_thread_id TO thread_id",
+        ] {
+            let directory = TempDirectory::new();
+            let store = Store::open(directory.0.clone()).unwrap();
+            let mut other = project(directory.0.join("other"));
+            other.name = "Other project".into();
+            let project = project(directory.0.join("checkout"));
+            let conversation = conversation(&project);
+            let owner = factory_thread(&project);
+            let unlaunched = factory_thread(&project);
+            store.save_project(project.clone()).await.unwrap();
+            store.save_project(other).await.unwrap();
+            for thread in [&conversation, &owner, &unlaunched] {
+                store.save_thread(thread.clone()).await.unwrap();
+            }
+            store.save_launch(launch(&project, &owner)).await.unwrap();
+            store.flush().await.unwrap();
+            let connection = Connection::open(directory.0.join("drost.sqlite3")).unwrap();
+            connection.execute_batch(corruption).unwrap();
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            drop(connection);
+            drop(store);
+            assert_recovery_unchanged(&directory.0);
+        }
     });
 }

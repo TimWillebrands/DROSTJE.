@@ -39,8 +39,6 @@ fn launch(root: &Path) -> FactoryLaunch {
     let spec = FactoryLaunchSpec {
         id,
         project_id: Uuid::new_v4(),
-        thread_id: Some(Uuid::new_v4()),
-        origin_message: None,
         source: FactorySource::AzureWorkItem(42),
         target_repo: root.join("repo"),
         target_branch: "main".into(),
@@ -49,11 +47,10 @@ fn launch(root: &Path) -> FactoryLaunch {
             .join("factory-launches")
             .join(id.to_string())
             .join("logs"),
-        harness: "omp".into(),
+        harness: "opencode".into(),
         model: None,
         thought_level: None,
         executable: None,
-        packet: None,
         confirm_unknown: false,
     };
     fs::create_dir_all(&spec.log_dir).unwrap();
@@ -61,7 +58,7 @@ fn launch(root: &Path) -> FactoryLaunch {
     FactoryLaunch {
         id,
         project_id: spec.project_id,
-        thread_id: spec.thread_id,
+        factory_thread_id: Uuid::new_v4(),
         descriptor: serde_json::to_value(spec).unwrap(),
         event_path: None,
         work_item_id: None,
@@ -398,10 +395,10 @@ fn full_task_terminal_and_artifact_projection_outlives_the_recent_note_window() 
         "story-loaded",
         json!({"userStoryId": 42, "title": "Kept title", "state": "Active", "tags": []}),
     ));
-    bytes.extend(event("attempt-ready", json!({"userStoryId": 42, "attemptId": "attempt-a", "targetBranch": "main", "baseSha": "abc", "mode": "new", "harness": "omp", "model": "chosen"})));
+    bytes.extend(event("attempt-ready", json!({"userStoryId": 42, "attemptId": "attempt-a", "targetBranch": "main", "baseSha": "abc", "mode": "new", "harness": "opencode", "model": "chosen"})));
     bytes.extend(event(
         "agent-selected",
-        json!({"userStoryId": 42, "attemptId": "attempt-a", "harness": "omp", "model": "actual"}),
+        json!({"userStoryId": 42, "attemptId": "attempt-a", "harness": "opencode", "model": "actual"}),
     ));
     bytes.extend(event(
         "feature-branch-ready",

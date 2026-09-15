@@ -1,17 +1,15 @@
 use super::workspace::{Region, Workspace};
 use crate::app::AppState;
-use gpui_kit::component::{Disableable, Selectable};
 use gpui_kit::{
     component::{
-        Sizable,
+        ActiveTheme, Disableable, Sizable, WindowExt,
         button::{Button, ButtonVariants},
-        h_flex,
-        input::{Input, InputState},
-        v_flex,
+        command::{Command as NativeCommand, CommandGroup, CommandItem, CommandState},
     },
     prelude::FluentBuilder,
     *,
 };
+use std::rc::Rc;
 use uuid::Uuid;
 
 gpui_kit::actions!(
@@ -19,26 +17,26 @@ gpui_kit::actions!(
     [
         AddProject,
         NewConversation,
+        NewFactoryThread,
         RenameProject,
         ArchiveProject,
-        RenameConversation,
-        ArchiveConversation,
+        RenameThread,
+        ArchiveThread,
+        CloseThread,
         ShowArchived,
-        SendToFactory,
-        OpenFactoryFolder,
-        DispatchAzureWorkItem,
         RefreshFactoryRuns,
         Settings,
         ResetLayout,
-        OpenPalette,
         FocusProjects,
-        FocusConversation,
-        FocusFactory,
+        FocusThread,
         FocusOutput,
+        ToggleProjects,
+        ToggleOutput,
+        OpenPalette,
         FocusLeft,
-        FocusRight,
-        FocusUp,
         FocusDown,
+        FocusUp,
+        FocusRight,
         SelectNext,
         SelectPrevious,
         SelectFirst,
@@ -53,8 +51,6 @@ gpui_kit::actions!(
         Dismiss,
         Confirm,
         Quit,
-        ToggleFactory,
-        ToggleOutput,
     ]
 );
 
@@ -62,52 +58,91 @@ gpui_kit::actions!(
 pub enum Command {
     AddProject,
     NewConversation,
+    NewFactoryThread,
     RenameProject,
     ArchiveProject,
-    RenameConversation,
-    ArchiveConversation,
+    RenameThread,
+    ArchiveThread,
+    CloseThread,
     ShowArchived,
-    SendToFactory,
-    OpenFactoryFolder,
-    DispatchAzureWorkItem,
     RefreshFactoryRuns,
     Settings,
     ResetLayout,
+    FocusProjects,
+    FocusThread,
+    FocusOutput,
+    ToggleProjects,
+    ToggleOutput,
 }
 impl Command {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 17] = [
         Self::AddProject,
         Self::NewConversation,
+        Self::NewFactoryThread,
         Self::RenameProject,
         Self::ArchiveProject,
-        Self::RenameConversation,
-        Self::ArchiveConversation,
+        Self::RenameThread,
+        Self::ArchiveThread,
+        Self::CloseThread,
         Self::ShowArchived,
-        Self::SendToFactory,
-        Self::OpenFactoryFolder,
-        Self::DispatchAzureWorkItem,
         Self::RefreshFactoryRuns,
         Self::Settings,
         Self::ResetLayout,
+        Self::FocusProjects,
+        Self::FocusThread,
+        Self::FocusOutput,
+        Self::ToggleProjects,
+        Self::ToggleOutput,
     ];
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::AddProject => "Add Project",
-            Self::NewConversation => "New Conversation",
-            Self::RenameProject => "Rename Project",
-            Self::ArchiveProject => "Archive Project",
-            Self::RenameConversation => "Rename Conversation",
-            Self::ArchiveConversation => "Archive Conversation",
-            Self::ShowArchived => "Show Archived",
-            Self::SendToFactory => "Send to Factory",
-            Self::OpenFactoryFolder => "Open Factory Folder",
-            Self::DispatchAzureWorkItem => "Dispatch Azure Work Item",
-            Self::RefreshFactoryRuns => "Refresh Factory Runs",
-            Self::Settings => "Settings",
-            Self::ResetLayout => "Reset Layout",
+            Self::AddProject => "Add project…",
+            Self::NewConversation => "New conversation",
+            Self::NewFactoryThread => "New Factory thread",
+            Self::RenameProject => "Rename project…",
+            Self::ArchiveProject => "Archive project…",
+            Self::RenameThread => "Rename thread…",
+            Self::ArchiveThread => "Archive thread…",
+            Self::CloseThread => "Close thread",
+            Self::ShowArchived => "Show archived threads",
+            Self::RefreshFactoryRuns => "Refresh Factory runs",
+            Self::Settings => "Settings…",
+            Self::ResetLayout => "Reset layout",
+            Self::FocusProjects => "Focus projects",
+            Self::FocusThread => "Focus thread",
+            Self::FocusOutput => "Focus output",
+            Self::ToggleProjects => "Toggle projects",
+            Self::ToggleOutput => "Toggle output",
         }
     }
+
+    pub fn action(self) -> Box<dyn Action> {
+        match self {
+            Self::AddProject => Box::new(AddProject),
+            Self::NewConversation => Box::new(NewConversation),
+            Self::NewFactoryThread => Box::new(NewFactoryThread),
+            Self::RenameProject => Box::new(RenameProject),
+            Self::ArchiveProject => Box::new(ArchiveProject),
+            Self::RenameThread => Box::new(RenameThread),
+            Self::ArchiveThread => Box::new(ArchiveThread),
+            Self::CloseThread => Box::new(CloseThread),
+            Self::ShowArchived => Box::new(ShowArchived),
+            Self::RefreshFactoryRuns => Box::new(RefreshFactoryRuns),
+            Self::Settings => Box::new(Settings),
+            Self::ResetLayout => Box::new(ResetLayout),
+            Self::FocusProjects => Box::new(FocusProjects),
+            Self::FocusThread => Box::new(FocusThread),
+            Self::FocusOutput => Box::new(FocusOutput),
+            Self::ToggleProjects => Box::new(ToggleProjects),
+            Self::ToggleOutput => Box::new(ToggleOutput),
+        }
+    }
+
     pub fn disabled_reason(self, state: &AppState) -> Option<String> {
+        if state.shutting_down {
+            return Some("Application is shutting down.".into());
+        }
         match self {
             Self::AddProject if state.registering => {
                 Some("A working tree is being inspected.".into())
@@ -117,111 +152,110 @@ impl Command {
             }
             Self::NewConversation | Self::RenameProject => state.mutable_project_reason(),
             Self::ArchiveProject => state.archive_project_reason(),
-            Self::RenameConversation => {
+            Self::RenameThread => state
+                .mutable_project_reason()
+                .or_else(|| match state.thread() {
+                    None => Some("Select a thread first.".into()),
+                    Some(thread) if thread.archived => {
+                        Some("Archived threads are read-only.".into())
+                    }
+                    _ => None,
+                }),
+            Self::ArchiveThread => state.archive_thread_reason(),
+            Self::CloseThread if state.thread().is_none() => Some("Select a thread first.".into()),
+            Self::NewFactoryThread => state.mutable_project_reason().or_else(|| {
                 state
-                    .mutable_project_reason()
-                    .or_else(|| match state.thread() {
-                        None => Some("Select a conversation first.".into()),
-                        Some(t) if t.archived => {
-                            Some("Archived conversations are read-only.".into())
-                        }
-                        _ => None,
+                    .selected_project
+                    .and_then(|id| match state.repositories.get(&id) {
+                        Some(Ok(_)) => None,
+                        Some(Err(error)) => Some(format!("Project root is unavailable: {error}")),
+                        None => Some("The project working tree has not been inspected.".into()),
                     })
-            }
-            Self::ArchiveConversation => state.archive_thread_reason(),
-            Self::SendToFactory | Self::OpenFactoryFolder | Self::DispatchAzureWorkItem => {
-                state.mutable_project_reason().or_else(|| {
-                    state
-                        .selected_project
-                        .and_then(|id| match state.repositories.get(&id) {
-                            Some(Ok(_)) => None,
-                            Some(Err(error)) => {
-                                Some(format!("Project root is unavailable: {error}"))
-                            }
-                            None => Some("The project working tree has not been inspected.".into()),
-                        })
-                })
-            }
+            }),
             _ => None,
         }
     }
 }
 
 pub fn bind_keys(cx: &mut App) {
-    let navigation =
-        Some("Workspace && !Input && !NativeInput && !CommandPalette && !Dialog && !NvimEditor");
-    let list = Some("List && !Input && !NativeInput && !CommandPalette && !Dialog && !NvimEditor");
-    let conversation =
-        Some("Conversation && !Input && !NativeInput && !CommandPalette && !Dialog && !NvimEditor");
+    let workspace = Some("Workspace && !Command && !PopupMenu && !Sheet && !Dialog");
+    let command = Some("DrostPalette");
+    let navigation = Some(
+        "Workspace && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog && !NvimEditor",
+    );
+    let list = Some(
+        "List && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog && !NvimEditor",
+    );
+    let projects = Some(
+        "ProjectsList && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog && !NvimEditor",
+    );
+    let thread = Some(
+        "Thread && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog && !NvimEditor",
+    );
+    let submit = Some(
+        "(Thread || NvimEditor || FactoryThreadForm) && !Command && !PopupMenu && !Sheet && !Dialog",
+    );
     cx.bind_keys(vec![
-        KeyBinding::new("cmd-shift-p", OpenPalette, Some("Workspace")),
-        KeyBinding::new("cmd-1", FocusProjects, Some("Workspace")),
-        KeyBinding::new("cmd-2", FocusConversation, Some("Workspace")),
-        KeyBinding::new("cmd-3", FocusFactory, Some("Workspace")),
-        KeyBinding::new("cmd-4", FocusOutput, Some("Workspace")),
-        KeyBinding::new(
-            "cmd-n",
-            NewConversation,
-            Some("Workspace && !Dialog && !CommandPalette"),
-        ),
-        KeyBinding::new("cmd-,", Settings, Some("Workspace")),
+        KeyBinding::new("cmd-shift-p", OpenPalette, workspace),
+        KeyBinding::new("cmd-1", FocusProjects, workspace),
+        KeyBinding::new("cmd-2", FocusThread, workspace),
+        KeyBinding::new("cmd-3", FocusOutput, workspace),
+        KeyBinding::new("cmd-b", ToggleProjects, workspace),
+        KeyBinding::new("cmd-j", ToggleOutput, workspace),
+        KeyBinding::new("cmd-n", NewConversation, workspace),
+        KeyBinding::new("cmd-shift-n", NewFactoryThread, workspace),
+        KeyBinding::new("cmd-,", Settings, workspace),
         KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("ctrl-h", FocusLeft, navigation),
-        KeyBinding::new("ctrl-j", FocusDown, navigation),
-        KeyBinding::new("ctrl-k", FocusUp, navigation),
-        KeyBinding::new("ctrl-l", FocusRight, navigation),
+        // The native Command rows resolve hints against the palette's own action host.
+        KeyBinding::new("cmd-1", FocusProjects, command),
+        KeyBinding::new("cmd-2", FocusThread, command),
+        KeyBinding::new("cmd-3", FocusOutput, command),
+        KeyBinding::new("cmd-b", ToggleProjects, command),
+        KeyBinding::new("cmd-j", ToggleOutput, command),
+        KeyBinding::new("cmd-n", NewConversation, command),
+        KeyBinding::new("cmd-shift-n", NewFactoryThread, command),
+        KeyBinding::new("cmd-,", Settings, command),
+        KeyBinding::new("ctrl-w h", FocusLeft, navigation),
+        KeyBinding::new("ctrl-w j", FocusDown, navigation),
+        KeyBinding::new("ctrl-w k", FocusUp, navigation),
+        KeyBinding::new("ctrl-w l", FocusRight, navigation),
+        KeyBinding::new("ctrl-w ctrl-h", FocusLeft, navigation),
+        KeyBinding::new("ctrl-w ctrl-j", FocusDown, navigation),
+        KeyBinding::new("ctrl-w ctrl-k", FocusUp, navigation),
+        KeyBinding::new("ctrl-w ctrl-l", FocusRight, navigation),
         KeyBinding::new("j", SelectNext, list),
         KeyBinding::new("down", SelectNext, list),
         KeyBinding::new("k", SelectPrevious, list),
         KeyBinding::new("up", SelectPrevious, list),
         KeyBinding::new("g g", SelectFirst, list),
         KeyBinding::new("shift-g", SelectLast, list),
-        KeyBinding::new(
-            "h",
-            CollapseProject,
-            Some("ProjectsList && !Input && !NativeInput"),
-        ),
-        KeyBinding::new(
-            "left",
-            CollapseProject,
-            Some("ProjectsList && !Input && !NativeInput"),
-        ),
-        KeyBinding::new(
-            "l",
-            ExpandProject,
-            Some("ProjectsList && !Input && !NativeInput"),
-        ),
-        KeyBinding::new(
-            "right",
-            ExpandProject,
-            Some("ProjectsList && !Input && !NativeInput"),
-        ),
+        KeyBinding::new("h", CollapseProject, projects),
+        KeyBinding::new("left", CollapseProject, projects),
+        KeyBinding::new("l", ExpandProject, projects),
+        KeyBinding::new("right", ExpandProject, projects),
         KeyBinding::new("enter", OpenSelection, list),
-        KeyBinding::new("j", SelectNext, conversation),
-        KeyBinding::new("down", SelectNext, conversation),
-        KeyBinding::new("k", SelectPrevious, conversation),
-        KeyBinding::new("up", SelectPrevious, conversation),
-        KeyBinding::new("g g", SelectFirst, conversation),
-        KeyBinding::new("shift-g", SelectLast, conversation),
-        KeyBinding::new("i", FocusComposer, conversation),
-        KeyBinding::new("cmd-escape", LeaveEditor, Some("NvimEditor")),
-        KeyBinding::new("cmd-enter", Submit, Some("Conversation || NvimEditor")),
-        KeyBinding::new("cmd-.", Interrupt, Some("Conversation || NvimEditor")),
+        KeyBinding::new("j", SelectNext, thread),
+        KeyBinding::new("down", SelectNext, thread),
+        KeyBinding::new("k", SelectPrevious, thread),
+        KeyBinding::new("up", SelectPrevious, thread),
+        KeyBinding::new("g g", SelectFirst, thread),
+        KeyBinding::new("shift-g", SelectLast, thread),
+        KeyBinding::new("i", FocusComposer, thread),
         KeyBinding::new(
-            "escape",
-            Dismiss,
-            Some("Dialog || CommandPalette || (Dialog > Input) || (CommandPalette > Input)"),
+            "cmd-escape",
+            LeaveEditor,
+            Some("NvimEditor && !Dialog && !Sheet"),
         ),
-        KeyBinding::new("cmd-enter", Confirm, Some("Dialog || (Dialog > Input)")),
+        KeyBinding::new("cmd-enter", Submit, submit),
         KeyBinding::new(
-            "down",
-            SelectNext,
-            Some("CommandPalette || (CommandPalette > Input)"),
+            "cmd-.",
+            Interrupt,
+            Some("(Thread || NvimEditor) && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "up",
-            SelectPrevious,
-            Some("CommandPalette || (CommandPalette > Input)"),
+            "cmd-enter",
+            Confirm,
+            Some("DrostForm && !Command && !PopupMenu"),
         ),
     ]);
 }
@@ -245,145 +279,285 @@ pub fn button(
         })
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum PaletteTarget {
     Command(Command),
     Project(Uuid),
     Thread(Uuid),
 }
-#[derive(Clone)]
-pub struct PaletteItem {
-    pub title: String,
-    pub detail: String,
-    pub target: PaletteTarget,
-    pub disabled: Option<String>,
-}
+
 pub struct Palette {
-    pub input: Entity<InputState>,
-    pub selected: usize,
-    pub previous_focus: Option<FocusHandle>,
-    pub subscription: Subscription,
+    pub command: Entity<CommandState>,
+    owner: WeakEntity<Workspace>,
+    state: Entity<AppState>,
+    closed: bool,
+    _subscription: Subscription,
 }
+
 impl Palette {
-    pub fn items(&self, state: &AppState, cx: &App) -> Vec<PaletteItem> {
-        let query = self.input.read(cx).value().to_lowercase();
-        let mut items: Vec<_> = Command::ALL
-            .into_iter()
-            .map(|command| PaletteItem {
-                title: command.label().into(),
-                detail: "Command".into(),
-                target: PaletteTarget::Command(command),
-                disabled: command.disabled_reason(state),
-            })
-            .collect();
-        items.extend(
-            state
+    pub fn open(
+        owner: WeakEntity<Workspace>,
+        state: Entity<AppState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let palette = cx.new(|cx| {
+            let command = cx.new(|cx| CommandState::new(window, cx));
+            let subscription = cx.observe(&state, |_, _, cx| cx.notify());
+            Self {
+                command,
+                owner,
+                state,
+                closed: false,
+                _subscription: subscription,
+            }
+        });
+        let content = palette.clone();
+        let close_owner = palette.downgrade();
+        // Dialog's pixel-only width API is resolved at the window/rem boundary.
+        let width =
+            (window.rem_size() * 40.).min(window.viewport_size().width - window.rem_size() * 2.);
+        window.open_dialog(cx, move |dialog, _, _| {
+            let close_owner = close_owner.clone();
+            dialog
+                .close_button(false)
+                .p_0()
+                .width(width)
+                .child(content.clone())
+                .on_close(move |_, _, cx| {
+                    let _ = close_owner.update(cx, |palette, cx| palette.cleanup(cx));
+                })
+        });
+        palette.read(cx).command.focus_handle(cx).focus(window, cx);
+        palette
+    }
+
+    /// Workspace takes its retained palette before asking the native host to close.
+    /// Root alone owns restoring the trigger focus.
+    pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.closed {
+            self.closed = true;
+            window.close_dialog(cx);
+        }
+    }
+
+    fn cleanup(&mut self, cx: &mut Context<Self>) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let id = cx.entity().entity_id();
+        let _ = self.owner.update(cx, |workspace, cx| {
+            if workspace
+                .palette
+                .as_ref()
+                .is_some_and(|palette| palette.entity_id() == id)
+            {
+                workspace.palette = None;
+                cx.notify();
+            }
+        });
+    }
+
+    fn run(&mut self, target: PaletteTarget, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if self.closed || self.state.read(cx).shutting_down {
+            return;
+        }
+        if let PaletteTarget::Command(command) = target
+            && command.disabled_reason(self.state.read(cx)).is_some()
+        {
+            return;
+        }
+        self.closed = true;
+        let id = cx.entity().entity_id();
+        let _ = self.owner.update(cx, |workspace, cx| {
+            if !workspace
+                .palette
+                .as_ref()
+                .is_some_and(|palette| palette.entity_id() == id)
+            {
+                return;
+            }
+            workspace.palette = None;
+            // Close only this host, before a command can open Settings or another dialog.
+            window.close_dialog(cx);
+            match target {
+                PaletteTarget::Command(command) => workspace.execute(command, window, cx),
+                target => workspace.run_palette_target(target, window, cx),
+            }
+            cx.notify();
+        });
+    }
+}
+
+impl Render for Palette {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
+        let mut targets = [Vec::new(), Vec::new(), Vec::new()];
+        let mut commands = CommandGroup::new().label("Commands");
+        for command in Command::ALL {
+            let reason = command.disabled_reason(state);
+            let label = match &reason {
+                Some(reason) => format!("{} — {reason}", command.label()),
+                None => command.label().to_owned(),
+            };
+            commands = commands.item(
+                CommandItem::new()
+                    .label(label)
+                    .action(command.action())
+                    .disabled(reason.is_some()),
+            );
+            targets[0].push(PaletteTarget::Command(command));
+        }
+        let mut projects = CommandGroup::new().label("Projects");
+        for project in state
+            .snapshot
+            .projects
+            .iter()
+            .filter(|project| state.show_archived || !project.archived)
+        {
+            projects = projects.item(
+                CommandItem::new().label(project.name.clone()).keywords([
+                    project.root.display().to_string(),
+                    if project.archived {
+                        "archived project"
+                    } else {
+                        "project"
+                    }
+                    .to_owned(),
+                ]),
+            );
+            targets[1].push(PaletteTarget::Project(project.id));
+        }
+        let mut threads = CommandGroup::new().label("Threads");
+        for thread in state.snapshot.threads.iter().filter(|thread| {
+            state.show_archived
+                || (!thread.archived
+                    && state
+                        .snapshot
+                        .projects
+                        .iter()
+                        .any(|project| project.id == thread.project_id && !project.archived))
+        }) {
+            let project = state
                 .snapshot
                 .projects
                 .iter()
-                .filter(|p| state.show_archived || !p.archived)
-                .map(|p| PaletteItem {
-                    title: p.name.clone(),
-                    detail: format!(
-                        "Project · {}{}",
-                        p.root.display(),
-                        if p.archived { " · Archived" } else { "" }
+                .find(|project| project.id == thread.project_id);
+            threads = threads.item(
+                CommandItem::new().label(thread.title.clone()).keywords([
+                    format!(
+                        "{:?} thread{}",
+                        thread.kind,
+                        if thread.archived { " archived" } else { "" }
                     ),
-                    target: PaletteTarget::Project(p.id),
-                    disabled: None,
-                }),
-        );
-        items.extend(
-            state
-                .snapshot
-                .threads
-                .iter()
-                .filter(|t| {
-                    state.show_archived
-                        || (!t.archived
-                            && state
-                                .snapshot
-                                .projects
-                                .iter()
-                                .any(|p| p.id == t.project_id && !p.archived))
-                })
-                .map(|t| PaletteItem {
-                    title: t.title.clone(),
-                    detail: format!(
-                        "Conversation{}",
-                        if t.archived { " · Archived" } else { "" }
-                    ),
-                    target: PaletteTarget::Thread(t.id),
-                    disabled: None,
-                }),
-        );
-        items.retain(|item| {
-            query.split_whitespace().all(|term| {
-                item.title.to_lowercase().contains(term)
-                    || item.detail.to_lowercase().contains(term)
-            })
-        });
-        items
-    }
-    pub fn render(&self, state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> AnyElement {
-        let items = self.items(state, cx);
-        let mut list = v_flex()
-            .id("palette-results")
-            .max_h(px(420.))
-            .overflow_y_scroll()
-            .gap_1();
-        if items.is_empty() {
-            list = list.child(
+                    project
+                        .map(|project| project.name.clone())
+                        .unwrap_or_default(),
+                ]),
+            );
+            targets[2].push(PaletteTarget::Thread(thread.id));
+        }
+        // Capture the exact unfiltered model installed by this render. Native filtering
+        // preserves group/row coordinates, including when a group has no visible rows.
+        let targets = Rc::new(targets);
+        let confirm_owner = cx.entity().downgrade();
+        let cancel_owner = cx.entity().downgrade();
+        let command = NativeCommand::new(&self.command)
+            .bordered(false)
+            .placeholder("Search commands, projects and threads…")
+            .max_h(rems(26.))
+            .group(commands)
+            .group(projects)
+            .group(threads)
+            .empty(|_, _, cx| {
                 div()
                     .p_3()
-                    .text_color(rgb(0x8B95A5))
-                    .child("No matching commands, projects or conversations."),
-            );
-        }
-        for (index, item) in items.into_iter().enumerate() {
-            let owner = owner.clone();
-            let target = item.target.clone();
-            list = list.child(
-                Button::new(("palette-item", index))
-                    .w_full()
-                    .ghost()
-                    .disabled(item.disabled.is_some())
-                    .when_some(item.disabled, |button, reason| button.tooltip(reason))
-                    .label(item.title)
-                    .selected(index == self.selected)
-                    .on_click(move |_, window, cx| {
-                        let _ = owner.update(cx, |workspace, cx| {
-                            workspace.run_palette_target(target.clone(), window, cx)
-                        });
-                    }),
-            );
-        }
-        v_flex()
-            .key_context("CommandPalette")
-            .w(px(650.))
-            .p_3()
-            .gap_3()
-            .bg(rgb(0x20242B))
-            .border_1()
-            .border_color(rgb(0x343A46))
-            .rounded_lg()
-            .child(Input::new(&self.input))
-            .child(list)
-            .child(
-                h_flex()
-                    .text_xs()
-                    .text_color(rgb(0x8B95A5))
-                    .child("↑ ↓ select · Return open · Escape dismiss"),
-            )
-            .into_any_element()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No matching commands, projects or threads.")
+            })
+            .on_confirm(move |index, window, cx| {
+                let Some(target) = targets
+                    .get(index.section)
+                    .and_then(|group| group.get(index.row))
+                    .copied()
+                else {
+                    return;
+                };
+                // Action dispatch precedes this deferred callback. Never execute or close
+                // again: the action may already have opened a different native surface.
+                if matches!(target, PaletteTarget::Command(_)) {
+                    return;
+                }
+                let _ = confirm_owner.update(cx, |palette, cx| palette.run(target, window, cx));
+            })
+            .on_cancel(move |_, cx| {
+                // Empty-query Cancel continues to Dialog, which owns the native pop.
+                let _ = cancel_owner.update(cx, |palette, cx| palette.cleanup(cx));
+            });
+        div()
+            .key_context("DrostPalette")
+            .on_action(cx.listener(|this, _: &AddProject, w, cx| {
+                this.run(PaletteTarget::Command(Command::AddProject), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewConversation, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewConversation), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewFactoryThread, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewFactoryThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RenameProject, w, cx| {
+                this.run(PaletteTarget::Command(Command::RenameProject), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ArchiveProject, w, cx| {
+                this.run(PaletteTarget::Command(Command::ArchiveProject), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RenameThread, w, cx| {
+                this.run(PaletteTarget::Command(Command::RenameThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ArchiveThread, w, cx| {
+                this.run(PaletteTarget::Command(Command::ArchiveThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseThread, w, cx| {
+                this.run(PaletteTarget::Command(Command::CloseThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowArchived, w, cx| {
+                this.run(PaletteTarget::Command(Command::ShowArchived), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RefreshFactoryRuns, w, cx| {
+                this.run(PaletteTarget::Command(Command::RefreshFactoryRuns), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &Settings, w, cx| {
+                this.run(PaletteTarget::Command(Command::Settings), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResetLayout, w, cx| {
+                this.run(PaletteTarget::Command(Command::ResetLayout), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusProjects, w, cx| {
+                this.run(PaletteTarget::Command(Command::FocusProjects), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusThread, w, cx| {
+                this.run(PaletteTarget::Command(Command::FocusThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FocusOutput, w, cx| {
+                this.run(PaletteTarget::Command(Command::FocusOutput), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleProjects, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleProjects), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleOutput, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleOutput), w, cx)
+            }))
+            .w_full()
+            .child(command)
     }
 }
 
 pub fn region_action(region: Region) -> &'static str {
     match region {
         Region::Projects => "Projects",
-        Region::Conversation => "Conversation",
-        Region::Factory => "Factory",
+        Region::Thread => "Thread",
         Region::Output => "Output",
     }
 }

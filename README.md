@@ -15,7 +15,7 @@ Een **drost** (of drossaard, als je het deftig wilt zeggen) was vroeger de rentm
 - 🗂️ **Je projecten bij elkaar houden.** Gewoon je bestaande git-repo's, geen gedoe.
 - 💬 **Kletsen met een coding agent.** Eén live gesprek, met geschiedenis, plaatjes en tools die je ziet werken.
 - ⌨️ **Écht in Neovim typen.** Geen Vim-imitatie, maar de echte. `ciw`, `dd`, `u`, het doet het allemaal.
-- 🏭 **Werk naar de Factory sturen.** Taak schrijven, nakijken, versturen. Daarna kijk je rustig hoe de run vordert.
+- **Factory-runs starten.** Een bestaande User Story of PRD/issues-map kiezen, launch-parameters instellen en daarna de native events en resultaten volgen.
 - 📜 **Terugzien wat er gebeurd is.** Elke run blijft bewaard, ook als je DROSTJE. tussendoor even dichtdoet.
 
 ## Wat DROSTJE. níet doet
@@ -33,15 +33,53 @@ cargo run
 
 Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor testen)? Zet `DROST_DATA_DIR`.
 
-De standaardmap is `~/Library/Application Support/Drost`. Eén instantie mag die map tegelijk gebruiken. Projecten, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen, werkpakketten en logs blijven bestanden. Archiveren verwijdert niets.
+De standaardmap is `~/Library/Application Support/Drost`. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
 
 Kies in Settings zo nodig expliciete executable-paden en de gedeelde Factory-data-root. OMP en Neovim draaien met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
+
+### Threads en werkruimte
+
+Projects bevat één gedeelde lijst met twee soorten threads:
+
+- **Conversation:** een interactieve OMP-sessie met geschiedenis en een echte Neovim-composer. Het model kies je onderaan de composer.
+- **Factory:** parameters voor een bestaande Azure DevOps User Story of een bestaande PRD/issues-map. `Advanced` bevat de branch en het optionele thought level. `Start run` slaat de definitieve configuratie eerst op; een opslagfout start niets.
+
+Na de eerste duurzame launch wordt de Factory-thread een alleen-lezen monitor met native events, resultaten en ruwe details. Ook een geweigerde launch blijft als historie bewaard. Een volgende poging begint in een **nieuwe Factory-thread**. Er is geen taakpakket-generator, handoff vanuit een bericht of Factory-composer.
+
+De werkruimte heeft Projects links, de geselecteerde Thread centraal en een optioneel Output-dock onderaan. Je kunt de native docks verplaatsen, groeperen en schalen; de indeling wordt bewaard. `Close thread` sluit de geselecteerde weergave en eventueel een inactieve Conversation-sessie, niet de historie of een onafhankelijke Factory-run.
+
+### Toetsenbord
+
+|Toets|Actie|
+|---|---|
+|`Cmd-Shift-P`|Command palette: opdrachten, projecten en beide threadsoorten|
+|`Cmd-N` / `Cmd-Shift-N`|Nieuwe Conversation / Factory-thread|
+|`Cmd-1` / `Cmd-2` / `Cmd-3`|Focus Projects / Thread / Output; opent zo nodig het dock|
+|`Cmd-B` / `Cmd-J`|Projects / Output tonen of verbergen|
+|`Ctrl-W`, daarna `h/j/k/l`|Naar een zichtbaar aangrenzend paneel; tweede toets mag ook met Control|
+|`j/k`, pijlen, `gg/G`, `h/l`, Return|Navigeren, springen, invouwen/uitvouwen en openen in Projects|
+|`i` in een Conversation|Focus naar de Neovim-composer|
+|`Cmd-Enter`|Prompt versturen, Factory-configuratie starten of formulier bevestigen|
+|`Cmd-.`|Interactieve turn onderbreken|
+|`Cmd-Escape`|Van Neovim terug naar Thread|
+|`Cmd-,`|Settings|
+|Escape|Bovenste menu of venster sluiten; in de palette eerst de zoektekst wissen|
+
+Neovim houdt zijn eigen insert-/command-line-betekenis van `Ctrl-W`; Return blijft daar een nieuwe regel. Directionele paneeltoetsen verlaten geen invoerveld of dialoog. In Neovim normal mode werken de paneelchords zonder je tekst te veranderen.
+
+### Uiterlijk
+
+Settings biedt **System**, **Light** en **Dark**, met een afzonderlijke themakeuze per modus. Save past de keuze toe; Cancel verandert het uiterlijk niet. De Neovim-grid volgt dezelfde kleuren en monospace-typografie.
+
+Eigen thema's staan in `<DROST_DATA_DIR>/themes` (standaard `~/Library/Application Support/Drost/themes`). Settings toont de map en kan die openen. Gebruik GPUI Kit `ThemeSet`-JSON: een object met een `themes`-array; iedere entry heeft een unieke `name` en `mode` (`light` of `dark`). Dit is niet het losse Zed-themaformaat. Alleen Default Light en Default Dark zijn ingebouwd.
+
+Toegevoegde en gewijzigde bestanden worden opnieuw geladen. Ontbreekt het gekozen thema, dan gebruikt Drost een standaardthema met een waarschuwing; de opgeslagen naam blijft behouden zodat herstel van het bestand de keuze kan herstellen. Gebruik unieke namen om dubbele registry-entries te vermijden.
 
 ### Vereisten en controle
 
 Getest met GPUI Kit `0.6.1`, OMP `18.2.0` (native RPC v2) en Neovim `0.12.3` op macOS. OMP-authenticatie en modeltoegang moeten al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
 
-`Check Readiness` toont echte `factory doctor --harness …`-uitvoer. Het Factory-formulier laat je kiezen uit `omp`, `opencode`, `codex` en `claude-code`; de echte Factory-run-test kiest `opencode` via datzelfde keuzeveld. Interactieve gesprekken blijven OMP gebruiken. De hier aangetroffen Factory-build `de152249fb93` kent de `omp`-harness nog niet. DROSTJE. voert geen upgrades of authenticatie uit.
+`Check readiness` toont echte `factory doctor --harness …`-uitvoer. Een Factory-thread gebruikt `opencode` (standaard), `codex` of `claude-code`; interactieve Conversations blijven OMP gebruiken. Een ongeldige of niet-ondersteunde keuze blijft zichtbaar en moet vóór Start worden aangepast. DROSTJE. voert geen upgrades of authenticatie uit.
 
 ```sh
 cargo check --all-targets
@@ -57,10 +95,12 @@ Maak eerst de wegwerp-repository `FX` uit [het applicatieplan](DROST_APPLICATION
 ```sh
 export DROST_RUNTIME_FIXTURE="$FX"
 cargo test --features runtime-qa --lib workspace_actions_with_real_backends -- --ignored --nocapture
+cargo test --features runtime-qa --lib thread_workspace_keyboard_and_themes -- --ignored --nocapture
 cargo test --features runtime-qa --lib orderly_quit_flushes_before_platform_deadline -- --ignored --nocapture
+cargo test --features runtime-qa --lib factory_start_requires_persisted_configuration -- --ignored --nocapture
 ```
 
-Met `DROST_PROVIDER_SMOKE=1` controleert de eerste QA-test ook een echte afbeelding/prompt, toolgebruik, interrupt/continue en sessieherstel. Dit gebruikt je bestaande authenticatie en provider-capaciteit.
+Deze scenario's versturen geen provider-turns en starten geen remote Factory-run. Ze controleren echte Neovim-draftwissels, beide threadsoorten, native palette-/focusgedrag, themawijzigingen, veilige afsluiting en de opslagbarrière vóór Factory Start.
 
 Gebruik de door de eerste QA-test gemelde datamap als `DROST_QA_DATA` voor layout/herstart-controle:
 
@@ -68,9 +108,9 @@ Gebruik de door de eerste QA-test gemelde datamap als `DROST_QA_DATA` voor layou
 cargo test --features runtime-qa --lib layout_and_factory_runtime_recovery -- --ignored --nocapture
 ```
 
-Alleen met `DROST_FACTORY_SMOKE=1` probeert die laatste test een echte Factory-dispatch met `opencode` op de fixture. Een readiness-weigering is zichtbaar en bewaart het concept; dat is geen geslaagde Factory-run. Het eerste echte macOS-venster is visueel gecontroleerd; de interacties zijn via GPUI test-support geverifieerd omdat Accessibility-automatisering niet beschikbaar was.
+De hersteltest heropent alleen de opgeslagen werkruimte. Als de fixture al launch-records bevat, worden die via de echte eventtracker in hun eigen Factory-thread getoond, zonder opnieuw te dispatchen. Exitcode 0 zonder terminal event blijft `Interrupted / Unknown`, niet Completed.
 
-De echte OpenCode-proef heeft dispatch, sandbox-initialisatie en GUI-herstart/herstel doorlopen. De run pauzeerde daarna met `PermissionDenied` / `SandboxNonZero`: Factory wees een ACP-verzoek van de agent naar `/proc/sys/kernel/random/uuid` af. De completion-assertie blijft terecht falen zolang de run niet werkelijk voltooit; de sandbox-policy is niet aangepast.
+Een eerdere echte OpenCode-proef heeft dispatch, sandbox-initialisatie en GUI-herstart/herstel doorlopen. Die run pauzeerde met `PermissionDenied` / `SandboxNonZero`: Factory wees een ACP-verzoek van de agent naar `/proc/sys/kernel/random/uuid` af. Die proef bewijst geen voltooide run; de sandbox-policy is niet aangepast en deze UI-QA herhaalt die remote proef niet.
 
 ## Onder de motorkap
 

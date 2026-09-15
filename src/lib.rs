@@ -10,7 +10,7 @@ pub mod ui;
 
 use gpui_kit::{
     assets::Assets,
-    component::{Root, Theme, ThemeMode},
+    component::{Root, TitleBar},
     *,
 };
 
@@ -27,23 +27,18 @@ pub fn run() {
     }
     gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
-        Theme::change(ThemeMode::Dark, None, cx);
-        {
-            let theme = Theme::global_mut(cx);
-            theme.font_family = ".SystemUIFont".into();
-            theme.font_size = px(13.);
-            theme.mono_font_family = "Menlo".into();
-            theme.colors.background = rgb(0x181B20).into();
-            theme.colors.foreground = rgb(0xD8DEE9).into();
-            theme.colors.border = rgb(0x343A46).into();
-            theme.colors.muted = rgb(0x20242B).into();
-            theme.colors.muted_foreground = rgb(0x8B95A5).into();
-            theme.colors.primary = rgb(0x7AA2F7).into();
-            theme.colors.accent = rgb(0x343A46).into();
+        match &bootstrap {
+            Ok(bootstrap) => ui::theme::initialize(
+                Some(&bootstrap.snapshot.settings),
+                Some(&bootstrap.data_dir),
+                cx,
+            ),
+            Err(_) => ui::theme::initialize(None, None, cx),
         }
-        Theme::sync_base(cx);
+        if let Err(error) = platform::set_application_icon() {
+            eprintln!("Could not set the Drost application icon: {error:#}");
+        }
         ui::commands::bind_keys(cx);
-        cx.on_action(|_: &ui::commands::Quit, cx| cx.quit());
         cx.set_menus(vec![Menu::new("Drost").items([
             MenuItem::action("Settings…", ui::commands::Settings),
             MenuItem::separator(),
@@ -56,32 +51,34 @@ pub fn run() {
         })
         .detach();
         let options = WindowOptions {
+            // Native window geometry is expressed in physical layout pixels.
             window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
             window_min_size: Some(size(px(900.), px(600.))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Drost".into()),
-                ..Default::default()
-            }),
-            ..Default::default()
+            ..TitleBar::window_options()
         };
         cx.spawn(async move |cx| {
             match cx.open_window(options, move |window, cx| {
                 let view: AnyView = match bootstrap {
                     Ok(bootstrap) => {
                         let state = cx.new(|cx| app::AppState::new(bootstrap, cx));
-                        cx.new(|cx| ui::workspace::Workspace::new(state, window, cx))
+                        let workspace =
+                            cx.new(|cx| ui::workspace::Workspace::new(state, window, cx));
+                        cx.new(|_| ui::workspace::WorkspaceRoot { workspace })
                             .into()
                     }
-                    Err(error) => cx
-                        .new(|_| ui::workspace::Recovery {
+                    Err(error) => {
+                        cx.on_action(|_: &ui::commands::Quit, cx| cx.quit());
+                        ui::theme::attach_recovery(window, cx).detach();
+                        cx.new(|_| ui::workspace::Recovery {
                             error: format!("{error:#}"),
                         })
-                        .into(),
+                        .into()
+                    }
                 };
                 cx.new(|cx| Root::new(view, window, cx))
             }) {
                 Ok(_) => {
-                    let _ = cx.update(|cx| cx.activate(true));
+                    cx.update(|cx| cx.activate(true));
                 }
                 Err(error) => eprintln!("Could not open Drost: {error:#}"),
             }

@@ -1,16 +1,48 @@
 use super::workspace::{Region, Workspace};
 use crate::{
-    app::AppEvent,
+    app::{AppEvent, NoticeLevel, WorkspaceNotice},
     model::*,
     neovim::{DraftKey, NvimConfig, NvimEditor, NvimView, NvimViewEvent},
     platform,
 };
+use gpui_kit::component::WindowExt;
 use gpui_kit::*;
 use serde_json::Value;
 
 impl Workspace {
+    fn can_edit_conversation(&self, id: ThreadId, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        !state.shutting_down
+            && state.storage_error.is_none()
+            && state.snapshot.threads.iter().any(|thread| {
+                thread.id == id
+                    && thread.kind == ThreadKind::Conversation
+                    && !thread.archived
+                    && state
+                        .snapshot
+                        .projects
+                        .iter()
+                        .any(|project| project.id == thread.project_id && !project.archived)
+            })
+    }
+
+    fn has_conversation_editor(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state.conversation_thread().is_some()
+            || self.editor_override.as_ref().is_some_and(|(key, _)| {
+                matches!(key, DraftKey::Extension { thread, .. }
+                if state.snapshot.threads.iter().any(|candidate| {
+                    candidate.id == *thread && candidate.kind == ThreadKind::Conversation
+                }))
+            })
+    }
+
     pub fn start_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.opening_editor || self.editor.is_some() {
+        if self.opening_editor
+            || self.editor.is_some()
+            || self.state.read(cx).shutting_down
+            || !self.has_conversation_editor(cx)
+        {
             return;
         }
         self.opening_editor = true;
@@ -23,10 +55,13 @@ impl Workspace {
             .and_then(|v| v.get("nvim"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let initial_theme = super::theme::nvim_theme(cx);
         cx.spawn_in(window, async move |workspace, window| {
             let result = async {
                 let executable = smol::unblock(move || platform::resolve_executable("nvim", explicit.as_deref())).await?;
-                NvimEditor::open(NvimConfig::new(executable)).await
+                let mut config = NvimConfig::new(executable);
+                config.initial_theme = Some(initial_theme);
+                NvimEditor::open(config).await
             }.await;
             let _ = workspace.update_in(window, |workspace, window, cx| {
                 workspace.opening_editor = false;
@@ -47,21 +82,58 @@ impl Workspace {
                             match event {
                                 NvimViewEvent::DraftChanged(draft) | NvimViewEvent::DraftActivated(draft) => workspace.state.update(cx, |state, cx| { state.record_draft(draft.clone()); cx.notify(); }),
                                 NvimViewEvent::Ready => { workspace.state.update(cx, |state, cx| { state.editor_error = None; cx.notify(); }); workspace.editor_selection = None; workspace.sync_session(window, cx); }
-                                NvimViewEvent::Failed(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(error.clone()); state.notice(format!("Neovim: {error}")); cx.notify(); }),
-                                NvimViewEvent::InputRejected(error) => workspace.state.update(cx, |state, cx| { state.notice(format!("Editor input: {error}")); cx.notify(); }),
+                                NvimViewEvent::Failed(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(error.clone()); state.notice(NoticeLevel::Error, format!("Neovim: {error}")); cx.notify(); }),
+                                NvimViewEvent::InputRejected(error) => workspace.state.update(cx, |state, cx| { state.notice(NoticeLevel::Warning, format!("Editor input: {error}")); cx.notify(); }),
                                 NvimViewEvent::CompositionChanged(false) => workspace.sync_session(window, cx),
+                                NvimViewEvent::FocusPane { key, generation, direction } => {
+                                    let state = workspace.state.read(cx);
+                                    let current = workspace.editor_selection.as_ref() == Some(key)
+                                        && state.drafts.get(key).is_some_and(|draft| draft.generation == *generation)
+                                        && !state.shutting_down;
+                                    let focused = workspace.editor.as_ref().is_some_and(|view| {
+                                        let view = view.read(cx);
+                                        view.active_key() == Some(key)
+                                            && view.focus_handle(cx).is_focused(window)
+                                            && !view.has_composition()
+                                    });
+                                    if current && focused && !window.has_active_dialog(cx) && !window.has_active_sheet(cx) {
+                                        workspace.spatial_focus(*direction, window, cx);
+                                    }
+                                }
                                 _ => {}
                             }
                             cx.notify();
                         }));
                         workspace.editor = Some(view);
+                        workspace.editor_theme = Some(initial_theme);
+                        workspace.sync_editor_theme(window, cx);
                         workspace.sync_session(window, cx);
                     }
-                    Err(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(format!("{error:#}")); state.notice(format!("Neovim could not start: {error:#}. Configure its executable in Settings.")); cx.notify(); }),
+                    Err(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(format!("{error:#}")); state.notice(NoticeLevel::Error, format!("Neovim could not start: {error:#}. Configure its executable in Settings.")); cx.notify(); }),
                 }
                 cx.notify();
             });
         }).detach();
+    }
+
+    pub(super) fn sync_editor_theme(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.state.read(cx).editor.clone() else {
+            return;
+        };
+        let palette = super::theme::nvim_theme(cx);
+        if self.editor_theme.as_ref() == Some(&palette) {
+            return;
+        }
+        match editor
+            .commands
+            .try_send(crate::neovim::NvimCommand::SetTheme(palette))
+        {
+            Ok(()) => self.editor_theme = Some(palette),
+            Err(error) => self.state.update(cx, |state, cx| {
+                state.editor_error = Some(format!("Editor theme update failed: {error}"));
+                cx.notify();
+            }),
+        }
     }
 
     pub fn sync_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -79,7 +151,11 @@ impl Workspace {
             self.extension = None;
             self.editor_override = None;
         }
-        let selected = self.state.read(cx).selected_thread;
+        let selected = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id);
         if let Some(id) = selected {
             self.state
                 .update(cx, |state, _| state.ensure_conversation(id));
@@ -87,15 +163,27 @@ impl Workspace {
         if self.editor_switching || self.state.read(cx).editor_error.is_some() {
             return;
         }
-        let desired = self.editor_override.clone().or_else(|| {
-            self.state
-                .read(cx)
-                .thread()
-                .filter(|t| !t.archived)
-                .map(|thread| (DraftKey::Thread(thread.id), thread.draft.clone()))
-        });
+        let desired = self
+            .editor_override
+            .as_ref()
+            .filter(|(key, _)| {
+                matches!(key, DraftKey::Extension { thread, .. }
+                if self.state.read(cx).snapshot.threads.iter().any(|candidate| {
+                    candidate.id == *thread && candidate.kind == ThreadKind::Conversation
+                }))
+            })
+            .cloned()
+            .or_else(|| {
+                self.state
+                    .read(cx)
+                    .conversation_thread()
+                    .filter(|thread| !thread.archived)
+                    .map(|thread| (DraftKey::Thread(thread.id), thread.draft.clone()))
+            });
+        if desired.is_some() && self.editor.is_none() {
+            self.start_editor(window, cx);
+        }
         if desired.as_ref().map(|(key, _)| key) == self.editor_selection.as_ref() {
-            self.apply_initial_factory_handoff(window, cx);
             return;
         }
         let Some(editor) = self.state.read(cx).editor.clone() else {
@@ -124,7 +212,7 @@ impl Workspace {
                         workspace.editor_selection = desired.map(|(key, _)| key);
                         workspace.sync_session(window, cx);
                     }
-                    Err(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(format!("{error:#}")); state.notice(format!("Draft switch cancelled: {error:#}. Cancel the editor command or restart Neovim.")); cx.notify(); }),
+                    Err(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(format!("{error:#}")); state.notice(NoticeLevel::Error, format!("Draft switch cancelled: {error:#}. Cancel the editor command or restart Neovim.")); cx.notify(); }),
                 }
                 cx.notify();
             });
@@ -132,7 +220,15 @@ impl Workspace {
     }
 
     pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_region(Region::Conversation, window, cx);
+        if !self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .is_some_and(|thread| self.can_edit_conversation(thread.id, cx))
+        {
+            return;
+        }
+        self.focus_region(Region::Thread, window, cx);
         self.sync_session(window, cx);
         if let Some(editor) = &self.editor {
             editor.update(cx, |view, cx| view.focus(window, cx));
@@ -141,6 +237,9 @@ impl Workspace {
         }
     }
     pub fn restart_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).shutting_down || !self.has_conversation_editor(cx) {
+            return;
+        }
         let Some(editor) = self.state.read(cx).editor.clone() else {
             self.start_editor(window, cx);
             return;
@@ -149,24 +248,26 @@ impl Workspace {
         smol::spawn(async move {
             if let Err(error) = editor.restart().await {
                 let _ = events
-                    .send(AppEvent::Notice(format!(
-                        "Editor restart failed: {error:#}"
-                    )))
+                    .send(AppEvent::Notice(WorkspaceNotice {
+                        level: NoticeLevel::Error,
+                        text: format!("Editor restart failed: {error:#}"),
+                    }))
                     .await;
             }
         })
         .detach();
     }
     pub fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.extension.is_some() {
+        if self.extension.is_some() && self.has_conversation_editor(cx) {
             self.confirm_extension(window, cx);
             return;
         }
-        if self.factory_form.is_some() {
-            self.review_factory_task(window, cx);
-            return;
-        }
-        let Some(id) = self.state.read(cx).selected_thread else {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id)
+        else {
             return;
         };
         if self.editor_switching
@@ -174,14 +275,17 @@ impl Workspace {
             || self.editor_override.is_some()
         {
             self.state.update(cx, |state, cx| {
-                state.notice("Wait for the selected conversation draft to activate");
+                state.notice(
+                    NoticeLevel::Warning,
+                    "Wait for the selected conversation draft to activate",
+                );
                 cx.notify();
             });
             return;
         }
         if let Some(reason) = self.state.read(cx).submit_reason(id) {
             self.state.update(cx, |state, cx| {
-                state.notice(reason);
+                state.notice(NoticeLevel::Warning, reason);
                 cx.notify();
             });
             return;
@@ -192,7 +296,10 @@ impl Workspace {
             .is_some_and(|view| view.read(cx).has_composition())
         {
             self.state.update(cx, |state, cx| {
-                state.notice("Complete or cancel input composition before sending");
+                state.notice(
+                    NoticeLevel::Warning,
+                    "Complete or cancel input composition before sending",
+                );
                 cx.notify();
             });
             return;
@@ -218,8 +325,12 @@ impl Workspace {
                         cx.notify();
                     }
                 });
-                if let Some(view) = &workspace.editor {
-                    view.update(cx, |view, cx| view.focus(window, cx));
+                if workspace.state.read(cx).selected_thread == Some(id)
+                    && workspace.editor_selection == Some(DraftKey::Thread(id))
+                {
+                    if let Some(view) = &workspace.editor {
+                        view.update(cx, |view, cx| view.focus(window, cx));
+                    }
                 }
                 cx.notify();
             });
@@ -228,6 +339,9 @@ impl Workspace {
     }
 
     pub fn restore_submitted(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_edit_conversation(id, cx) {
+            return;
+        }
         let Some(submission) = self
             .state
             .read(cx)
@@ -260,6 +374,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_edit_conversation(id, cx) {
+            return;
+        }
         let Some(editor) = self.state.read(cx).editor.clone() else {
             self.start_editor(window, cx);
             return;
@@ -267,6 +384,14 @@ impl Workspace {
         let approval = window.prompt(PromptLevel::Warning, "Replace this conversation draft?", Some("This explicitly replaces its current draft. New typing after this review will not be overwritten."), &["Replace Draft", "Cancel"], cx);
         cx.spawn_in(window, async move |workspace, window| {
             if approval.await != Ok(0) {
+                return;
+            }
+            if !workspace
+                .update_in(window, |workspace, _, cx| {
+                    workspace.can_edit_conversation(id, cx)
+                })
+                .unwrap_or(false)
+            {
                 return;
             }
             let result = async {
@@ -282,6 +407,9 @@ impl Workspace {
             }
             .await;
             let _ = workspace.update_in(window, |workspace, window, cx| {
+                if !workspace.can_edit_conversation(id, cx) {
+                    return;
+                }
                 workspace.state.update(cx, |state, cx| {
                     match result {
                         Ok(()) => {
@@ -297,12 +425,19 @@ impl Workspace {
                                 state.save_thread(thread);
                             }
                         }
-                        Err(error) => state.notice(format!("Draft was not replaced: {error:#}")),
+                        Err(error) => state.notice(
+                            NoticeLevel::Error,
+                            format!("Draft was not replaced: {error:#}"),
+                        ),
                     }
                     cx.notify();
                 });
-                if let Some(view) = &workspace.editor {
-                    view.update(cx, |view, cx| view.focus(window, cx));
+                if workspace.state.read(cx).selected_thread == Some(id)
+                    && workspace.editor_selection == Some(DraftKey::Thread(id))
+                {
+                    if let Some(view) = &workspace.editor {
+                        view.update(cx, |view, cx| view.focus(window, cx));
+                    }
                 }
             });
         })
@@ -310,9 +445,17 @@ impl Workspace {
     }
 
     pub fn attach_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.state.read(cx).selected_thread else {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id)
+        else {
             return;
         };
+        if !self.can_edit_conversation(id, cx) {
+            return;
+        }
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -325,7 +468,10 @@ impl Workspace {
                 Ok(Ok(Some(paths))) => workspace.import_images(id, paths, window, cx),
                 Ok(Ok(None)) => {}
                 other => workspace.state.update(cx, |state, cx| {
-                    state.notice(format!("Image selection failed: {other:?}"));
+                    state.notice(
+                        NoticeLevel::Error,
+                        format!("Image selection failed: {other:?}"),
+                    );
                     cx.notify();
                 }),
             });
@@ -339,20 +485,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.state.read(cx).storage_error.is_some() {
-            return;
-        }
-        if !self.state.read(cx).snapshot.threads.iter().any(|thread| {
-            thread.id == id
-                && !thread.archived
-                && self
-                    .state
-                    .read(cx)
-                    .snapshot
-                    .projects
-                    .iter()
-                    .any(|project| project.id == thread.project_id && !project.archived)
-        }) {
+        if !self.can_edit_conversation(id, cx) {
             return;
         }
         let data = self.state.read(cx).data_dir.clone();
@@ -365,28 +498,24 @@ impl Workspace {
             })
             .await;
             let _ = workspace.update_in(window, |workspace, _, cx| {
+                if !workspace.can_edit_conversation(id, cx) {
+                    return;
+                }
                 workspace.state.update(cx, |state, cx| {
                     if let Some(mut thread) = state
                         .snapshot
                         .threads
                         .iter()
-                        .find(|t| {
-                            t.id == id
-                                && !t.archived
-                                && state
-                                    .snapshot
-                                    .projects
-                                    .iter()
-                                    .any(|p| p.id == t.project_id && !p.archived)
-                        })
+                        .find(|thread| thread.id == id)
                         .cloned()
                     {
                         for result in results {
                             match result {
                                 Ok(image) => thread.attachments.push(image),
-                                Err(error) => {
-                                    state.notice(format!("Attachment rejected: {error:#}"))
-                                }
+                                Err(error) => state.notice(
+                                    NoticeLevel::Error,
+                                    format!("Attachment rejected: {error:#}"),
+                                ),
                             }
                         }
                         state.save_thread(thread);
@@ -398,9 +527,12 @@ impl Workspace {
         .detach();
     }
     pub fn optimize_images(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread) = self.state.read(cx).thread().cloned() else {
+        let Some(thread) = self.state.read(cx).conversation_thread().cloned() else {
             return;
         };
+        if !self.can_edit_conversation(thread.id, cx) {
+            return;
+        }
         let Some(editor) = self.state.read(cx).editor.clone() else {
             return;
         };
@@ -411,22 +543,30 @@ impl Workspace {
                 let snapshot = editor.snapshot(DraftKey::Thread(thread.id)).await?;
                 smol::unblock(move || crate::attachments::optimize(uuid::Uuid::new_v4(), &snapshot.text, &thread.attachments, &data)).await
             }.await;
-            let _ = workspace.update_in(window, |workspace, _, cx| workspace.state.update(cx, |state, cx| {
-                match result {
-                    Ok(prepared) => if let Some(mut current) = state.snapshot.threads.iter().find(|t| t.id == thread.id).cloned() {
-                        if current.attachments.iter().map(|image| image.id).collect::<Vec<_>>() == original_ids { current.attachments = prepared; state.save_thread(current); state.notice("Prepared JPEG copies are shown below. Review their actual dimensions and previews before Send; originals are retained."); }
-                        else { state.notice("Attachments changed during optimization; current attachments were preserved"); }
-                    },
-                    Err(error) => state.notice(format!("Images were not prepared: {error:#}")),
+            let _ = workspace.update_in(window, |workspace, _, cx| {
+                if !workspace.can_edit_conversation(thread.id, cx) {
+                    return;
                 }
-                cx.notify();
-            }));
+                workspace.state.update(cx, |state, cx| {
+                    match result {
+                        Ok(prepared) => if let Some(mut current) = state.snapshot.threads.iter().find(|t| t.id == thread.id).cloned() {
+                            if current.attachments.iter().map(|image| image.id).collect::<Vec<_>>() == original_ids { current.attachments = prepared; state.save_thread(current); state.notice(NoticeLevel::Info, "Prepared JPEG copies are shown below. Review their actual dimensions and previews before Send; originals are retained."); }
+                            else { state.notice(NoticeLevel::Warning, "Attachments changed during optimization; current attachments were preserved"); }
+                        },
+                        Err(error) => state.notice(NoticeLevel::Error, format!("Images were not prepared: {error:#}")),
+                    }
+                    cx.notify();
+                });
+            });
         }).detach();
     }
 }
 
 impl Workspace {
     pub fn cancel_editor_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).shutting_down || !self.has_conversation_editor(cx) {
+            return;
+        }
         if let Some(view) = &self.editor {
             view.update(cx, |view, cx| view.cancel_composition(window, cx));
         }
@@ -439,7 +579,10 @@ impl Workspace {
                 workspace.state.update(cx, |state, cx| {
                     match result {
                         Ok(()) => state.editor_error = None,
-                        Err(error) => state.notice(format!("Editor requires restart: {error:#}")),
+                        Err(error) => state.notice(
+                            NoticeLevel::Error,
+                            format!("Editor requires restart: {error:#}"),
+                        ),
                     }
                     cx.notify();
                 });
@@ -450,15 +593,8 @@ impl Workspace {
     }
     pub fn copy_draft_recovery(&self, cx: &mut App) {
         let state = self.state.read(cx);
-        let factory_drafts: std::collections::BTreeMap<_, _> = state
-            .snapshot
-            .settings
-            .iter()
-            .filter(|(key, _)| key.starts_with("factory_draft:"))
-            .collect();
         let text = serde_json::json!({
             "threads": state.snapshot.threads,
-            "factory_drafts": factory_drafts,
             "editor_buffers": state.drafts.values().map(|draft| serde_json::json!({ "key": format!("{:?}", draft.key), "text": draft.text })).collect::<Vec<_>>(),
             "saved_uncommitted_preedit": state.snapshot.settings.get("recovered_composition"),
             "current_uncommitted_preedit": self.editor.as_ref().map(|view| view.read(cx).recovery_text()),
@@ -474,6 +610,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.flush_layout(cx);
         if let Some(view) = &self.editor {
             let text = view.read(cx).recovery_text();
             let key = view.read(cx).active_key().cloned();
@@ -486,7 +623,7 @@ impl Workspace {
                 });
             }
         }
-        self.focus_region(Region::Conversation, window, cx);
+        self.focus_region(Region::Thread, window, cx);
         self.state
             .update(cx, |state, cx| state.begin_shutdown(allow_data_loss, cx));
     }

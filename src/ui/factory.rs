@@ -1,28 +1,124 @@
-use super::{
-    commands::{Command, button},
-    workspace::{Region, Workspace},
+use super::workspace::{Region, Workspace};
+use crate::{
+    app::{AppState, NoticeLevel},
+    model::FactoryLaunch,
 };
-use crate::app::AppState;
 use gpui_kit::{
     component::{
-        Selectable, Sizable,
+        ActiveTheme, Sizable,
+        accordion::Accordion,
         button::{Button, ButtonVariants},
-        h_flex, v_flex,
+        h_flex,
+        menu::{DropdownMenu, PopupMenuItem},
+        v_flex,
     },
     *,
 };
 use std::path::{Path, PathBuf};
 
-pub fn path_actions(label: &'static str, path: &Path) -> AnyElement {
+// Disclosure state belongs to the native element identity, not the selected thread.
+#[derive(IntoElement)]
+struct Disclosure {
+    id: SharedString,
+    title: SharedString,
+    content: AnyElement,
+}
+
+impl RenderOnce for Disclosure {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state = window.use_keyed_state(self.id.clone(), cx, |_, _| false);
+        let open = *state.read(cx);
+        Accordion::new(self.id)
+            .small()
+            .bordered(false)
+            .h_auto()
+            .item(|item| {
+                let item = item.title(self.title).open(open);
+                if open { item.child(self.content) } else { item }
+            })
+            .on_toggle_click(move |indices, window, cx| {
+                state.update(cx, |open, _| *open = !indices.is_empty());
+                window.refresh();
+            })
+    }
+}
+
+fn disclosure(
+    id: impl Into<SharedString>,
+    title: impl Into<SharedString>,
+    content: impl IntoElement,
+) -> Disclosure {
+    Disclosure {
+        id: id.into(),
+        title: title.into(),
+        content: content.into_any_element(),
+    }
+}
+
+#[derive(IntoElement)]
+struct JsonDetail(serde_json::Value);
+
+impl RenderOnce for JsonDetail {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        plain_text(
+            serde_json::to_string_pretty(&self.0).unwrap_or_else(|_| self.0.to_string()),
+            cx,
+        )
+    }
+}
+
+fn plain_text(text: impl Into<SharedString>, cx: &App) -> AnyElement {
+    div()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(cx.theme().mono_font_size)
+        .whitespace_normal()
+        .child(text.into())
+        .into_any_element()
+}
+
+// Only new log content can request following. Opening a disclosure or repainting
+// must not pull a reader back down, and an offset above the bottom stays put.
+#[derive(IntoElement)]
+struct FollowingScroll {
+    id: SharedString,
+    revision: Option<(u64, usize)>,
+    scroll: ScrollHandle,
+    content: AnyElement,
+}
+
+impl RenderOnce for FollowingScroll {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let previous = window.use_keyed_state(self.id.clone(), cx, |_, _| None);
+        let changed = previous.read(cx).as_ref() != Some(&self.revision);
+        if changed {
+            if previous.read(cx).is_none()
+                || self.scroll.offset().y + self.scroll.max_offset().y <= Pixels::ZERO
+            {
+                self.scroll.scroll_to_bottom();
+            }
+            previous.update(cx, |previous, _| *previous = Some(self.revision));
+        }
+        div()
+            .id(self.id)
+            .size_full()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll)
+            .child(self.content)
+    }
+}
+
+pub fn path_actions(label: &'static str, path: &Path, cx: &App) -> AnyElement {
     let reveal = path.to_path_buf();
     let copy = path.to_string_lossy().into_owned();
     let reveal_id = SharedString::from(format!("reveal-{label}-{copy}"));
     let copy_id = SharedString::from(format!("copy-{label}-{copy}"));
     v_flex()
         .gap_1()
-        .child(div().font_family("Menlo").text_xs().child(copy.clone()))
+        .child(plain_text(copy.clone(), cx))
         .child(
             h_flex()
+                .flex_wrap()
                 .gap_1()
                 .child(
                     Button::new(reveal_id)
@@ -35,7 +131,7 @@ pub fn path_actions(label: &'static str, path: &Path) -> AnyElement {
                     Button::new(copy_id)
                         .small()
                         .ghost()
-                        .label("Copy Path")
+                        .label("Copy path")
                         .on_click(move |_, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
                         }),
@@ -58,226 +154,185 @@ fn read_button(
     .small()
     .ghost()
     .label(label)
-    .on_click(move |_, _, cx| {
+    .on_click(move |_, window, cx| {
         let _ = owner.update(cx, |workspace, cx| {
             workspace.state.update(cx, |state, cx| {
                 state.load_factory_text(path.clone(), before, cx)
-            })
+            });
+            workspace.focus_region(Region::Output, window, cx);
         });
     })
+}
+
+fn selected_launch(state: &AppState) -> Option<&FactoryLaunch> {
+    let thread = state.factory_thread()?;
+    state
+        .snapshot
+        .launches
+        .iter()
+        .find(|launch| launch.factory_thread_id == thread.id)
 }
 
 pub fn render(
     state: &AppState,
     owner: &WeakEntity<Workspace>,
     scroll: &ScrollHandle,
+    cx: &App,
 ) -> AnyElement {
-    let mut body = v_flex()
-        .id("factory-history")
-        .flex_1()
-        .min_h_0()
-        .overflow_y_scroll()
-        .track_scroll(scroll)
-        .gap_3();
-    let launches: Vec<_> = state
-        .snapshot
-        .launches
-        .iter()
-        .filter(|launch| state.selected_project == Some(launch.project_id))
-        .collect();
-    if launches.is_empty() {
-        body = body.child(div().text_color(rgb(0x8B95A5)).child(
-            "No Factory launches recorded for this project. Nothing is launched automatically.",
-        ));
-    }
-    for launch in launches {
-        let owner = owner.clone();
-        let id = launch.id;
-        let source = launch
-            .descriptor
-            .get("source")
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "Source not recorded".into());
-        let projection = state.factory_runs.get(&id);
-        let title = projection
-            .and_then(|snapshot| snapshot.title.clone())
-            .or_else(|| {
-                launch
-                    .descriptor
-                    .get("packet")
-                    .and_then(|packet| packet.get("title"))
-                    .and_then(|value| value.as_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| source.clone());
-        let harness = launch
-            .descriptor
-            .get("harness")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Not recorded");
-        let model = launch
-            .descriptor
-            .get("model")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Harness default");
-        let status = projection
-            .map(|snapshot| snapshot.status_text())
-            .unwrap_or_else(|| {
-                launch
-                    .launch_error
-                    .clone()
-                    .unwrap_or_else(|| "Launch outcome unknown; replaying durable history".into())
-            });
-        body = body.child(
-            v_flex()
-                .gap_1()
-                .pb_3()
-                .border_b_1()
-                .border_color(rgb(0x343A46))
+    let Some(launch) = selected_launch(state) else {
+        return div()
+            .p_3()
+            .text_color(cx.theme().muted_foreground)
+            .child("No Factory run recorded for this thread.")
+            .into_any_element();
+    };
+    let snapshot = state.factory_runs.get(&launch.id);
+    let status = snapshot
+        .map(|snapshot| snapshot.status_text())
+        .unwrap_or_else(|| {
+            launch
+                .launch_error
+                .as_ref()
+                .map(|error| format!("Launch failed: {error}"))
+                .unwrap_or_else(|| "Launch outcome unknown; replaying durable history".into())
+        });
+    let menu_owner = owner.clone();
+    let mut header = v_flex()
+        .px_3()
+        .pt_3()
+        .gap_2()
+        .text_color(cx.theme().foreground)
+        .child(
+            h_flex()
+                .gap_2()
+                .justify_between()
                 .child(
-                    Button::new(SharedString::from(format!("factory-launch-{id}")))
+                    div()
+                        .text_sm()
+                        .text_color(if launch.launch_error.is_some() {
+                            cx.theme().danger
+                        } else {
+                            cx.theme().foreground
+                        })
+                        .child(status),
+                )
+                .child(
+                    Button::new("factory-monitor-menu")
                         .small()
                         .ghost()
-                        .w_full()
-                        .label(title)
-                        .selected(state.selected_launch == Some(id))
-                        .on_click(move |_, window, cx| {
-                            let _ = owner.update(cx, |workspace, cx| {
-                                workspace
-                                    .state
-                                    .update(cx, |state, cx| state.select_factory_launch(id, cx));
-                                workspace.focus_region(Region::Output, window, cx);
-                            });
+                        .label("Run actions")
+                        .dropdown_menu(move |menu, _, _| {
+                            let owner = menu_owner.clone();
+                            menu.item(PopupMenuItem::new("Refresh run status").on_click(
+                                move |_, _, cx| {
+                                    let _ = owner.update(cx, |workspace, cx| {
+                                        workspace.state.update(cx, |state, cx| {
+                                            state.refresh_factory_runs();
+                                            cx.notify();
+                                        });
+                                    });
+                                },
+                            ))
                         }),
-                )
-                .child(div().text_xs().child(source))
+                ),
+        );
+    if let Some(error) = launch
+        .launch_error
+        .as_ref()
+        .filter(|_| snapshot.is_some_and(|snapshot| snapshot.reported_state.terminal()))
+    {
+        header = header.child(div().text_color(cx.theme().danger).child(error.clone()));
+    }
+    let mut body = v_flex().p_3().gap_3().text_color(cx.theme().foreground);
+    if let Some(snapshot) = snapshot {
+        for diagnostic in &snapshot.diagnostics {
+            body = body.child(
+                div()
+                    .text_color(cx.theme().warning)
+                    .child(diagnostic.clone()),
+            );
+        }
+        for path in &snapshot.correlation_candidates {
+            body = body.child(path_actions("correlation-candidate", path, cx));
+        }
+        let mut events = v_flex().gap_2();
+        if snapshot.notes.is_empty() {
+            events = events.child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("No Factory events recorded yet."),
+            );
+        }
+        for note in snapshot
+            .notes
+            .iter()
+            .skip(snapshot.notes.len().saturating_sub(200))
+        {
+            let mut row = v_flex()
+                .gap_1()
+                .pb_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x8B95A5))
-                        .child(format!("{harness} · {model}")),
-                )
-                .child(
-                    div().text_xs().child(format!(
-                        "Work item: {} · attempt: {}",
-                        launch
-                            .work_item_id
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| "unknown".into()),
-                        launch.attempt_id.as_deref().unwrap_or("not recorded")
-                    )),
-                )
-                .child(div().text_xs().child(status)),
-        );
-    }
-    v_flex()
-        .size_full()
-        .p_3()
-        .gap_3()
-        .child(
-            h_flex()
-                .flex_wrap()
-                .gap_1()
-                .child(button("factory-send", Command::SendToFactory, owner, state))
-                .child(button(
-                    "factory-refresh",
-                    Command::RefreshFactoryRuns,
-                    owner,
-                    state,
-                )),
-        )
-        .child(
-            h_flex()
-                .flex_wrap()
-                .gap_1()
-                .child(button(
-                    "factory-folder",
-                    Command::OpenFactoryFolder,
-                    owner,
-                    state,
-                ))
-                .child(button(
-                    "factory-azure",
-                    Command::DispatchAzureWorkItem,
-                    owner,
-                    state,
-                )),
-        )
-        .child(body)
-        .into_any_element()
-}
-
-pub fn output(
-    state: &AppState,
-    owner: &WeakEntity<Workspace>,
-    scroll: &ScrollHandle,
-) -> AnyElement {
-    let mut body = v_flex()
-        .id("output-detail")
-        .size_full()
-        .overflow_y_scroll()
-        .track_scroll(scroll)
-        .p_3()
-        .gap_2();
-    if let Some(launch) = state.selected_launch.and_then(|id| {
-        state
-            .snapshot
-            .launches
-            .iter()
-            .find(|launch| launch.id == id)
-    }) {
-        body = body.child(format!(
-            "Factory launch {} · created {}",
-            launch.id, launch.created_at
-        ));
-        if let Some(error) = &launch.launch_error {
-            body = body.child(div().text_color(rgb(0xE6A0A0)).child(error.clone()));
-        }
-        if let Some(snapshot) = state.factory_runs.get(&launch.id) {
-            body = body
-                .child(div().text_lg().child(snapshot.status_text()))
-                .child(format!(
-                    "Last event: {}",
-                    snapshot.last_seen.as_deref().unwrap_or("none")
-                ));
-            for diagnostic in &snapshot.diagnostics {
-                body = body.child(div().text_color(rgb(0xE5C07B)).child(diagnostic.clone()));
-            }
-            for path in &snapshot.correlation_candidates {
-                body = body.child(path_actions("correlation-candidate", path));
-            }
-            if let Some(branch) = snapshot
-                .details
-                .get("feature-branch-ready")
-                .and_then(|value| value.get("featureBranch"))
-                .and_then(|value| value.as_str())
-            {
-                let branch = branch.to_owned();
-                let copy = branch.clone();
-                body = body.child(
-                    h_flex()
-                        .gap_2()
-                        .child(format!("Feature ref: {branch}"))
-                        .child(
-                            Button::new("copy-feature-ref")
-                                .small()
-                                .ghost()
-                                .label("Copy ref")
-                                .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
-                                }),
-                        ),
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "{} · {}",
+                            note.timestamp.as_deref().unwrap_or("Unknown time"),
+                            note.event_type
+                        )),
                 );
+            if let Some(text) = [
+                "text",
+                "message",
+                "title",
+                "reason",
+                "diagnostic",
+                "stopFailure",
+            ]
+            .into_iter()
+            .find_map(|key| {
+                note.payload
+                    .get(key)
+                    .and_then(|value| value.as_str())
+                    .filter(|text| !text.is_empty())
+            }) {
+                row = row.child(div().text_sm().whitespace_normal().child(text.to_owned()));
             }
-            if !snapshot.tasks.is_empty() {
-                body = body.child(div().text_lg().child("Tasks and dependency links"));
-            }
+            events = events.child(row.child(disclosure(
+                format!("factory-event-{}-{}", launch.id, note.offset),
+                "Raw event",
+                plain_text(note.raw.clone(), cx),
+            )));
+        }
+        body = body.child(events);
+    }
+    if let Some(path) = &launch.event_path {
+        let oldest = snapshot
+            .and_then(|snapshot| snapshot.notes.first())
+            .map(|note| note.offset);
+        let mut controls = h_flex().flex_wrap().gap_1();
+        if let Some(offset) = oldest.filter(|offset| *offset > 0) {
+            controls = controls.child(read_button(
+                "Older events…",
+                path.clone(),
+                Some(offset),
+                owner,
+            ));
+        }
+        body =
+            body.child(controls.child(read_button("Read raw events", path.clone(), None, owner)));
+    }
+    if let Some(snapshot) = snapshot {
+        if !snapshot.tasks.is_empty() {
+            let mut tasks = v_flex().gap_2();
             for task in snapshot.tasks.values() {
                 let mut row = v_flex()
                     .gap_1()
-                    .p_2()
+                    .pb_2()
                     .border_b_1()
-                    .border_color(rgb(0x343A46))
+                    .border_color(cx.theme().border)
                     .child(format!(
                         "{} · {} · {}",
                         task.id,
@@ -294,117 +349,166 @@ pub fn output(
                     row = row.child(format!("Step: {step}"));
                 }
                 if let Some(diagnostic) = &task.diagnostic {
-                    row = row.child(div().text_color(rgb(0xE5C07B)).child(diagnostic.clone()));
+                    row = row.child(
+                        div()
+                            .text_color(cx.theme().warning)
+                            .child(diagnostic.clone()),
+                    );
                 }
-                body = body.child(row);
+                tasks = tasks.child(row);
             }
-            for path in &snapshot.transcripts {
-                body = body.child(
-                    v_flex()
-                        .gap_1()
-                        .child("Sandbox transcript (plain text)")
-                        .child(path_actions("transcript", path))
-                        .child(read_button("Tail transcript", path.clone(), None, owner)),
-                );
-            }
-            for path in &snapshot.artifacts {
-                body = body.child(path_actions("artifact", path));
-            }
-            if !snapshot.details.is_null() {
-                body = body.child(
-                    div()
-                        .font_family("Menlo")
-                        .text_xs()
-                        .whitespace_normal()
-                        .child(
-                            serde_json::to_string_pretty(&snapshot.details)
-                                .unwrap_or_else(|_| snapshot.details.to_string()),
-                        ),
-                );
-            }
-            body = body.child(
-                div()
-                    .text_lg()
-                    .child("Recent events and advisory notes (latest 200)"),
-            );
-            for note in &snapshot.notes {
-                body = body.child(
-                    v_flex()
-                        .gap_1()
-                        .pb_2()
-                        .border_b_1()
-                        .border_color(rgb(0x343A46))
-                        .child(format!(
-                            "{} · {}",
-                            note.timestamp.as_deref().unwrap_or("unknown time"),
-                            note.event_type
-                        ))
-                        .child(
-                            div()
-                                .font_family("Menlo")
-                                .text_xs()
-                                .whitespace_normal()
-                                .child(note.payload.to_string()),
-                        ),
-                );
-            }
-        } else {
-            body = body.child("Launch outcome unknown; durable event files are being replayed. No process ownership is inferred.");
-        }
-        if let Some(path) = &launch.event_path {
-            body = body.child(path_actions("events", path)).child(read_button(
-                "Read raw events",
-                path.clone(),
-                None,
-                owner,
+            body = body.child(disclosure(
+                format!("factory-tasks-{}", launch.id),
+                "Tasks and dependencies",
+                tasks,
             ));
         }
+        if let Some(branch) = snapshot
+            .details
+            .get("feature-branch-ready")
+            .and_then(|value| value.get("featureBranch"))
+            .and_then(|value| value.as_str())
+        {
+            let copy = branch.to_owned();
+            body = body.child(disclosure(
+                format!("factory-ref-{}", launch.id),
+                "Feature ref",
+                v_flex()
+                    .gap_1()
+                    .child(plain_text(branch.to_owned(), cx))
+                    .child(
+                        Button::new("copy-feature-ref")
+                            .small()
+                            .ghost()
+                            .label("Copy ref")
+                            .on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))
+                            }),
+                    ),
+            ));
+        }
+        for (label, paths) in [
+            ("Artifacts", &snapshot.artifacts),
+            ("Transcripts", &snapshot.transcripts),
+        ] {
+            if !paths.is_empty() {
+                let mut content = v_flex().gap_2();
+                for path in paths {
+                    content = content.child(path_actions(label, path, cx));
+                    if label == "Transcripts" {
+                        content = content.child(read_button(
+                            "Read transcript",
+                            path.clone(),
+                            None,
+                            owner,
+                        ));
+                    }
+                }
+                body = body.child(disclosure(
+                    format!("factory-{label}-{}", launch.id),
+                    label,
+                    content,
+                ));
+            }
+        }
+        if snapshot
+            .details
+            .as_object()
+            .is_some_and(|details| !details.is_empty())
+        {
+            body = body.child(disclosure(
+                format!("factory-details-{}", launch.id),
+                "Result details",
+                JsonDetail(snapshot.details.clone()),
+            ));
+        }
+    }
+    body = body.child(disclosure(
+        format!("factory-parameters-{}", launch.id),
+        "Run parameters (read-only)",
+        v_flex()
+            .gap_2()
+            .child(format!(
+                "Launch {} · created {}",
+                launch.id, launch.created_at
+            ))
+            .child(JsonDetail(launch.descriptor.clone())),
+    ));
+    v_flex()
+        .size_full()
+        .min_h_0()
+        .child(header)
+        .child(div().flex_1().min_h_0().child(FollowingScroll {
+            id: format!("factory-monitor-{}", launch.id).into(),
+            revision: snapshot.and_then(|snapshot| {
+                snapshot
+                    .notes
+                    .last()
+                    .map(|note| (note.offset, snapshot.notes.len()))
+            }),
+            scroll: scroll.clone(),
+            content: body.into_any_element(),
+        }))
+        .into_any_element()
+}
+
+pub fn output(
+    state: &AppState,
+    owner: &WeakEntity<Workspace>,
+    scroll: &ScrollHandle,
+    cx: &App,
+) -> AnyElement {
+    let mut body = v_flex().p_3().gap_2().text_color(cx.theme().foreground);
+    if let Some(launch) = selected_launch(state) {
         let launch_dir = state
             .data_dir
             .join("factory-launches")
             .join(launch.id.to_string());
-        body = body.child(
-            h_flex()
-                .gap_2()
-                .child(read_button(
-                    "Tail launcher stdout",
-                    launch_dir.join("stdout.log"),
-                    None,
-                    owner,
-                ))
-                .child(read_button(
-                    "Tail launcher stderr",
-                    launch_dir.join("stderr.log"),
-                    None,
-                    owner,
-                )),
-        );
-        for key in ["log_dir", "target_repo", "data_root"] {
-            if let Some(path) = launch.descriptor.get(key).and_then(|value| value.as_str()) {
-                body = body
-                    .child(div().text_xs().child(key))
-                    .child(path_actions(key, &PathBuf::from(path)));
-            }
+        let mut controls = h_flex()
+            .flex_wrap()
+            .gap_1()
+            .child(read_button(
+                "Read launcher stdout",
+                launch_dir.join("stdout.log"),
+                None,
+                owner,
+            ))
+            .child(read_button(
+                "Read launcher stderr",
+                launch_dir.join("stderr.log"),
+                None,
+                owner,
+            ));
+        if let Some(path) = &launch.event_path {
+            controls = controls.child(read_button("Read raw events", path.clone(), None, owner));
         }
-        let descriptor = serde_json::to_string_pretty(&launch.descriptor)
-            .unwrap_or_else(|_| launch.descriptor.to_string());
-        body = body.child(
+        let descriptor = launch.descriptor.clone();
+        body = body.child(controls).child(
             Button::new("copy-launch-descriptor")
                 .small()
                 .ghost()
                 .label("Copy launch descriptor")
                 .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(descriptor.clone()))
+                    let text = serde_json::to_string_pretty(&descriptor)
+                        .unwrap_or_else(|_| descriptor.to_string());
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }),
         );
+        for key in ["log_dir", "target_repo", "data_root"] {
+            if let Some(path) = launch.descriptor.get(key).and_then(|value| value.as_str()) {
+                body = body.child(disclosure(
+                    format!("output-{key}-{}", launch.id),
+                    key,
+                    path_actions(key, Path::new(path), cx),
+                ));
+            }
+        }
     }
     if let Some(path) = &state.factory_text_path {
-        body = body
-            .child(div().text_lg().child("File-backed output"))
-            .child(path_actions("selected-output", path));
+        body = body.child(path_actions("selected-output", path, cx));
         match &state.factory_text {
             Some(Ok(page)) => {
-                let mut controls = h_flex().gap_2().child(read_button(
+                let mut controls = h_flex().flex_wrap().gap_1().child(read_button(
                     "Latest / resume tail",
                     path.clone(),
                     None,
@@ -431,43 +535,58 @@ pub fn output(
                                 }),
                         ),
                     )
-                    .child(
-                        div()
-                            .font_family("Menlo")
-                            .text_xs()
-                            .whitespace_normal()
-                            .child(page.text.clone()),
-                    );
+                    .child(plain_text(page.text.clone(), cx));
             }
             Some(Err(error)) => {
                 body = body.child(
                     div()
-                        .text_color(rgb(0xE5C07B))
+                        .text_color(cx.theme().danger)
                         .child(format!("File unavailable: {error}")),
-                )
+                );
             }
             None => body = body.child("Loading file…"),
         }
     }
-    body = body.child(div().text_sm().child("Workspace diagnostics"));
-    if state.notices.is_empty() {
+    if !state.notices.is_empty() {
         body = body.child(
             div()
-                .text_color(rgb(0x8B95A5))
-                .child("No workspace errors reported."),
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Workspace diagnostics"),
         );
     }
     for notice in &state.notices {
-        body = body.child(div().font_family("Menlo").text_xs().child(notice.clone()));
+        let (level, color) = match notice.level {
+            NoticeLevel::Info => ("Info", cx.theme().muted_foreground),
+            NoticeLevel::Diagnostic => ("Diagnostic", cx.theme().muted_foreground),
+            NoticeLevel::Warning => ("Warning", cx.theme().warning),
+            NoticeLevel::Error => ("Error", cx.theme().danger),
+        };
+        body = body.child(
+            div()
+                .text_xs()
+                .text_color(color)
+                .child(format!("{level}: {}", notice.text)),
+        );
     }
     for project in &state.snapshot.projects {
         if let Some(Err(error)) = state.repositories.get(&project.id) {
             body = body.child(
                 div()
-                    .text_color(rgb(0xE6A0A0))
+                    .text_color(cx.theme().danger)
                     .child(format!("{}: {error}", project.name)),
             );
         }
     }
-    body.into_any_element()
+    FollowingScroll {
+        id: "output-detail".into(),
+        revision: state
+            .factory_text
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map(|page| (page.end_offset, page.text.len())),
+        scroll: scroll.clone(),
+        content: body.into_any_element(),
+    }
+    .into_any_element()
 }

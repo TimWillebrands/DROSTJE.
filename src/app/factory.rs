@@ -19,21 +19,30 @@ impl AppState {
         } else {
             self.snapshot.launches.push(snapshot.launch.clone());
         }
+        if self.selected_thread == Some(snapshot.launch.factory_thread_id)
+            && self.selected_launch != Some(id)
+        {
+            self.select_launch_output(Some(id));
+        }
         self.factory_runs.insert(id, snapshot);
     }
 
     pub fn refresh_factory_runs(&mut self) {
         let Some(manager) = self.factory.clone() else {
-            self.notice("Factory tracking is unavailable; see startup diagnostics");
+            self.notice(
+                NoticeLevel::Error,
+                "Factory tracking is unavailable; see startup diagnostics",
+            );
             return;
         };
         let sender = self.events.clone();
         smol::spawn(async move {
             if let Err(error) = manager.rescan().await {
                 let _ = sender
-                    .send(AppEvent::Notice(format!(
-                        "Factory refresh failed: {error:#}"
-                    )))
+                    .send(AppEvent::Notice(WorkspaceNotice {
+                        level: NoticeLevel::Error,
+                        text: format!("Factory refresh failed: {error:#}"),
+                    }))
                     .await;
             }
         })
@@ -41,23 +50,31 @@ impl AppState {
     }
 
     pub fn select_factory_launch(&mut self, id: LaunchId, cx: &mut Context<Self>) {
-        if let Some(project_id) = self
+        let Some(owner) = self
             .snapshot
             .launches
             .iter()
             .find(|launch| launch.id == id)
-            .map(|launch| launch.project_id)
-        {
-            if self.selected_project != Some(project_id) {
-                self.select_project(project_id);
-            }
-        }
-        self.selected_launch = Some(id);
+            .map(|launch| launch.factory_thread_id)
+            .filter(|owner| {
+                self.snapshot
+                    .threads
+                    .iter()
+                    .any(|thread| thread.id == *owner && thread.kind == ThreadKind::Factory)
+            })
+        else {
+            return;
+        };
+        self.select_thread(owner);
+        cx.notify();
+    }
+
+    pub(super) fn select_launch_output(&mut self, id: Option<LaunchId>) {
+        self.selected_launch = id;
         self.set_setting("selected_launch", json!(id));
         self.factory_text = None;
         self.factory_text_path = None;
         self.factory_text_generation = Uuid::new_v4();
-        cx.notify();
     }
 
     pub fn load_factory_text(

@@ -11,6 +11,9 @@ impl AppState {
         let Some(thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
             return;
         };
+        if thread.kind != ThreadKind::Conversation {
+            return;
+        }
         let Some(project) = self
             .snapshot
             .projects
@@ -100,8 +103,14 @@ impl AppState {
     }
 
     pub fn retry_conversation(&mut self, id: ThreadId) {
+        if !self.is_conversation(id) {
+            return;
+        }
         if self.active_threads.contains(&id) {
-            self.notice("Stop the active turn before reconnecting.");
+            self.notice(
+                NoticeLevel::Warning,
+                "Stop the active turn before reconnecting.",
+            );
             return;
         }
         if let Some(old) = self.conversations.remove(&id) {
@@ -119,7 +128,12 @@ impl AppState {
         if let Some(error) = &self.storage_error {
             return Some(format!("Storage is not writable: {error}"));
         }
-        let thread = self.snapshot.threads.iter().find(|t| t.id == id)?;
+        let Some(thread) = self.snapshot.threads.iter().find(|t| t.id == id) else {
+            return Some("Select a Conversation first".into());
+        };
+        if thread.kind != ThreadKind::Conversation {
+            return Some("Factory threads do not accept prompts".into());
+        }
         if thread.archived
             || self
                 .snapshot
@@ -165,26 +179,38 @@ impl AppState {
     }
 
     pub fn send_command(&mut self, id: ThreadId, command: ConversationCommand) {
+        if !self.is_conversation(id) {
+            return;
+        }
         let Some(commands) = self
             .conversations
             .get(&id)
             .and_then(|s| s.commands.as_ref())
         else {
-            self.notice("OMP is not connected");
+            self.notice(NoticeLevel::Warning, "OMP is not connected");
             return;
         };
         if let Err(error) = commands.try_send(command) {
-            self.notice(format!("OMP command could not be queued: {error}"));
+            self.notice(
+                NoticeLevel::Error,
+                format!("OMP command could not be queued: {error}"),
+            );
         }
     }
     pub fn interrupt(&mut self, id: ThreadId) {
-        if self.active_threads.contains(&id) {
+        if self.is_conversation(id) && self.active_threads.contains(&id) {
             self.send_command(id, ConversationCommand::Interrupt);
         }
     }
     pub fn select_model(&mut self, id: ThreadId, model: ModelKey) {
+        if !self.is_conversation(id) {
+            return;
+        }
         if self.active_threads.contains(&id) {
-            self.notice("Model changes are disabled during a turn");
+            self.notice(
+                NoticeLevel::Warning,
+                "Model changes are disabled during a turn",
+            );
             return;
         }
         self.send_command(id, ConversationCommand::SelectModel(model));
@@ -194,6 +220,12 @@ impl AppState {
     }
 
     pub fn record_draft(&mut self, draft: DraftSnapshot) {
+        let id = match &draft.key {
+            DraftKey::Thread(id) | DraftKey::Extension { thread: id, .. } => *id,
+        };
+        if !self.is_conversation(id) {
+            return;
+        }
         if self.drafts.get(&draft.key).is_some_and(|old| {
             old.generation == draft.generation && old.changedtick > draft.changedtick
         }) {
@@ -212,17 +244,6 @@ impl AppState {
                     }
                 }
             }
-            DraftKey::Factory(id) => {
-                let setting = format!("factory_draft:{id}");
-                let mut value = self
-                    .snapshot
-                    .settings
-                    .get(&setting)
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                value["body"] = json!(draft.text);
-                self.set_setting(&setting, value);
-            }
             DraftKey::Extension { .. } => {}
         }
     }
@@ -231,6 +252,9 @@ impl AppState {
         let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
             return;
         };
+        if thread.kind != ThreadKind::Conversation {
+            return;
+        }
         if self.storage_error.is_some() || self.editor_error.is_some() {
             self.submission_failed(id, "Storage or editor is unavailable".into());
             return;
@@ -277,15 +301,18 @@ impl AppState {
         }).detach();
     }
     pub fn submission_failed(&mut self, id: ThreadId, error: String) {
+        if !self.is_conversation(id) {
+            return;
+        }
         if let Some(session) = self.conversations.get_mut(&id) {
             session.preparing = false;
             session.error = Some(error.clone());
         }
         self.active_threads.remove(&id);
-        self.notice(error);
+        self.notice(NoticeLevel::Error, error);
     }
     pub fn acknowledge_recovery(&mut self, id: ThreadId) {
-        if self.active_threads.contains(&id) {
+        if !self.is_conversation(id) || self.active_threads.contains(&id) {
             return;
         }
         if let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() {
@@ -300,6 +327,9 @@ impl AppState {
         event: ConversationEvent,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_conversation(id) {
+            return;
+        }
         let Some(mut session) = self.conversations.remove(&id) else {
             return;
         };
@@ -423,7 +453,10 @@ impl AppState {
                                                     .snapshot
                                                     .threads
                                                     .iter()
-                                                    .find(|t| t.id == id)
+                                                    .find(|t| {
+                                                        t.id == id
+                                                            && t.kind == ThreadKind::Conversation
+                                                    })
                                                     .cloned()
                                                 {
                                                     if thread
@@ -439,9 +472,10 @@ impl AppState {
                                                 }
                                             }
                                             Ok(false) => {}
-                                            Err(error) => this.notice(format!(
-                                                "Submitted text retained: {error:#}"
-                                            )),
+                                            Err(error) => this.notice(
+                                                NoticeLevel::Error,
+                                                format!("Submitted text retained: {error:#}"),
+                                            ),
                                         }
                                         cx.notify();
                                     });
@@ -505,7 +539,7 @@ impl AppState {
                                 if let Some(session) = state.conversations.get_mut(&id).filter(|session| session.generation == generation) {
                                     session.widgets.insert("Proposed editor replacement — review before replacing your draft".into(), vec![text]);
                                 }
-                                if let Err(error) = result { state.notice(format!("Could not set editor text: {error:#}")); }
+                                if let Err(error) = result { state.notice(NoticeLevel::Error, format!("Could not set editor text: {error:#}")); }
                                 cx.notify();
                             });
                         }
@@ -538,7 +572,15 @@ impl AppState {
                     session.widgets.insert(key, lines);
                 }
             }
-            ConversationEvent::Notice { level, text } => self.notice(format!("{level}: {text}")),
+            ConversationEvent::Notice { level, text } => {
+                let level = match level.as_str() {
+                    "info" => NoticeLevel::Info,
+                    "warning" => NoticeLevel::Warning,
+                    "error" => NoticeLevel::Error,
+                    _ => NoticeLevel::Diagnostic,
+                };
+                self.notice(level, text);
+            }
             ConversationEvent::LinkOffered { url, instructions } => {
                 if session.links.len() == 200 {
                     session.links.remove(0);

@@ -2,9 +2,10 @@ mod events;
 mod launch;
 
 pub use events::{TextPage, read_text};
+pub(crate) use launch::same_source;
 pub use launch::{FactoryManager, check_readiness};
 
-use crate::model::{FactoryLaunch, LaunchId, ProjectId, ThreadId};
+use crate::model::{FactoryLaunch, LaunchId, ProjectId};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -16,23 +17,9 @@ pub enum FactorySource {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WorkPacket {
-    pub title: String,
-    pub task: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OriginMessage {
-    pub index: usize,
-    pub displayed_text: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FactoryLaunchSpec {
     pub id: LaunchId,
     pub project_id: ProjectId,
-    pub thread_id: Option<ThreadId>,
-    pub origin_message: Option<OriginMessage>,
     pub source: FactorySource,
     pub target_repo: PathBuf,
     pub target_branch: String,
@@ -42,7 +29,6 @@ pub struct FactoryLaunchSpec {
     pub model: Option<String>,
     pub thought_level: Option<String>,
     pub executable: Option<PathBuf>,
-    pub packet: Option<WorkPacket>,
     pub confirm_unknown: bool,
 }
 

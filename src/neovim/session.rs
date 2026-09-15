@@ -1,9 +1,10 @@
 use super::{
     ClipboardContent, DraftKey, DraftRevision, DraftSnapshot, NvimCommand, NvimConfig, NvimEditor,
-    NvimEvent,
+    NvimEvent, NvimTheme,
     grid::GridReducer,
     rpc::{self, Incoming, Rpc},
 };
+use crate::model::PaneDirection;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_channel::{Receiver, Sender};
 use rmpv::Value;
@@ -173,6 +174,7 @@ impl Events {
 
 struct Session {
     config: NvimConfig,
+    theme: Option<NvimTheme>,
     rpc: Option<Rpc>,
     generation: Uuid,
     channel: u64,
@@ -192,6 +194,7 @@ impl Session {
     fn new(config: NvimConfig, events: Sender<NvimEvent>) -> Self {
         let generation = Uuid::new_v4();
         Self {
+            theme: config.initial_theme,
             config,
             rpc: None,
             generation,
@@ -326,6 +329,9 @@ impl Session {
             vec![self.channel.into(), self.generation.to_string().into()],
         )
         .await?;
+        if let Some(theme) = self.theme {
+            self.apply_theme(theme).await?;
+        }
         self.call("nvim_command", vec!["redraw!".into()]).await?;
         let deadline = Instant::now() + RPC_TIMEOUT;
         while self.grid.snapshot().serial == 0 {
@@ -336,6 +342,24 @@ impl Session {
     async fn lua(&mut self, code: &str, args: Vec<Value>) -> Result<Value> {
         self.call("nvim_exec_lua", vec![code.into(), Value::Array(args)])
             .await
+    }
+    async fn apply_theme(&mut self, theme: NvimTheme) -> Result<()> {
+        self.lua(
+            "local theme=...; drost.apply_theme(theme)",
+            vec![rpc::dictionary([
+                ("dark", theme.dark.into()),
+                ("background", theme.background.into()),
+                ("foreground", theme.foreground.into()),
+                ("popover", theme.popover.into()),
+                ("popover_foreground", theme.popover_foreground.into()),
+                ("selection", theme.selection.into()),
+                ("caret", theme.caret.into()),
+                ("primary", theme.primary.into()),
+                ("primary_foreground", theme.primary_foreground.into()),
+            ])],
+        )
+        .await?;
+        Ok(())
     }
     async fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value> {
         self.call_until(method, args, Instant::now() + RPC_TIMEOUT)
@@ -454,9 +478,13 @@ impl Session {
                 | "drost_drain"
                 | "drost_snapshot"
                 | "drost_cursor"
+                | "drost_focus_pane"
                 | "drost_clipboard_set" => {
-                    if args.first().and_then(Value::as_str)
-                        != Some(self.generation.to_string().as_str())
+                    if args
+                        .first()
+                        .and_then(Value::as_str)
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                        != Some(self.generation)
                     {
                         return Ok(());
                     }
@@ -520,6 +548,28 @@ impl Session {
                                     draft.snapshot.cursor = parse_cursor(&args[3])?;
                                     self.events
                                         .emit(NvimEvent::DraftChanged(draft.snapshot.clone()));
+                                }
+                            }
+                        }
+                        "drost_focus_pane" => {
+                            ensure!(args.len() == 3, "Malformed pane-focus callback");
+                            let direction = match args[2].as_str() {
+                                Some("left") => PaneDirection::Left,
+                                Some("down") => PaneDirection::Down,
+                                Some("up") => PaneDirection::Up,
+                                Some("right") => PaneDirection::Right,
+                                _ => bail!("Invalid pane-focus direction"),
+                            };
+                            if let Some(key) = self.key_for(&args[1])? {
+                                if self.active.as_ref() == Some(&key)
+                                    && !self.composition
+                                    && !self.frozen
+                                {
+                                    self.events.emit(NvimEvent::FocusPane {
+                                        key,
+                                        generation: self.generation,
+                                        direction,
+                                    });
                                 }
                             }
                         }
@@ -1103,6 +1153,12 @@ impl Session {
                     self.fail(format!("Editor restart failed: {error:#}"));
                 }
                 let _ = reply.try_send(result);
+            }
+            NvimCommand::SetTheme(theme) => {
+                self.theme = Some(theme);
+                if let Err(error) = self.apply_theme(theme).await {
+                    self.fail(format!("Editor theme could not be applied: {error:#}"));
+                }
             }
             NvimCommand::ResumeInput => self.frozen = false,
             NvimCommand::SetComposition(value) => self.composition = value,

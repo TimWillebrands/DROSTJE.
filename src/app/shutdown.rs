@@ -122,7 +122,7 @@ impl AppState {
                     state.shutting_down = false;
                     let error = format!("Quit cancelled: {error:#}");
                     state.shutdown_error = Some(error.clone());
-                    state.notice(error);
+                    state.notice(NoticeLevel::Error, error);
                     cx.notify();
                 }
             });
