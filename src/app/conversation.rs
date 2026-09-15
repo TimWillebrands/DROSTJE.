@@ -1,0 +1,582 @@
+use super::*;
+
+impl AppState {
+    pub fn ensure_conversation(&mut self, id: ThreadId) {
+        if self.shutting_down
+            || self.conversations.contains_key(&id)
+            || self.storage_error.is_some()
+        {
+            return;
+        }
+        let Some(thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let Some(project) = self
+            .snapshot
+            .projects
+            .iter()
+            .find(|p| p.id == thread.project_id)
+            .cloned()
+        else {
+            return;
+        };
+        if (thread.archived || project.archived) && thread.session_ref.is_none() {
+            return;
+        }
+        let mut session = ConversationSession::new(thread.model.clone());
+        let (finished, drain) = async_channel::bounded(1);
+        session.finished = Some(drain);
+        let generation = session.generation;
+        self.conversations.insert(id, session);
+        let saved = self.persist_thread(thread.clone());
+        let sender = self.events.clone();
+        let explicit = self
+            .snapshot
+            .settings
+            .get("executables")
+            .and_then(|v| v.get("omp"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let session_dir = self.data_dir.join("omp-sessions").join(id.to_string());
+        smol::spawn(async move {
+            let result = async {
+                saved
+                    .recv()
+                    .await
+                    .context("Persistence owner closed")?
+                    .map_err(anyhow::Error::msg)?;
+                let config = smol::unblock(move || -> Result<_> {
+                    let repository = platform::inspect_repository(&project.root)?;
+                    Ok(harness::ConversationConfig {
+                        allow_empty_session: thread.submission.is_none(),
+                        harness: thread.harness,
+                        executable: platform::resolve_executable("omp", explicit.as_deref())?,
+                        cwd: repository.root,
+                        session_dir,
+                        session_ref: thread.session_ref,
+                        model: thread.model,
+                    })
+                })
+                .await?;
+                harness::open(config).await
+            }
+            .await;
+            match result {
+                Ok(handle) => {
+                    let events = handle.events.clone();
+                    let commands = handle.commands.clone();
+                    if sender
+                        .send(AppEvent::HarnessOpened(id, generation, Ok(handle)))
+                        .await
+                        .is_err()
+                    {
+                        let _ = commands.send(ConversationCommand::Close).await;
+                        return;
+                    }
+                    while let Ok(event) = events.recv().await {
+                        if sender
+                            .send(AppEvent::Harness(id, generation, event))
+                            .await
+                            .is_err()
+                        {
+                            let _ = commands.send(ConversationCommand::Close).await;
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = sender
+                        .send(AppEvent::HarnessOpened(
+                            id,
+                            generation,
+                            Err(format!("{error:#}")),
+                        ))
+                        .await;
+                }
+            }
+            let _ = sender.send(AppEvent::HarnessDrained(finished)).await;
+        })
+        .detach();
+    }
+
+    pub fn retry_conversation(&mut self, id: ThreadId) {
+        if self.active_threads.contains(&id) {
+            self.notice("Stop the active turn before reconnecting.");
+            return;
+        }
+        if let Some(old) = self.conversations.remove(&id) {
+            if let Some(commands) = old.commands {
+                let _ = commands.try_send(ConversationCommand::Close);
+            }
+        }
+        self.ensure_conversation(id);
+    }
+
+    pub fn submit_reason(&self, id: ThreadId) -> Option<String> {
+        if self.shutting_down {
+            return Some("Application is shutting down".into());
+        }
+        if let Some(error) = &self.storage_error {
+            return Some(format!("Storage is not writable: {error}"));
+        }
+        let thread = self.snapshot.threads.iter().find(|t| t.id == id)?;
+        if thread.archived
+            || self
+                .snapshot
+                .projects
+                .iter()
+                .any(|p| p.id == thread.project_id && p.archived)
+        {
+            return Some("Archived history is read-only".into());
+        }
+        if !matches!(self.repositories.get(&thread.project_id), Some(Ok(_))) {
+            return Some("Project root is unavailable".into());
+        }
+        if self.editor.is_none() || self.editor_error.is_some() {
+            return Some("Connect or restart Neovim before sending".into());
+        }
+        let Some(session) = self.conversations.get(&id) else {
+            return Some("Open the OMP session first".into());
+        };
+        if session.preparing
+            || self.active_threads.contains(&id)
+            || session.state != ConversationState::Ready
+        {
+            return Some(format!(
+                "Conversation is {:?}; only one foreground turn is allowed",
+                session.state
+            ));
+        }
+        if !session.persisted {
+            return Some("Saving the provider session reference".into());
+        }
+        if thread.submission.is_some() {
+            return Some("Review the previous submitted draft before starting another turn".into());
+        }
+        if !thread.attachments.is_empty()
+            && !session.models.iter().any(|m| {
+                Some(&m.key) == session.model.as_ref()
+                    && m.input.iter().any(|input| input == "image")
+            })
+        {
+            return Some("The selected model does not advertise image input".into());
+        }
+        None
+    }
+
+    pub fn send_command(&mut self, id: ThreadId, command: ConversationCommand) {
+        let Some(commands) = self
+            .conversations
+            .get(&id)
+            .and_then(|s| s.commands.as_ref())
+        else {
+            self.notice("OMP is not connected");
+            return;
+        };
+        if let Err(error) = commands.try_send(command) {
+            self.notice(format!("OMP command could not be queued: {error}"));
+        }
+    }
+    pub fn interrupt(&mut self, id: ThreadId) {
+        if self.active_threads.contains(&id) {
+            self.send_command(id, ConversationCommand::Interrupt);
+        }
+    }
+    pub fn select_model(&mut self, id: ThreadId, model: ModelKey) {
+        if self.active_threads.contains(&id) {
+            self.notice("Model changes are disabled during a turn");
+            return;
+        }
+        self.send_command(id, ConversationCommand::SelectModel(model));
+    }
+    pub fn respond(&mut self, id: ThreadId, request_id: String, answer: UserAnswer) {
+        self.send_command(id, ConversationCommand::Respond { request_id, answer });
+    }
+
+    pub fn record_draft(&mut self, draft: DraftSnapshot) {
+        if self.drafts.get(&draft.key).is_some_and(|old| {
+            old.generation == draft.generation && old.changedtick > draft.changedtick
+        }) {
+            return;
+        }
+        let key = draft.key.clone();
+        self.drafts.insert(key.clone(), draft.clone());
+        match key {
+            DraftKey::Thread(id) => {
+                if let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned()
+                {
+                    if thread.draft != draft.text {
+                        thread.draft = draft.text;
+                        thread.updated_at = platform::now();
+                        self.save_thread(thread);
+                    }
+                }
+            }
+            DraftKey::Factory(id) => {
+                let setting = format!("factory_draft:{id}");
+                let mut value = self
+                    .snapshot
+                    .settings
+                    .get(&setting)
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                value["body"] = json!(draft.text);
+                self.set_setting(&setting, value);
+            }
+            DraftKey::Extension { .. } => {}
+        }
+    }
+
+    pub fn submit_snapshot(&mut self, id: ThreadId, draft: DraftSnapshot, cx: &mut Context<Self>) {
+        let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        if self.storage_error.is_some() || self.editor_error.is_some() {
+            self.submission_failed(id, "Storage or editor is unavailable".into());
+            return;
+        }
+        if draft.key != DraftKey::Thread(id) {
+            self.submission_failed(id, "Editor snapshot belongs to another draft".into());
+            return;
+        }
+        if draft.text.trim().is_empty() && thread.attachments.is_empty() {
+            self.submission_failed(id, "Enter a prompt or attach an image".into());
+            return;
+        }
+        let Some(session) = self.conversations.get_mut(&id) else {
+            return;
+        };
+        let Some(commands) = session.commands.clone() else {
+            self.submission_failed(id, "OMP disconnected before submission".into());
+            return;
+        };
+        let request_id = Uuid::new_v4();
+        let generation = session.generation;
+        session.submitted.insert(request_id, draft.clone());
+        thread.submission = Some(
+            json!({"request_id":request_id,"text":draft.text,"attachments":thread.attachments,"state":"pending"}),
+        );
+        thread.updated_at = platform::now();
+        let images = thread.attachments.clone();
+        let saved = self.persist_thread(thread);
+        let sender = self.events.clone();
+        cx.spawn(async move |this, cx| {
+            let text = draft.text.clone();
+            let result = async {
+                let checked = images.clone(); let prompt = text.clone();
+                let size = smol::unblock(move || harness::submission_size(request_id, &prompt, &checked)).await?;
+                anyhow::ensure!(size <= crate::attachments::FRAME_LIMIT, "Prompt exceeds 1 MiB. Use Optimize images for sending, remove images, or reduce text.");
+                saved.recv().await.context("Persistence owner closed")?.map_err(anyhow::Error::msg)?;
+                commands.send(ConversationCommand::Submit { request_id, text, images }).await.context("OMP disconnected before submission")?;
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            if let Err(error) = result {
+                let _ = sender.send(AppEvent::Harness(id, generation, ConversationEvent::Failed { request_id: Some(request_id), message: format!("{error:#}") })).await;
+            }
+            let _ = this.update(cx, |this, cx| { if let Some(session) = this.conversations.get_mut(&id) { if session.generation == generation { session.preparing = false; } } cx.notify(); });
+        }).detach();
+    }
+    pub fn submission_failed(&mut self, id: ThreadId, error: String) {
+        if let Some(session) = self.conversations.get_mut(&id) {
+            session.preparing = false;
+            session.error = Some(error.clone());
+        }
+        self.active_threads.remove(&id);
+        self.notice(error);
+    }
+    pub fn acknowledge_recovery(&mut self, id: ThreadId) {
+        if self.active_threads.contains(&id) {
+            return;
+        }
+        if let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() {
+            thread.submission = None;
+            self.save_thread(thread);
+        }
+    }
+
+    pub(super) fn receive_conversation(
+        &mut self,
+        id: ThreadId,
+        event: ConversationEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut session) = self.conversations.remove(&id) else {
+            return;
+        };
+        let mut thread = self.snapshot.threads.iter().find(|t| t.id == id).cloned();
+        match event {
+            ConversationEvent::Ready {
+                session_ref,
+                models,
+            } => {
+                session.models = models;
+                session.persisted = false;
+                if let Some(mut thread) = thread.take() {
+                    thread.session_ref = Some(session_ref);
+                    let saved = self.persist_thread(thread);
+                    let generation = session.generation;
+                    cx.spawn(async move |this, cx| {
+                        let result = saved.recv().await;
+                        let _ = this.update(cx, |this, cx| {
+                            if let Some(session) = this
+                                .conversations
+                                .get_mut(&id)
+                                .filter(|s| s.generation == generation)
+                            {
+                                match result {
+                                    Ok(Ok(())) => session.persisted = true,
+                                    Ok(Err(error)) => session.error = Some(error),
+                                    Err(error) => session.error = Some(error.to_string()),
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+            }
+            ConversationEvent::StateChanged(state) => {
+                if matches!(
+                    state,
+                    ConversationState::Running
+                        | ConversationState::WaitingForInput
+                        | ConversationState::Interrupting
+                ) {
+                    self.active_threads.insert(id);
+                } else if !session.preparing {
+                    self.active_threads.remove(&id);
+                }
+                if matches!(
+                    state,
+                    ConversationState::Disconnected | ConversationState::Failed
+                ) {
+                    session.requests.clear();
+                }
+                session.state = state;
+            }
+            ConversationEvent::HistoryReset => {
+                session.messages.clear();
+                session.indices.clear();
+                session.list.reset(0);
+            }
+            ConversationEvent::History {
+                messages,
+                next_cursor,
+            } => {
+                for message in messages {
+                    session.message(message);
+                }
+                if let (Some(cursor), Some(commands)) = (next_cursor, &session.commands) {
+                    let _ = commands.try_send(ConversationCommand::LoadHistory {
+                        cursor: Some(cursor),
+                    });
+                }
+            }
+            ConversationEvent::MessageUpdated(message) => session.message(message),
+            ConversationEvent::ToolUpdated(tool) => {
+                session.tools.insert(tool.id.clone(), Arc::new(tool));
+            }
+            ConversationEvent::UserRequest(request) => {
+                session.requests.insert(request.id.clone(), request);
+            }
+            ConversationEvent::UserRequestDismissed { request_id } => {
+                session.requests.remove(&request_id);
+            }
+            ConversationEvent::SubmissionAccepted { request_id } => {
+                if let Some(mut thread) = thread.take() {
+                    let matches = thread
+                        .submission
+                        .as_ref()
+                        .and_then(|v| v.get("request_id"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == request_id.to_string());
+                    if matches {
+                        if let Some(submission) = &mut thread.submission {
+                            submission["state"] = json!("accepted");
+                        }
+                        let sent_images: Vec<ImageAttachment> = thread
+                            .submission
+                            .as_ref()
+                            .and_then(|v| v.get("attachments"))
+                            .cloned()
+                            .and_then(|v| serde_json::from_value(v).ok())
+                            .unwrap_or_default();
+                        let sent_ids: Vec<_> = sent_images.iter().map(|image| image.id).collect();
+                        let saved = self.persist_thread(thread);
+                        if let (Some(editor), Some(submitted)) = (
+                            self.editor.clone(),
+                            session.submitted.get(&request_id).cloned(),
+                        ) {
+                            cx.spawn(async move |this, cx| {
+                                if matches!(saved.recv().await, Ok(Ok(()))) {
+                                    let result = editor
+                                        .replace_if_revision(
+                                            submitted.key.clone(),
+                                            submitted.revision(),
+                                            String::new(),
+                                        )
+                                        .await;
+                                    let _ = this.update(cx, |this, cx| {
+                                        match result {
+                                            Ok(true) => {
+                                                if let Some(mut thread) = this
+                                                    .snapshot
+                                                    .threads
+                                                    .iter()
+                                                    .find(|t| t.id == id)
+                                                    .cloned()
+                                                {
+                                                    if thread
+                                                        .attachments
+                                                        .iter()
+                                                        .map(|image| image.id)
+                                                        .collect::<Vec<_>>()
+                                                        == sent_ids
+                                                    {
+                                                        thread.attachments.clear();
+                                                        this.save_thread(thread);
+                                                    }
+                                                }
+                                            }
+                                            Ok(false) => {}
+                                            Err(error) => this.notice(format!(
+                                                "Submitted text retained: {error:#}"
+                                            )),
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            })
+                            .detach();
+                        }
+                    }
+                }
+            }
+            ConversationEvent::TurnSettled {
+                request_id,
+                outcome,
+            } => {
+                self.active_threads.remove(&id);
+                session.preparing = false;
+                session.outcome = Some(outcome.clone());
+                session.requests.clear();
+                session.submitted.remove(&request_id);
+                if let Some(mut thread) = thread.take() {
+                    if thread
+                        .submission
+                        .as_ref()
+                        .and_then(|v| v.get("request_id"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == request_id.to_string())
+                    {
+                        if matches!(outcome, TurnOutcome::Completed | TurnOutcome::Interrupted) {
+                            thread.submission = None;
+                        } else if let Some(submission) = &mut thread.submission {
+                            submission["state"] = json!(format!("{outcome:?}").to_lowercase());
+                        }
+                        self.save_thread(thread);
+                    }
+                }
+            }
+            ConversationEvent::ModelSelected(model) => {
+                session.model = Some(model.clone());
+                if let Some(mut thread) = thread.take() {
+                    thread.model = Some(model);
+                    self.save_thread(thread);
+                }
+            }
+            ConversationEvent::TitleChanged(title) => {
+                if let Some(mut thread) = thread.take() {
+                    thread.title = title;
+                    self.save_thread(thread);
+                }
+            }
+            ConversationEvent::EditorTextRequested(text) => {
+                if let (Some(editor), Some(draft)) = (
+                    self.editor.clone(),
+                    self.drafts.get(&DraftKey::Thread(id)).cloned(),
+                ) {
+                    if draft.text.is_empty() {
+                        let generation = session.generation;
+                        cx.spawn(async move |this, cx| {
+                        let result = editor.replace_if_revision(draft.key.clone(), draft.revision(), text.clone()).await;
+                        if !matches!(result, Ok(true)) {
+                            let _ = this.update(cx, |state, cx| {
+                                if let Some(session) = state.conversations.get_mut(&id).filter(|session| session.generation == generation) {
+                                    session.widgets.insert("Proposed editor replacement — review before replacing your draft".into(), vec![text]);
+                                }
+                                if let Err(error) = result { state.notice(format!("Could not set editor text: {error:#}")); }
+                                cx.notify();
+                            });
+                        }
+                    }).detach();
+                    } else {
+                        session.widgets.insert(
+                            "Proposed editor replacement — review before replacing your draft"
+                                .into(),
+                            vec![text],
+                        );
+                    }
+                } else {
+                    session.widgets.insert(
+                        "Proposed editor replacement — review before replacing your draft".into(),
+                        vec![text],
+                    );
+                }
+            }
+            ConversationEvent::StatusUpdated { key, text } => {
+                if let Some(text) = text {
+                    session.statuses.insert(key, text);
+                } else {
+                    session.statuses.remove(&key);
+                }
+            }
+            ConversationEvent::WidgetUpdated { key, lines } => {
+                if lines.is_empty() {
+                    session.widgets.remove(&key);
+                } else {
+                    session.widgets.insert(key, lines);
+                }
+            }
+            ConversationEvent::Notice { level, text } => self.notice(format!("{level}: {text}")),
+            ConversationEvent::LinkOffered { url, instructions } => {
+                if session.links.len() == 200 {
+                    session.links.remove(0);
+                }
+                session.links.push((url, instructions));
+            }
+            ConversationEvent::Diagnostic { label, raw } => {
+                if session.diagnostics.len() == 200 {
+                    session.diagnostics.pop_front();
+                }
+                session.diagnostics.push_back((label, raw));
+            }
+            ConversationEvent::Failed {
+                request_id,
+                message,
+            } => {
+                session.error = Some(message.clone());
+                session.preparing = false;
+                if request_id.is_some() {
+                    self.active_threads.remove(&id);
+                    session.outcome = Some(TurnOutcome::Failed);
+                }
+                if let Some(mut thread) = thread.take() {
+                    if let Some(submission) = &mut thread.submission {
+                        if request_id.is_some_and(|id| {
+                            submission
+                                .get("request_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|value| value == id.to_string())
+                        }) {
+                            submission["state"] = json!("failed");
+                            submission["error"] = json!(message);
+                            self.save_thread(thread);
+                        }
+                    }
+                }
+            }
+        }
+        self.conversations.insert(id, session);
+    }
+}

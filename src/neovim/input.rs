@@ -1,0 +1,1764 @@
+use super::grid::{GridSnapshot, Highlight, HighlightedChunk};
+use super::{
+    ClipboardContent, DraftKey, DraftRevision, DraftSnapshot, NvimCommand, NvimEditor, NvimEvent,
+};
+use gpui_kit::{prelude::*, *};
+use std::{collections::VecDeque, ops::Range, sync::Arc, time::Instant};
+
+#[derive(Clone, Debug)]
+pub enum NvimViewEvent {
+    Ready,
+    DraftChanged(DraftSnapshot),
+    DraftActivated(DraftSnapshot),
+    Failed(String),
+    InputRejected(String),
+    CompositionChanged(bool),
+}
+
+#[derive(Clone)]
+enum Target {
+    Buffer {
+        key: DraftKey,
+        revision: DraftRevision,
+    },
+    Cmdline {
+        generation: uuid::Uuid,
+        level: u64,
+        expected: String,
+    },
+}
+
+struct Composition {
+    target: Target,
+    range: Range<usize>,
+    base: String,
+    text: String,
+    selection: Range<usize>,
+    anchor: Point<Pixels>,
+    recoverable: bool,
+}
+
+struct PaintedText {
+    origin: Point<Pixels>,
+    line: ShapedLine,
+}
+
+struct Frame {
+    overlays: Vec<PaintedText>,
+    texts: Vec<PaintedText>,
+    backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
+    cmd_cursor: Option<Point<Pixels>>,
+    cmd_layout: Option<(ShapedLine, Point<Pixels>, usize)>,
+}
+
+/// The sole consumer of an editor's event channel. The shadow only answers native
+/// synchronous input queries; Neovim's flushed grid is the display authority.
+pub struct NvimView {
+    editor: NvimEditor,
+    focus_handle: FocusHandle,
+    _focus_subscriptions: Vec<Subscription>,
+    _events: Task<()>,
+    grid: Arc<GridSnapshot>,
+    draft: Option<DraftSnapshot>,
+    ready: bool,
+    error: Option<String>,
+    diagnostic: Option<String>,
+    composition: Option<Composition>,
+    pending_compositions: VecDeque<String>,
+    recovery: String,
+    bounds: Option<Bounds<Pixels>>,
+    cell: Size<Pixels>,
+    font_size: Pixels,
+    frame: Option<Frame>,
+    requested_size: Option<(u32, u32)>,
+    blink_epoch: Instant,
+    blink_timer: Option<Task<()>>,
+    bell: u64,
+    dragging: Option<MouseButton>,
+    scroll_remainder: Point<f32>,
+}
+
+impl EventEmitter<NvimViewEvent> for NvimView {}
+
+impl NvimView {
+    pub fn new(editor: NvimEditor, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        let subscriptions = vec![
+            cx.on_focus(&focus_handle, window, |this, _, cx| {
+                this.blink_epoch = Instant::now();
+                this.send(NvimCommand::Focus(true), cx);
+                cx.notify();
+            }),
+            cx.on_blur(&focus_handle, window, |this, _, cx| {
+                this.send(NvimCommand::Focus(false), cx);
+                cx.notify();
+            }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.send(
+                    NvimCommand::Focus(
+                        window.is_window_active() && this.focus_handle.is_focused(window),
+                    ),
+                    cx,
+                );
+                this.blink_epoch = Instant::now();
+                cx.notify();
+            }),
+        ];
+        let receiver = editor.events.clone();
+        let events = cx.spawn(async move |this, cx| {
+            while let Ok(event) = receiver.recv().await {
+                if this.update(cx, |this, cx| this.receive(event, cx)).is_err() {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.fail(
+                    "Neovim event stream closed. Restart Editor to recover the saved draft.".into(),
+                    cx,
+                );
+            });
+        });
+        Self {
+            editor,
+            focus_handle,
+            _focus_subscriptions: subscriptions,
+            _events: events,
+            grid: Arc::new(GridSnapshot::default()),
+            draft: None,
+            ready: false,
+            error: None,
+            diagnostic: None,
+            composition: None,
+            pending_compositions: VecDeque::new(),
+            recovery: String::new(),
+            bounds: None,
+            cell: size(px(8.), px(20.)),
+            font_size: px(14.),
+            frame: None,
+            requested_size: None,
+            blink_epoch: Instant::now(),
+            bell: 0,
+            dragging: None,
+            blink_timer: None,
+            scroll_remainder: point(0., 0.),
+        }
+    }
+
+    pub fn editor(&self) -> NvimEditor {
+        self.editor.clone()
+    }
+
+    pub fn mode(&self) -> &str {
+        &self.grid.mode
+    }
+
+    pub fn draft_revision(&self) -> Option<DraftRevision> {
+        self.draft.as_ref().map(DraftSnapshot::revision)
+    }
+
+    pub fn active_key(&self) -> Option<&DraftKey> {
+        self.draft.as_ref().map(|draft| &draft.key)
+    }
+
+    pub fn latest_snapshot(&self) -> Option<&DraftSnapshot> {
+        self.draft.as_ref()
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+    }
+
+    pub fn has_composition(&self) -> bool {
+        self.composition.is_some()
+            || !self.pending_compositions.is_empty()
+            || !self.recovery.is_empty()
+    }
+
+    pub fn recoverable_composition(&self) -> &str {
+        &self.recovery
+    }
+
+    /// Separately persist this on quit if the semantic draft barrier refuses an
+    /// unfinished composition. Never silently merge it into a committed draft.
+    pub fn recovery_text(&self) -> String {
+        let active = self
+            .composition
+            .as_ref()
+            .map(|composition| composition.text.as_str())
+            .unwrap_or("");
+        let mut text = String::with_capacity(
+            self.recovery.len()
+                + active.len()
+                + self
+                    .pending_compositions
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
+        );
+        text.push_str(&self.recovery);
+        for pending in &self.pending_compositions {
+            text.push_str(pending);
+        }
+        text.push_str(active);
+        text
+    }
+
+    pub fn cancel_composition(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.discard_composition(cx);
+    }
+
+    fn enabled(&self) -> bool {
+        self.ready
+            && self.error.is_none()
+            && !self.grid.rows.is_empty()
+            && self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| draft.generation == self.grid.generation)
+    }
+
+    fn send(&mut self, command: NvimCommand, cx: &mut Context<Self>) -> bool {
+        match self.editor.try_command(command) {
+            Ok(()) => true,
+            Err(error) => {
+                self.fail(format!("{error:#}"), cx);
+                false
+            }
+        }
+    }
+
+    fn fail(&mut self, error: String, cx: &mut Context<Self>) {
+        self.ready = false;
+        self.dragging = None;
+        for text in self.pending_compositions.drain(..) {
+            self.recovery.push_str(&text);
+        }
+        if let Some(composition) = self.composition.as_mut() {
+            composition.recoverable = true;
+        }
+        self.error = Some(error.clone());
+        cx.emit(NvimViewEvent::Failed(error));
+        cx.emit(NvimViewEvent::CompositionChanged(self.has_composition()));
+        cx.notify();
+    }
+
+    fn reject(&mut self, diagnostic: String, cx: &mut Context<Self>) {
+        self.diagnostic = Some(diagnostic.clone());
+        cx.emit(NvimViewEvent::InputRejected(diagnostic));
+        cx.notify();
+    }
+
+    fn receive(&mut self, event: NvimEvent, cx: &mut Context<Self>) {
+        match event {
+            NvimEvent::Grid(grid) => {
+                if self
+                    .draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.generation != grid.generation)
+                {
+                    return;
+                }
+                if self.grid.cursor != grid.cursor
+                    || self.grid.mode_index != grid.mode_index
+                    || self
+                        .grid
+                        .cmdline
+                        .last_key_value()
+                        .map(|(level, cmd)| (*level, cmd.pos))
+                        != grid
+                            .cmdline
+                            .last_key_value()
+                            .map(|(level, cmd)| (*level, cmd.pos))
+                {
+                    self.blink_epoch = Instant::now();
+                }
+                self.grid = grid;
+                self.frame = None;
+            }
+            NvimEvent::DraftChanged(draft) => {
+                if self.draft.as_ref().is_some_and(|active| {
+                    active.key == draft.key && active.generation == draft.generation
+                }) {
+                    self.draft = Some(draft.clone());
+                }
+                cx.emit(NvimViewEvent::DraftChanged(draft));
+            }
+            NvimEvent::DraftActivated(draft) => {
+                if self.grid.generation != draft.generation {
+                    self.frame = None;
+                    self.requested_size = None;
+                }
+                self.draft = Some(draft.clone());
+                self.blink_epoch = Instant::now();
+                cx.emit(NvimViewEvent::DraftActivated(draft));
+            }
+            NvimEvent::ClipboardGet { reply } => {
+                let content = cx
+                    .read_from_clipboard()
+                    .and_then(|item| clipboard_content(&item))
+                    .ok_or_else(|| "The native clipboard contains no text".to_string());
+                let _ = reply.try_send(content);
+            }
+            NvimEvent::ClipboardSet(content) => {
+                // Native metadata is owned by the clipboard item, not a stale text cache.
+                let metadata = serde_json::json!({"drost_nvim_register": content.regtype, "lines": content.lines});
+                cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                    content.text(),
+                    metadata,
+                ));
+            }
+            NvimEvent::CompositionCommitted => {
+                self.pending_compositions.pop_front();
+                cx.emit(NvimViewEvent::CompositionChanged(self.has_composition()));
+            }
+            NvimEvent::CompositionRejected(error) => {
+                if let Some(text) = self.pending_compositions.pop_front() {
+                    self.recovery.push_str(&text);
+                }
+                self.reject(error, cx);
+                cx.emit(NvimViewEvent::CompositionChanged(self.has_composition()));
+            }
+            NvimEvent::InputRejected(error) => self.reject(error, cx),
+            NvimEvent::Failed(error) => self.fail(error, cx),
+            NvimEvent::Ready => {
+                self.ready = true;
+                self.error = None;
+                self.diagnostic = None;
+                self.requested_size = None;
+                cx.emit(NvimViewEvent::Ready);
+            }
+        }
+        cx.notify();
+    }
+
+    fn base_text(&self) -> (String, usize) {
+        if let Some((_, cmd)) = self.grid.cmdline.last_key_value() {
+            let text: String = cmd
+                .content
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect();
+            let cursor = byte_floor(&text, cmd.pos);
+            (text, cursor)
+        } else {
+            self.draft
+                .as_ref()
+                .map(|draft| (draft.text.clone(), buffer_offset(&draft.text, draft.cursor)))
+                .unwrap_or_default()
+        }
+    }
+
+    fn native_text(&self) -> (String, Range<usize>) {
+        if let Some(composition) = self.composition.as_ref() {
+            let mut text = composition.base.clone();
+            if let Some(range) = exact_utf16_range(&text, &composition.range) {
+                text.replace_range(range, &composition.text);
+                return (
+                    text,
+                    composition.range.start + composition.selection.start
+                        ..composition.range.start + composition.selection.end,
+                );
+            }
+        }
+        let (text, cursor) = self.base_text();
+        let cursor = utf16_offset(&text, cursor);
+        (text, cursor..cursor)
+    }
+
+    fn target(&self) -> Option<Target> {
+        if let Some((level, cmd)) = self.grid.cmdline.last_key_value() {
+            Some(Target::Cmdline {
+                generation: self.grid.generation,
+                level: *level,
+                expected: cmd
+                    .content
+                    .iter()
+                    .map(|chunk| chunk.text.as_str())
+                    .collect(),
+            })
+        } else {
+            self.draft.as_ref().map(|draft| Target::Buffer {
+                key: draft.key.clone(),
+                revision: draft.revision(),
+            })
+        }
+    }
+
+    fn target_current(&self, target: &Target) -> bool {
+        match target {
+            Target::Buffer { key, revision } => {
+                self.grid.cmdline.is_empty()
+                    && self.draft.as_ref().is_some_and(|draft| {
+                        &draft.key == key
+                            && draft.generation == revision.generation
+                            && draft.changedtick == revision.changedtick
+                    })
+            }
+            Target::Cmdline {
+                generation,
+                level,
+                expected,
+            } => {
+                self.grid.generation == *generation
+                    && self
+                        .grid
+                        .cmdline
+                        .last_key_value()
+                        .is_some_and(|(active, cmd)| {
+                            active == level
+                                && cmd
+                                    .content
+                                    .iter()
+                                    .map(|chunk| chunk.text.as_str())
+                                    .collect::<String>()
+                                    == *expected
+                        })
+            }
+        }
+    }
+
+    fn discard_composition(&mut self, cx: &mut Context<Self>) {
+        self.composition = None;
+        self.recovery.clear();
+        self.send(NvimCommand::SetComposition(false), cx);
+        cx.emit(NvimViewEvent::CompositionChanged(self.has_composition()));
+        cx.notify();
+    }
+
+    fn retain_native(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selection: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(composition) = self.composition.as_mut() {
+            if splice_composition(composition, range, text, selection).is_err() {
+                self.recovery.push_str(text);
+            }
+            composition.recoverable = true;
+        } else {
+            self.recovery.push_str(text);
+        }
+        cx.emit(NvimViewEvent::CompositionChanged(self.has_composition()));
+        cx.notify();
+    }
+
+    fn replace(&mut self, target: Target, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        if !self.target_current(&target) {
+            self.recovery.push_str(text);
+            self.reject("The draft changed during native composition. Composition is retained; copy it before cancelling or restarting.".into(), cx);
+            cx.emit(NvimViewEvent::CompositionChanged(self.has_composition()));
+            return;
+        }
+        let command = match target {
+            Target::Buffer { key, revision } => NvimCommand::Replace {
+                key,
+                revision,
+                range,
+                text: text.into(),
+            },
+            Target::Cmdline { expected, .. } => NvimCommand::ReplaceCmdline {
+                expected,
+                range,
+                text: text.into(),
+            },
+        };
+        self.pending_compositions.push_back(text.to_owned());
+        self.send(command, cx);
+        cx.emit(NvimViewEvent::CompositionChanged(self.has_composition()));
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = &event.keystroke;
+        if key.modifiers.platform {
+            // Workspace shortcuts (especially Cmd-Return and Cmd-Escape) bubble.
+            if key.modifiers.control || key.modifiers.alt || key.modifiers.shift {
+                return;
+            }
+            match key.key.as_str() {
+                "c" | "x" if self.enabled() && !self.has_composition() => {
+                    self.send(
+                        NvimCommand::Copy {
+                            cut: key.key == "x",
+                        },
+                        cx,
+                    );
+                }
+                "v" if self.enabled() && !self.has_composition() => {
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        self.send(NvimCommand::Paste(text), cx);
+                    }
+                }
+                _ => return,
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if key.key == "f23" || key.key == "f24" {
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if self.composition.is_some() {
+            if key.key == "escape" {
+                self.discard_composition(cx);
+                window.prevent_default();
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if !self.enabled() {
+            return;
+        }
+        if let Some(notation) = key_notation(key) {
+            self.send(NvimCommand::Input(notation), cx);
+            self.blink_epoch = Instant::now();
+            window.prevent_default();
+            cx.stop_propagation();
+        }
+        // Printable keys, including Option-generated native Unicode, are delivered
+        // only by replace_text_in_range. Never guess Neovim's current mode here.
+    }
+
+    fn mouse(
+        &mut self,
+        button: MouseButton,
+        action: &str,
+        position: Point<Pixels>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.enabled() || !self.grid.mouse_enabled || self.has_composition() {
+            return;
+        }
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        let name = match button {
+            MouseButton::Left => "left",
+            MouseButton::Right => "right",
+            MouseButton::Middle => "middle",
+            _ => return,
+        };
+        let (row, col) = self.screen_cell(position, bounds);
+        self.send(
+            NvimCommand::Mouse {
+                button: name.into(),
+                action: action.into(),
+                modifiers: mouse_modifiers(modifiers),
+                row,
+                col,
+            },
+            cx,
+        );
+    }
+
+    fn screen_cell(&self, position: Point<Pixels>, bounds: Bounds<Pixels>) -> (u32, u32) {
+        let col = ((position.x - bounds.left()) / self.cell.width)
+            .floor()
+            .max(0.) as usize;
+        let row = ((position.y - bounds.top()) / self.cell.height)
+            .floor()
+            .max(0.) as usize;
+        (
+            row.min(self.grid.rows.len().saturating_sub(1)) as u32,
+            col.min(self.grid.cols.saturating_sub(1)) as u32,
+        )
+    }
+
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus(window, cx);
+        self.dragging = Some(event.button);
+        self.mouse(event.button, "press", event.position, event.modifiers, cx);
+    }
+
+    fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.dragging.take().is_some() {
+            self.mouse(event.button, "release", event.position, event.modifiers, cx);
+        }
+    }
+
+    fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(button) = self.dragging {
+            self.mouse(button, "drag", event.position, event.modifiers, cx);
+        }
+    }
+
+    fn scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.enabled() || !self.grid.mouse_enabled || self.has_composition() {
+            return;
+        }
+        let Some(bounds) = self.bounds else {
+            return;
+        };
+        let delta = match event.delta {
+            ScrollDelta::Pixels(delta) => {
+                point(delta.x / self.cell.width, delta.y / self.cell.height)
+            }
+            ScrollDelta::Lines(delta) => delta,
+        };
+        self.scroll_remainder.x += delta.x;
+        self.scroll_remainder.y += delta.y;
+        let x = self.scroll_remainder.x.trunc() as i32;
+        let y = self.scroll_remainder.y.trunc() as i32;
+        self.scroll_remainder.x -= x as f32;
+        self.scroll_remainder.y -= y as f32;
+        let (row, col) = self.screen_cell(event.position, bounds);
+        for (count, negative, positive) in [(y, "down", "up"), (x, "right", "left")] {
+            for _ in 0..count.unsigned_abs() {
+                self.send(
+                    NvimCommand::Mouse {
+                        button: "wheel".into(),
+                        action: if count < 0 { negative } else { positive }.into(),
+                        modifiers: mouse_modifiers(event.modifiers),
+                        row,
+                        col,
+                    },
+                    cx,
+                );
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    fn cursor_origin(&self) -> Point<Pixels> {
+        if let Some(cursor) = self.frame.as_ref().and_then(|frame| frame.cmd_cursor) {
+            return cursor;
+        }
+        point(
+            self.cell.width * self.grid.cursor.1 as f32,
+            self.cell.height * self.grid.cursor.0 as f32,
+        )
+    }
+
+    fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let cell_height = window.line_height();
+        if self.frame.is_none()
+            || font_size != self.font_size
+            || cell_height != self.cell.height
+            || self
+                .bounds
+                .is_none_or(|previous| previous.size != bounds.size)
+        {
+            self.font_size = font_size;
+            let run = text_run(&self.grid, 0, 1);
+            let width = window
+                .text_system()
+                .shape_line("M".into(), font_size, &[run], None)
+                .width();
+            self.cell = size(width.max(px(1.)), cell_height.max(px(1.)));
+            let visible_rows = (bounds.size.height / self.cell.height).floor().max(1.) as usize;
+            self.frame = Some(make_frame(
+                &self.grid,
+                self.cell,
+                font_size,
+                visible_rows,
+                bounds.size.width,
+                window,
+            ));
+        }
+        self.bounds = Some(bounds);
+        let strip_rows = self.grid.cmdline.len() + self.grid.cmdline_block.len();
+        let cols = (bounds.size.width / self.cell.width).floor().max(1.) as u32;
+        let rows = ((bounds.size.height / self.cell.height).floor() as usize)
+            .saturating_sub(strip_rows)
+            .max(1) as u32;
+        if self.ready && self.requested_size != Some((cols, rows)) {
+            self.requested_size = Some((cols, rows));
+            self.send(NvimCommand::Resize { cols, rows }, cx);
+        }
+        if self.bell != self.grid.bell {
+            self.bell = self.grid.bell;
+            window.play_system_bell();
+        }
+    }
+
+    fn arm_blink(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.blink_timer = None;
+        if !self.enabled()
+            || !window.is_window_active()
+            || !self.focus_handle.is_focused(window)
+            || self.grid.busy
+            || self.composition.is_some()
+            || !self.grid.cursor_style_enabled
+        {
+            return;
+        }
+        let Some(style) = self
+            .grid
+            .mode_styles
+            .get(self.grid.mode_index)
+            .filter(|style| style.blinkwait > 0 && style.blinkon > 0 && style.blinkoff > 0)
+        else {
+            return;
+        };
+        let elapsed = self.blink_epoch.elapsed().as_millis() as u64;
+        let delay = if elapsed < style.blinkwait {
+            style.blinkwait - elapsed
+        } else {
+            let phase = (elapsed - style.blinkwait) % (style.blinkon + style.blinkoff);
+            if phase < style.blinkoff {
+                style.blinkoff - phase
+            } else {
+                style.blinkon + style.blinkoff - phase
+            }
+        };
+        self.blink_timer = Some(cx.spawn(async move |this, cx| {
+            smol::Timer::after(std::time::Duration::from_millis(delay.max(1))).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        }));
+    }
+
+    fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let Some(frame) = self.frame.as_ref() else {
+            return;
+        };
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            window.paint_quad(fill(bounds, rgb(self.grid.default_bg)));
+            for (rect, color) in &frame.backgrounds {
+                window.paint_quad(fill(
+                    Bounds::new(bounds.origin + rect.origin, rect.size),
+                    *color,
+                ));
+            }
+            for text in &frame.texts {
+                let _ = text.line.paint_background(
+                    bounds.origin + text.origin,
+                    self.cell.height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+                let _ = text.line.paint(
+                    bounds.origin + text.origin,
+                    self.cell.height,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+            for text in &frame.overlays {
+                let origin = bounds.origin + text.origin;
+                window.paint_quad(fill(
+                    Bounds::new(
+                        origin,
+                        size(text.line.width().max(self.cell.width), self.cell.height),
+                    ),
+                    rgb(self.grid.default_bg),
+                ));
+                let _ =
+                    text.line
+                        .paint(origin, self.cell.height, TextAlign::Left, None, window, cx);
+            }
+            if window.is_window_active()
+                && self.focus_handle.is_focused(window)
+                && self.enabled()
+                && !self.grid.busy
+                && self.composition.is_none()
+            {
+                self.paint_cursor(bounds, window, cx);
+            }
+            if let Some(composition) = self.composition.as_ref() {
+                let cursor = utf16_byte(&composition.text, composition.selection.end)
+                    .unwrap_or(composition.text.len());
+                let mut offset = 0;
+                for (row, text) in composition.text.split('\n').enumerate() {
+                    let mut run = text_run(&self.grid, 0, text.len());
+                    run.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(run.color),
+                        wavy: composition.recoverable,
+                    });
+                    let line = window.text_system().shape_line(
+                        text.to_owned().into(),
+                        self.font_size,
+                        &[run],
+                        None,
+                    );
+                    let origin = bounds.origin
+                        + composition.anchor
+                        + point(px(0.), self.cell.height * row as f32);
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            origin,
+                            size(line.width().max(self.cell.width), self.cell.height),
+                        ),
+                        rgb(self.grid.default_bg),
+                    ));
+                    let _ = line.paint(origin, self.cell.height, TextAlign::Left, None, window, cx);
+                    if (offset..=offset + text.len()).contains(&cursor) {
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                origin + point(line.x_for_index(cursor - offset), px(0.)),
+                                size(px(1.), self.cell.height),
+                            ),
+                            rgb(self.grid.default_fg),
+                        ));
+                    }
+                    offset += text.len() + 1;
+                }
+            }
+        });
+    }
+
+    fn paint_cursor(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+        let style = self
+            .grid
+            .cursor_style_enabled
+            .then(|| self.grid.mode_styles.get(self.grid.mode_index))
+            .flatten();
+        if let Some(style) =
+            style.filter(|style| style.blinkwait > 0 && style.blinkon > 0 && style.blinkoff > 0)
+        {
+            let elapsed = self.blink_epoch.elapsed().as_millis() as u64;
+            if elapsed >= style.blinkwait
+                && (elapsed - style.blinkwait) % (style.blinkon + style.blinkoff) < style.blinkoff
+            {
+                return;
+            }
+        }
+        let origin = bounds.origin + self.cursor_origin();
+        let fraction = style
+            .map(|style| style.cell_percentage.clamp(1, 100) as f32 / 100.)
+            .unwrap_or(1.);
+        let shape = style.map(|style| style.shape.as_str()).unwrap_or("block");
+        let (fg, bg, _) = colors(&self.grid, style.map(|style| style.attr_id).unwrap_or(0));
+        let color = if style.is_some_and(|style| style.attr_id != 0) {
+            bg
+        } else {
+            fg
+        };
+        let width = if self.grid.cmdline.is_empty() {
+            self.grid
+                .rows
+                .get(self.grid.cursor.0)
+                .and_then(|row| row.get(self.grid.cursor.1 + 1))
+                .filter(|cell| cell.text.is_empty())
+                .map(|_| self.cell.width * 2.)
+                .unwrap_or(self.cell.width)
+        } else {
+            self.cell.width
+        };
+        let cursor = match shape {
+            "vertical" => Bounds::new(
+                origin,
+                size((self.cell.width * fraction).max(px(1.)), self.cell.height),
+            ),
+            "horizontal" => Bounds::new(
+                origin + point(px(0.), self.cell.height * (1. - fraction)),
+                size(width, (self.cell.height * fraction).max(px(1.))),
+            ),
+            _ => Bounds::new(origin, size(width, self.cell.height)),
+        };
+        window.paint_quad(fill(cursor, color));
+        if shape == "block" && self.grid.cmdline.is_empty() {
+            if let Some(cell) = self
+                .grid
+                .rows
+                .get(self.grid.cursor.0)
+                .and_then(|row| row.get(self.grid.cursor.1))
+            {
+                if !cell.text.is_empty() {
+                    let mut run = text_run(&self.grid, cell.hl_id, cell.text.len());
+                    run.color = if style.is_some_and(|style| style.attr_id != 0) {
+                        fg
+                    } else {
+                        bg
+                    };
+                    let line = window.text_system().shape_line(
+                        cell.text.clone().into(),
+                        self.font_size,
+                        &[run],
+                        None,
+                    );
+                    let _ = line.paint(origin, self.cell.height, TextAlign::Left, None, window, cx);
+                }
+            }
+        }
+        if shape == "block" {
+            let layout = self.frame.as_ref().and_then(|frame| {
+                frame
+                    .overlays
+                    .iter()
+                    .find(|overlay| Some(overlay.origin) == frame.cmd_cursor)
+                    .map(|overlay| (&overlay.line, overlay.origin))
+                    .or_else(|| {
+                        frame
+                            .cmd_layout
+                            .as_ref()
+                            .map(|(line, origin, _)| (line, *origin))
+                    })
+            });
+            if let Some((line, position)) = layout {
+                let mut run = text_run(&self.grid, 0, line.text.len());
+                run.color = if style.is_some_and(|style| style.attr_id != 0) {
+                    fg
+                } else {
+                    bg
+                };
+                let inverse = window.text_system().shape_line(
+                    line.text.clone(),
+                    self.font_size,
+                    &[run],
+                    None,
+                );
+                window.with_content_mask(Some(ContentMask { bounds: cursor }), |window| {
+                    let _ = inverse.paint(
+                        bounds.origin + position,
+                        self.cell.height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
+    }
+}
+
+impl EntityInputHandler for NvimView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let (text, _) = self.native_text();
+        let start = utf16_floor(&text, range.start);
+        let end = utf16_ceil(&text, range.end.max(range.start));
+        *adjusted = Some(utf16_offset(&text, start)..utf16_offset(&text, end));
+        Some(text[start..end].to_owned())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        if !ignore_disabled && !self.enabled() {
+            return None;
+        }
+        Some(UTF16Selection {
+            range: self.native_text().1,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.composition.as_ref().map(|composition| {
+            composition.range.start
+                ..composition.range.start + composition.text.encode_utf16().count()
+        })
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .composition
+            .as_ref()
+            .is_some_and(|composition| !composition.recoverable)
+        {
+            self.discard_composition(cx);
+        }
+    }
+
+    fn paste(&mut self, item: ClipboardItem, _: &mut Window, cx: &mut Context<Self>) {
+        if self.enabled() && !self.has_composition() {
+            if let Some(text) = item.text() {
+                self.send(NvimCommand::Paste(text), cx);
+            }
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.enabled() {
+            self.retain_native(range, text, None, cx);
+            return;
+        }
+        if text.is_empty() && self.composition.is_some() {
+            self.discard_composition(cx);
+            return;
+        }
+        self.blink_epoch = Instant::now();
+        if let Some(mut composition) = self.composition.take() {
+            if let Err(error) = splice_composition(&mut composition, range, text, None) {
+                self.composition = Some(composition);
+                self.recovery.push_str(text);
+                self.reject(error, cx);
+                return;
+            }
+            if !self.send(NvimCommand::SetComposition(false), cx) {
+                self.recovery.push_str(&composition.text);
+                return;
+            }
+            self.replace(composition.target, composition.range, &composition.text, cx);
+        } else if let Some(range) = range.filter(|range| !range.is_empty()) {
+            if let Some(target) = self.target() {
+                self.replace(target, range, text, cx);
+            }
+        } else {
+            self.send(NvimCommand::Input(text.replace('<', "<LT>")), cx);
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        selection: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.enabled() {
+            self.retain_native(range, text, selection, cx);
+            return;
+        }
+        if text.is_empty() {
+            self.discard_composition(cx);
+            return;
+        }
+        if let Some(composition) = self.composition.as_mut() {
+            if let Err(error) = splice_composition(composition, range, text, selection) {
+                self.recovery.push_str(text);
+                self.reject(error, cx);
+                return;
+            }
+        } else {
+            let Some(target) = self.target() else {
+                return;
+            };
+            let (base, cursor) = self.base_text();
+            let cursor = utf16_offset(&base, cursor);
+            let range = range.unwrap_or(cursor..cursor);
+            if exact_utf16_range(&base, &range).is_none() {
+                self.recovery.push_str(text);
+                self.reject(
+                    "Native composition supplied an invalid Unicode range; the text was retained."
+                        .into(),
+                    cx,
+                );
+                cx.emit(NvimViewEvent::CompositionChanged(true));
+                return;
+            }
+            let length = text.encode_utf16().count();
+            let selection = selection.unwrap_or(length..length);
+            let start = utf16_offset(text, utf16_floor(text, selection.start));
+            let end = utf16_offset(text, utf16_ceil(text, selection.end.max(selection.start)));
+            self.composition = Some(Composition {
+                target,
+                range,
+                base,
+                text: text.into(),
+                selection: start..end,
+                anchor: self.cursor_origin(),
+                recoverable: false,
+            });
+            if !self.send(NvimCommand::SetComposition(true), cx) {
+                return;
+            }
+        }
+        cx.emit(NvimViewEvent::CompositionChanged(true));
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range: Range<usize>,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        if let Some(composition) = self.composition.as_ref() {
+            let start = utf16_floor(
+                &composition.text,
+                range.start.saturating_sub(composition.range.start),
+            );
+            let end = utf16_ceil(
+                &composition.text,
+                range.end.saturating_sub(composition.range.start),
+            );
+            let line_start = composition.text[..start]
+                .rfind('\n')
+                .map_or(0, |newline| newline + 1);
+            let line_end = composition.text[start..]
+                .find('\n')
+                .map_or(composition.text.len(), |newline| start + newline);
+            let row = composition.text[..line_start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            let text = &composition.text[line_start..line_end];
+            let line = window.text_system().shape_line(
+                text.to_owned().into(),
+                self.font_size,
+                &[text_run(&self.grid, 0, text.len())],
+                None,
+            );
+            let start_x = line.x_for_index(start - line_start);
+            let end_x = line.x_for_index(end.min(line_end).max(start) - line_start);
+            return Some(Bounds::new(
+                bounds.origin + composition.anchor + point(start_x, self.cell.height * row as f32),
+                size((end_x - start_x).max(px(1.)), self.cell.height),
+            ));
+        }
+        if let Some((line, origin, prefix)) = self
+            .frame
+            .as_ref()
+            .and_then(|frame| frame.cmd_layout.as_ref())
+        {
+            let (text, _) = self.base_text();
+            let start = utf16_floor(&text, range.start) + prefix;
+            let end = utf16_ceil(&text, range.end) + prefix;
+            return Some(Bounds::new(
+                bounds.origin + *origin + point(line.x_for_index(start), px(0.)),
+                size(
+                    (line.x_for_index(end) - line.x_for_index(start)).max(px(1.)),
+                    self.cell.height,
+                ),
+            ));
+        }
+        // Buffer rows may wrap and contain concealed text. Only Neovim can map those
+        // rows; the reported screen cursor is the authoritative IME candidate anchor.
+        let (text, cursor) = self.base_text();
+        let cursor = utf16_offset(&text, cursor);
+        (range.start == cursor)
+            .then_some(Bounds::new(bounds.origin + self.cursor_origin(), self.cell))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        let bounds = self.bounds?;
+        if let Some(composition) = self.composition.as_ref() {
+            let row = ((position.y - bounds.top() - composition.anchor.y) / self.cell.height)
+                .floor()
+                .max(0.) as usize;
+            let start = buffer_offset(&composition.text, (row, 0));
+            let end = composition.text[start..]
+                .find('\n')
+                .map_or(composition.text.len(), |newline| start + newline);
+            let text = &composition.text[start..end];
+            let line = window.text_system().shape_line(
+                text.to_owned().into(),
+                self.font_size,
+                &[text_run(&self.grid, 0, text.len())],
+                None,
+            );
+            let byte = line.closest_index_for_x(position.x - bounds.left() - composition.anchor.x);
+            return Some(composition.range.start + utf16_offset(&composition.text, start + byte));
+        }
+        if let Some((line, origin, prefix)) = self
+            .frame
+            .as_ref()
+            .and_then(|frame| frame.cmd_layout.as_ref())
+        {
+            let (text, _) = self.base_text();
+            let byte = line
+                .closest_index_for_x(position.x - bounds.left() - origin.x)
+                .saturating_sub(*prefix);
+            return Some(utf16_offset(&text, byte_floor(&text, byte)));
+        }
+        let (text, cursor) = self.base_text();
+        let origin = bounds.origin + self.cursor_origin();
+        if position.x >= origin.x
+            && position.x <= origin.x + self.cell.width
+            && position.y >= origin.y
+            && position.y <= origin.y + self.cell.height
+        {
+            Some(utf16_offset(&text, cursor))
+        } else {
+            None
+        }
+    }
+
+    fn text_length_utf16(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        Some(self.native_text().0.encode_utf16().count())
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range: Range<usize>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(composition) = self.composition.as_mut() {
+            let start = range.start.saturating_sub(composition.range.start);
+            let end = range.end.saturating_sub(composition.range.start);
+            if range.start >= composition.range.start
+                && exact_utf16_range(&composition.text, &(start..end)).is_some()
+            {
+                composition.selection = start..end;
+                cx.notify();
+            }
+        }
+    }
+
+    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
+        self.enabled()
+    }
+}
+
+impl Focusable for NvimView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for NvimView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.arm_blink(window, cx);
+        let prepare = cx.entity();
+        let paint = prepare.clone();
+        let mut surface = div()
+            .size_full()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .key_context("NvimEditor")
+            .track_focus(&self.focus_handle)
+            .font_family("Menlo")
+            .text_size(px(14.))
+            .line_height(px(20.))
+            .on_key_down(cx.listener(Self::key_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::mouse_up))
+            .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_scroll_wheel(cx.listener(Self::scroll))
+            .child(
+                canvas(
+                    move |bounds, window, cx| {
+                        prepare.update(cx, |this, cx| this.prepare(bounds, window, cx))
+                    },
+                    move |bounds, (), window, cx| {
+                        paint.update(cx, |this, cx| {
+                            window.handle_input(
+                                &this.focus_handle,
+                                ElementInputHandler::new(bounds, cx.entity()),
+                                cx,
+                            );
+                            this.paint(bounds, window, cx);
+                        });
+                    },
+                )
+                .w_full()
+                .flex_1()
+                .min_h_0(),
+            );
+        if let Some(error) = self.error.as_ref() {
+            surface = surface.child(
+                div()
+                    .p_2()
+                    .text_color(rgb(0xFFA7A7))
+                    .child(error.clone())
+                    .child(
+                        div()
+                            .id("nvim-restart")
+                            .cursor_pointer()
+                            .child("Restart Editor")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let editor = this.editor.clone();
+                                cx.spawn(async move |this, cx| {
+                                    if let Err(error) = editor.restart().await {
+                                        let _ = this.update(cx, |this, cx| {
+                                            this.fail(format!("{error:#}"), cx)
+                                        });
+                                    }
+                                })
+                                .detach();
+                            })),
+                    ),
+            );
+        } else if !self.enabled() {
+            surface = surface.child(
+                div()
+                    .p_2()
+                    .text_color(rgb(0xAAB2C0))
+                    .child("Waiting for Neovim's initial grid…"),
+            );
+        }
+        if let Some(diagnostic) = self.diagnostic.as_ref() {
+            surface = surface.child(
+                div()
+                    .p_2()
+                    .text_color(rgb(0xFFD080))
+                    .child(diagnostic.clone())
+                    .child(
+                        div()
+                            .id("nvim-dismiss-diagnostic")
+                            .cursor_pointer()
+                            .child("Dismiss")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.diagnostic = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        if self.has_composition() {
+            let recovery = if let Some(composition) = self.composition.as_ref() {
+                format!("{}{}", self.recovery, composition.text)
+            } else {
+                self.recovery.clone()
+            };
+            if !self.recovery.is_empty()
+                || self
+                    .composition
+                    .as_ref()
+                    .is_some_and(|composition| composition.recoverable)
+            {
+                surface = surface.child(
+                    div()
+                        .p_2()
+                        .text_color(rgb(0xFFD080))
+                        .child("Uncommitted composition retained")
+                        .child(
+                            div()
+                                .id("nvim-copy-composition")
+                                .cursor_pointer()
+                                .child("Copy Composition")
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        recovery.clone(),
+                                    ))
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("nvim-cancel-composition")
+                                .cursor_pointer()
+                                .child("Cancel Composition")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel_composition(window, cx)
+                                })),
+                        ),
+                );
+            }
+        }
+        surface
+    }
+}
+
+fn splice_composition(
+    composition: &mut Composition,
+    range: Option<Range<usize>>,
+    text: &str,
+    selection: Option<Range<usize>>,
+) -> Result<(), String> {
+    let old_length = composition.text.encode_utf16().count();
+    let marked = composition.range.start..composition.range.start + old_length;
+    let requested = range.unwrap_or(marked.clone());
+    let base_range = exact_utf16_range(&composition.base, &composition.range)
+        .ok_or_else(|| "The native composition anchor is no longer valid".to_string())?;
+    let mut virtual_text = composition.base.clone();
+    virtual_text.replace_range(base_range, &composition.text);
+    let requested_bytes = exact_utf16_range(&virtual_text, &requested).ok_or_else(|| {
+        "Native composition supplied an invalid Unicode replacement range; text was retained"
+            .to_string()
+    })?;
+    let start = requested.start.min(marked.start);
+    let old_end = requested.end.max(marked.end);
+    let base_end = composition.range.end + old_end - marked.end;
+    let length = text.encode_utf16().count();
+    let new_end = old_end - (requested.end - requested.start) + length;
+    virtual_text.replace_range(requested_bytes, text);
+    let new_range = exact_utf16_range(&virtual_text, &(start..new_end)).ok_or_else(|| {
+        "Native composition could not preserve the replacement boundary".to_string()
+    })?;
+    let selection = selection.unwrap_or(length..length);
+    let selected_start = utf16_offset(text, utf16_floor(text, selection.start));
+    let selected_end = utf16_offset(text, utf16_ceil(text, selection.end.max(selection.start)));
+    composition.range = start..base_end;
+    composition.text = virtual_text[new_range].to_owned();
+    composition.selection =
+        requested.start - start + selected_start..requested.start - start + selected_end;
+    Ok(())
+}
+
+fn byte_floor(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn utf16_byte(text: &str, offset: usize) -> Option<usize> {
+    let mut units = 0;
+    for (byte, character) in text.char_indices() {
+        if units == offset {
+            return Some(byte);
+        }
+        units += character.len_utf16();
+        if units > offset {
+            return None;
+        }
+    }
+    (units == offset).then_some(text.len())
+}
+
+fn utf16_floor(text: &str, offset: usize) -> usize {
+    let mut units = 0;
+    for (byte, character) in text.char_indices() {
+        if units + character.len_utf16() > offset {
+            return byte;
+        }
+        units += character.len_utf16();
+    }
+    text.len()
+}
+
+fn utf16_ceil(text: &str, offset: usize) -> usize {
+    let mut units = 0;
+    for (byte, character) in text.char_indices() {
+        if units >= offset {
+            return byte;
+        }
+        units += character.len_utf16();
+    }
+    text.len()
+}
+
+fn utf16_offset(text: &str, byte: usize) -> usize {
+    text[..byte_floor(text, byte)].encode_utf16().count()
+}
+
+fn exact_utf16_range(text: &str, range: &Range<usize>) -> Option<Range<usize>> {
+    if range.start > range.end {
+        return None;
+    }
+    Some(utf16_byte(text, range.start)?..utf16_byte(text, range.end)?)
+}
+
+fn buffer_offset(text: &str, cursor: (usize, usize)) -> usize {
+    let mut start = 0;
+    for _ in 0..cursor.0 {
+        let Some(newline) = text[start..].find('\n') else {
+            return text.len();
+        };
+        start += newline + 1;
+    }
+    let length = text[start..].find('\n').unwrap_or(text.len() - start);
+    start + byte_floor(&text[start..start + length], cursor.1)
+}
+
+fn key_notation(key: &Keystroke) -> Option<String> {
+    let name = match key.key.as_str() {
+        "escape" => "Esc",
+        "enter" | "return" => "CR",
+        "backspace" => "BS",
+        "delete" => "Del",
+        "tab" => "Tab",
+        "up" => "Up",
+        "down" => "Down",
+        "left" => "Left",
+        "right" => "Right",
+        "home" => "Home",
+        "end" => "End",
+        "pageup" => "PageUp",
+        "pagedown" => "PageDown",
+        "space" if key.modifiers.control => "Space",
+        name if name.strip_prefix('f').is_some_and(|number| {
+            number
+                .parse::<u8>()
+                .is_ok_and(|number| (1..=22).contains(&number))
+        }) =>
+        {
+            name
+        }
+        _ if key.modifiers.control || (key.modifiers.alt && key.key_char.is_none()) => {
+            key.key.as_str()
+        }
+        _ => return None,
+    };
+    let mut modifiers = String::new();
+    if key.modifiers.control {
+        modifiers.push_str("C-");
+    }
+    if key.modifiers.alt {
+        modifiers.push_str("M-");
+    }
+    if key.modifiers.shift {
+        modifiers.push_str("S-");
+    }
+    Some(format!("<{modifiers}{name}>"))
+}
+
+fn mouse_modifiers(modifiers: Modifiers) -> String {
+    let mut result = String::new();
+    if modifiers.control {
+        result.push('C');
+    }
+    if modifiers.alt {
+        result.push('A');
+    }
+    if modifiers.shift {
+        result.push('S');
+    }
+    if modifiers.platform {
+        result.push('D');
+    }
+    result
+}
+
+fn clipboard_content(item: &ClipboardItem) -> Option<ClipboardContent> {
+    let text = item.text()?;
+    if let Some(metadata) = item
+        .metadata()
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+    {
+        if let (Some(regtype), Some(lines)) = (
+            metadata["drost_nvim_register"].as_str(),
+            metadata["lines"].as_array(),
+        ) {
+            let lines: Option<Vec<String>> = lines
+                .iter()
+                .map(|line| line.as_str().map(str::to_owned))
+                .collect();
+            if let Some(lines) = lines {
+                let content = ClipboardContent {
+                    lines,
+                    regtype: regtype.into(),
+                };
+                if content.text() == text
+                    && (regtype == "v" || regtype == "V" || regtype.starts_with('\u{16}'))
+                {
+                    return Some(content);
+                }
+            }
+        }
+    }
+    let linewise = text.ends_with('\n');
+    let body = if linewise {
+        &text[..text.len() - 1]
+    } else {
+        &text
+    };
+    Some(ClipboardContent {
+        lines: body.split('\n').map(str::to_owned).collect(),
+        regtype: if linewise { "V" } else { "v" }.into(),
+    })
+}
+
+fn colors(grid: &GridSnapshot, id: u64) -> (Hsla, Hsla, Hsla) {
+    let default = Highlight::default();
+    let highlight = grid.highlights.get(&id).unwrap_or(&default);
+    let mut foreground = highlight.foreground.unwrap_or(grid.default_fg);
+    let mut background = highlight.background.unwrap_or(grid.default_bg);
+    if highlight.reverse {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    let blend = highlight.blend.min(100) as u32;
+    let mut blended = 0;
+    for shift in [0, 8, 16] {
+        let channel = (((background >> shift) & 255) * (100 - blend)
+            + ((grid.default_bg >> shift) & 255) * blend)
+            / 100;
+        blended |= channel << shift;
+    }
+    (
+        rgb(foreground).into(),
+        rgb(blended).into(),
+        rgb(highlight.special.unwrap_or(grid.default_sp)).into(),
+    )
+}
+
+fn text_run(grid: &GridSnapshot, id: u64, len: usize) -> TextRun {
+    let default = Highlight::default();
+    let highlight = grid.highlights.get(&id).unwrap_or(&default);
+    let (color, _, special) = colors(grid, id);
+    let mut font = font("Menlo");
+    if highlight.bold {
+        font = font.bold();
+    }
+    if highlight.italic {
+        font = font.italic();
+    }
+    TextRun {
+        len,
+        font,
+        color,
+        background_color: None,
+        underline: (highlight.underline || highlight.undercurl).then_some(UnderlineStyle {
+            thickness: px(1.),
+            color: Some(special),
+            wavy: highlight.undercurl,
+        }),
+        strikethrough: highlight.strikethrough.then_some(StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(color),
+        }),
+    }
+}
+
+fn shape_chunks(
+    grid: &GridSnapshot,
+    chunks: &[HighlightedChunk],
+    prefix: &str,
+    font_size: Pixels,
+    window: &Window,
+) -> ShapedLine {
+    let mut text = prefix.to_owned();
+    let mut runs = Vec::with_capacity(chunks.len() + 1);
+    if !prefix.is_empty() {
+        runs.push(text_run(grid, 0, prefix.len()));
+    }
+    for chunk in chunks {
+        if chunk.text.is_empty() {
+            continue;
+        }
+        text.push_str(&chunk.text);
+        let mut run = text_run(grid, chunk.hl_id, chunk.text.len());
+        run.background_color = Some(colors(grid, chunk.hl_id).1);
+        runs.push(run);
+    }
+    window
+        .text_system()
+        .shape_line(text.into(), font_size, &runs, None)
+}
+
+fn make_frame(
+    grid: &GridSnapshot,
+    cell: Size<Pixels>,
+    font_size: Pixels,
+    visible_rows: usize,
+    visible_width: Pixels,
+    window: &Window,
+) -> Frame {
+    let mut frame = Frame {
+        texts: Vec::new(),
+        backgrounds: Vec::new(),
+        overlays: Vec::new(),
+        cmd_cursor: None,
+        cmd_layout: None,
+    };
+    for (row_index, row) in grid.rows.iter().enumerate() {
+        for (column, value) in row.iter().enumerate() {
+            let origin = point(cell.width * column as f32, cell.height * row_index as f32);
+            frame
+                .backgrounds
+                .push((Bounds::new(origin, cell), colors(grid, value.hl_id).1));
+            if value.text.is_empty() {
+                continue;
+            }
+            // One Neovim cell can contain a base character plus combining marks;
+            // wide continuation cells never contribute independent glyphs or columns.
+            let run = text_run(grid, value.hl_id, value.text.len());
+            let line =
+                window
+                    .text_system()
+                    .shape_line(value.text.clone().into(), font_size, &[run], None);
+            frame.texts.push(PaintedText { origin, line });
+        }
+    }
+    let strip_length = grid.cmdline_block.len() + grid.cmdline.len();
+    let skip = strip_length.saturating_sub(visible_rows.saturating_sub(1));
+    let mut row = grid.rows.len();
+    for chunks in grid.cmdline_block.iter().skip(skip) {
+        frame.texts.push(PaintedText {
+            origin: point(px(0.), cell.height * row as f32),
+            line: shape_chunks(grid, chunks, "", font_size, window),
+        });
+        row += 1;
+    }
+    for (level, cmd) in grid
+        .cmdline
+        .iter()
+        .skip(skip.saturating_sub(grid.cmdline_block.len()))
+    {
+        let prefix = format!("{}{}{}", cmd.firstc, cmd.prompt, " ".repeat(cmd.indent));
+        let line = shape_chunks(grid, &cmd.content, &prefix, font_size, window);
+        let text: String = cmd
+            .content
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect();
+        let byte = byte_floor(&text, cmd.pos);
+        let before = chunk_range(&cmd.content, 0..byte);
+        let prefix_line = shape_chunks(grid, &before, &prefix, font_size, window);
+        let horizontal_scroll = (prefix_line.width() + cell.width - visible_width).max(px(0.));
+        let origin = point(-horizontal_scroll, cell.height * row as f32);
+        let cursor = origin + point(prefix_line.width(), px(0.));
+        let active = grid
+            .cmdline
+            .last_key_value()
+            .is_some_and(|(active, _)| active == level);
+        if active {
+            frame.cmd_cursor = Some(cursor);
+            frame.cmd_layout = Some((line.clone(), origin, prefix.len()));
+        }
+        if let Some((special, shift)) = cmd.special.as_ref() {
+            let special_line = window.text_system().shape_line(
+                special.clone().into(),
+                font_size,
+                &[text_run(grid, 0, special.len())],
+                None,
+            );
+            if *shift {
+                let suffix = chunk_range(&cmd.content, byte..text.len());
+                frame.texts.push(PaintedText {
+                    origin,
+                    line: prefix_line,
+                });
+                frame.texts.push(PaintedText {
+                    origin: cursor + point(special_line.width(), px(0.)),
+                    line: shape_chunks(grid, &suffix, "", font_size, window),
+                });
+            } else {
+                frame.texts.push(PaintedText { origin, line });
+            }
+            frame.overlays.push(PaintedText {
+                origin: cursor,
+                line: special_line,
+            });
+        } else {
+            frame.texts.push(PaintedText { origin, line });
+        }
+        row += 1;
+    }
+    frame
+}
+
+fn chunk_range(chunks: &[HighlightedChunk], range: Range<usize>) -> Vec<HighlightedChunk> {
+    let mut offset = 0;
+    let mut result = Vec::new();
+    for chunk in chunks {
+        let start = range.start.saturating_sub(offset).min(chunk.text.len());
+        let end = range.end.saturating_sub(offset).min(chunk.text.len());
+        if start < end {
+            result.push(HighlightedChunk {
+                hl_id: chunk.hl_id,
+                text: chunk.text[start..end].to_owned(),
+            });
+        }
+        offset += chunk.text.len();
+        if offset >= range.end {
+            break;
+        }
+    }
+    result
+}
