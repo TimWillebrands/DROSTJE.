@@ -1,7 +1,7 @@
 use super::workspace::{Region, Workspace};
 use crate::{
     app::{AppState, NoticeLevel},
-    model::FactoryLaunch,
+    model::{FactoryLaunch, ThreadId},
 };
 use gpui_kit::{
     component::{
@@ -165,21 +165,25 @@ fn read_button(
 }
 
 fn selected_launch(state: &AppState) -> Option<&FactoryLaunch> {
-    let thread = state.factory_thread()?;
+    launch_for(state, state.factory_thread()?.id)
+}
+/// The launch recorded for a Factory thread, if it was ever started.
+pub fn launch_for(state: &AppState, thread_id: ThreadId) -> Option<&FactoryLaunch> {
     state
         .snapshot
         .launches
         .iter()
-        .find(|launch| launch.factory_thread_id == thread.id)
+        .find(|launch| launch.factory_thread_id == thread_id)
 }
 
 pub fn render(
     state: &AppState,
+    thread_id: ThreadId,
     owner: &WeakEntity<Workspace>,
     scroll: &ScrollHandle,
     cx: &App,
 ) -> AnyElement {
-    let Some(launch) = selected_launch(state) else {
+    let Some(launch) = launch_for(state, thread_id) else {
         return div()
             .p_3()
             .text_color(cx.theme().muted_foreground)

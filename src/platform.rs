@@ -193,10 +193,7 @@ mod tests {
             assert_eq!(icon.get_pixel(corner.0, corner.1).0[3], 0);
         }
         assert!(icon.get_pixel(512, 512).0[3] >= 250);
-        let filled_pixels = icon
-            .pixels()
-            .filter(|pixel| pixel.0[3] >= 250)
-            .count();
+        let filled_pixels = icon.pixels().filter(|pixel| pixel.0[3] >= 250).count();
         assert!(filled_pixels * 100 / (1024 * 1024) >= 80);
     }
 }

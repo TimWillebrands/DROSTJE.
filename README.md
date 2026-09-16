@@ -41,12 +41,12 @@ Kies in Settings zo nodig expliciete executable-paden en de gedeelde Factory-dat
 
 Projects bevat één gedeelde lijst met twee soorten threads:
 
-- **Conversation:** een interactieve OMP-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Het model kies je onderaan de composer.
+- **Conversation:** een interactieve OMP-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Elk project in de zijbalk heeft een `+` om direct een nieuwe Conversation voor dat project te starten. Het model kies je onderaan de composer.
 - **Factory:** parameters voor een bestaande Azure DevOps User Story of een bestaande PRD/issues-map. `Advanced` bevat de branch en het optionele thought level. `Start run` slaat de definitieve configuratie eerst op; een opslagfout start niets.
 
 Na de eerste duurzame launch wordt de Factory-thread een alleen-lezen monitor met native events, resultaten en ruwe details. Ook een geweigerde launch blijft als historie bewaard. Een volgende poging begint in een **nieuwe Factory-thread**. Er is geen taakpakket-generator, handoff vanuit een bericht of Factory-composer.
 
-De werkruimte heeft Projects links, threadtabs centraal en een optioneel Output-dock onderaan. Je kunt de native docks verplaatsen, groeperen en schalen; de indeling wordt bewaard. Conversations en Factory-threads blijven tegelijk open in de tabstrip van het Thread-dock; bij te veel tabs biedt het overloopmenu toegang tot de rest. `Close thread` sluit alleen die tab en eventueel een inactieve Conversation-sessie, niet de historie of een lopende turn of Factory-run. Bij sluiten van de actieve tab wordt een aangrenzende tab geselecteerd. Concepttekst blijft behouden bij wisselen, sluiten en opnieuw openen.
+De werkruimte heeft Projects links, threads centraal en een optioneel Output-dock onderaan. Elke open thread is een eigen dock-paneel: sleep een tab naast of onder een andere om meerdere Conversations tegelijk in beeld te hebben, of laat ze als tabs bij elkaar. Je kunt de native docks verplaatsen, groeperen en schalen; de indeling, inclusief welke threads open staan, wordt bewaard. Het paneel dat focus krijgt (klik, tab, of `Ctrl-W` + `h/j/k/l`) is de geselecteerde thread; alleen dat paneel host de Neovim-editor, andere zichtbare Conversations tonen hun bewaarde concept met de hint `Press i to edit`. `Close thread` sluit alleen dat paneel en eventueel een inactieve Conversation-sessie, niet de historie of een lopende turn of Factory-run. Bij sluiten van de actieve thread krijgt een aangrenzende thread focus. Concepttekst blijft behouden bij wisselen, sluiten en opnieuw openen.
 
 Zonder geopende thread zie je compacte startacties in het midden; een lege tabstrip wordt niet getoond. Opslagstatus staat in de titelbalk, niet in een aparte onderbalk. Output blijft bereikbaar via de dockkop, `Cmd-J` en de command palette.
 
@@ -60,16 +60,17 @@ Zonder geopende thread zie je compacte startacties in het midden; een lege tabst
 |`Cmd-B` / `Cmd-J`|Projects / Output tonen of verbergen|
 |`Ctrl-Tab` / `Ctrl-Shift-Tab`|Volgende / vorige open threadtab|
 |`Cmd-W`|Huidige threadtab sluiten|
-|`Ctrl-W`, daarna `h/j/k/l`|Naar een zichtbaar aangrenzend paneel; tweede toets mag ook met Control|
+|`Ctrl-W`, daarna `h/j/k/l`|Naar een zichtbaar aangrenzend paneel, ook vanuit de prompt-editor; tweede toets mag ook met Control|
 |`j/k`, pijlen, `gg/G`, `h/l`, Return|Navigeren, springen, invouwen/uitvouwen en openen in Projects|
 |`i` in een Conversation|Focus naar de prompteditor|
+|`Cmd-V` in een Conversation|Afbeelding van het klembord als bijlage toevoegen (PNG, JPEG, WebP, TIFF); tekst plakt in de editor|
 |`Cmd-Enter`|Prompt versturen, Factory-configuratie starten of formulier bevestigen|
 |`Cmd-.`|Interactieve turn onderbreken|
 |`Cmd-Escape`|Van de prompteditor terug naar Thread|
 |`Cmd-,`|Settings|
 |Escape|Bovenste menu of venster sluiten; in de palette eerst de zoektekst wissen|
 
-In insert-modus voegt Return een nieuwe regel toe; alleen `Cmd-Enter` verstuurt. Escape schakelt binnen de editor de Neovim-modus terug; `Cmd-Escape` verlaat de editor. Moties, operators, visual-selectie, registers, zoeken en undo/redo worden door Neovim uitgevoerd. `Cmd-C/X/V` gebruikt het systeemklembord. Directionele paneeltoetsen nemen geen editorinvoer over.
+In insert-modus voegt Return een nieuwe regel toe; alleen `Cmd-Enter` verstuurt. Escape schakelt binnen de editor de Neovim-modus terug; `Cmd-Escape` verlaat de editor. Moties, operators, visual-selectie, registers, zoeken en undo/redo worden door Neovim uitgevoerd. `Cmd-C/X/V` gebruikt het systeemklembord; bevat het klembord een afbeelding, dan wordt die als bijlage bij de draft gezet in plaats van geplakt als tekst. Directionele paneeltoetsen nemen geen editorinvoer over.
 
 Versturen neemt een gecontroleerde snapshot nadat Neovim de eerdere invoer verwerkt heeft. Tijdens actieve tekstcompositie of een onvoltooide Neovim-opdracht wordt niet verstuurd of naar een andere draft gewisseld. Onvoltooide IME-tekst blijft aparte recoverytekst; die wordt nooit automatisch verstuurd of in een projectbestand geschreven.
 

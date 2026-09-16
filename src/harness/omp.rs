@@ -1153,6 +1153,9 @@ impl Actor {
                     role: "system".into(),
                     content: vec![ContentBlock::Text(string(&value, "text"))],
                     raw: None,
+                    tool_call_id: None,
+                    error: false,
+                    exit_code: None,
                 };
                 if self.local_outputs.len() == 128 {
                     self.local_outputs.pop_front();
@@ -1489,14 +1492,17 @@ impl Actor {
         let mut tool = existing.unwrap_or_else(|| ToolActivity {
             id: id.clone(),
             name: string(value, "toolName"),
+            intent: None,
             input: Value::Null,
             result: Vec::new(),
             error: false,
+            exit_code: None,
             complete: false,
             raw: None,
         });
         if let Some(args) = value.get("args") {
             tool.input = args.clone();
+            tool.intent = intent(value, args);
         }
         if let Some(name) = value["toolName"].as_str() {
             tool.name = name.into();
@@ -1510,6 +1516,7 @@ impl Actor {
             tool.result = content;
             tool.raw = raw;
             if let Some(details) = result.get("details") {
+                tool.exit_code = details["exitCode"].as_i64();
                 tool.raw = Some(json!({"unrecognizedContent":tool.raw,"details":details}));
             }
         }
@@ -1759,12 +1766,27 @@ fn normalize_message(
     ) {
         raw = Some(value.clone());
     }
+    let tool_call_id = value["toolCallId"]
+        .as_str()
+        .filter(|id| !id.is_empty() && role == "toolResult")
+        .map(str::to_owned);
     Message {
         id: message_id(value, fallback),
         role,
         content,
         raw,
+        tool_call_id,
+        error: value["isError"] == true,
+        exit_code: value["details"]["exitCode"].as_i64(),
     }
+}
+/// OMP sends the purpose line as `intent` and, for most tools, also as the `i` argument.
+fn intent(block: &Value, arguments: &Value) -> Option<String> {
+    block["intent"]
+        .as_str()
+        .or_else(|| arguments["i"].as_str())
+        .filter(|intent| !intent.trim().is_empty())
+        .map(str::to_owned)
 }
 fn normalize_content(
     value: &Value,
@@ -1783,6 +1805,15 @@ fn normalize_content(
         match block["type"].as_str() {
             Some("text") => content.push(ContentBlock::Text(string(block, "text"))),
             Some("thinking") => content.push(ContentBlock::Thinking(string(block, "thinking"))),
+            Some("toolCall") if block["id"].as_str().is_some_and(|id| !id.is_empty()) => {
+                let arguments = block.get("arguments").cloned().unwrap_or(Value::Null);
+                content.push(ContentBlock::ToolCall {
+                    id: string(block, "id"),
+                    name: string(block, "name"),
+                    intent: intent(block, &arguments),
+                    input: arguments,
+                });
+            }
             Some("image") => {
                 let image = images.import(block, directory);
                 match image {
@@ -2124,6 +2155,73 @@ mod tests {
         assert!(
             matches!(&message.content[..],[ContentBlock::Text(before),ContentBlock::ImageError(_),ContentBlock::Text(after)] if before=="Before" && after=="After")
         );
+    }
+
+    #[test]
+    fn tool_call_block_keeps_id_name_intent_and_arguments() {
+        let message = normalize_message(
+            &json!({"role":"assistant","timestamp":2,"content":[
+                {"type":"text","text":"Looking"},
+                {"type":"toolCall","id":"call_1","name":"bash","intent":"List files","arguments":{"command":"ls","i":"List files"}},
+                {"type":"toolCall","id":"call_2","name":"read","arguments":{"path":"a.rs","i":"Read a"}},
+                {"type":"toolCall","name":"orphan","arguments":{}}
+            ]}),
+            "fallback",
+            std::path::Path::new("/unused"),
+            &mut ImageCache::default(),
+        );
+        assert!(message.tool_call_id.is_none());
+        assert!(!message.error);
+        match &message.content[..] {
+            [
+                ContentBlock::Text(text),
+                ContentBlock::ToolCall {
+                    id,
+                    name,
+                    intent,
+                    input,
+                },
+                ContentBlock::ToolCall {
+                    id: second,
+                    intent: second_intent,
+                    ..
+                },
+            ] => {
+                assert_eq!(text, "Looking");
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "bash");
+                assert_eq!(intent.as_deref(), Some("List files"));
+                assert_eq!(input["command"], "ls");
+                assert_eq!(second, "call_2");
+                assert_eq!(second_intent.as_deref(), Some("Read a"));
+            }
+            other => panic!("unexpected blocks: {other:?}"),
+        }
+        // A tool call without an ID cannot be answered; it stays visible as raw data.
+        assert!(message.raw.is_some());
+    }
+
+    #[test]
+    fn tool_result_message_keeps_call_reference_error_and_exit_code() {
+        let message = normalize_message(
+            &json!({"role":"toolResult","timestamp":3,"toolCallId":"call_1","toolName":"bash",
+                "isError":true,"details":{"exitCode":1,"wallTimeMs":5},
+                "content":[{"type":"text","text":"boom"}]}),
+            "fallback",
+            std::path::Path::new("/unused"),
+            &mut ImageCache::default(),
+        );
+        assert_eq!(message.tool_call_id.as_deref(), Some("call_1"));
+        assert!(message.error);
+        assert_eq!(message.exit_code, Some(1));
+        assert!(matches!(&message.content[..], [ContentBlock::Text(text)] if text == "boom"));
+        let user = normalize_message(
+            &json!({"role":"user","timestamp":4,"toolCallId":"stray","content":[]}),
+            "fallback",
+            std::path::Path::new("/unused"),
+            &mut ImageCache::default(),
+        );
+        assert!(user.tool_call_id.is_none());
     }
 
     #[test]

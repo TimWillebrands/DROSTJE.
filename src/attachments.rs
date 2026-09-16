@@ -86,6 +86,42 @@ pub fn import_bytes(bytes: &[u8], declared_mime: &str, data: &Path) -> Result<Im
     );
     own(bytes, &image, mime, extension, data, None)
 }
+/// Clipboard images have no source file. PNG, JPEG and WebP are stored as
+/// pasted; TIFF (what macOS offers for many copied bitmaps) is re-encoded as
+/// PNG so the stored copy stays within the formats the harness accepts.
+pub fn import_pasted(bytes: &[u8], data: &Path) -> Result<ImageAttachment> {
+    ensure!(
+        bytes.len() as u64 <= FILE_LIMIT,
+        "Pasted image exceeds 20 MiB"
+    );
+    let format =
+        image::guess_format(bytes).context("Clipboard bytes are not a recognized image")?;
+    match format {
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP => {
+            let (image, mime, extension) = decode(bytes)?;
+            own(bytes, &image, mime, extension, data, None)
+        }
+        ImageFormat::Tiff => {
+            let (width, height) =
+                ImageReader::with_format(Cursor::new(bytes), format).into_dimensions()?;
+            ensure!(
+                u64::from(width) * u64::from(height) <= PIXEL_LIMIT,
+                "Pasted image exceeds 32 megapixels"
+            );
+            let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(256 * 1024 * 1024);
+            reader.limits(limits);
+            let tiff = reader.decode().context("Decode pasted TIFF")?;
+            let mut png = Vec::new();
+            tiff.write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+                .context("Encode pasted TIFF as PNG")?;
+            let (image, mime, extension) = decode(&png)?;
+            own(&png, &image, mime, extension, data, None)
+        }
+        _ => bail!("Only PNG, JPEG, WebP and TIFF images can be pasted"),
+    }
+}
 fn flatten(image: DynamicImage) -> DynamicImage {
     let rgba = image.to_rgba8();
     let mut rgb = RgbImage::new(rgba.width(), rgba.height());

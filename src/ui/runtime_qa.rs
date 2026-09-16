@@ -10,8 +10,8 @@ use crate::{
     },
 };
 use gpui_kit::{
-    App, AppContext, Context, Entity, Focusable, TestAppContext, VisualTestContext, Window,
-    WindowHandle,
+    App, AppContext, ClipboardItem, Context, Entity, Focusable, Image, ImageFormat, Modifiers,
+    TestAppContext, VisualTestContext, Window, WindowHandle,
     component::{Root, Theme, ThemeMode, WindowExt},
     px, size,
 };
@@ -236,6 +236,106 @@ async fn quit(cx: &mut TestAppContext, fixture: &Fixture) {
     })
     .await;
     fixture.store.flush().await.unwrap();
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; sidebar '+' and clipboard paste against a real store"]
+async fn project_plus_starts_conversation_and_clipboard_image_attaches(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let project = cx.read(|cx| fixture.state.read(cx).snapshot.projects[0].id);
+    let count = cx.read(|cx| fixture.state.read(cx).snapshot.threads.len());
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    let selector: &'static str = Box::leak(format!("new-conversation-{project}").into_boxed_str());
+    let plus = visual
+        .debug_bounds(selector)
+        .expect("project row shows its '+'");
+    visual.simulate_click(plus.center(), Modifiers::default());
+    until(
+        cx,
+        "'+' created a conversation",
+        Duration::from_secs(5),
+        |cx| {
+            let state = fixture.state.read(cx);
+            state.snapshot.threads.len() == count + 1
+                && state
+                    .conversation_thread()
+                    .is_some_and(|thread| thread.project_id == project)
+        },
+    )
+    .await;
+    let conversation = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+    assert!(cx.read(|cx| fixture.state.read(cx).selected_project == Some(project)));
+
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        2,
+        2,
+        image::Rgba([1, 2, 3, 255]),
+    ))
+    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    .unwrap();
+    cx.update(|cx| {
+        cx.write_to_clipboard(ClipboardItem::new_image(&Image {
+            format: ImageFormat::Png,
+            bytes: png,
+            id: 1,
+        }))
+    });
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.focus_region(Region::Thread, window, cx),
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-v");
+    until(cx, "pasted image attached", Duration::from_secs(10), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == conversation)
+            .is_some_and(|thread| {
+                thread.attachments.len() == 1
+                    && thread.attachments[0].mime == "image/png"
+                    && thread.attachments[0].width == 2
+            })
+    })
+    .await;
+
+    let notices = cx.read(|cx| fixture.state.read(cx).notices.len());
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("just text".into())));
+    cx.dispatch_action(fixture.window.into(), commands::PasteImage);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).notices.len()),
+        notices + 1,
+        "a text-only clipboard reports a warning instead of attaching"
+    );
+    assert_eq!(
+        cx.read(|cx| fixture
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == conversation)
+            .unwrap()
+            .attachments
+            .len()),
+        1
+    );
+    quit(cx, &fixture).await;
 }
 
 #[gpui_kit::test]

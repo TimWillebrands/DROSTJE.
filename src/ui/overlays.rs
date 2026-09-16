@@ -545,6 +545,14 @@ impl DetailContent {
                         "Running"
                     }
                 )))
+                .when_some(tool.intent.clone(), |body, intent| {
+                    body.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(intent),
+                    )
+                })
                 .child(
                     div()
                         .font_family(cx.theme().mono_font_family.clone())
@@ -607,13 +615,14 @@ impl DetailContent {
         for (index, tool) in session.tools.values().enumerate() {
             let owner = self.owner.clone();
             let tool_id = tool.id.clone();
+            let summary = super::conversation::tool_summary(&tool.name, &tool.input);
             body = body.child(
                 Button::new(("detail-tool", index))
                     .small()
                     .ghost()
                     .label(format!(
                         "{} · {}",
-                        tool.name,
+                        tool.intent.as_deref().unwrap_or(&tool.name),
                         if tool.error {
                             "Failed"
                         } else if tool.complete {
@@ -622,6 +631,9 @@ impl DetailContent {
                             "Running"
                         }
                     ))
+                    .when(!summary.body.is_empty(), |button| {
+                        button.tooltip(summary.body)
+                    })
                     .on_click(move |_, window, cx| {
                         let _ = owner.update(cx, |workspace, cx| {
                             workspace.tool_detail = Some((thread_id, tool_id.clone()));

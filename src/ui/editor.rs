@@ -630,6 +630,61 @@ impl Workspace {
         })
         .detach();
     }
+    /// Attaches whatever the native clipboard holds: copied image bytes or
+    /// copied image files. Text is left to the editor.
+    pub fn paste_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id)
+        else {
+            return;
+        };
+        if !self.can_edit_conversation(id, cx) {
+            return;
+        }
+        let mut images = Vec::new();
+        let mut paths = Vec::new();
+        if let Some(item) = cx.read_from_clipboard() {
+            for entry in item.into_entries() {
+                match entry {
+                    ClipboardEntry::Image(image) => images.push(image.bytes),
+                    ClipboardEntry::ExternalPaths(external) => {
+                        paths.extend(external.paths().iter().cloned())
+                    }
+                    ClipboardEntry::String(_) => {}
+                }
+            }
+        }
+        if images.is_empty() && paths.is_empty() {
+            self.state.update(cx, |state, cx| {
+                state.notice(
+                    NoticeLevel::Warning,
+                    "The clipboard holds no image. Copy an image or use Attach…",
+                );
+                cx.notify();
+            });
+            return;
+        }
+        if !paths.is_empty() {
+            self.import_images(id, paths, window, cx);
+        }
+        if !images.is_empty() {
+            let data = self.state.read(cx).data_dir.clone();
+            self.import_attachments(
+                id,
+                move || {
+                    images
+                        .iter()
+                        .map(|bytes| crate::attachments::import_pasted(bytes, &data))
+                        .collect()
+                },
+                window,
+                cx,
+            );
+        }
+    }
     pub fn import_images(
         &mut self,
         id: ThreadId,
@@ -637,18 +692,33 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.can_edit_conversation(id, cx) {
-            return;
-        }
         let data = self.state.read(cx).data_dir.clone();
-        cx.spawn_in(window, async move |workspace, window| {
-            let results = smol::unblock(move || {
+        self.import_attachments(
+            id,
+            move || {
                 paths
                     .iter()
                     .map(|path| crate::attachments::import(path, &data))
-                    .collect::<Vec<_>>()
-            })
-            .await;
+                    .collect()
+            },
+            window,
+            cx,
+        );
+    }
+    /// Runs `import` off the GPUI thread and appends accepted images to the
+    /// thread's draft attachments; rejections become notices.
+    fn import_attachments(
+        &mut self,
+        id: ThreadId,
+        import: impl FnOnce() -> Vec<anyhow::Result<ImageAttachment>> + Send + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_edit_conversation(id, cx) {
+            return;
+        }
+        cx.spawn_in(window, async move |workspace, window| {
+            let results = smol::unblock(import).await;
             let _ = workspace.update_in(window, |workspace, _, cx| {
                 if !workspace.can_edit_conversation(id, cx) {
                     return;

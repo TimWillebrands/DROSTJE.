@@ -2,8 +2,8 @@ mod conversation;
 mod factory;
 mod shutdown;
 use crate::harness::{
-    self, ConversationCommand, ConversationEvent, ConversationHandle, ConversationState, Message,
-    ModelChoice, ToolActivity, TurnOutcome, UserAnswer, UserRequest,
+    self, ContentBlock, ConversationCommand, ConversationEvent, ConversationHandle,
+    ConversationState, Message, ModelChoice, ToolActivity, TurnOutcome, UserAnswer, UserRequest,
 };
 use crate::{model::*, platform, store::Store};
 use anyhow::{Context as _, Result};
@@ -36,6 +36,10 @@ pub struct ConversationSession {
     pub preparing: bool,
     pub list: ListState,
     indices: HashMap<String, usize>,
+    /// IDs of every `ContentBlock::ToolCall` seen, so their result messages fold
+    /// into the call's card instead of rendering as separate rows.
+    tool_calls: HashSet<String>,
+    tool_results: HashMap<String, usize>,
     submitted: HashMap<Uuid, DraftSnapshot>,
 }
 impl ConversationSession {
@@ -60,19 +64,48 @@ impl ConversationSession {
             preparing: false,
             list: ListState::new(0, ListAlignment::Bottom, px(500.)),
             indices: HashMap::new(),
+            tool_calls: HashSet::new(),
+            tool_results: HashMap::new(),
             submitted: HashMap::new(),
         }
     }
     fn message(&mut self, message: Message) {
-        if let Some(index) = self.indices.get(&message.id).copied() {
+        for block in &message.content {
+            if let ContentBlock::ToolCall { id, .. } = block {
+                self.tool_calls.insert(id.clone());
+            }
+        }
+        let index = if let Some(index) = self.indices.get(&message.id).copied() {
             self.messages[index] = Arc::new(message);
             self.list.splice(index..index + 1, 1);
+            index
         } else {
             let index = self.messages.len();
             self.indices.insert(message.id.clone(), index);
             self.messages.push(Arc::new(message));
             self.list.splice(index..index, 1);
+            index
+        };
+        if let Some(call_id) = &self.messages[index].tool_call_id {
+            self.tool_results.insert(call_id.clone(), index);
         }
+    }
+    fn reset_history(&mut self) {
+        self.messages.clear();
+        self.indices.clear();
+        self.tool_calls.clear();
+        self.tool_results.clear();
+        self.list.reset(0);
+    }
+    /// True once the assistant message that issued this call has been seen.
+    pub fn has_tool_call(&self, call_id: &str) -> bool {
+        self.tool_calls.contains(call_id)
+    }
+    /// The historical result message answering a tool call, if any.
+    pub fn tool_result(&self, call_id: &str) -> Option<&Arc<Message>> {
+        self.tool_results
+            .get(call_id)
+            .and_then(|index| self.messages.get(*index))
     }
 }
 
@@ -874,5 +907,60 @@ impl AppState {
             }
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContentBlock, ConversationSession, Message, Value};
+
+    fn message(id: &str, role: &str, content: Vec<ContentBlock>) -> Message {
+        Message {
+            id: id.into(),
+            role: role.into(),
+            content,
+            raw: None,
+            tool_call_id: None,
+            error: false,
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn session_folds_tool_results_under_their_call() {
+        let mut session = ConversationSession::new(None);
+        assert!(!session.has_tool_call("call_1"));
+        session.message(message(
+            "assistant:1",
+            "assistant",
+            vec![ContentBlock::ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                intent: None,
+                input: Value::Null,
+            }],
+        ));
+        assert!(session.has_tool_call("call_1"));
+        assert!(session.tool_result("call_1").is_none());
+        let mut result = message(
+            "toolResult:2",
+            "toolResult",
+            vec![ContentBlock::Text("partial".into())],
+        );
+        result.tool_call_id = Some("call_1".into());
+        session.message(result.clone());
+        result.content = vec![ContentBlock::Text("final".into())];
+        result.exit_code = Some(1);
+        session.message(result);
+        assert_eq!(session.messages.len(), 2);
+        let found = session
+            .tool_result("call_1")
+            .expect("result indexed by call id");
+        assert_eq!(found.exit_code, Some(1));
+        assert!(matches!(&found.content[..], [ContentBlock::Text(text)] if text == "final"));
+        session.reset_history();
+        assert!(!session.has_tool_call("call_1"));
+        assert!(session.tool_result("call_1").is_none());
+        assert!(session.messages.is_empty());
     }
 }

@@ -4,8 +4,7 @@ Drost is a macOS desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.1"`) that
 drives local coding agents (OMP over native RPC), edits prompts in embedded
 Neovim within a GPUI Kit-styled composer, and dispatches work to the Compliance Software Factory CLI. The README
 is Dutch and user-facing; code, comments, commits, docs and UI strings are
-English. `DROST_APPLICATION_PLAN.md` records the original scope; the README
-documents the current thread workflow and shortcuts.
+English. 
 
 This is a normative file. **Must** is a correctness or ecosystem constraint,
 **should** is the default that needs a stated reason to override, **may** is

@@ -75,6 +75,15 @@ pub enum ContentBlock {
     Thinking(String),
     Image(ImageAttachment),
     ImageError(String),
+    /// An assistant's request to run a tool. Its outcome arrives separately: live
+    /// through `ToolActivity`, or in history as a message whose `tool_call_id` matches.
+    ToolCall {
+        id: String,
+        name: String,
+        /// Short provider-supplied purpose line, shown as the card caption.
+        intent: Option<String>,
+        input: Value,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -82,14 +91,20 @@ pub struct Message {
     pub role: String,
     pub content: Vec<ContentBlock>,
     pub raw: Option<Value>,
+    /// Set on tool result messages; names the `ContentBlock::ToolCall` they answer.
+    pub tool_call_id: Option<String>,
+    pub error: bool,
+    pub exit_code: Option<i64>,
 }
 #[derive(Clone, Debug)]
 pub struct ToolActivity {
     pub id: String,
     pub name: String,
+    pub intent: Option<String>,
     pub input: Value,
     pub result: Vec<ContentBlock>,
     pub error: bool,
+    pub exit_code: Option<i64>,
     pub complete: bool,
     pub raw: Option<Value>,
 }

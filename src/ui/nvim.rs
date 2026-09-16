@@ -1,3 +1,4 @@
+use super::commands::PasteImage;
 use crate::model::{DraftKey, DraftRevision, DraftSnapshot};
 use crate::neovim::grid::{GridSnapshot, Highlight, HighlightedChunk};
 use crate::neovim::{ClipboardContent, NvimCommand, NvimEditor, NvimEvent};
@@ -494,8 +495,8 @@ impl NvimView {
                     );
                 }
                 "v" if self.enabled() && !self.has_composition() => {
-                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                        self.send(NvimCommand::Paste(text), cx);
+                    if let Some(item) = cx.read_from_clipboard() {
+                        self.paste_item(item, window, cx);
                     }
                 }
                 _ => return,
@@ -1015,12 +1016,9 @@ impl EntityInputHandler for NvimView {
         }
     }
 
-    fn paste(&mut self, item: ClipboardItem, _: &mut Window, cx: &mut Context<Self>) {
-        if self.enabled()
-            && !self.has_composition()
-            && let Some(text) = item.text()
-        {
-            self.send(NvimCommand::Paste(text), cx);
+    fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
+        if self.enabled() && !self.has_composition() {
+            self.paste_item(item, window, cx);
         }
     }
 
@@ -1539,6 +1537,24 @@ fn mouse_modifiers(modifiers: Modifiers) -> String {
         result.push('D');
     }
     result
+}
+
+impl NvimView {
+    /// Text goes to Neovim; an image clipboard becomes a draft attachment through
+    /// the workspace's `PasteImage` action so composer and palette share one path.
+    fn paste_item(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
+        if clipboard_has_image(&item) {
+            window.dispatch_action(Box::new(PasteImage), cx);
+        } else if let Some(text) = item.text() {
+            self.send(NvimCommand::Paste(text), cx);
+        }
+    }
+}
+
+fn clipboard_has_image(item: &ClipboardItem) -> bool {
+    item.entries()
+        .iter()
+        .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
 }
 
 fn clipboard_content(item: &ClipboardItem) -> Option<ClipboardContent> {

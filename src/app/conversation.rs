@@ -384,11 +384,7 @@ impl AppState {
                 }
                 session.state = state;
             }
-            ConversationEvent::HistoryReset => {
-                session.messages.clear();
-                session.indices.clear();
-                session.list.reset(0);
-            }
+            ConversationEvent::HistoryReset => session.reset_history(),
             ConversationEvent::History {
                 messages,
                 next_cursor,

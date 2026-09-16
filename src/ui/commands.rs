@@ -37,6 +37,7 @@ gpui_kit::actions!(
         RestartEditor,
         CancelEditorCommand,
         CopyDraftRecovery,
+        PasteImage,
         OpenPalette,
         FocusLeft,
         FocusDown,
@@ -83,9 +84,10 @@ pub enum Command {
     RestartEditor,
     CancelEditorCommand,
     CopyDraftRecovery,
+    PasteImage,
 }
 impl Command {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::AddProject,
         Self::NewConversation,
         Self::NewFactoryThread,
@@ -108,6 +110,7 @@ impl Command {
         Self::RestartEditor,
         Self::CancelEditorCommand,
         Self::CopyDraftRecovery,
+        Self::PasteImage,
     ];
 
     pub fn label(self) -> &'static str {
@@ -134,6 +137,7 @@ impl Command {
             Self::RestartEditor => "Restart Neovim editor",
             Self::CancelEditorCommand => "Cancel editor command",
             Self::CopyDraftRecovery => "Copy draft recovery",
+            Self::PasteImage => "Paste image from clipboard",
         }
     }
 
@@ -161,6 +165,7 @@ impl Command {
             Self::RestartEditor => Box::new(RestartEditor),
             Self::CancelEditorCommand => Box::new(CancelEditorCommand),
             Self::CopyDraftRecovery => Box::new(CopyDraftRecovery),
+            Self::PasteImage => Box::new(PasteImage),
         }
     }
 
@@ -200,6 +205,17 @@ impl Command {
                         None => Some("The project working tree has not been inspected.".into()),
                     })
             }),
+            Self::PasteImage => {
+                state
+                    .mutable_project_reason()
+                    .or_else(|| match state.conversation_thread() {
+                        None => Some("Select a conversation first.".into()),
+                        Some(thread) if thread.archived => {
+                            Some("Archived threads are read-only.".into())
+                        }
+                        _ => None,
+                    })
+            }
             _ => None,
         }
     }
@@ -210,6 +226,9 @@ pub fn bind_keys(cx: &mut App) {
     let command = Some("DrostPalette");
     let navigation =
         Some("Workspace && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
+    // The prompt buffer is the one native input whose Ctrl-W is Drost's, not the
+    // editor's: a single-window Neovim has no window to move to.
+    let editor_navigation = Some("PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog");
     let list =
         Some("List && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
     let projects = Some(
@@ -254,6 +273,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-w ctrl-j", FocusDown, navigation),
         KeyBinding::new("ctrl-w ctrl-k", FocusUp, navigation),
         KeyBinding::new("ctrl-w ctrl-l", FocusRight, navigation),
+        KeyBinding::new("ctrl-w h", FocusLeft, editor_navigation),
+        KeyBinding::new("ctrl-w j", FocusDown, editor_navigation),
+        KeyBinding::new("ctrl-w k", FocusUp, editor_navigation),
+        KeyBinding::new("ctrl-w l", FocusRight, editor_navigation),
+        KeyBinding::new("ctrl-w ctrl-h", FocusLeft, editor_navigation),
+        KeyBinding::new("ctrl-w ctrl-j", FocusDown, editor_navigation),
+        KeyBinding::new("ctrl-w ctrl-k", FocusUp, editor_navigation),
+        KeyBinding::new("ctrl-w ctrl-l", FocusRight, editor_navigation),
         KeyBinding::new("j", SelectNext, list),
         KeyBinding::new("down", SelectNext, list),
         KeyBinding::new("k", SelectPrevious, list),
@@ -272,6 +299,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("g g", SelectFirst, thread),
         KeyBinding::new("shift-g", SelectLast, thread),
         KeyBinding::new("i", FocusComposer, thread),
+        // Inside the composer Neovim owns Cmd-V and hands image clipboards to the same Action.
+        KeyBinding::new("cmd-v", PasteImage, thread),
         KeyBinding::new(
             "cmd-escape",
             LeaveEditor,

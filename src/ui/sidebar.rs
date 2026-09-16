@@ -1,5 +1,5 @@
 use super::{
-    commands::{CollapseProject, Command, ExpandProject},
+    commands::{CollapseProject, Command, ExpandProject, NewConversation},
     workspace::Workspace,
 };
 use crate::{
@@ -203,6 +203,7 @@ pub fn render(
                     .expect("project row");
                 let collapsed = state.collapsed.contains(&id);
                 let toggle_owner = owner.clone();
+                let new_owner = owner.clone();
                 let error = state
                     .repositories
                     .get(&id)
@@ -279,7 +280,39 @@ pub fn render(
                                             .small()
                                             .text_color(theme.danger),
                                     )
-                                }),
+                                })
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "new-conversation-{id}"
+                                    )))
+                                    .ghost()
+                                    .xsmall()
+                                    .cursor_default()
+                                    .icon(IconName::Plus)
+                                    .debug_selector(move || format!("new-conversation-{id}"))
+                                    .disabled(project.archived || state.storage_error.is_some())
+                                    .tooltip_with_action(
+                                        if project.archived {
+                                            "Archived project is read-only"
+                                        } else {
+                                            "New conversation"
+                                        },
+                                        &NewConversation,
+                                        Some("Workspace"),
+                                    )
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            // Select the clicked project first so the
+                                            // shared Action targets this row, not the
+                                            // keyboard cursor.
+                                            let _ = new_owner.update(cx, |workspace, cx| {
+                                                workspace.select_row(row, false, window, cx)
+                                            });
+                                            window.dispatch_action(Box::new(NewConversation), cx);
+                                        },
+                                    ),
+                                ),
                         )
                         .on_click(move |_, window, cx| {
                             let _ = action_owner.update(cx, |workspace, cx| {

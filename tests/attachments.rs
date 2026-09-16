@@ -62,3 +62,39 @@ fn explicit_optimization_retains_original_and_flattens_transparency() {
             <= attachments::FRAME_LIMIT
     );
 }
+
+#[test]
+fn pasted_tiff_is_stored_as_png_and_pasted_png_keeps_its_bytes() {
+    let temp = Temp::new();
+    let image = RgbaImage::from_pixel(4, 3, Rgba([200, 100, 50, 255]));
+    let mut tiff = Vec::new();
+    DynamicImage::ImageRgba8(image.clone())
+        .write_to(&mut std::io::Cursor::new(&mut tiff), ImageFormat::Tiff)
+        .unwrap();
+    let pasted = attachments::import_pasted(&tiff, &temp.0.join("data")).unwrap();
+    assert_eq!(pasted.mime, "image/png");
+    assert_eq!((pasted.width, pasted.height), (4, 3));
+    assert!(pasted.original.is_none());
+    let (decoded, mime, _) = attachments::decode(&fs::read(&pasted.path).unwrap()).unwrap();
+    assert_eq!(mime, "image/png");
+    assert_eq!(decoded.to_rgba8(), image);
+
+    let mut png = Vec::new();
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut std::io::Cursor::new(&mut png), ImageFormat::Png)
+        .unwrap();
+    let pasted = attachments::import_pasted(&png, &temp.0.join("data")).unwrap();
+    assert_eq!(pasted.mime, "image/png");
+    assert_eq!(fs::read(&pasted.path).unwrap(), png);
+}
+
+#[test]
+fn pasted_bytes_outside_the_supported_formats_are_rejected() {
+    let temp = Temp::new();
+    let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;";
+    let error = attachments::import_pasted(gif, &temp.0.join("data")).unwrap_err();
+    assert!(error.to_string().contains("Only PNG, JPEG, WebP and TIFF"));
+    let error = attachments::import_pasted(b"not an image", &temp.0.join("data")).unwrap_err();
+    assert!(error.to_string().contains("not a recognized image"));
+    assert!(!temp.0.join("data").join("attachments").exists());
+}
