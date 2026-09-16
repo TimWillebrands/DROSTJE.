@@ -6,6 +6,13 @@ use std::{
     process::Command,
 };
 
+#[cfg_attr(
+    not(any(target_os = "macos", test)),
+    expect(
+        dead_code,
+        reason = "only AppKit consumes the icon at runtime; tests decode it everywhere"
+    )
+)]
 const APPLICATION_ICON: &[u8] = include_bytes!("../assets/drostje-app-icon.png");
 
 #[cfg(target_os = "macos")]
@@ -45,7 +52,18 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
 pub fn data_dir() -> Result<PathBuf> {
     absolute(match env::var_os("DROSTJE_DATA_DIR") {
         Some(p) => p.into(),
-        None => home()?.join("Library/Application Support/Drostje"),
+        None => default_data_dir()?,
+    })
+}
+#[cfg(target_os = "macos")]
+fn default_data_dir() -> Result<PathBuf> {
+    Ok(home()?.join("Library/Application Support/Drostje"))
+}
+#[cfg(not(target_os = "macos"))]
+fn default_data_dir() -> Result<PathBuf> {
+    Ok(match env::var_os("XDG_DATA_HOME") {
+        Some(p) => PathBuf::from(p).join("drostje"),
+        None => home()?.join(".local/share/drostje"),
     })
 }
 pub fn factory_data_root() -> Result<PathBuf> {
