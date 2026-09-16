@@ -99,6 +99,151 @@ pub struct RepositoryInfo {
     pub branches: Vec<String>,
     pub dirty: bool,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryDiff {
+    pub patch: String,
+    pub changed_files: usize,
+    pub additions: usize,
+    pub deletions: usize,
+    pub truncated: bool,
+}
+
+const MAX_DIFF_BYTES: usize = 512 * 1024;
+const MAX_UNTRACKED_FILE_BYTES: usize = 128 * 1024;
+
+pub fn working_tree_diff(root: &Path) -> Result<RepositoryDiff> {
+    let status = git(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let entries = status_entries(&status);
+    let tracked = git(
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--unified=3",
+            "HEAD",
+            "--",
+        ],
+    );
+    let mut patch = match tracked {
+        Ok(patch) => patch,
+        Err(error) if git(root, &["rev-parse", "--verify", "HEAD"]).is_ok() => {
+            return Err(error);
+        }
+        Err(_) => {
+            let staged = git(
+                root,
+                &[
+                    "diff",
+                    "--cached",
+                    "--no-ext-diff",
+                    "--no-color",
+                    "--unified=3",
+                    "--",
+                ],
+            )?;
+            let unstaged = git(
+                root,
+                &["diff", "--no-ext-diff", "--no-color", "--unified=3", "--"],
+            )?;
+            [staged, unstaged]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+    for (status, path) in &entries {
+        if *status == "??" {
+            append_untracked_patch(root, path, &mut patch)?;
+        }
+    }
+    let mut truncated = false;
+    if patch.len() > MAX_DIFF_BYTES {
+        let mut end = MAX_DIFF_BYTES;
+        while !patch.is_char_boundary(end) {
+            end -= 1;
+        }
+        patch.truncate(end);
+        patch.push_str("\n\nDiff truncated at 512 KiB.");
+        truncated = true;
+    }
+    let additions = patch
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count();
+    let deletions = patch
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count();
+    Ok(RepositoryDiff {
+        patch,
+        changed_files: entries.len(),
+        additions,
+        deletions,
+        truncated,
+    })
+}
+
+fn status_entries(status: &str) -> Vec<(&str, &str)> {
+    let mut fields = status.split('\0').filter(|field| !field.is_empty());
+    let mut entries = Vec::new();
+    while let Some(field) = fields.next() {
+        if field.len() < 3 {
+            continue;
+        }
+        let state = &field[..2];
+        let path = &field[3..];
+        entries.push((state, path));
+        if state.contains('R') || state.contains('C') {
+            let _ = fields.next();
+        }
+    }
+    entries
+}
+
+fn append_untracked_patch(root: &Path, path: &str, patch: &mut String) -> Result<()> {
+    let relative = Path::new(path);
+    ensure!(
+        !relative.is_absolute()
+            && !relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+        "Git returned an invalid untracked path"
+    );
+    let bytes = match fs::read(root.join(relative)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Read untracked file {}", relative.display()));
+        }
+    };
+    if !patch.is_empty() {
+        patch.push('\n');
+    }
+    patch.push_str(&format!(
+        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+    ));
+    if bytes.len() > MAX_UNTRACKED_FILE_BYTES {
+        patch.push_str("Untracked file is larger than 128 KiB; content omitted.\n");
+    } else if let Ok(text) = std::str::from_utf8(&bytes) {
+        let lines = text.lines().count();
+        patch.push_str(&format!("@@ -0,0 +1,{lines} @@\n"));
+        for line in text.lines() {
+            patch.push('+');
+            patch.push_str(line);
+            patch.push('\n');
+        }
+    } else {
+        patch.push_str("Binary untracked file; content omitted.\n");
+    }
+    Ok(())
+}
 pub fn git(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -180,7 +325,53 @@ pub fn now() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::APPLICATION_ICON;
+    use super::{APPLICATION_ICON, working_tree_diff};
+    use std::{fs, path::Path, process::Command};
+
+    struct TempRepository(std::path::PathBuf);
+
+    impl TempRepository {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("drostje-diff-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            git(&path, &["init", "-b", "main"]);
+            fs::write(path.join("tracked.txt"), "before\n").unwrap();
+            git(&path, &["add", "tracked.txt"]);
+            git(
+                &path,
+                &[
+                    "-c",
+                    "user.name=DROSTJE.",
+                    "-c",
+                    "user.email=drostje@example.invalid",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+            );
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRepository {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn application_icon_is_a_filled_rounded_square() {
@@ -195,5 +386,23 @@ mod tests {
         assert!(icon.get_pixel(512, 512).0[3] >= 250);
         let filled_pixels = icon.pixels().filter(|pixel| pixel.0[3] >= 250).count();
         assert!(filled_pixels * 100 / (1024 * 1024) >= 80);
+    }
+
+    #[test]
+    fn working_tree_diff_includes_tracked_and_untracked_content() {
+        let repository = TempRepository::new();
+        fs::write(repository.0.join("tracked.txt"), "after\n").unwrap();
+        fs::write(repository.0.join("new.txt"), "new line\n").unwrap();
+
+        let diff = working_tree_diff(&repository.0).unwrap();
+
+        assert_eq!(diff.changed_files, 2);
+        assert_eq!(diff.additions, 2);
+        assert_eq!(diff.deletions, 1);
+        assert!(diff.patch.contains("-before"));
+        assert!(diff.patch.contains("+after"));
+        assert!(diff.patch.contains("diff --git a/new.txt b/new.txt"));
+        assert!(diff.patch.contains("+new line"));
+        assert!(!diff.truncated);
     }
 }

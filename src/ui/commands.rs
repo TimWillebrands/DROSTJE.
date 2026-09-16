@@ -34,6 +34,8 @@ gpui_kit::actions!(
         FocusOutput,
         ToggleProjects,
         ToggleOutput,
+        ToggleConversationDiffs,
+        RefreshConversationDiff,
         RestartEditor,
         CancelEditorCommand,
         CopyDraftRecovery,
@@ -82,12 +84,14 @@ pub enum Command {
     ToggleProjects,
     ToggleOutput,
     RestartEditor,
+    ToggleConversationDiffs,
+    RefreshConversationDiff,
     CancelEditorCommand,
     CopyDraftRecovery,
     PasteImage,
 }
 impl Command {
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::AddProject,
         Self::NewConversation,
         Self::NewFactoryThread,
@@ -107,6 +111,8 @@ impl Command {
         Self::FocusOutput,
         Self::ToggleProjects,
         Self::ToggleOutput,
+        Self::ToggleConversationDiffs,
+        Self::RefreshConversationDiff,
         Self::RestartEditor,
         Self::CancelEditorCommand,
         Self::CopyDraftRecovery,
@@ -134,6 +140,8 @@ impl Command {
             Self::FocusOutput => "Focus output",
             Self::ToggleProjects => "Toggle projects",
             Self::ToggleOutput => "Toggle output",
+            Self::ToggleConversationDiffs => "Toggle conversation changes",
+            Self::RefreshConversationDiff => "Refresh conversation changes",
             Self::RestartEditor => "Restart Neovim editor",
             Self::CancelEditorCommand => "Cancel editor command",
             Self::CopyDraftRecovery => "Copy draft recovery",
@@ -163,6 +171,8 @@ impl Command {
             Self::ToggleProjects => Box::new(ToggleProjects),
             Self::ToggleOutput => Box::new(ToggleOutput),
             Self::RestartEditor => Box::new(RestartEditor),
+            Self::ToggleConversationDiffs => Box::new(ToggleConversationDiffs),
+            Self::RefreshConversationDiff => Box::new(RefreshConversationDiff),
             Self::CancelEditorCommand => Box::new(CancelEditorCommand),
             Self::CopyDraftRecovery => Box::new(CopyDraftRecovery),
             Self::PasteImage => Box::new(PasteImage),
@@ -205,6 +215,11 @@ impl Command {
                         None => Some("The project working tree has not been inspected.".into()),
                     })
             }),
+            Self::ToggleConversationDiffs | Self::RefreshConversationDiff
+                if state.conversation_thread().is_none() =>
+            {
+                Some("Select a conversation first.".into())
+            }
             Self::PasteImage => {
                 state
                     .mutable_project_reason()
@@ -366,7 +381,7 @@ pub struct Palette {
     owner: WeakEntity<Workspace>,
     state: Entity<AppState>,
     closed: bool,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Palette {
@@ -378,13 +393,29 @@ impl Palette {
     ) -> Entity<Self> {
         let palette = cx.new(|cx| {
             let command = cx.new(|cx| CommandState::new(window, cx));
-            let subscription = cx.observe(&state, |_, _, cx| cx.notify());
+            let subscriptions = vec![
+                cx.observe(&state, |_, _, cx| cx.notify()),
+                cx.subscribe(
+                    &state,
+                    |_, _, change: &crate::app::PresentationChange, cx| {
+                        if matches!(
+                            change,
+                            crate::app::PresentationChange::Thread(_)
+                                | crate::app::PresentationChange::Draft(_)
+                                | crate::app::PresentationChange::Selection
+                                | crate::app::PresentationChange::Projects
+                        ) {
+                            cx.notify();
+                        }
+                    },
+                ),
+            ];
             Self {
                 command,
                 owner,
                 state,
                 closed: false,
-                _subscription: subscription,
+                _subscriptions: subscriptions,
             }
         });
         let content = palette.clone();
@@ -626,6 +657,20 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &ToggleProjects, w, cx| {
                 this.run(PaletteTarget::Command(Command::ToggleProjects), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleConversationDiffs, w, cx| {
+                this.run(
+                    PaletteTarget::Command(Command::ToggleConversationDiffs),
+                    w,
+                    cx,
+                )
+            }))
+            .on_action(cx.listener(|this, _: &RefreshConversationDiff, w, cx| {
+                this.run(
+                    PaletteTarget::Command(Command::RefreshConversationDiff),
+                    w,
+                    cx,
+                )
             }))
             .on_action(cx.listener(|this, _: &ToggleOutput, w, cx| {
                 this.run(PaletteTarget::Command(Command::ToggleOutput), w, cx)

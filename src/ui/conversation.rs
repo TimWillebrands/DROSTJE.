@@ -1,5 +1,7 @@
 use super::{
     commands::{Command, button},
+    job_notice::{JobNotice, JobOutput, JobResult},
+    todo_list::{self, TodoList, TodoStatus},
     workspace::Workspace,
 };
 use crate::{
@@ -24,6 +26,7 @@ use gpui_kit::{
         searchable_list::SearchableListItem,
         select::{Select, SelectEvent, SelectState},
         spinner::Spinner,
+        tag::Tag,
         text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, markdown, markdown_ast},
         v_flex,
     },
@@ -32,6 +35,164 @@ use gpui_kit::{
 };
 use serde_json::Value;
 use std::sync::Arc;
+
+pub(super) struct TranscriptDisclosure;
+impl EventEmitter<TranscriptDisclosure> for Workspace {}
+
+/// Owns transcript layout independently of drafts, forms and the workspace shell.
+pub(super) struct TranscriptView {
+    id: ThreadId,
+    state: Entity<AppState>,
+    owner: WeakEntity<Workspace>,
+    list: ListState,
+    generation: Option<uuid::Uuid>,
+    revision: u64,
+    count: usize,
+    invalidate_rows: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl TranscriptView {
+    pub(super) fn new(
+        id: ThreadId,
+        state: Entity<AppState>,
+        owner: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut subscriptions = vec![
+            cx.subscribe(
+                &state,
+                move |this, _, event: &crate::app::PresentationChange, cx| match event {
+                    crate::app::PresentationChange::Transcript(thread) if *thread == id => {
+                        cx.notify()
+                    }
+                    crate::app::PresentationChange::Thread(thread) if *thread == id => {
+                        this.invalidate_rows = true;
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+            cx.observe(&state, |this, _, cx| {
+                this.invalidate_rows = true;
+                cx.notify();
+            }),
+            cx.observe_global::<gpui_kit::component::Theme>(|this, cx| {
+                this.invalidate_rows = true;
+                cx.notify();
+            }),
+        ];
+        if let Some(workspace) = owner.upgrade() {
+            subscriptions.push(cx.subscribe(
+                &workspace,
+                |this, _, _: &TranscriptDisclosure, cx| {
+                    this.invalidate_rows = true;
+                    cx.notify();
+                },
+            ));
+        }
+        Self {
+            id,
+            state,
+            owner,
+            list: ListState::new(0, ListAlignment::Bottom, px(500.)),
+            generation: None,
+            revision: 0,
+            count: 0,
+            invalidate_rows: false,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn sync(&mut self, cx: &App) {
+        let Some(session) = self.state.read(cx).conversations.get(&self.id) else {
+            if self.count != 0 {
+                self.list.reset(0);
+                self.count = 0;
+            }
+            self.generation = None;
+            return;
+        };
+        let count = session.messages.len();
+        if self.generation != Some(session.generation) {
+            self.list.reset(count);
+        } else if self.invalidate_rows {
+            self.list.splice(0..self.count, count);
+        } else if let Some(changes) = session.transcript_changes_since(self.revision) {
+            let mut changed: Vec<_> = changes
+                .filter(|index| *index < self.count && *index < count)
+                .collect();
+            changed.sort_unstable();
+            changed.dedup();
+            for index in changed {
+                self.list.splice(index..index + 1, 1);
+            }
+            if count > self.count {
+                self.list.splice(self.count..self.count, count - self.count);
+            } else if count < self.count {
+                self.list.splice(count..self.count, 0);
+            }
+        } else {
+            self.list.reset(count);
+        }
+        self.generation = Some(session.generation);
+        self.revision = session.transcript_revision;
+        self.count = count;
+        self.invalidate_rows = false;
+    }
+
+    pub(super) fn scroll(
+        &mut self,
+        delta: isize,
+        endpoint: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync(cx);
+        if endpoint {
+            if delta < 0 {
+                self.list.scroll_to_reveal_item(0);
+            } else {
+                self.list.scroll_to_end();
+            }
+        } else {
+            self.list
+                .scroll_by(window.rem_size() * (delta as f32 * 2.25));
+        }
+        cx.notify();
+    }
+}
+
+impl Render for TranscriptView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync(cx);
+        let state = self.state.clone();
+        let owner = self.owner.clone();
+        let id = self.id;
+        list(self.list.clone(), move |index, _, cx| {
+            let state = state.read(cx);
+            let Some(session) = state.conversations.get(&id) else {
+                return div().into_any_element();
+            };
+            session
+                .messages
+                .get(index)
+                .cloned()
+                .map(|current| {
+                    message(
+                        current,
+                        id,
+                        session,
+                        state.active_threads.contains(&id),
+                        &owner,
+                        cx,
+                    )
+                })
+                .unwrap_or_else(|| div().into_any_element())
+        })
+        .size_full()
+    }
+}
 
 #[derive(Clone, PartialEq)]
 struct ModelOption {
@@ -286,7 +447,7 @@ fn toggle(
             if !workspace.expanded.remove(&key) {
                 workspace.expanded.insert(key.clone());
             }
-            cx.notify();
+            cx.emit(TranscriptDisclosure);
         });
     }
 }
@@ -325,27 +486,9 @@ pub(super) fn block(
 ) -> AnyElement {
     let expanded = is_expanded(owner, &identity, cx);
     match content {
-        ContentBlock::Text(text) if text.len() <= 16_384 => {
+        ContentBlock::Text(text) => guarded_text(identity, text, owner, cx, || {
             markdown_text(text.clone()).into_any_element()
-        }
-        ContentBlock::Text(text) => {
-            let key = identity.clone();
-            v_flex()
-                .gap_2()
-                .child(
-                    Button::new(SharedString::from(identity))
-                        .small()
-                        .ghost()
-                        .label(format!(
-                            "{} large result ({} bytes)",
-                            if expanded { "Collapse" } else { "Expand" },
-                            text.len()
-                        ))
-                        .on_click(toggle(owner, key)),
-                )
-                .when(expanded, |view| view.child(markdown_text(text.clone())))
-                .into_any_element()
-        }
+        }),
         ContentBlock::Thinking(text) => {
             let key = identity.clone();
             v_flex()
@@ -412,6 +555,67 @@ pub(super) fn block(
     }
 }
 
+/// Text that may be huge: past 16 KiB it folds behind a button so a stray
+/// megabyte of output cannot stall a frame.
+fn guarded_text(
+    identity: String,
+    text: &str,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+    render: impl FnOnce() -> AnyElement,
+) -> AnyElement {
+    if text.len() <= 16_384 {
+        return render();
+    }
+    let expanded = is_expanded(owner, &identity, cx);
+    let key = identity.clone();
+    v_flex()
+        .gap_2()
+        .child(
+            Button::new(SharedString::from(identity))
+                .small()
+                .ghost()
+                .label(format!(
+                    "{} large result ({} bytes)",
+                    if expanded { "Collapse" } else { "Expand" },
+                    text.len()
+                ))
+                .on_click(toggle(owner, key)),
+        )
+        .when(expanded, |view| view.child(render()))
+        .into_any_element()
+}
+/// Plain output (compiler messages, grep hits, file contents) rendered through
+/// the kit's Markdown code block, which brings the code font, background,
+/// highlighting for a known language and copy support.
+fn code_block(text: &str, language: &str) -> impl IntoElement {
+    markdown_text(code_fence(text, language))
+}
+/// Wrap `text` in a fence longer than any backtick run it contains, so the
+/// block always closes where intended.
+fn code_fence(text: &str, language: &str) -> String {
+    let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    format!("{fence}{language}\n{text}\n{fence}\n")
+}
+/// Tools whose results are plain output rather than prose, with the language
+/// the code block should highlight. `None` keeps the Markdown rendering.
+fn result_language<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
+    match name {
+        "bash" | "eval" | "grep" | "glob" => Some("text"),
+        "read" | "write" | "edit" => Some(
+            text_field(input, "path")
+                .and_then(|path| path.rsplit_once('.'))
+                .map(|(_, extension)| extension)
+                .filter(|extension| {
+                    !extension.is_empty() && extension.chars().all(char::is_alphanumeric)
+                })
+                .unwrap_or("text"),
+        ),
+        _ => None,
+    }
+}
 /// What a tool card says about its call, derived from the tool name and input only.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ToolSummary {
@@ -482,15 +686,7 @@ pub fn tool_summary(name: &str, input: &Value) -> ToolSummary {
                 .or_else(|| text_field(input, "path"))
                 .map(str::to_owned),
         ),
-        "todo" => (
-            Lucide::ListTodo,
-            text_field(input, "op").map(|op| {
-                match text_field(input, "task").or_else(|| text_field(input, "phase")) {
-                    Some(subject) => format!("{op}  {subject}"),
-                    None => op.to_owned(),
-                }
-            }),
-        ),
+        "todo" => (Lucide::ListTodo, todo_list::describe_change(input)),
         "task" => (
             Lucide::Workflow,
             input["tasks"].as_array().map(|tasks| match tasks.len() {
@@ -572,6 +768,15 @@ fn tool_card(
         content: result,
         exit_code,
     } = result;
+    if name == "todo"
+        && outcome != ToolOutcome::Failed
+        && let Some(list) = result.iter().find_map(|block| match block {
+            ContentBlock::Text(text) => TodoList::parse(text),
+            _ => None,
+        })
+    {
+        return todo_card(key, call, &list, outcome, owner, cx);
+    }
     let summary = tool_summary(name, input);
     let has_result = !result.is_empty() || exit_code.is_some();
     let expanded = outcome == ToolOutcome::Failed || is_expanded(owner, &key, cx);
@@ -655,12 +860,187 @@ fn tool_card(
         if let Some(code) = exit_code.filter(|code| *code != 0 || outcome == ToolOutcome::Failed) {
             output = output.child(mono(cx).child(format!("Exit code {code}")));
         }
+        let language = result_language(name, input);
         for (index, block) in result.iter().enumerate() {
-            output = output.child(self::block(block, format!("{key}:{index}"), owner, cx));
+            let identity = format!("{key}:{index}");
+            output = output.child(match (block, language) {
+                (ContentBlock::Text(text), Some(language)) => {
+                    guarded_text(identity, text, owner, cx, || {
+                        code_block(text, language).into_any_element()
+                    })
+                }
+                _ => self::block(block, identity, owner, cx),
+            });
         }
         card = card.child(output);
     }
     card.into_any_element()
+}
+
+/// A `todo` call whose result parsed: what changed, OMP's tally and the
+/// checklist. A new or blocked list opens by default; other changes fold the
+/// list behind the disclosure so a run of `done` calls stays short.
+fn todo_card(
+    key: String,
+    call: ToolCall<'_>,
+    list: &TodoList,
+    outcome: ToolOutcome,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    let ToolCall {
+        name,
+        intent,
+        input,
+    } = call;
+    let change = todo_list::describe_change(input).unwrap_or_else(|| name.to_owned());
+    let open_by_default = matches!(text_field(input, "op"), Some("init" | "block"));
+    let open = open_by_default != is_expanded(owner, &key, cx);
+    let (done, total) = list.progress();
+    let tally = list
+        .overall
+        .clone()
+        .unwrap_or_else(|| format!("{done}/{total} done"));
+    let header = h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(
+            Icon::new(Lucide::ListTodo)
+                .xsmall()
+                .text_color(cx.theme().muted_foreground),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(intent.unwrap_or(name).to_owned()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(tally),
+        )
+        .when(outcome == ToolOutcome::Running, |row| {
+            row.child(Spinner::new().xsmall())
+        })
+        .child(disclosure(
+            key.clone(),
+            open,
+            owner,
+            if open { "Hide tasks" } else { "Show tasks" },
+        ));
+    v_flex()
+        .id(SharedString::from(format!("{key}:card")))
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .p_3()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().muted)
+        .on_click(toggle(owner, key.clone()))
+        .child(header)
+        .child(div().text_sm().child(change))
+        .when(open, |card| card.child(todo_checklist(list, cx)))
+        .into_any_element()
+}
+fn todo_checklist(list: &TodoList, cx: &App) -> Div {
+    let mut column = v_flex()
+        .gap_1()
+        .pt_2()
+        .mt_1()
+        .border_t_1()
+        .border_color(cx.theme().border);
+    for phase in &list.phases {
+        let active = list.active_phase.as_deref() == Some(phase.name.as_str());
+        let (done, total) = phase.progress();
+        column = column.child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .pt_1()
+                .text_xs()
+                .text_color(if active {
+                    cx.theme().foreground
+                } else {
+                    cx.theme().muted_foreground
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(phase.name.clone()),
+                )
+                .child(div().child(format!("{done}/{total}"))),
+        );
+        for task in &phase.tasks {
+            let (icon, icon_color, text_color, dropped) = match &task.status {
+                TodoStatus::Completed => (
+                    Lucide::SquareCheck,
+                    cx.theme().muted_foreground,
+                    cx.theme().muted_foreground,
+                    false,
+                ),
+                TodoStatus::InProgress => (
+                    Lucide::SquareDot,
+                    cx.theme().primary,
+                    cx.theme().foreground,
+                    false,
+                ),
+                TodoStatus::Pending => (
+                    Lucide::Square,
+                    cx.theme().muted_foreground,
+                    cx.theme().foreground,
+                    false,
+                ),
+                TodoStatus::Dropped => (
+                    Lucide::SquareMinus,
+                    cx.theme().muted_foreground,
+                    cx.theme().muted_foreground,
+                    true,
+                ),
+                TodoStatus::Blocked(_) => (
+                    Lucide::Ban,
+                    cx.theme().warning,
+                    cx.theme().foreground,
+                    false,
+                ),
+            };
+            let mut body = v_flex().flex_1().min_w_0().child(
+                div()
+                    .text_color(text_color)
+                    .when(dropped, |text| text.line_through())
+                    .child(task.content.clone()),
+            );
+            if let TodoStatus::Blocked(reason) = &task.status {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(reason.clone()),
+                );
+            }
+            column = column.child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .pt_0p5()
+                            .child(Icon::new(icon).xsmall().text_color(icon_color)),
+                    )
+                    .child(body),
+            );
+        }
+    }
+    column
 }
 
 fn tool_call_row(
@@ -716,6 +1096,28 @@ fn tool_call_row(
     tool_card(key, call, result, owner, cx)
 }
 
+/// OMP injects `<system-reminder>` nudges, `<irc>` relays and `<critical>`
+/// mode notes as `custom` messages for the model's benefit; the transcript
+/// hides them. The role check keeps the same text visible when a user pastes it.
+fn harness_note_hidden(message: &Message) -> bool {
+    const HIDDEN: [(&str, &str); 3] = [
+        ("<system-reminder>", "</system-reminder>"),
+        ("<irc>", "</irc>"),
+        ("<critical>", "</critical>"),
+    ];
+    message.role == "custom"
+        && !message.content.is_empty()
+        && message.content.iter().all(|block| match block {
+            ContentBlock::Text(text) => {
+                let text = text.trim();
+                HIDDEN
+                    .iter()
+                    .any(|(open, close)| text.starts_with(open) && text.ends_with(close))
+            }
+            _ => false,
+        })
+}
+
 fn message(
     message: Arc<Message>,
     id: ThreadId,
@@ -748,6 +1150,9 @@ fn message(
             owner,
             cx,
         ));
+    }
+    if harness_note_hidden(&message) {
+        return div().into_any_element();
     }
     let user_message = message.role == "user";
     let raw_key = format!("raw:{id}:{}", message.id);
@@ -833,6 +1238,19 @@ fn message(
                 has_images = true;
                 images = images.child(block(item, identity, owner, cx));
             }
+            ContentBlock::Text(text) if message.role == "custom" => match JobNotice::parse(text) {
+                Some(notice) => {
+                    for job in &notice.jobs {
+                        body = body.child(job_card(
+                            format!("job:{id}:{}:{}", message.id, job.id),
+                            job,
+                            owner,
+                            cx,
+                        ));
+                    }
+                }
+                None => body = body.child(block(item, identity, owner, cx)),
+            },
             _ => body = body.child(block(item, identity, owner, cx)),
         }
     }
@@ -863,6 +1281,205 @@ fn message(
             .child(actions)
             .child(body),
     )
+}
+
+/// One finished background job from a `<system-notice>`: a task agent's report
+/// or a shell command's output. A structured report opens by default; raw
+/// output folds behind the disclosure like any tool result.
+fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &App) -> AnyElement {
+    let structured = matches!(job.output, JobOutput::Structured(_));
+    let has_output = !matches!(job.output, JobOutput::Empty);
+    let open = has_output && (structured != is_expanded(owner, &key, cx));
+    let status: Option<AnyElement> = job.status.as_deref().map(|status| {
+        let lowered = status.to_ascii_lowercase();
+        let tag = if lowered == "completed" {
+            Tag::success()
+        } else if lowered.contains("fail") || lowered.contains("error") {
+            Tag::danger()
+        } else {
+            Tag::secondary()
+        };
+        tag.small().child(status.to_owned()).into_any_element()
+    });
+    let mut header = h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(
+            Icon::new(if job.agent.is_some() {
+                Lucide::Workflow
+            } else {
+                Lucide::Terminal
+            })
+            .xsmall()
+            .text_color(cx.theme().muted_foreground),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(format!("Background job {}", job.id)),
+        );
+    for detail in [job.agent.as_deref(), job.duration.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        header = header.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(detail.to_owned()),
+        );
+    }
+    header = header.when_some(status, |row, status| row.child(status));
+    if has_output {
+        header = header.child(disclosure(
+            key.clone(),
+            open,
+            owner,
+            if open { "Hide output" } else { "Show output" },
+        ));
+    }
+    let mut card = v_flex()
+        .id(SharedString::from(format!("{key}:card")))
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .p_3()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().muted)
+        .child(header);
+    if has_output {
+        card = card.on_click(toggle(owner, key.clone()));
+    }
+    if !has_output {
+        card = card.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("No output"),
+        );
+    }
+    if open {
+        let mut output = v_flex()
+            .gap_2()
+            .pt_2()
+            .mt_1()
+            .border_t_1()
+            .border_color(cx.theme().border);
+        if let Some(full) = &job.full_output {
+            output = output.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("Preview only; the full output is at {full}")),
+            );
+        }
+        output = match &job.output {
+            JobOutput::Structured(value) => output.child(structured_view(value, 0, cx)),
+            JobOutput::Text(text) => {
+                let language = if text.trim_start().starts_with(['{', '[']) {
+                    "json"
+                } else {
+                    "text"
+                };
+                output.child(guarded_text(
+                    format!("{key}:output"),
+                    text,
+                    owner,
+                    cx,
+                    || code_block(text, language).into_any_element(),
+                ))
+            }
+            JobOutput::Empty => output,
+        };
+        card = card.child(output);
+    }
+    card.into_any_element()
+}
+/// Generic reading view for a job's JSON report: keys become captions, strings
+/// render as Markdown, string lists as bullets, nested objects indent. Beyond a
+/// few levels the raw JSON is shown so nothing is hidden.
+fn structured_view(value: &Value, depth: usize, cx: &App) -> AnyElement {
+    const MAX_DEPTH: usize = 3;
+    match value {
+        Value::Object(fields) if depth < MAX_DEPTH && !fields.is_empty() => {
+            let mut column = v_flex().gap_2().min_w_0();
+            for (key, value) in fields {
+                let caption = humanise_key(key);
+                column = column.child(
+                    v_flex()
+                        .gap_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(caption),
+                        )
+                        .child(structured_view(value, depth + 1, cx)),
+                );
+            }
+            column.into_any_element()
+        }
+        Value::Array(items)
+            if depth < MAX_DEPTH
+                && !items.is_empty()
+                && items.iter().all(|item| item.is_string()) =>
+        {
+            let list = items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| format!("- {}", item.replace('\n', "\n  ")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            markdown_text(list).into_any_element()
+        }
+        Value::Array(items)
+            if depth < MAX_DEPTH
+                && !items.is_empty()
+                && items.iter().all(|item| item.is_object()) =>
+        {
+            let mut column = v_flex().gap_2().min_w_0();
+            for item in items {
+                column = column.child(
+                    div()
+                        .pl_3()
+                        .border_l_1()
+                        .border_color(cx.theme().border)
+                        .child(structured_view(item, depth + 1, cx)),
+                );
+            }
+            column.into_any_element()
+        }
+        Value::String(text) => markdown_text(text.clone()).into_any_element(),
+        Value::Null => div()
+            .text_color(cx.theme().muted_foreground)
+            .child("None")
+            .into_any_element(),
+        Value::Bool(_) | Value::Number(_) => mono(cx).child(value.to_string()).into_any_element(),
+        Value::Object(_) | Value::Array(_) => code_block(
+            &serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+            "json",
+        )
+        .into_any_element(),
+    }
+}
+/// `tests_added` → `Tests added`, `main_required` → `Main required`.
+fn humanise_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for (index, ch) in key.chars().enumerate() {
+        let ch = if ch == '_' || ch == '-' { ' ' } else { ch };
+        if index == 0 {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn request_card(
@@ -1039,11 +1656,167 @@ pub fn welcome(state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> Any
         .into_any_element()
 }
 
-pub fn render(
+pub(super) fn render(
+    state: &AppState,
+    id: ThreadId,
+    owner: &WeakEntity<Workspace>,
+    scroll: &ScrollHandle,
+    transcript: &Entity<TranscriptView>,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .items_stretch()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .child(render_content(state, id, owner, scroll, transcript, cx)),
+        )
+        .child(diff_sidebar(state, id, owner, cx))
+        .into_any_element()
+}
+
+fn diff_sidebar(
+    state: &AppState,
+    id: ThreadId,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    let open = state.conversation_diff_open(id);
+    let toggle = button(
+        "toggle-conversation-diffs",
+        Command::ToggleConversationDiffs,
+        owner,
+        state,
+    )
+    .label("")
+    .icon(if open {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronLeft
+    })
+    .tooltip(if open { "Hide changes" } else { "Show changes" })
+    .debug_selector(|| "toggle-conversation-diffs".into());
+    if !open {
+        return v_flex()
+            .w(rems(2.5))
+            .h_full()
+            .flex_shrink_0()
+            .items_center()
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .pt_2()
+            .child(toggle)
+            .into_any_element();
+    }
+    let diff = state.conversation_diff(id);
+    let loading = diff.is_none_or(|diff| diff.loading);
+    let result = diff.and_then(|diff| diff.result.as_ref());
+    let summary = match result {
+        Some(Ok(diff)) if diff.changed_files > 0 => format!(
+            "{} files · +{} −{}",
+            diff.changed_files, diff.additions, diff.deletions
+        ),
+        Some(Ok(_)) => "Working tree clean".to_owned(),
+        Some(Err(_)) => "Changes unavailable".to_owned(),
+        None if loading => "Loading changes…".to_owned(),
+        None => "Changes not loaded".to_owned(),
+    };
+    let mut body = v_flex()
+        .id("conversation-diff-sidebar")
+        .debug_selector(|| "conversation-diff-sidebar".into())
+        .w(rems(22.))
+        .max_w(relative(0.4))
+        .h_full()
+        .min_w_0()
+        .min_h_0()
+        .flex_shrink_0()
+        .border_l_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().sidebar)
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .px_2()
+                .py_1()
+                .child(Label::new("Changes").secondary(summary))
+                .child(div().flex_1())
+                .when(loading, |row| row.child(Spinner::new().xsmall()))
+                .child(
+                    button(
+                        "refresh-conversation-diff",
+                        Command::RefreshConversationDiff,
+                        owner,
+                        state,
+                    )
+                    .label("Refresh")
+                    .debug_selector(|| "refresh-conversation-diff".into()),
+                )
+                .child(toggle),
+        );
+    body = body.child(match result {
+        Some(Ok(diff)) if diff.patch.is_empty() => div()
+            .flex_1()
+            .p_3()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("No uncommitted changes")
+            .into_any_element(),
+        Some(Ok(diff)) => div()
+            .id("conversation-diff-patch")
+            .debug_selector(|| "conversation-diff-patch".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_2()
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(cx.theme().mono_font_size)
+            .whitespace_normal()
+            .child(diff.patch.clone())
+            .into_any_element(),
+        Some(Err(error)) => v_flex()
+            .flex_1()
+            .gap_2()
+            .p_3()
+            .text_sm()
+            .child(
+                Alert::error(
+                    "conversation-diff-error",
+                    format!("Changes could not be read: {error}"),
+                )
+                .small(),
+            )
+            .child("Retry after restoring access to the working tree.")
+            .into_any_element(),
+        None => div()
+            .flex_1()
+            .p_3()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(if loading {
+                "Reading working tree changes…"
+            } else {
+                "Open or refresh this conversation to read changes."
+            })
+            .into_any_element(),
+    });
+    body.into_any_element()
+}
+
+fn render_content(
     state: &AppState,
     id: ThreadId,
     owner: &WeakEntity<Workspace>,
     _scroll: &ScrollHandle,
+    transcript: &Entity<TranscriptView>,
     cx: &App,
 ) -> AnyElement {
     let drop_owner = owner.clone();
@@ -1100,27 +1873,12 @@ pub fn render(
             ));
         }
         statuses = session.statuses.values().cloned().collect();
-        let state_entity = owner.upgrade().map(|owner| owner.read(cx).state.clone());
-        let history_owner = owner.clone();
         root = root.child(
-            list(session.list.clone(), move |index, _, cx| {
-                let cx: &App = cx;
-                let Some(state) = state_entity.as_ref().map(|state| state.read(cx)) else {
-                    return div().into_any_element();
-                };
-                let Some(session) = state.conversations.get(&id) else {
-                    return div().into_any_element();
-                };
-                let active = state.active_threads.contains(&id);
-                session
-                    .messages
-                    .get(index)
-                    .cloned()
-                    .map(|current| message(current, id, session, active, &history_owner, cx))
-                    .unwrap_or_else(|| div().into_any_element())
-            })
-            .flex_1()
-            .min_h(rems(4.)),
+            div().relative().flex_1().min_h(rems(4.)).min_w_0().child(
+                transcript
+                    .clone()
+                    .cached(StyleRefinement::default().absolute().size_full()),
+            ),
         );
         for request in session.requests.values() {
             root = root.child(inset(request_card(id, request, owner, cx)));
@@ -1180,9 +1938,16 @@ pub fn render(
         }
     } else {
         root = root.child(div().flex_1().p_4().child(if thread.archived {
-            "Archived conversation has no provider history."
+            "Archived conversation has no provider history.".into()
         } else {
-            "Opening native OMP session…"
+            format!(
+                "Opening {} session…",
+                if thread.harness == "claude-code" {
+                    "Claude Code"
+                } else {
+                    "OMP"
+                }
+            )
         }));
     }
     // A submission that is simply in flight is already visible through the
@@ -1265,6 +2030,7 @@ pub fn render(
     let mut composer = v_flex()
         .id("composer-content")
         .debug_selector(|| "composer-content".into())
+        .test_support()
         .min_h_0();
     let mut previews = h_flex()
         .id("draft-attachments")
@@ -1394,7 +2160,7 @@ pub fn render(
                     )
                 }),
         );
-    // OMP's status bar (context use, mode, …) sits where Zed shows its mode text.
+    // The harness status line sits where Zed shows its mode text.
     controls = controls.child(
         div()
             .flex_1()
@@ -1521,8 +2287,92 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
-    use super::{Lucide, SUMMARY_LIMIT, ToolSummary, Value, tool_summary};
+    use super::{
+        ContentBlock, Lucide, Message, SUMMARY_LIMIT, ToolSummary, Value, code_fence,
+        harness_note_hidden, humanise_key, result_language, tool_summary,
+    };
     use serde_json::json;
+
+    fn custom(role: &str, text: &str) -> Message {
+        Message {
+            id: "m".into(),
+            role: role.into(),
+            content: vec![ContentBlock::Text(text.into())],
+            raw: None,
+            tool_call_id: None,
+            error: false,
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn code_fences_outrun_backticks_inside_the_text() {
+        assert_eq!(code_fence("a\nb\n", "text"), "```text\na\nb\n```\n");
+        assert_eq!(
+            code_fence("see ```rust\nfn x() {}\n```", "text"),
+            "````text\nsee ```rust\nfn x() {}\n```\n````\n"
+        );
+        assert_eq!(code_fence("", "json"), "```json\n\n```\n");
+    }
+
+    #[test]
+    fn plain_output_tools_get_a_code_block_in_the_file_language() {
+        assert_eq!(result_language("bash", &Value::Null), Some("text"));
+        assert_eq!(
+            result_language("read", &json!({"path":"src/main.rs"})),
+            Some("rs")
+        );
+        assert_eq!(
+            result_language("read", &json!({"path":"Makefile"})),
+            Some("text")
+        );
+        assert_eq!(
+            result_language("write", &json!({"path":"notes.tar.gz"})),
+            Some("gz")
+        );
+        assert_eq!(result_language("task", &Value::Null), None);
+        assert_eq!(result_language("web_search", &Value::Null), None);
+    }
+
+    #[test]
+    fn report_keys_read_as_captions() {
+        assert_eq!(humanise_key("tests_added"), "Tests added");
+        assert_eq!(humanise_key("main-required"), "Main required");
+        assert_eq!(humanise_key("Summary"), "Summary");
+        assert_eq!(humanise_key(""), "");
+    }
+
+    #[test]
+    fn harness_notes_hide_only_when_injected_by_the_harness() {
+        assert!(harness_note_hidden(&custom(
+            "custom",
+            "<system-reminder>\n2 todo items still open.\n</system-reminder>"
+        )));
+        assert!(harness_note_hidden(&custom(
+            "custom",
+            "<irc>\nIncoming IRC message from agent `Review`:\n</irc>\n"
+        )));
+        assert!(harness_note_hidden(&custom(
+            "custom",
+            "<critical>\nPlan mode active.\n</critical>"
+        )));
+        // The same text typed by the user, or a notice the harness wants shown, stays.
+        assert!(!harness_note_hidden(&custom(
+            "user",
+            "<system-reminder>look</system-reminder>"
+        )));
+        assert!(!harness_note_hidden(&custom(
+            "custom",
+            "<system-notice>\nBackground job bg_1 has completed.\n</system-notice>"
+        )));
+        assert!(!harness_note_hidden(&custom(
+            "custom",
+            "<irc>partial</irc> and a trailing remark"
+        )));
+        let mut empty = custom("custom", "");
+        empty.content.clear();
+        assert!(!harness_note_hidden(&empty));
+    }
 
     #[test]
     fn tool_summary_prefers_command_path_pattern_and_falls_back_to_json() {

@@ -1,13 +1,18 @@
 use super::commands::PasteImage;
 use crate::model::{DraftKey, DraftRevision, DraftSnapshot};
-use crate::neovim::grid::{GridSnapshot, Highlight, HighlightedChunk};
+use crate::neovim::grid::{Cell, GridSnapshot, Highlight, HighlightedChunk};
 use crate::neovim::{ClipboardContent, NvimCommand, NvimEditor, NvimEvent};
 use gpui_kit::{
     component::{ActiveTheme, alert::Alert, label::Label},
     prelude::*,
     *,
 };
-use std::{collections::VecDeque, ops::Range, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    ops::Range,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Debug)]
 pub enum NvimViewEvent {
@@ -47,10 +52,105 @@ struct PaintedText {
     line: ShapedLine,
 }
 
+/// Each cell is shaped independently. Only compatible, undecorated layouts are
+/// combined: glyph positions stay relative to Neovim columns, not text advances.
+struct GridText {
+    origin: Point<Pixels>,
+    layout: LineLayout,
+    decorations: Vec<DecorationRun>,
+}
+
+enum RowText {
+    Batched(GridText),
+    Decorated(usize),
+}
+
+#[derive(Default)]
+struct RowShape {
+    texts: Vec<RowText>,
+    // Indexed in paint order: avoid a large common variant or a box per cell.
+    decorated: Vec<PaintedText>,
+    backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
+}
+
+struct RowCacheKey {
+    font: Font,
+    font_size: Pixels,
+    cell: Size<Pixels>,
+    viewport: Size<Pixels>,
+    scale_factor: f32,
+    cols: usize,
+    theme: [u32; 4],
+    defaults: [u32; 3],
+    highlights: Arc<HashMap<u64, Highlight>>,
+}
+
+impl PartialEq for RowCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.font == other.font
+            && self.font_size == other.font_size
+            && self.cell == other.cell
+            && self.viewport == other.viewport
+            && self.scale_factor == other.scale_factor
+            && self.cols == other.cols
+            && self.theme == other.theme
+            && self.defaults == other.defaults
+            && Arc::ptr_eq(&self.highlights, &other.highlights)
+    }
+}
+
+struct CachedRow {
+    // Retain the allocation so a recycled pointer cannot hit a stale shape.
+    _source: Arc<Vec<Cell>>,
+    shape: Arc<RowShape>,
+    visible: bool,
+}
+
+#[derive(Default)]
+struct RowCache {
+    key: Option<RowCacheKey>,
+    rows: HashMap<usize, CachedRow>,
+}
+
+impl RowCache {
+    fn prepare(
+        &mut self,
+        key: RowCacheKey,
+        rows: &[Arc<Vec<Cell>>],
+        mut shape: impl FnMut(&[Cell]) -> RowShape,
+    ) -> Vec<Arc<RowShape>> {
+        if self.key.as_ref() != Some(&key) {
+            self.rows = HashMap::new();
+            self.key = Some(key);
+        }
+        for cached in self.rows.values_mut() {
+            cached.visible = false;
+        }
+        let result = rows
+            .iter()
+            .map(|row| {
+                let cached = self
+                    .rows
+                    .entry(Arc::as_ptr(row) as usize)
+                    .or_insert_with(|| CachedRow {
+                        _source: Arc::clone(row),
+                        shape: Arc::new(shape(row)),
+                        visible: false,
+                    });
+                cached.visible = true;
+                Arc::clone(&cached.shape)
+            })
+            .collect();
+        // Scrolled-out rows are not an unbounded history of shaped text.
+        self.rows.retain(|_, cached| cached.visible);
+        result
+    }
+}
+
 struct Frame {
     overlays: Vec<PaintedText>,
     texts: Vec<PaintedText>,
-    backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
+    rows: Vec<Arc<RowShape>>,
     cmd_cursor: Option<Point<Pixels>>,
     cmd_layout: Option<(ShapedLine, Point<Pixels>, usize)>,
 }
@@ -75,8 +175,10 @@ pub struct NvimView {
     cell: Size<Pixels>,
     font_size: Pixels,
     font: Font,
+    scale_factor: f32,
     theme_colors: Option<[u32; 4]>,
     frame: Option<Frame>,
+    row_cache: RowCache,
     requested_size: Option<(u32, u32)>,
     blink_epoch: Instant,
     blink_timer: Option<Task<()>>,
@@ -113,9 +215,35 @@ impl NvimView {
         ];
         let receiver = editor.events.clone();
         let events = cx.spawn(async move |this, cx| {
-            while let Ok(event) = receiver.recv().await {
-                if this.update(cx, |this, cx| this.receive(event, cx)).is_err() {
-                    break;
+            while let Ok(first) = receiver.recv().await {
+                let mut exhausted = false;
+                if this
+                    .update(cx, |this, cx| {
+                        let started = Instant::now();
+                        let mut count = 1;
+                        this.receive(first, cx);
+                        loop {
+                            if count >= 64 || started.elapsed() >= Duration::from_millis(2) {
+                                exhausted = true;
+                                break;
+                            }
+                            let Ok(event) = receiver.try_recv() else {
+                                break;
+                            };
+                            // Never coalesce semantic events across a grid, draft activation,
+                            // clipboard callback or composition acknowledgment.
+                            this.receive(event, cx);
+                            count += 1;
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if exhausted {
+                    // A ready channel never yields by itself. Return to the native
+                    // event loop before consuming more, so key input cannot starve.
+                    smol::Timer::after(Duration::from_millis(1)).await;
                 }
             }
             let _ = this.update(cx, |this, cx| {
@@ -143,8 +271,10 @@ impl NvimView {
             cell: size(cx.theme().mono_font_size, cx.theme().mono_font_size),
             font_size: cx.theme().mono_font_size,
             font: font(cx.theme().mono_font_family.clone()),
+            scale_factor: window.scale_factor(),
             theme_colors: None,
             frame: None,
+            row_cache: RowCache::default(),
             requested_size: None,
             blink_epoch: Instant::now(),
             bell: 0,
@@ -655,10 +785,8 @@ impl NvimView {
             u32::from(background.blend(theme.caret.to_rgb())) >> 8,
         ];
         let font = font(theme.mono_font_family.clone());
-        if self.font != font {
-            self.font = font;
-            self.frame = None;
-        }
+        let font_changed = self.font != font;
+        self.font = font;
         if self.ready
             && self.theme_colors != Some(colors)
             && self.send(
@@ -674,29 +802,80 @@ impl NvimView {
             self.theme_colors = Some(colors);
         }
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-        let cell_height = window.line_height();
-        if self.frame.is_none()
+        let cell_height = window.line_height().max(px(1.));
+        let scale_factor = window.scale_factor();
+        let metrics_changed = font_changed
             || font_size != self.font_size
             || cell_height != self.cell.height
+            || scale_factor != self.scale_factor
+            || self.bounds.is_none()
             || self
-                .bounds
-                .is_none_or(|previous| previous.size != bounds.size)
-        {
+                .row_cache
+                .key
+                .as_ref()
+                .is_none_or(|key| key.highlights.get(&0) != self.grid.highlights.get(&0));
+        if metrics_changed {
             self.font_size = font_size;
+            self.scale_factor = scale_factor;
             let run = text_run(&self.grid, &self.font, 0, 1);
             let width = window
                 .text_system()
                 .shape_line("M".into(), font_size, &[run], None)
                 .width();
-            self.cell = size(width.max(px(1.)), cell_height.max(px(1.)));
-            let visible_rows = (bounds.size.height / self.cell.height).floor().max(1.) as usize;
+            self.cell = size(width.max(px(1.)), cell_height);
+        }
+        if self.frame.is_none()
+            || metrics_changed
+            || self
+                .row_cache
+                .key
+                .as_ref()
+                .is_none_or(|key| key.theme != colors)
+            || self
+                .bounds
+                .is_none_or(|previous| previous.size != bounds.size)
+        {
+            let key = RowCacheKey {
+                font: self.font.clone(),
+                font_size,
+                cell: self.cell,
+                viewport: bounds.size,
+                scale_factor,
+                cols: self.grid.cols,
+                theme: colors,
+                defaults: [
+                    self.grid.default_fg,
+                    self.grid.default_bg,
+                    self.grid.default_sp,
+                ],
+                highlights: Arc::clone(&self.grid.highlights),
+            };
+            // Include a partly visible bottom row, but never shape offscreen rows.
+            let row_count = self
+                .grid
+                .rows
+                .len()
+                .min((bounds.size.height / self.cell.height).ceil().max(0.) as usize);
+            let visible_cols = (bounds.size.width / self.cell.width).ceil().max(0.) as usize;
+            let rows = self
+                .row_cache
+                .prepare(key, &self.grid.rows[..row_count], |row| {
+                    shape_row(
+                        &row[..row.len().min(visible_cols)],
+                        &self.grid,
+                        &self.font,
+                        self.cell,
+                        font_size,
+                        window.text_system(),
+                    )
+                });
             self.frame = Some(make_frame(
                 &self.grid,
                 &self.font,
                 self.cell,
                 font_size,
-                visible_rows,
-                bounds.size.width,
+                bounds.size,
+                rows,
                 window,
             ));
         }
@@ -763,11 +942,41 @@ impl NvimView {
                 rgb(self.grid.default_bg).into()
             };
             window.paint_quad(fill(bounds, background));
-            for (rect, color) in &frame.backgrounds {
-                window.paint_quad(fill(
-                    Bounds::new(bounds.origin + rect.origin, rect.size),
-                    *color,
-                ));
+            // Backgrounds precede all glyphs, including overhangs from other rows.
+            for (row_index, row) in frame.rows.iter().enumerate() {
+                let origin = bounds.origin + point(px(0.), self.cell.height * row_index as f32);
+                for (rect, color) in &row.backgrounds {
+                    window.paint_quad(fill(Bounds::new(origin + rect.origin, rect.size), *color));
+                }
+            }
+            for (row_index, row) in frame.rows.iter().enumerate() {
+                let origin = bounds.origin + point(px(0.), self.cell.height * row_index as f32);
+                for text in &row.texts {
+                    match text {
+                        RowText::Batched(text) => {
+                            let _ = text.layout.paint(
+                                origin + text.origin,
+                                self.cell.height,
+                                TextAlign::Left,
+                                None,
+                                &text.decorations,
+                                window,
+                                cx,
+                            );
+                        }
+                        RowText::Decorated(index) => {
+                            let text = &row.decorated[*index];
+                            let _ = text.line.paint(
+                                origin + text.origin,
+                                self.cell.height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                }
             }
             for text in &frame.texts {
                 let _ = text.line.paint_background(
@@ -1673,55 +1882,144 @@ fn shape_chunks(
         .shape_line(text.into(), font_size, &runs, None)
 }
 
+impl GridText {
+    fn append(&mut self, origin: Point<Pixels>, line: &LineLayout, color: Hsla) {
+        let offset = origin.x - self.origin.x;
+        let byte_offset = self.layout.len;
+        for run in &line.runs {
+            if self
+                .layout
+                .runs
+                .last()
+                .is_none_or(|last| last.font_id != run.font_id)
+            {
+                self.layout.runs.push(ShapedRun {
+                    font_id: run.font_id,
+                    glyphs: Vec::with_capacity(run.glyphs.len()),
+                });
+            }
+            // The run was just inserted if absent.
+            if let Some(destination) = self.layout.runs.last_mut() {
+                destination.glyphs.extend(run.glyphs.iter().map(|glyph| {
+                    let mut glyph = glyph.clone();
+                    glyph.position.x += offset;
+                    glyph.index += byte_offset;
+                    glyph
+                }));
+            }
+        }
+        self.layout.width = self.layout.width.max(offset + line.width);
+        self.layout.len += line.len;
+        if let Some(decoration) = self.decorations.last_mut()
+            && decoration.color == color
+        {
+            decoration.len += line.len as u32;
+        } else {
+            self.decorations.push(DecorationRun {
+                len: line.len as u32,
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+    }
+}
+
+impl RowShape {
+    fn push_text(&mut self, origin: Point<Pixels>, line: ShapedLine, run: TextRun) {
+        if run.underline.is_some() || run.strikethrough.is_some() {
+            // Retain exact per-cell decoration extent, including overhang and
+            // fallback metrics. A concatenated underline would cross grid gaps.
+            self.texts.push(RowText::Decorated(self.decorated.len()));
+            self.decorated.push(PaintedText { origin, line });
+            return;
+        }
+        if let Some(RowText::Batched(batch)) = self.texts.last_mut()
+            && batch.layout.ascent == line.ascent
+            && batch.layout.descent == line.descent
+        {
+            batch.append(origin, &line, run.color);
+            return;
+        }
+        let mut batch = GridText {
+            origin,
+            layout: LineLayout {
+                font_size: line.font_size,
+                ascent: line.ascent,
+                descent: line.descent,
+                ..LineLayout::default()
+            },
+            decorations: Vec::new(),
+        };
+        batch.append(origin, &line, run.color);
+        self.texts.push(RowText::Batched(batch));
+    }
+}
+
+fn shape_row(
+    row: &[Cell],
+    grid: &GridSnapshot,
+    font: &Font,
+    cell: Size<Pixels>,
+    font_size: Pixels,
+    text_system: &WindowTextSystem,
+) -> RowShape {
+    let mut shape = RowShape::default();
+    let default_background = rgb(grid.default_bg).into();
+    for (column, value) in row.iter().enumerate() {
+        let origin = point(cell.width * column as f32, px(0.));
+        let background = colors(grid, value.hl_id).1;
+        if background != default_background {
+            if let Some((rect, previous)) = shape.backgrounds.last_mut()
+                && *previous == background
+                && rect.right() == origin.x
+            {
+                rect.size.width += cell.width;
+            } else {
+                shape
+                    .backgrounds
+                    .push((Bounds::new(origin, cell), background));
+            }
+        }
+        let decorated = grid.highlights.get(&value.hl_id).is_some_and(|highlight| {
+            highlight.underline || highlight.undercurl || highlight.strikethrough
+        });
+        if value.text.is_empty() || (!decorated && value.text == " ") {
+            continue;
+        }
+        // Shape the complete grapheme Neovim put in this cell, never a
+        // concatenated row. Wide continuation cells contribute no glyphs;
+        // combining marks, fallback fonts and emoji retain their shaped offsets.
+        let run = text_run(grid, font, value.hl_id, value.text.len());
+        let line = text_system.shape_line(
+            value.text.clone().into(),
+            font_size,
+            std::slice::from_ref(&run),
+            None,
+        );
+        shape.push_text(origin, line, run);
+    }
+    shape
+}
+
 fn make_frame(
     grid: &GridSnapshot,
     font: &Font,
     cell: Size<Pixels>,
     font_size: Pixels,
-    visible_rows: usize,
-    visible_width: Pixels,
+    viewport: Size<Pixels>,
+    rows: Vec<Arc<RowShape>>,
     window: &Window,
 ) -> Frame {
+    let visible_rows = (viewport.height / cell.height).floor().max(1.) as usize;
     let mut frame = Frame {
         texts: Vec::new(),
-        backgrounds: Vec::new(),
+        rows,
         overlays: Vec::new(),
         cmd_cursor: None,
         cmd_layout: None,
     };
-    for (row_index, row) in grid.rows.iter().enumerate() {
-        for (column, value) in row.iter().enumerate() {
-            let origin = point(cell.width * column as f32, cell.height * row_index as f32);
-            let background = colors(grid, value.hl_id).1;
-            if background != rgb(grid.default_bg).into() {
-                if let Some((rect, previous)) = frame.backgrounds.last_mut()
-                    && *previous == background
-                    && rect.top() == origin.y
-                    && rect.right() == origin.x
-                {
-                    rect.size.width += cell.width;
-                } else {
-                    frame
-                        .backgrounds
-                        .push((Bounds::new(origin, cell), background));
-                }
-            }
-            let decorated = grid.highlights.get(&value.hl_id).is_some_and(|highlight| {
-                highlight.underline || highlight.undercurl || highlight.strikethrough
-            });
-            if value.text.is_empty() || (!decorated && value.text == " ") {
-                continue;
-            }
-            // One Neovim cell can contain a base character plus combining marks;
-            // wide continuation cells never contribute independent glyphs or columns.
-            let run = text_run(grid, font, value.hl_id, value.text.len());
-            let line =
-                window
-                    .text_system()
-                    .shape_line(value.text.clone().into(), font_size, &[run], None);
-            frame.texts.push(PaintedText { origin, line });
-        }
-    }
     let strip_length = grid.cmdline_block.len() + grid.cmdline.len();
     let skip = strip_length.saturating_sub(visible_rows.saturating_sub(1));
     let mut row = grid.rows.len();
@@ -1747,7 +2045,7 @@ fn make_frame(
         let byte = byte_floor(&text, cmd.pos);
         let before = chunk_range(&cmd.content, 0..byte);
         let prefix_line = shape_chunks(grid, font, &before, &prefix, font_size, window);
-        let horizontal_scroll = (prefix_line.width() + cell.width - visible_width).max(px(0.));
+        let horizontal_scroll = (prefix_line.width() + cell.width - viewport.width).max(px(0.));
         let origin = point(-horizontal_scroll, cell.height * row as f32);
         let cursor = origin + point(prefix_line.width(), px(0.));
         let active = grid
@@ -1810,6 +2108,113 @@ fn chunk_range(chunks: &[HighlightedChunk], range: Range<usize>) -> Vec<Highligh
     result
 }
 
+#[cfg(test)]
+mod row_cache_tests {
+    use super::{Cell, GridSnapshot, Highlight, RowCache, RowCacheKey, RowShape};
+    use gpui_kit::{font, px, size};
+    use std::cell::Cell as Counter;
+    use std::sync::Arc;
+
+    fn key(grid: &GridSnapshot) -> RowCacheKey {
+        RowCacheKey {
+            font: font("monospace"),
+            font_size: px(14.),
+            cell: size(px(8.), px(18.)),
+            viewport: size(px(800.), px(400.)),
+            scale_factor: 2.,
+            cols: grid.cols,
+            theme: [0; 4],
+            defaults: [grid.default_fg, grid.default_bg, grid.default_sp],
+            highlights: Arc::clone(&grid.highlights),
+        }
+    }
+
+    #[test]
+    fn unchanged_and_scrolled_rows_reuse_shapes_but_evicted_rows_do_not() {
+        let a = Arc::new(vec![Cell {
+            text: "a".into(),
+            hl_id: 0,
+        }]);
+        let b = Arc::new(vec![Cell {
+            text: "b".into(),
+            hl_id: 0,
+        }]);
+        let mut grid = GridSnapshot {
+            cols: 1,
+            rows: vec![a.clone(), b.clone(), a.clone()],
+            ..GridSnapshot::default()
+        };
+        let mut cache = RowCache::default();
+        let calls = Counter::new(0);
+        let shape = |_: &[Cell]| {
+            calls.set(calls.get() + 1);
+            RowShape::default()
+        };
+        let first = cache.prepare(key(&grid), &grid.rows, shape);
+        assert_eq!(calls.get(), 2);
+        assert!(Arc::ptr_eq(&first[0], &first[2]));
+        grid.cursor = (1, 0);
+        let cursor = cache.prepare(key(&grid), &grid.rows, shape);
+        assert_eq!(calls.get(), 2);
+        assert!(Arc::ptr_eq(&first[0], &cursor[0]));
+        grid.rows.swap(0, 1);
+        let scrolled = cache.prepare(key(&grid), &grid.rows, shape);
+        assert_eq!(calls.get(), 2);
+        assert!(Arc::ptr_eq(&first[1], &scrolled[0]));
+        Arc::make_mut(&mut grid.rows[1])[0].text = "changed".into();
+        cache.prepare(key(&grid), &grid.rows, shape);
+        assert_eq!(calls.get(), 3);
+        // Only the visible slice is retained. Returning to an evicted row must
+        // shape it again rather than keeping a history of every visited row.
+        cache.prepare(key(&grid), &grid.rows[..1], shape);
+        cache.prepare(key(&grid), &[a], shape);
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[test]
+    fn geometry_font_theme_and_highlights_invalidate_retained_shapes() {
+        let grid = GridSnapshot {
+            cols: 1,
+            rows: vec![Arc::new(vec![Cell::default()])],
+            ..GridSnapshot::default()
+        };
+        let mut cache = RowCache::default();
+        let calls = Counter::new(0);
+        let shape = |_: &[Cell]| {
+            calls.set(calls.get() + 1);
+            RowShape::default()
+        };
+        let changes: &[fn(&mut RowCacheKey)] = &[
+            |key| key.font = font("another font"),
+            |key| key.font_size = px(15.),
+            |key| key.cell.width = px(9.),
+            |key| key.cell.height = px(20.),
+            |key| key.viewport.width = px(400.),
+            |key| key.scale_factor = 1.,
+            |key| key.cols = 2,
+            |key| key.theme[0] = 1,
+            |key| key.defaults[0] = 1,
+            |key| {
+                Arc::make_mut(&mut key.highlights).insert(
+                    0,
+                    Highlight {
+                        bold: true,
+                        ..Highlight::default()
+                    },
+                );
+            },
+        ];
+        for change in changes {
+            cache.prepare(key(&grid), &grid.rows, shape);
+            let before = calls.get();
+            let mut changed = key(&grid);
+            change(&mut changed);
+            cache.prepare(changed, &grid.rows, shape);
+            assert_eq!(calls.get(), before + 1);
+        }
+    }
+}
+
 #[cfg(all(test, feature = "runtime-qa"))]
 mod tests {
     use super::{DraftKey, Instant, NvimCommand, NvimEditor, NvimView};
@@ -1817,6 +2222,152 @@ mod tests {
     use gpui_kit::component::Root;
     use gpui_kit::{AppContext, Entity, EntityInputHandler, TestAppContext};
     use std::time::Duration;
+
+    #[gpui_kit::test]
+    fn batched_rows_preserve_independent_unicode_cell_geometry(cx: &mut TestAppContext) {
+        use super::{Cell, GridSnapshot, Highlight, RowText, shape_row, text_run};
+        use gpui_kit::{
+            FontId, GlyphId, Hsla, LineLayout, Pixels, Point, WindowTextSystem, font, point, px,
+            size,
+        };
+
+        fn glyphs(
+            layout: &LineLayout,
+            origin: Point<Pixels>,
+            color: impl Fn(usize) -> Hsla,
+        ) -> Vec<(FontId, GlyphId, Point<Pixels>, bool, Hsla)> {
+            let baseline = (px(22.) - layout.ascent - layout.descent) / 2. + layout.ascent;
+            layout
+                .runs
+                .iter()
+                .flat_map(|run| {
+                    let color = &color;
+                    run.glyphs.iter().map(move |glyph| {
+                        (
+                            run.font_id,
+                            glyph.id,
+                            origin + glyph.position + point(px(0.), baseline),
+                            glyph.is_emoji,
+                            color(glyph.index),
+                        )
+                    })
+                })
+                .collect()
+        }
+
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let font = font("Menlo");
+            let cell = size(px(9.), px(22.));
+            let mut grid = GridSnapshot::default();
+            let highlights = std::sync::Arc::make_mut(&mut grid.highlights);
+            highlights.insert(
+                1,
+                Highlight {
+                    foreground: Some(0xff0000),
+                    italic: true,
+                    ..Highlight::default()
+                },
+            );
+            highlights.insert(
+                2,
+                Highlight {
+                    underline: true,
+                    undercurl: true,
+                    strikethrough: true,
+                    ..Highlight::default()
+                },
+            );
+            // Deliberately non-natural cell width, ligature candidates, spaces,
+            // wide continuations, combining marks, emoji, RTL and fallback fonts.
+            let row: Vec<Cell> = [
+                ("f", 0),
+                ("i", 0),
+                (" ", 0),
+                ("界", 1),
+                ("", 1),
+                ("e\u{301}", 0),
+                ("🙂", 0),
+                ("", 0),
+                ("x", 2),
+                ("ג", 0),
+                ("A", 1),
+                (" ", 2),
+                ("_", 2),
+            ]
+            .into_iter()
+            .map(|(text, hl_id)| Cell {
+                text: text.into(),
+                hl_id,
+            })
+            .collect();
+            let mut expected = Vec::new();
+            let mut expected_decorations = Vec::new();
+            for (column, value) in row.iter().enumerate() {
+                let run = text_run(&grid, &font, value.hl_id, value.text.len());
+                let decorated = run.underline.is_some() || run.strikethrough.is_some();
+                if value.text.is_empty() || (!decorated && value.text == " ") {
+                    continue;
+                }
+                let line = text_system.shape_line(
+                    value.text.clone().into(),
+                    px(14.),
+                    std::slice::from_ref(&run),
+                    None,
+                );
+                let origin = point(cell.width * column as f32, px(0.));
+                expected.extend(glyphs(&line, origin, |_| run.color));
+                if decorated {
+                    expected_decorations.push((origin, line.width()));
+                }
+            }
+            let shape = shape_row(&row, &grid, &font, cell, px(14.), &text_system);
+            let mut actual = Vec::new();
+            let mut actual_decorations = Vec::new();
+            for text in &shape.texts {
+                match text {
+                    RowText::Batched(batch) => {
+                        actual.extend(glyphs(&batch.layout, batch.origin, |index| {
+                            let mut end = 0;
+                            batch
+                                .decorations
+                                .iter()
+                                .find_map(|decoration| {
+                                    end += decoration.len as usize;
+                                    (index < end).then_some(decoration.color)
+                                })
+                                .expect("every positioned glyph has a color")
+                        }))
+                    }
+                    RowText::Decorated(index) => {
+                        let text = &shape.decorated[*index];
+                        let column = (text.origin.x / cell.width).round() as usize;
+                        let run = text_run(&grid, &font, row[column].hl_id, text.line.len());
+                        actual.extend(glyphs(&text.line, text.origin, |_| run.color));
+                        actual_decorations.push((text.origin, text.line.width()));
+                    }
+                }
+            }
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(
+                    (actual.0, actual.1, actual.3, actual.4),
+                    (expected.0, expected.1, expected.3, expected.4)
+                );
+                assert!((actual.2.x - expected.2.x).abs() < px(0.001));
+                assert!((actual.2.y - expected.2.y).abs() < px(0.001));
+            }
+            assert_eq!(actual_decorations, expected_decorations);
+            assert!(
+                shape.texts.len()
+                    < row
+                        .iter()
+                        .filter(|cell| !cell.text.is_empty() && cell.text != " ")
+                        .count()
+            );
+        });
+    }
 
     async fn until(
         cx: &mut TestAppContext,

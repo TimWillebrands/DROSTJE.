@@ -35,13 +35,13 @@ Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor
 
 De standaardmap is `~/Library/Application Support/Drostje`. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
 
-Kies in Settings zo nodig expliciete executable-paden en de gedeelde Factory-data-root. OMP draait met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
+Kies in Settings zo nodig expliciete executable-paden, de Conversation-harness per project en de gedeelde Factory-data-root. OMP en Claude Code draaien met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
 
 ### Threads en werkruimte
 
 Projects bevat één gedeelde lijst met twee soorten threads:
 
-- **Conversation:** een interactieve OMP-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Elk project in de zijbalk heeft een `+` om direct een nieuwe Conversation voor dat project te starten. Het model kies je onderaan de composer.
+- **Conversation:** een interactieve OMP- of Claude Code-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Rechts toont een inklapbare zijbalk de actuele Git-wijzigingen terwijl een turn loopt; `Toggle conversation changes` en `Refresh conversation changes` staan ook in de command palette. Elk project in de zijbalk heeft een `+` om direct een nieuwe Conversation met de gekozen projectstandaard te starten. Het model kies je onderaan de composer.
 - **Factory:** parameters voor een bestaande Azure DevOps User Story of een bestaande PRD/issues-map. `Advanced` bevat de branch en het optionele thought level. `Start run` slaat de definitieve configuratie eerst op; een opslagfout start niets.
 
 Na de eerste duurzame launch wordt de Factory-thread een alleen-lezen monitor met native events, resultaten en ruwe details. Ook een geweigerde launch blijft als historie bewaard. Een volgende poging begint in een **nieuwe Factory-thread**. Er is geen taakpakket-generator, handoff vanuit een bericht of Factory-composer.
@@ -88,9 +88,9 @@ Toegevoegde en gewijzigde bestanden worden opnieuw geladen. Ontbreekt het gekoze
 
 GPUI Kit is vastgezet op `0.6.1`. De prompteditor vereist een geïnstalleerde Neovim met de benodigde embedded-RPC- en UI-API's; getest met **Neovim 0.12.3** op macOS. Het pad wordt via PATH ontdekt of expliciet in Settings opgegeven. DROSTJE. start Neovim zonder gebruikers-init, plugins, ShaDa, swap- of undobestanden en gebruikt alleen eigen scratchbuffers. Dit is geen OS-sandbox: expliciete Neovim-opdrachten draaien met je lokale rechten.
 
-De OMP-integratie is getest met `18.2.0` (native RPC v2); authenticatie en modeltoegang moeten al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
+De OMP-integratie is getest met `18.2.0` (native RPC v2). Claude Code gebruikt de streaming JSON-interface en vraagt toestemming voor tools in DROSTJE. zelf. Authenticatie en modeltoegang moeten voor de gekozen Conversation-harness al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
 
-`Check readiness` toont echte `factory doctor --harness …`-uitvoer. Een Factory-thread gebruikt `opencode` (standaard), `codex` of `claude-code`; interactieve Conversations blijven OMP gebruiken. Een ongeldige of niet-ondersteunde keuze blijft zichtbaar en moet vóór Start worden aangepast. DROSTJE. voert geen upgrades of authenticatie uit.
+`Check readiness` toont echte `factory doctor --harness …`-uitvoer. Een Conversation gebruikt per project `omp` (standaard) of `claude-code`; een Factory-thread gebruikt `opencode` (standaard), `codex` of `claude-code`. Een ongeldige of niet-ondersteunde keuze blijft zichtbaar en moet vóór de volgende Conversation of Factory-run worden aangepast. DROSTJE. voert geen upgrades of authenticatie uit.
 
 ```sh
 cargo check --all-targets
@@ -109,11 +109,21 @@ cargo test --features runtime-qa --lib workspace_actions_with_real_backends -- -
 cargo test --features runtime-qa --lib editor_startup_failure_and_restart_preserve_draft -- --ignored --nocapture
 cargo test --features runtime-qa --lib thread_workspace_keyboard_and_themes -- --ignored --nocapture
 cargo test --features runtime-qa --lib empty_workspace_actions_stay_compact -- --ignored --nocapture
+cargo test --features runtime-qa --lib conversation_diff_sidebar_tracks_working_tree -- --ignored --nocapture
 cargo test --features runtime-qa --lib orderly_quit_flushes_before_platform_deadline -- --ignored --nocapture
 cargo test --features runtime-qa --lib factory_start_requires_persisted_configuration -- --ignored --nocapture
 ```
 
-Deze scenario's versturen geen provider-turns en starten geen remote Factory-run. Ze controleren native draftwissels, nieuwe regels, bescherming tegen verouderde acknowledgements, openen/sluiten/herstellen van threadtabs, beide threadsoorten, palette-/focusgedrag, themawijzigingen, veilige afsluiting en de opslagbarrière vóór Factory Start.
+Deze scenario's versturen geen provider-turns en starten geen remote Factory-run. Ze controleren native draftwissels, nieuwe regels, live Git-wijzigingen, bescherming tegen verouderde acknowledgements, openen/sluiten/herstellen van threadtabs, beide threadsoorten, palette-/focusgedrag, themawijzigingen, veilige afsluiting en de opslagbarrière vóór Factory Start.
+
+De vergelijkende prestatieworkload typt in de Neovim-composer, een Factory-invoer en Settings, en wisselt tussen tabs. Hij rapporteert mediaan en p95 van toetsafhandeling tot de GPUI-testdispatcher klaar is, niet de fysieke invoer-tot-schermlatentie. Er gelden geen tijdsdrempels in de gewone tests:
+
+```sh
+cargo test --features runtime-qa --lib interaction_performance_workload -- --ignored --nocapture
+DROSTJE_PERF_HIDDEN_THREADS=8 cargo test --features runtime-qa --lib interaction_performance_workload -- --ignored --nocapture
+```
+
+De tweede variant opent acht extra echte, inactieve Conversations om werk door verborgen tabs zichtbaar te maken. Ook deze workload verstuurt geen prompts en gebruikt alleen de wegwerp-repository.
 
 Gebruik de door de eerste QA-test gemelde datamap als `DROSTJE_QA_DATA` voor layout/herstart-controle:
 
@@ -127,7 +137,7 @@ Een eerdere echte OpenCode-proef heeft dispatch, sandbox-initialisatie en GUI-he
 
 ## Onder de motorkap
 
-Rust + GPUI, macOS. Gesprekken lopen via OMP, prompttekst bewerk je met ingebedde Neovim binnen de GPUI Kit-composer, en klussen gaan via de `factory` CLI naar de Compliance Software Factory. Nodig: Rust, `nvim`, `omp`, `factory`.
+Rust + GPUI, macOS. Gesprekken lopen via OMP of Claude Code, prompttekst bewerk je met ingebedde Neovim binnen de GPUI Kit-composer, en klussen gaan via de `factory` CLI naar de Compliance Software Factory. Nodig: Rust, `nvim`, `factory` en minstens één van `omp` of `claude`.
 
 ---
 

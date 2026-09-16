@@ -33,14 +33,11 @@ impl AppState {
         self.conversations.insert(id, session);
         let saved = self.persist_thread(thread.clone());
         let sender = self.events.clone();
-        let explicit = self
-            .snapshot
-            .settings
-            .get("executables")
-            .and_then(|v| v.get("omp"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let session_dir = self.data_dir.join("omp-sessions").join(id.to_string());
+        let executables = self.snapshot.settings.get("executables").cloned();
+        let session_dir = self
+            .data_dir
+            .join(format!("{}-sessions", thread.harness))
+            .join(id.to_string());
         smol::spawn(async move {
             let result = async {
                 saved
@@ -50,10 +47,15 @@ impl AppState {
                     .map_err(anyhow::Error::msg)?;
                 let config = smol::unblock(move || -> Result<_> {
                     let repository = platform::inspect_repository(&project.root)?;
+                    let executable_name = harness::executable_name(&thread.harness)?;
+                    let explicit = executables
+                        .as_ref()
+                        .and_then(|value| value.get(executable_name))
+                        .and_then(Value::as_str);
                     Ok(harness::ConversationConfig {
                         allow_empty_session: thread.submission.is_none(),
                         harness: thread.harness,
-                        executable: platform::resolve_executable("omp", explicit.as_deref())?,
+                        executable: platform::resolve_executable(executable_name, explicit)?,
                         cwd: repository.root,
                         session_dir,
                         session_ref: thread.session_ref,
@@ -150,7 +152,7 @@ impl AppState {
             return Some("Connect or restart Neovim before sending".into());
         }
         let Some(session) = self.conversations.get(&id) else {
-            return Some("Open the OMP session first".into());
+            return Some("Open the conversation harness first".into());
         };
         if session.preparing
             || self.active_threads.contains(&id)
@@ -187,16 +189,20 @@ impl AppState {
             .get(&id)
             .and_then(|s| s.commands.as_ref())
         else {
-            self.notice(NoticeLevel::Warning, "OMP is not connected");
+            self.notice(
+                NoticeLevel::Warning,
+                "Conversation harness is not connected",
+            );
             return;
         };
         if let Err(error) = commands.try_send(command) {
             self.notice(
                 NoticeLevel::Error,
-                format!("OMP command could not be queued: {error}"),
+                format!("Harness command could not be queued: {error}"),
             );
         }
     }
+
     pub fn interrupt(&mut self, id: ThreadId) {
         if self.is_conversation(id) && self.active_threads.contains(&id) {
             self.send_command(id, ConversationCommand::Interrupt);
@@ -271,7 +277,7 @@ impl AppState {
             return;
         };
         let Some(commands) = session.commands.clone() else {
-            self.submission_failed(id, "OMP disconnected before submission".into());
+            self.submission_failed(id, "Harness disconnected before submission".into());
             return;
         };
         let request_id = Uuid::new_v4();
@@ -291,13 +297,21 @@ impl AppState {
                 let size = smol::unblock(move || harness::submission_size(request_id, &prompt, &checked)).await?;
                 anyhow::ensure!(size <= crate::attachments::FRAME_LIMIT, "Prompt exceeds 1 MiB. Use Optimize images for sending, remove images, or reduce text.");
                 saved.recv().await.context("Persistence owner closed")?.map_err(anyhow::Error::msg)?;
-                commands.send(ConversationCommand::Submit { request_id, text, images }).await.context("OMP disconnected before submission")?;
+                commands.send(ConversationCommand::Submit { request_id, text, images }).await.context("Harness disconnected before submission")?;
                 Ok::<_, anyhow::Error>(())
             }.await;
             if let Err(error) = result {
                 let _ = sender.send(AppEvent::Harness(id, generation, ConversationEvent::Failed { request_id: Some(request_id), message: format!("{error:#}") })).await;
             }
-            let _ = this.update(cx, |this, cx| { if let Some(session) = this.conversations.get_mut(&id) { if session.generation == generation { session.preparing = false; } } cx.notify(); });
+            let _ = this.update(cx, |this, cx| {
+                if let Some(session) = this.conversations.get_mut(&id)
+                    && session.generation == generation
+                    && session.preparing
+                {
+                    session.preparing = false;
+                    cx.emit(PresentationChange::Thread(id));
+                }
+            });
         }).detach();
     }
     pub fn submission_failed(&mut self, id: ThreadId, error: String) {
@@ -333,7 +347,52 @@ impl AppState {
         let Some(mut session) = self.conversations.remove(&id) else {
             return;
         };
-        let mut thread = self.snapshot.threads.iter().find(|t| t.id == id).cloned();
+        let refresh_diff = matches!(
+            &event,
+            ConversationEvent::Ready { .. }
+                | ConversationEvent::StateChanged(_)
+                | ConversationEvent::ToolUpdated(_)
+                | ConversationEvent::TurnSettled { .. }
+                | ConversationEvent::Failed { .. }
+        );
+        let presentation = match &event {
+            ConversationEvent::HistoryReset
+            | ConversationEvent::History { .. }
+            | ConversationEvent::MessageUpdated(_)
+            | ConversationEvent::ToolUpdated(_) => PresentationChange::Transcript(id),
+            ConversationEvent::Ready { .. }
+            | ConversationEvent::StateChanged(_)
+            | ConversationEvent::UserRequest(_)
+            | ConversationEvent::UserRequestDismissed { .. }
+            | ConversationEvent::SubmissionAccepted { .. }
+            | ConversationEvent::TurnSettled { .. }
+            | ConversationEvent::ModelSelected(_)
+            | ConversationEvent::TitleChanged(_)
+            | ConversationEvent::EditorTextRequested(_)
+            | ConversationEvent::StatusUpdated { .. }
+            | ConversationEvent::WidgetUpdated { .. }
+            | ConversationEvent::Notice { .. }
+            | ConversationEvent::LinkOffered { .. }
+            | ConversationEvent::Diagnostic { .. }
+            | ConversationEvent::Failed { .. } => PresentationChange::Thread(id),
+        };
+        let mut thread = if matches!(
+            &event,
+            ConversationEvent::Ready { .. }
+                | ConversationEvent::SubmissionAccepted { .. }
+                | ConversationEvent::TurnSettled { .. }
+                | ConversationEvent::ModelSelected(_)
+                | ConversationEvent::TitleChanged(_)
+                | ConversationEvent::Failed { .. }
+        ) {
+            self.snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .cloned()
+        } else {
+            None
+        };
         match event {
             ConversationEvent::Ready {
                 session_ref,
@@ -358,8 +417,8 @@ impl AppState {
                                     Ok(Err(error)) => session.error = Some(error),
                                     Err(error) => session.error = Some(error.to_string()),
                                 }
+                                cx.emit(PresentationChange::Thread(id));
                             }
-                            cx.notify();
                         });
                     })
                     .detach();
@@ -400,6 +459,7 @@ impl AppState {
             }
             ConversationEvent::MessageUpdated(message) => session.message(message),
             ConversationEvent::ToolUpdated(tool) => {
+                session.mark_tool_changed(&tool.id);
                 session.tools.insert(tool.id.clone(), Arc::new(tool));
             }
             ConversationEvent::UserRequest(request) => {
@@ -467,7 +527,7 @@ impl AppState {
                                                 format!("Submitted text retained: {error:#}"),
                                             ),
                                         }
-                                        cx.notify();
+                                        cx.emit(PresentationChange::Thread(id));
                                     });
                                 }
                             })
@@ -547,7 +607,7 @@ impl AppState {
                                         format!("Could not set editor text: {error:#}"),
                                     );
                                 }
-                                cx.notify();
+                                cx.emit(PresentationChange::Thread(id));
                             });
                         }
                     })
@@ -621,5 +681,9 @@ impl AppState {
             }
         }
         self.conversations.insert(id, session);
+        if refresh_diff {
+            self.queue_conversation_diff(id, cx);
+        }
+        cx.emit(presentation);
     }
 }

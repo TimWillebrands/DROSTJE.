@@ -1,5 +1,10 @@
 use super::{theme, workspace::Workspace};
-use crate::{app::AppState, model::ModelKey, platform};
+use crate::{
+    app::{AppState, PresentationChange},
+    harness,
+    model::ModelKey,
+    platform,
+};
 use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Sizable, ThemeMode, ThemeRegistry, WindowExt,
@@ -7,9 +12,9 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         form::{Field as FormField, Form},
         h_flex,
-        input::{Input, InputState},
+        input::{Input, InputEvent, InputState},
         searchable_list::SearchableListItem,
-        select::{Select, SelectState},
+        select::{Select, SelectEvent, SelectState},
         setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
         v_flex,
     },
@@ -17,7 +22,7 @@ use gpui_kit::{
     *,
 };
 use serde_json::json;
-use std::{fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -95,7 +100,7 @@ pub struct Field {
     pub label: &'static str,
     pub input: Entity<InputState>,
 }
-pub struct Dialog {
+pub struct SurfaceContent {
     pub kind: DialogKind,
     pub fields: Vec<Field>,
     pub error: Option<String>,
@@ -104,192 +109,261 @@ pub struct Dialog {
     surface_id: Uuid,
     settings_id: SharedString,
     hosted: bool,
+    owner: WeakEntity<Workspace>,
+    state: Entity<AppState>,
+    presentation: SurfacePresentation,
+    _subscriptions: Vec<Subscription>,
 }
-impl Dialog {
-    pub fn new(kind: DialogKind, state: &AppState, window: &mut Window, cx: &mut App) -> Self {
-        let mut selects = Vec::new();
-        let mut fields = Vec::new();
-        let mut field = |key, label, value: String| {
-            let input = cx.new(|cx| {
-                let mut input = InputState::new(window, cx);
-                input.set_value(value, window, cx);
-                input
-            });
-            fields.push(Field { key, label, input });
-        };
-        match &kind {
-            DialogKind::AddProject => field("path", "Existing Git working tree", String::new()),
-            DialogKind::RenameProject(id) => field(
-                "name",
-                "Project name",
-                state
-                    .snapshot
-                    .projects
-                    .iter()
-                    .find(|p| p.id == *id)
-                    .map(|p| p.name.clone())
-                    .unwrap_or_default(),
-            ),
-            DialogKind::RenameThread(id) => field(
-                "name",
-                "Thread title",
-                state
-                    .snapshot
-                    .threads
-                    .iter()
-                    .find(|t| t.id == *id)
-                    .map(|t| t.title.clone())
-                    .unwrap_or_default(),
-            ),
-            DialogKind::Settings(project) => {
-                for (key, label) in [
-                    ("nvim", "Neovim executable (blank: discover on PATH)"),
-                    ("omp", "OMP executable (blank: discover on PATH)"),
-                    ("factory", "Factory executable (blank: discover on PATH)"),
-                ] {
+impl SurfaceContent {
+    pub fn new(
+        kind: DialogKind,
+        state: Entity<AppState>,
+        owner: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let (fields, selects) = state.update(cx, |state, cx| {
+            let mut selects = Vec::new();
+            let mut fields = Vec::new();
+            let mut field = |key, label, value: String| {
+                let input = cx.new(|cx| {
+                    let mut input = InputState::new(window, cx);
+                    input.set_value(value, window, cx);
+                    input
+                });
+                fields.push(Field { key, label, input });
+            };
+            match &kind {
+                DialogKind::AddProject => field("path", "Existing Git working tree", String::new()),
+                DialogKind::RenameProject(id) => field(
+                    "name",
+                    "Project name",
+                    state
+                        .snapshot
+                        .projects
+                        .iter()
+                        .find(|p| p.id == *id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default(),
+                ),
+                DialogKind::RenameThread(id) => field(
+                    "name",
+                    "Thread title",
+                    state
+                        .snapshot
+                        .threads
+                        .iter()
+                        .find(|t| t.id == *id)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_default(),
+                ),
+                DialogKind::Settings(project) => {
+                    for (key, label) in [
+                        ("nvim", "Neovim executable (blank: discover on PATH)"),
+                        ("omp", "OMP executable (blank: discover on PATH)"),
+                        ("claude", "Claude Code executable (blank: discover on PATH)"),
+                        ("factory", "Factory executable (blank: discover on PATH)"),
+                    ] {
+                        field(
+                            key,
+                            label,
+                            state
+                                .snapshot
+                                .settings
+                                .get("executables")
+                                .and_then(|v| v.get(key))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .into(),
+                        );
+                    }
                     field(
-                        key,
-                        label,
+                        "factory_data_root",
+                        "Shared Factory data root (absolute path)",
                         state
                             .snapshot
                             .settings
-                            .get("executables")
-                            .and_then(|v| v.get(key))
+                            .get("factory_data_root")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .into(),
                     );
-                }
-                field(
-                    "factory_data_root",
-                    "Shared Factory data root (absolute path)",
-                    state
-                        .snapshot
-                        .settings
-                        .get("factory_data_root")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .into(),
-                );
-                if let Some(project) = project.and_then(|id| {
-                    state
-                        .snapshot
-                        .projects
-                        .iter()
-                        .find(|p| p.id == id && !p.archived)
-                }) {
-                    field(
-                        "provider",
-                        "Interactive default provider (blank: harness default)",
-                        project
-                            .defaults
-                            .interactive_model
-                            .as_ref()
-                            .map(|m| m.provider.clone())
-                            .unwrap_or_default(),
-                    );
-                    field(
-                        "model",
-                        "Interactive default model ID",
-                        project
-                            .defaults
-                            .interactive_model
-                            .as_ref()
-                            .map(|m| m.id.clone())
-                            .unwrap_or_default(),
-                    );
-                    field(
-                        "factory_model",
-                        "Factory model (blank: harness default)",
-                        project.defaults.factory_model.clone().unwrap_or_default(),
-                    );
-                    field(
-                        "factory_thought_level",
-                        "Factory thought level (optional)",
-                        project
-                            .defaults
-                            .factory_thought_level
-                            .clone()
-                            .unwrap_or_default(),
-                    );
-                    field(
-                        "factory_target_branch",
-                        "Factory target branch (blank: Git branch)",
-                        project
-                            .defaults
-                            .factory_target_branch
-                            .clone()
-                            .unwrap_or_default(),
-                    );
-                }
-                let mode = state
-                    .snapshot
-                    .settings
-                    .get("theme_mode")
-                    .and_then(|value| value.as_str())
-                    .filter(|mode| ["system", "light", "dark"].contains(mode))
-                    .unwrap_or("system");
-                selects.push(select_field(
-                    "theme_mode",
-                    "Appearance",
-                    vec![
-                        Choice::new("system", "System"),
-                        Choice::new("light", "Light"),
-                        Choice::new("dark", "Dark"),
-                    ],
-                    mode,
-                    window,
-                    cx,
-                ));
-                for (key, label, mode) in [
-                    ("theme_light", "Light theme", ThemeMode::Light),
-                    ("theme_dark", "Dark theme", ThemeMode::Dark),
-                ] {
-                    let selected = state
-                        .snapshot
-                        .settings
-                        .get(key)
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    selects.push(select_field(
-                        key,
-                        label,
-                        theme_choices(mode, selected, cx),
-                        selected,
-                        window,
-                        cx,
-                    ));
-                }
-                if let Some(project) = project.and_then(|id| {
-                    state
-                        .snapshot
-                        .projects
-                        .iter()
-                        .find(|project| project.id == id && !project.archived)
-                }) {
-                    let selected = &project.defaults.factory_harness;
-                    let mut choices = ["opencode", "codex", "claude-code"]
-                        .into_iter()
-                        .map(|name| Choice::new(name, name))
-                        .collect::<Vec<_>>();
-                    if !choices.iter().any(|choice| &choice.value == selected) {
-                        choices.push(Choice {
-                            value: selected.clone(),
-                            label: format!("{selected} (unsupported)").into(),
-                            unavailable: true,
-                        });
+                    if let Some(project) = project.and_then(|id| {
+                        state
+                            .snapshot
+                            .projects
+                            .iter()
+                            .find(|p| p.id == id && !p.archived)
+                    }) {
+                        field(
+                            "provider",
+                            "Interactive default provider (blank: harness default)",
+                            project
+                                .defaults
+                                .interactive_model
+                                .as_ref()
+                                .map(|m| m.provider.clone())
+                                .unwrap_or_default(),
+                        );
+                        field(
+                            "model",
+                            "Interactive default model ID",
+                            project
+                                .defaults
+                                .interactive_model
+                                .as_ref()
+                                .map(|m| m.id.clone())
+                                .unwrap_or_default(),
+                        );
+                        field(
+                            "factory_model",
+                            "Factory model (blank: harness default)",
+                            project.defaults.factory_model.clone().unwrap_or_default(),
+                        );
+                        field(
+                            "factory_thought_level",
+                            "Factory thought level (optional)",
+                            project
+                                .defaults
+                                .factory_thought_level
+                                .clone()
+                                .unwrap_or_default(),
+                        );
+                        field(
+                            "factory_target_branch",
+                            "Factory target branch (blank: Git branch)",
+                            project
+                                .defaults
+                                .factory_target_branch
+                                .clone()
+                                .unwrap_or_default(),
+                        );
                     }
+                    let mode = state
+                        .snapshot
+                        .settings
+                        .get("theme_mode")
+                        .and_then(|value| value.as_str())
+                        .filter(|mode| ["system", "light", "dark"].contains(mode))
+                        .unwrap_or("system");
                     selects.push(select_field(
-                        "factory_harness",
-                        "Harness",
-                        choices,
-                        selected,
+                        "theme_mode",
+                        "Appearance",
+                        vec![
+                            Choice::new("system", "System"),
+                            Choice::new("light", "Light"),
+                            Choice::new("dark", "Dark"),
+                        ],
+                        mode,
                         window,
                         cx,
                     ));
+                    for (key, label, mode) in [
+                        ("theme_light", "Light theme", ThemeMode::Light),
+                        ("theme_dark", "Dark theme", ThemeMode::Dark),
+                    ] {
+                        let selected = state
+                            .snapshot
+                            .settings
+                            .get(key)
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        selects.push(select_field(
+                            key,
+                            label,
+                            theme_choices(mode, selected, cx),
+                            selected,
+                            window,
+                            cx,
+                        ));
+                    }
+                    if let Some(project) = project.and_then(|id| {
+                        state
+                            .snapshot
+                            .projects
+                            .iter()
+                            .find(|project| project.id == id && !project.archived)
+                    }) {
+                        let selected = &project.defaults.interactive_harness;
+                        let mut choices = harness::CONVERSATION_HARNESSES
+                            .into_iter()
+                            .map(|name| Choice::new(name, name))
+                            .collect::<Vec<_>>();
+                        if !choices.iter().any(|choice| &choice.value == selected) {
+                            choices.push(Choice {
+                                value: selected.clone(),
+                                label: format!("{selected} (unsupported)").into(),
+                                unavailable: true,
+                            });
+                        }
+                        selects.push(select_field(
+                            "interactive_harness",
+                            "Conversation harness",
+                            choices,
+                            selected,
+                            window,
+                            cx,
+                        ));
+                        let selected = &project.defaults.factory_harness;
+                        let mut choices = ["opencode", "codex", "claude-code"]
+                            .into_iter()
+                            .map(|name| Choice::new(name, name))
+                            .collect::<Vec<_>>();
+                        if !choices.iter().any(|choice| &choice.value == selected) {
+                            choices.push(Choice {
+                                value: selected.clone(),
+                                label: format!("{selected} (unsupported)").into(),
+                                unavailable: true,
+                            });
+                        }
+                        selects.push(select_field(
+                            "factory_harness",
+                            "Harness",
+                            choices,
+                            selected,
+                            window,
+                            cx,
+                        ));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+            (fields, selects)
+        });
+        let presentation = SurfacePresentation::new(&kind, state.read(cx));
+        let mut subscriptions = vec![
+            cx.observe(&state, |surface, _, cx| surface.refresh_presentation(cx)),
+            cx.subscribe(&state, |surface, _, change: &PresentationChange, cx| {
+                if matches!(change, PresentationChange::Persistence) {
+                    surface.refresh_presentation(cx);
+                }
+            }),
+            cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()),
+            cx.observe_global_in::<ThemeRegistry>(window, |surface, window, cx| {
+                surface.refresh_theme_choices(window, cx);
+                cx.notify();
+            }),
+        ];
+        for field in &fields {
+            let key = field.key;
+            subscriptions.push(cx.subscribe(
+                &field.input,
+                move |surface, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        surface.clear_field_error(key, cx);
+                    }
+                },
+            ));
+        }
+        for select in &selects {
+            let key = select.key;
+            subscriptions.push(cx.subscribe(
+                &select.state,
+                move |surface, _, _: &SelectEvent<Vec<Choice>>, cx| {
+                    surface.clear_field_error(key, cx);
+                },
+            ));
+            subscriptions.push(cx.observe(&select.state, |_, _, cx| cx.notify()));
         }
         let surface_id = Uuid::new_v4();
         Self {
@@ -301,7 +375,68 @@ impl Dialog {
             surface_id,
             settings_id: format!("drostje-settings-{surface_id}").into(),
             hosted: false,
+            owner,
+            state,
+            presentation,
+            _subscriptions: subscriptions,
         }
+    }
+
+    fn refresh_presentation(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        if !self.presentation.matches(&self.kind, state) {
+            self.presentation = SurfacePresentation::new(&self.kind, state);
+            cx.notify();
+        }
+    }
+
+    fn clear_field_error(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.error.is_some() && (self.error_field.is_none() || self.error_field == Some(key)) {
+            self.error = None;
+            self.error_field = None;
+            cx.notify();
+        }
+    }
+
+    fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self
+            .fields
+            .iter()
+            .find(|field| field.key == "path")
+            .map(|field| field.input.clone())
+        else {
+            return;
+        };
+        let previous = input.read(cx).value();
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add Project".into()),
+        });
+        cx.spawn_in(window, async move |surface, window| {
+            let result = picked.await;
+            let _ = surface.update_in(window, |surface, window, cx| {
+                if input.read(cx).value() != previous {
+                    return;
+                }
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            input.update(cx, |input, cx| {
+                                input.set_value(path.to_string_lossy().into_owned(), window, cx)
+                            });
+                        }
+                    }
+                    Ok(Ok(None)) => {}
+                    other => surface.set_error(
+                        &field_error("path", format!("Folder picker failed: {other:?}")),
+                        cx,
+                    ),
+                }
+            });
+        })
+        .detach();
     }
     pub(super) fn value(&self, key: &str, cx: &App) -> String {
         if let Some(select) = self.select(key) {
@@ -325,9 +460,10 @@ impl Dialog {
             .map(|field| &field.state)
     }
 
-    pub fn set_error(&mut self, error: &anyhow::Error) {
+    pub fn set_error(&mut self, error: &anyhow::Error, cx: &mut Context<Self>) {
         self.error_field = error.downcast_ref::<FieldError>().map(|error| error.key);
         self.error = Some(format!("{error:#}"));
+        cx.notify();
     }
     pub fn apply(&self, state: &mut AppState, cx: &App) -> anyhow::Result<bool> {
         if let Some(error) = &state.storage_error {
@@ -438,6 +574,13 @@ impl Dialog {
                         .cloned()
                 });
                 if let Some(project) = &mut project {
+                    let interactive_harness = self.value("interactive_harness", cx);
+                    if !harness::CONVERSATION_HARNESSES.contains(&interactive_harness.as_str()) {
+                        return Err(field_error(
+                            "interactive_harness",
+                            "Choose omp or claude-code.",
+                        ));
+                    }
                     let provider = self.value("provider", cx);
                     let model = self.value("model", cx);
                     if provider.is_empty() != model.is_empty() {
@@ -465,6 +608,7 @@ impl Dialog {
                             id: model,
                         })
                     };
+                    project.defaults.interactive_harness = interactive_harness;
                     project.defaults.factory_harness = harness;
                     let optional = |key| {
                         let value = self.value(key, cx);
@@ -488,7 +632,12 @@ impl Dialog {
                     .map_err(|error| field_error("theme_dark", format!("{error:#}")))?;
                 state.set_setting(
                     "executables",
-                    json!({ "nvim": self.value("nvim", cx), "omp": self.value("omp", cx), "factory": self.value("factory", cx) }),
+                    json!({
+                        "nvim": self.value("nvim", cx),
+                        "omp": self.value("omp", cx),
+                        "claude": self.value("claude", cx),
+                        "factory": self.value("factory", cx),
+                    }),
                 );
                 state.set_setting("factory_data_root", json!(root));
                 state.set_setting("theme_mode", json!(mode));
@@ -554,6 +703,14 @@ impl Dialog {
                 )
             };
         let warning = match key {
+            "interactive_harness" => {
+                let selected = self.value(key, cx);
+                (!harness::CONVERSATION_HARNESSES.contains(&selected.as_str())).then(|| {
+                    format!(
+                        "Saved conversation harness {selected:?} is unsupported. Choose a supported harness."
+                    )
+                })
+            }
             "factory_harness" => {
                 let selected = self.value(key, cx);
                 (!["opencode", "codex", "claude-code"].contains(&selected.as_str())).then(|| {
@@ -609,7 +766,7 @@ impl Dialog {
         key: &'static str,
         group: &'static str,
         readonly: bool,
-        owner: &WeakEntity<Workspace>,
+        owner: &WeakEntity<SurfaceContent>,
     ) -> Option<SettingItem> {
         let label = self
             .selects
@@ -623,7 +780,6 @@ impl Dialog {
                     .map(|field| field.label)
             })?;
         let owner = owner.clone();
-        let id = self.surface_id;
         Some(
             SettingItem::new(
                 label,
@@ -631,15 +787,10 @@ impl Dialog {
                     let Some(owner) = owner.upgrade() else {
                         return div().into_any_element();
                     };
-                    let workspace = owner.read(cx);
-                    let Some(dialog) = workspace
-                        .dialog
-                        .as_ref()
-                        .filter(|dialog| dialog.surface_id == id)
-                    else {
-                        return div().into_any_element();
-                    };
-                    dialog.field_content(key, options.is_disabled(), cx).1
+                    owner
+                        .read(cx)
+                        .field_content(key, options.is_disabled(), cx)
+                        .1
                 }),
             )
             .keywords([key, group])
@@ -652,7 +803,7 @@ impl Dialog {
         &self,
         project_id: Option<Uuid>,
         state: &AppState,
-        owner: &WeakEntity<Workspace>,
+        owner: &WeakEntity<SurfaceContent>,
         _: &App,
     ) -> AnyElement {
         let readonly = state.storage_error.is_some();
@@ -681,7 +832,7 @@ impl Dialog {
                 ))
                 .keywords(["appearance", "theme", "folder"]),
             );
-        let tools = fields("Tools", &["nvim", "omp", "factory"])
+        let tools = fields("Tools", &["nvim", "omp", "claude", "factory"])
             .description("DROSTJE. does not install, authenticate, or upgrade tools.");
         let factory = fields(
             "Factory defaults",
@@ -693,7 +844,10 @@ impl Dialog {
                 "factory_target_branch",
             ],
         );
-        let mut project = fields("Project defaults", &["provider", "model"]);
+        let mut project = fields(
+            "Project defaults",
+            &["interactive_harness", "provider", "model"],
+        );
         if let Some(selected) = project_id.and_then(|id| {
             state
                 .snapshot
@@ -725,10 +879,15 @@ impl Dialog {
         let mut diagnostics = SettingGroup::new()
             .title("Diagnostics")
             .description(format!(
-                "Application data: {}. OMP runs with local user privileges. Factory uses its configured sandbox policy.",
+                "Application data: {}. Conversation harnesses run with local user privileges. Factory uses its configured sandbox policy.",
                 state.data_dir.display()
             ));
-        for (name, title) in [("nvim", "Neovim"), ("omp", "OMP"), ("factory", "Factory")] {
+        for (name, title) in [
+            ("nvim", "Neovim"),
+            ("omp", "OMP"),
+            ("claude", "Claude Code"),
+            ("factory", "Factory"),
+        ] {
             let status = state
                 .diagnostics
                 .get(name)
@@ -744,8 +903,8 @@ impl Dialog {
                             .small()
                             .label("Refresh diagnostics")
                             .on_click(move |_, _, cx| {
-                                let _ = owner.update(cx, |workspace, cx| {
-                                    workspace.state.read(cx).refresh_diagnostics()
+                                let _ = owner.update(cx, |surface, cx| {
+                                    surface.state.read(cx).refresh_diagnostics()
                                 });
                             })
                     }),
@@ -754,7 +913,7 @@ impl Dialog {
                 .keywords([name, "diagnostics", "setup", "retry"]),
             );
         }
-        // Settings retains search/navigation internally; draft controls remain owned by Dialog.
+        // Kit Settings retains search/navigation; this entity owns the draft controls.
         let settings = Settings::new(self.settings_id.clone()).page(
             SettingPage::new("Settings")
                 .default_open(true)
@@ -780,7 +939,7 @@ impl Dialog {
             .into_any_element()
     }
 
-    fn body(&self, state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> AnyElement {
+    fn body(&self, state: &AppState, owner: &WeakEntity<SurfaceContent>, cx: &App) -> AnyElement {
         let readonly = state.storage_error.is_some();
         let mut body = v_flex().id("dialog-body").w_full().gap_5().pb_4();
         match self.kind {
@@ -795,7 +954,7 @@ impl Dialog {
                     .child(Form::new().child(self.form_field("path", readonly, cx)))
                     .child(Button::new("choose-project-folder").small().disabled(readonly)
                         .label("Choose folder…").on_click(move |_, window, cx| {
-                            let _ = owner.update(cx, |workspace, cx| workspace.pick_project_folder(window, cx));
+                            let _ = owner.update(cx, |surface, cx| surface.pick_folder(window, cx));
                         }));
             }
             DialogKind::ArchiveProject(_) | DialogKind::ArchiveThread(_) => {
@@ -851,30 +1010,56 @@ fn theme_choices(mode: ThemeMode, selected: &str, cx: &App) -> Vec<Choice> {
     choices
 }
 
-struct SurfaceContent {
-    owner: WeakEntity<Workspace>,
-    id: Uuid,
-    _subscriptions: Vec<Subscription>,
+struct SurfacePresentation {
+    readonly: bool,
+    project: Option<(String, bool)>,
+    diagnostics: BTreeMap<String, String>,
+}
+
+impl SurfacePresentation {
+    fn project<'a>(kind: &DialogKind, state: &'a AppState) -> Option<(&'a str, bool)> {
+        let DialogKind::Settings(Some(id)) = kind else {
+            return None;
+        };
+        state
+            .snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == *id)
+            .map(|project| (project.name.as_str(), project.archived))
+    }
+
+    fn new(kind: &DialogKind, state: &AppState) -> Self {
+        Self {
+            readonly: state.storage_error.is_some(),
+            project: Self::project(kind, state).map(|(name, archived)| (name.to_owned(), archived)),
+            diagnostics: if matches!(kind, DialogKind::Settings(_)) {
+                state.diagnostics.clone()
+            } else {
+                BTreeMap::new()
+            },
+        }
+    }
+
+    fn matches(&self, kind: &DialogKind, state: &AppState) -> bool {
+        self.readonly == state.storage_error.is_some()
+            && self
+                .project
+                .as_ref()
+                .map(|(name, archived)| (name.as_str(), *archived))
+                == Self::project(kind, state)
+            && (!matches!(kind, DialogKind::Settings(_)) || self.diagnostics == state.diagnostics)
+    }
 }
 
 impl Render for SurfaceContent {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(owner) = self.owner.upgrade() else {
-            return div().into_any_element();
-        };
-        let workspace = owner.read(cx);
-        let Some(dialog) = workspace
-            .dialog
-            .as_ref()
-            .filter(|dialog| dialog.surface_id == self.id)
-        else {
-            return div().into_any_element();
-        };
+        let surface = cx.entity().downgrade();
         let owner = self.owner.clone();
-        let id = self.id;
+        let id = self.surface_id;
         div()
             .w_full()
-            .when(matches!(dialog.kind, DialogKind::Settings(_)), |view| {
+            .when(matches!(self.kind, DialogKind::Settings(_)), |view| {
                 view.size_full().min_h_0().min_w_0().overflow_hidden()
             })
             .key_context("DrostjeForm")
@@ -882,30 +1067,34 @@ impl Render for SurfaceContent {
                 cx.stop_propagation();
                 confirm_surface(&owner, id, window, cx);
             })
-            .child(dialog.body(workspace.state.read(cx), &self.owner, cx))
+            .child(self.body(self.state.read(cx), &surface, cx))
             .into_any_element()
     }
 }
 
-fn footer(owner: &WeakEntity<Workspace>, id: Uuid, cx: &App) -> AnyElement {
-    let Some(workspace) = owner.upgrade() else {
-        return div().into_any_element();
-    };
-    let workspace = workspace.read(cx);
-    let Some(dialog) = workspace
-        .dialog
-        .as_ref()
-        .filter(|dialog| dialog.surface_id == id)
-    else {
-        return div().into_any_element();
-    };
-    let readonly = workspace.state.read(cx).storage_error.is_some();
+struct SurfaceFooter {
+    content: WeakEntity<SurfaceContent>,
+    _subscription: Subscription,
+}
+
+impl Render for SurfaceFooter {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(content) = self.content.upgrade() else {
+            return div().into_any_element();
+        };
+        footer(content.read(cx))
+    }
+}
+
+fn footer(dialog: &SurfaceContent) -> AnyElement {
+    let readonly = dialog.presentation.readonly;
+    let id = dialog.surface_id;
     let archive = matches!(
         dialog.kind,
         DialogKind::ArchiveProject(_) | DialogKind::ArchiveThread(_)
     );
-    let cancel = owner.clone();
-    let confirm = owner.clone();
+    let cancel = dialog.owner.clone();
+    let confirm = dialog.owner.clone();
     h_flex()
         .w_full()
         .justify_end()
@@ -919,7 +1108,7 @@ fn footer(owner: &WeakEntity<Workspace>, id: Uuid, cx: &App) -> AnyElement {
                         if workspace
                             .dialog
                             .as_ref()
-                            .is_some_and(|dialog| dialog.surface_id == id)
+                            .is_some_and(|dialog| dialog.read(cx).surface_id == id)
                         {
                             workspace.dismiss(window, cx);
                         }
@@ -949,7 +1138,7 @@ fn confirm_surface(owner: &WeakEntity<Workspace>, id: Uuid, window: &mut Window,
         if workspace
             .dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.surface_id == id)
+            .is_some_and(|dialog| dialog.read(cx).surface_id == id)
         {
             workspace.confirm_dialog(window, cx);
         }
@@ -961,7 +1150,7 @@ fn clear_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
         if workspace
             .dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.surface_id == id)
+            .is_some_and(|dialog| dialog.read(cx).surface_id == id)
         {
             workspace.dialog = None;
             cx.notify();
@@ -972,79 +1161,51 @@ fn clear_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
 /// The Root captures trigger focus and owns trapping, dismissal, and one focus restoration.
 pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |window, cx| {
-        let Ok(Some((id, kind, title, state, selects))) = owner.update(cx, |workspace, _| {
-            let dialog = workspace.dialog.as_mut().filter(|dialog| !dialog.hosted)?;
-            dialog.hosted = true;
-            Some((
-                dialog.surface_id,
-                dialog.kind.clone(),
-                dialog.title(),
-                workspace.state.clone(),
-                dialog
-                    .selects
-                    .iter()
-                    .map(|field| field.state.clone())
-                    .collect::<Vec<_>>(),
-            ))
+        let Ok(Some(content)) = owner.update(cx, |workspace, cx| {
+            workspace
+                .dialog
+                .as_ref()
+                .filter(|dialog| !dialog.read(cx).hosted)
+                .cloned()
         }) else {
             return;
         };
-        let Some(workspace) = owner.upgrade() else {
-            return;
-        };
-        let content = cx.new(|cx| {
-            let mut subscriptions = vec![
-                cx.observe(&workspace, |_, _, cx| cx.notify()),
-                cx.observe(&state, |_, _, cx| cx.notify()),
-                cx.observe_global_in::<ThemeRegistry>(
-                    window,
-                    |this: &mut SurfaceContent, window, cx| {
-                        let _ = this.owner.update(cx, |workspace, cx| {
-                            if let Some(dialog) = workspace
-                                .dialog
-                                .as_ref()
-                                .filter(|dialog| dialog.surface_id == this.id)
-                            {
-                                dialog.refresh_theme_choices(window, cx);
-                            }
-                        });
-                        cx.notify();
-                    },
-                ),
-            ];
-            for select in &selects {
-                subscriptions.push(cx.observe(select, |_, _, cx| cx.notify()));
-            }
-            SurfaceContent {
-                owner: owner.clone(),
-                id,
-                _subscriptions: subscriptions,
-            }
+        let (id, kind, title) = content.update(cx, |dialog, _| {
+            dialog.hosted = true;
+            (dialog.surface_id, dialog.kind.clone(), dialog.title())
+        });
+        let footer = cx.new(|cx| SurfaceFooter {
+            content: content.downgrade(),
+            _subscription: cx.observe(&content, |_, _, cx| cx.notify()),
         });
         let host_owner = owner.clone();
         match kind {
             DialogKind::Settings(_) => {
-                window.open_sheet(cx, move |sheet, window, cx| {
+                window.open_sheet(cx, move |sheet, window, _| {
                     let close = host_owner.clone();
                     sheet
                         .title(title)
                         .size((window.rem_size() * 56.).min(window.viewport_size().width))
                         .resizable(false)
                         .px_0()
-                        .child(content.clone())
-                        .footer(footer(&host_owner, id, cx))
+                        .child(
+                            content
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        )
+                        .footer(footer.clone())
                         .on_close(move |_, _, cx| clear_surface(&close, id, cx))
                 });
             }
             DialogKind::ArchiveProject(_) | DialogKind::ArchiveThread(_) => {
-                window.open_alert_dialog(cx, move |alert, window, cx| {
+                window.open_alert_dialog(cx, move |alert, window, _| {
                     let close = host_owner.clone();
                     let confirm = host_owner.clone();
                     alert
                         .title(title)
                         .width((window.rem_size() * 30.).min(window.viewport_size().width))
                         .child(content.clone())
-                        .footer(footer(&host_owner, id, cx))
+                        .footer(footer.clone())
                         .on_ok(move |_, window, cx| {
                             confirm_surface(&confirm, id, window, cx);
                             false
@@ -1053,14 +1214,14 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                 });
             }
             _ => {
-                window.open_dialog(cx, move |dialog, window, cx| {
+                window.open_dialog(cx, move |dialog, window, _| {
                     let close = host_owner.clone();
                     let confirm = host_owner.clone();
                     dialog
                         .title(title)
                         .width((window.rem_size() * 30.).min(window.viewport_size().width))
                         .child(content.clone())
-                        .footer(footer(&host_owner, id, cx))
+                        .footer(footer.clone())
                         .on_ok(move |_, window, cx| {
                             confirm_surface(&confirm, id, window, cx);
                             false
@@ -1075,10 +1236,11 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
             let Some(dialog) = workspace
                 .dialog
                 .as_ref()
-                .filter(|dialog| dialog.surface_id == id)
+                .filter(|dialog| dialog.read(cx).surface_id == id)
             else {
                 return;
             };
+            let dialog = dialog.read(cx);
             let focus = if let Some(select) = dialog.select("theme_mode") {
                 Some(select.focus_handle(cx))
             } else {

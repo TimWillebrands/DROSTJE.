@@ -1,6 +1,6 @@
 use super::{settings::Field, workspace::Workspace};
 use crate::{
-    app::{AppState, NoticeLevel},
+    app::{AppState, NoticeLevel, PresentationChange},
     factory::{self, FactoryLaunchSpec, FactorySource, Liveness},
     model::*,
     platform,
@@ -51,6 +51,8 @@ impl FormError {
 
 pub struct FactoryThreadForm {
     pub thread_id: ThreadId,
+    state: Entity<AppState>,
+    owner: WeakEntity<Workspace>,
     project_id: ProjectId,
     config: FactoryThreadConfig,
     fields: Vec<Field>,
@@ -104,27 +106,14 @@ impl FactoryThreadForm {
     }
 }
 
-impl Workspace {
-    pub fn sync_factory_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let state = self.state.read(cx);
-        let thread = state.factory_thread().filter(|thread| {
-            !state
-                .snapshot
-                .launches
-                .iter()
-                .any(|launch| launch.factory_thread_id == thread.id)
-        });
-        let Some(thread) = thread else {
-            self.factory_form = None;
-            return;
-        };
-        if self
-            .factory_form
-            .as_ref()
-            .is_some_and(|form| form.thread_id == thread.id)
-        {
-            return;
-        }
+impl FactoryThreadForm {
+    fn new(
+        thread: &Thread,
+        state: Entity<AppState>,
+        owner: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let thread_id = thread.id;
         let project_id = thread.project_id;
         let config = thread
@@ -167,11 +156,10 @@ impl Workspace {
             subscriptions.push(cx.subscribe_in(
                 &field.input,
                 window,
-                move |workspace, input, event: &InputEvent, _, cx| {
+                move |form, input, event: &InputEvent, _, cx| {
                     if matches!(event, InputEvent::Change) {
                         let value = input.read(cx).value().to_string();
-                        workspace.factory_config_changed(
-                            thread_id,
+                        form.config_changed(
                             move |config| match key {
                                 "source" => config.source = value,
                                 "model" => config.model = value,
@@ -188,7 +176,7 @@ impl Workspace {
         subscriptions.push(cx.subscribe_in(
             &source,
             window,
-            move |workspace, _, event: &SelectEvent<Vec<String>>, _, cx| {
+            move |form, _, event: &SelectEvent<Vec<String>>, _, cx| {
                 let SelectEvent::Confirm(Some(value)) = event else {
                     return;
                 };
@@ -197,30 +185,36 @@ impl Workspace {
                 } else {
                     FactorySourceKind::WorkItem
                 };
-                workspace.factory_config_changed(
-                    thread_id,
-                    move |config| config.source_kind = kind,
-                    cx,
-                );
+                form.config_changed(move |config| config.source_kind = kind, cx);
             },
         ));
         subscriptions.push(cx.subscribe_in(
             &harness,
             window,
-            move |workspace, _, event: &SelectEvent<Vec<String>>, _, cx| {
+            move |form, _, event: &SelectEvent<Vec<String>>, _, cx| {
                 let SelectEvent::Confirm(Some(value)) = event else {
                     return;
                 };
                 let value = value.clone();
-                workspace.factory_config_changed(
-                    thread_id,
-                    move |config| config.harness = value,
-                    cx,
-                );
+                form.config_changed(move |config| config.harness = value, cx);
             },
         ));
-        self.factory_form = Some(FactoryThreadForm {
+        subscriptions.push(cx.observe(&state, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()));
+        subscriptions.push(
+            cx.subscribe(&state, |form, _, change: &PresentationChange, cx| {
+                if matches!(change, PresentationChange::Thread(id) if *id == form.thread_id)
+                    || (matches!(change, PresentationChange::Persistence)
+                        && form.state.read(cx).storage_error.is_some())
+                {
+                    cx.notify();
+                }
+            }),
+        );
+        Self {
             thread_id,
+            state,
+            owner,
             project_id,
             config,
             fields,
@@ -232,15 +226,15 @@ impl Workspace {
             readiness: None,
             readiness_request: None,
             _subscriptions: subscriptions,
-        });
+        }
     }
 
-    fn factory_config_changed(
+    fn config_changed(
         &mut self,
-        thread_id: ThreadId,
         change: impl FnOnce(&mut FactoryThreadConfig),
         cx: &mut Context<Self>,
     ) {
+        let thread_id = self.thread_id;
         let config = self.state.update(cx, |state, cx| {
             if state.pending_factory.contains(&thread_id) {
                 return None;
@@ -259,22 +253,68 @@ impl Workspace {
             }
             thread.updated_at = platform::now();
             state.save_thread(thread);
-            cx.notify();
+            cx.emit(PresentationChange::Persistence);
             Some(config)
         });
         if let Some(config) = config {
-            if let Some(form) = self
-                .factory_form
-                .as_mut()
-                .filter(|form| form.thread_id == thread_id)
-            {
-                form.config = config;
-                form.error = None;
-                form.readiness = None;
-                form.readiness_request = None;
+            let branch_warning = |config: &FactoryThreadConfig| {
+                self.state
+                    .read(cx)
+                    .repositories
+                    .get(&self.project_id)
+                    .is_some_and(|repository| {
+                        repository.as_ref().is_ok_and(|repository| {
+                            repository.dirty
+                                && repository.branch.as_deref() == Some(config.target_branch.trim())
+                        })
+                    })
+            };
+            let presentation_changed = self.config.source_kind != config.source_kind
+                || self.config.harness != config.harness
+                || branch_warning(&self.config) != branch_warning(&config)
+                || self.error.is_some()
+                || self.readiness.is_some()
+                || self.readiness_request.is_some();
+            self.config = config;
+            self.error = None;
+            self.readiness = None;
+            self.readiness_request = None;
+            if presentation_changed {
+                cx.notify();
             }
-            cx.notify();
         }
+    }
+}
+
+impl Workspace {
+    pub fn sync_factory_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let thread = state.factory_thread().filter(|thread| {
+            !state
+                .snapshot
+                .launches
+                .iter()
+                .any(|launch| launch.factory_thread_id == thread.id)
+        });
+        let Some(thread) = thread else {
+            if self.factory_form.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        if self
+            .factory_form
+            .as_ref()
+            .is_some_and(|form| form.read(cx).thread_id == thread.id)
+        {
+            return;
+        }
+        let thread = thread.clone();
+        let state = self.state.clone();
+        let owner = cx.entity().downgrade();
+        self.factory_form =
+            Some(cx.new(|cx| FactoryThreadForm::new(&thread, state, owner, window, cx)));
+        cx.notify();
     }
 
     fn factory_form_error(
@@ -285,13 +325,10 @@ impl Workspace {
     ) {
         if let Some(form) = self
             .factory_form
-            .as_mut()
-            .filter(|form| form.thread_id == thread_id)
+            .as_ref()
+            .filter(|form| form.read(cx).thread_id == thread_id)
         {
-            if error.field == Some("target_branch") || error.field == Some("thought_level") {
-                form.advanced = true;
-            }
-            form.error = Some(error);
+            form.update(cx, |form, cx| form.set_error(error, cx));
         } else if !self
             .state
             .read(cx)
@@ -310,7 +347,6 @@ impl Workspace {
                 cx.notify();
             });
         }
-        cx.notify();
     }
 
     fn finish_factory_start(
@@ -321,20 +357,25 @@ impl Workspace {
     ) {
         self.state.update(cx, |state, cx| {
             state.pending_factory.remove(&thread_id);
-            cx.notify();
+            cx.emit(PresentationChange::Thread(thread_id));
         });
         if let Some(error) = error {
             self.factory_form_error(thread_id, error, cx);
         }
+    }
+}
+
+impl FactoryThreadForm {
+    fn set_error(&mut self, error: FormError, cx: &mut Context<Self>) {
+        if error.field == Some("target_branch") || error.field == Some("thought_level") {
+            self.advanced = true;
+        }
+        self.error = Some(error);
         cx.notify();
     }
 
-    fn pick_factory_folder(
-        &mut self,
-        thread_id: ThreadId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread_id = self.thread_id;
         let state = self.state.read(cx);
         if state.pending_factory.contains(&thread_id) {
             return;
@@ -353,10 +394,10 @@ impl Workspace {
             multiple: false,
             prompt: Some("Choose Factory folder".into()),
         });
-        cx.spawn_in(window, async move |workspace, window| {
+        cx.spawn_in(window, async move |form, window| {
             let selected = result.await;
-            let _ = workspace.update_in(window, |workspace, window, cx| {
-                let state = workspace.state.read(cx);
+            let _ = form.update_in(window, |form, window, cx| {
+                let state = form.state.read(cx);
                 if state.pending_factory.contains(&thread_id) {
                     return;
                 }
@@ -371,24 +412,13 @@ impl Workspace {
                     Ok(Ok(Some(paths))) => {
                         if let Some(path) = paths.first() {
                             let value = path.to_string_lossy().into_owned();
-                            workspace.factory_config_changed(
-                                thread_id,
-                                |config| config.source = value.clone(),
-                                cx,
-                            );
-                            if let Some(form) = workspace
-                                .factory_form
-                                .as_ref()
-                                .filter(|form| form.thread_id == thread_id)
-                            {
-                                form.input("source")
-                                    .update(cx, |input, cx| input.set_value(value, window, cx));
-                            }
+                            form.config_changed(|config| config.source = value.clone(), cx);
+                            form.input("source")
+                                .update(cx, |input, cx| input.set_value(value, window, cx));
                         }
                     }
                     Ok(Ok(None)) => {}
-                    error => workspace.factory_form_error(
-                        thread_id,
+                    error => form.set_error(
                         FormError::field("source", format!("Folder picker failed: {error:?}")),
                         cx,
                     ),
@@ -398,36 +428,18 @@ impl Workspace {
         .detach();
     }
 
-    pub fn check_factory_readiness(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.state.read(cx).factory_thread().map(|thread| thread.id) else {
-            return;
-        };
-        self.check_factory_readiness_for(thread_id, window, cx);
-    }
-
-    fn check_factory_readiness_for(
-        &mut self,
-        thread_id: ThreadId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(form) = self
-            .factory_form
-            .as_ref()
-            .filter(|form| form.thread_id == thread_id)
-        else {
-            return;
-        };
+    fn check_readiness(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread_id = self.thread_id;
         let state = self.state.read(cx);
-        if form.readiness_request.is_some() || state.pending_factory.contains(&thread_id) {
+        if self.readiness_request.is_some() || state.pending_factory.contains(&thread_id) {
             return;
         }
         let Ok(thread) = editable_thread(state, thread_id) else {
             return;
         };
-        let harness = form.config(cx).harness;
+        let harness = self.config(cx).harness;
         if !HARNESSES.contains(&harness.as_str()) {
-            self.factory_form_error(thread_id, unsupported_harness(&harness), cx);
+            self.set_error(unsupported_harness(&harness), cx);
             return;
         }
         let cwd = state
@@ -440,18 +452,15 @@ impl Workspace {
             .clone();
         let executable = configured_executable(state);
         let request = Uuid::new_v4();
-        let form = self.factory_form.as_mut().expect("Selected Factory form");
-        form.readiness_request = Some(request);
-        form.readiness = None;
-        form.error = None;
-        cx.spawn_in(window, async move |workspace, window| {
+        self.readiness_request = Some(request);
+        self.readiness = None;
+        self.error = None;
+        cx.spawn_in(window, async move |form, window| {
             let result = factory::check_readiness(executable, cwd, harness)
                 .await
                 .map_err(|error| format!("Readiness refused:\n{error:#}"));
-            let _ = workspace.update_in(window, |workspace, _, cx| {
-                if let Some(form) = workspace.factory_form.as_mut().filter(|form| {
-                    form.thread_id == thread_id && form.readiness_request == Some(request)
-                }) {
+            let _ = form.update_in(window, |form, _, cx| {
+                if form.readiness_request == Some(request) {
                     form.readiness_request = None;
                     form.readiness = Some(result);
                     cx.notify();
@@ -460,6 +469,21 @@ impl Workspace {
         })
         .detach();
         cx.notify();
+    }
+}
+
+impl Workspace {
+    pub fn check_factory_readiness(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.state.read(cx).factory_thread().map(|thread| thread.id) else {
+            return;
+        };
+        if let Some(form) = self
+            .factory_form
+            .as_ref()
+            .filter(|form| form.read(cx).thread_id == thread_id)
+        {
+            form.update(cx, |form, cx| form.check_readiness(window, cx));
+        }
     }
 
     pub fn start_factory_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -478,18 +502,20 @@ impl Workspace {
         let Some(form) = self
             .factory_form
             .as_ref()
-            .filter(|form| form.thread_id == thread_id)
+            .filter(|form| form.read(cx).thread_id == thread_id)
         else {
             return;
         };
-        if form.readiness_request.is_some()
+        if form.read(cx).readiness_request.is_some()
             || self.state.read(cx).pending_factory.contains(&thread_id)
         {
             return;
         }
-        let config = form.config(cx);
+        let config = form.read(cx).config(cx);
         // Capture raw inputs, including incomplete values, before validating or starting work.
-        self.factory_config_changed(thread_id, |saved| *saved = config.clone(), cx);
+        form.update(cx, |form, cx| {
+            form.config_changed(|saved| *saved = config.clone(), cx)
+        });
         let spec = match factory_spec(self.state.read(cx), thread_id, &config) {
             Ok(spec) => spec,
             Err(error) => {
@@ -518,7 +544,7 @@ impl Workspace {
             .collect();
         self.state.update(cx, |state, cx| {
             state.pending_factory.insert(thread_id);
-            cx.notify();
+            cx.emit(PresentationChange::Thread(thread_id));
         });
         cx.spawn_in(window, async move |workspace, window| {
             let result = smol::unblock(move || {
@@ -542,7 +568,6 @@ impl Workspace {
             });
         })
         .detach();
-        cx.notify();
     }
 
     fn confirm_factory_start(
@@ -637,7 +662,7 @@ impl Workspace {
                 .clone()
                 .context("Factory tracking is unavailable; see Output")?;
             let persisted = state.persist_thread(thread);
-            cx.notify();
+            cx.emit(PresentationChange::Persistence);
             Ok::<_, anyhow::Error>((manager, persisted))
         });
         let (manager, persisted) = match result {
@@ -877,14 +902,14 @@ fn input_field(
     )
 }
 
-pub fn render(
-    form: &FactoryThreadForm,
-    workspace: &Workspace,
-    owner: &WeakEntity<Workspace>,
-    _window: &Window,
-    cx: &App,
-) -> AnyElement {
-    let state = workspace.state.read(cx);
+impl Render for FactoryThreadForm {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        render(self, &cx.entity().downgrade(), cx)
+    }
+}
+
+fn render(form: &FactoryThreadForm, owner: &WeakEntity<FactoryThreadForm>, cx: &App) -> AnyElement {
+    let state = form.state.read(cx);
     let thread_id = form.thread_id;
     let project = state
         .snapshot
@@ -897,7 +922,7 @@ pub fn render(
     let folder = form.config.source_kind == FactorySourceKind::Folder;
     let pick = owner.clone();
     let ready = owner.clone();
-    let start = owner.clone();
+    let start = form.owner.clone();
     let advanced = owner.clone();
     let mut source = input_field(
         form,
@@ -921,9 +946,7 @@ pub fn render(
                     .label("Choose folder…")
                     .disabled(disabled)
                     .on_click(move |_, window, cx| {
-                        let _ = pick.update(cx, |workspace, cx| {
-                            workspace.pick_factory_folder(thread_id, window, cx)
-                        });
+                        let _ = pick.update(cx, |form, cx| form.pick_folder(window, cx));
                     }),
             );
     }
@@ -1025,14 +1048,8 @@ pub fn render(
                                     "Advanced +"
                                 })
                                 .on_click(move |_, _, cx| {
-                                    let _ = advanced.update(cx, |workspace, cx| {
-                                        if let Some(form) = workspace
-                                            .factory_form
-                                            .as_mut()
-                                            .filter(|form| form.thread_id == thread_id)
-                                        {
-                                            form.advanced = !form.advanced;
-                                        }
+                                    let _ = advanced.update(cx, |form, cx| {
+                                        form.advanced = !form.advanced;
                                         cx.notify();
                                     });
                                 }),
@@ -1089,9 +1106,8 @@ pub fn render(
                                 })
                                 .disabled(disabled)
                                 .on_click(move |_, window, cx| {
-                                    let _ = ready.update(cx, |workspace, cx| {
-                                        workspace.check_factory_readiness_for(thread_id, window, cx)
-                                    });
+                                    let _ = ready
+                                        .update(cx, |form, cx| form.check_readiness(window, cx));
                                 }),
                         )
                         .child(

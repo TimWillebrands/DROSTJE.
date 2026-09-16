@@ -54,6 +54,7 @@ pub struct ModelKey {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectDefaults {
+    pub interactive_harness: String,
     pub interactive_model: Option<ModelKey>,
     pub factory_harness: String,
     pub factory_model: Option<String>,
@@ -63,6 +64,7 @@ pub struct ProjectDefaults {
 impl Default for ProjectDefaults {
     fn default() -> Self {
         Self {
+            interactive_harness: "omp".into(),
             interactive_model: None,
             factory_harness: "opencode".into(),
             factory_model: None,

@@ -272,17 +272,35 @@ impl Workspace {
             palette.update(cx, |palette, cx| palette.dismiss(window, cx));
         }
         if let Some(dialog) = self.dialog.take() {
-            super::settings::close_surface(&dialog.kind, window, cx);
+            let kind = dialog.read(cx).kind.clone();
+            super::settings::close_surface(&kind, window, cx);
         }
         let workspace_entity = cx.entity();
         let owner = workspace_entity.downgrade();
         let state = self.state.clone();
-        let content = cx.new(|cx| DetailContent {
+        let content = cx.new(|cx: &mut Context<DetailContent>| DetailContent {
             owner: owner.clone(),
             key: key.clone(),
             _subscriptions: vec![
                 cx.observe(&workspace_entity, |_, _, cx| cx.notify()),
                 cx.observe(&state, |_, _, cx| cx.notify()),
+                cx.subscribe(
+                    &state,
+                    |content, _, change: &crate::app::PresentationChange, cx| {
+                        let thread = match &content.key {
+                            SurfaceKey::Extension(thread, _) | SurfaceKey::Details(thread, _) => {
+                                Some(*thread)
+                            }
+                            SurfaceKey::Image(_) => None,
+                        };
+                        if matches!(change, crate::app::PresentationChange::Thread(id)
+                        | crate::app::PresentationChange::Transcript(id)
+                        | crate::app::PresentationChange::Draft(id) if Some(*id) == thread)
+                        {
+                            cx.notify();
+                        }
+                    },
+                ),
             ],
         });
         self.detail_surface = Some(key.clone());

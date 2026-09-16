@@ -1,9 +1,20 @@
-//! Native conversation boundary. Provider wire objects stay in `omp`.
+//! Native conversation boundary. Provider wire objects stay in their harness module.
+mod claude;
 mod omp;
 
 use crate::model::{ImageAttachment, ModelKey};
 use serde_json::Value;
 use std::{path::PathBuf, time::SystemTime};
+pub const CONVERSATION_HARNESSES: [&str; 2] = ["omp", "claude-code"];
+
+pub fn executable_name(harness: &str) -> anyhow::Result<&'static str> {
+    match harness {
+        "omp" => Ok("omp"),
+        "claude-code" => Ok("claude"),
+        harness => anyhow::bail!("Unsupported conversation harness: {harness}"),
+    }
+}
+
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -184,16 +195,22 @@ pub enum ConversationEvent {
     },
 }
 pub async fn open(config: ConversationConfig) -> anyhow::Result<ConversationHandle> {
-    omp::open(config).await
+    match config.harness.as_str() {
+        "claude-code" => claude::open(config).await,
+        "omp" => omp::open(config).await,
+        harness => anyhow::bail!("Unsupported conversation harness: {harness}"),
+    }
 }
 
-/// Physical JSONL size, without loading or base64-encoding the owned image files.
+/// Largest physical JSONL request for a supported harness, without loading or
+/// base64-encoding the owned image files.
 pub fn submission_size(
     request_id: Uuid,
     text: &str,
     images: &[ImageAttachment],
 ) -> anyhow::Result<u64> {
-    omp::submission_size(request_id, text, images)
+    Ok(omp::submission_size(request_id, text, images)?
+        .max(claude::submission_size(request_id, text, images)?))
 }
 /// Image preparation uses this before writing reviewed copies to disk.
 pub fn submission_size_for_lengths(
@@ -201,5 +218,9 @@ pub fn submission_size_for_lengths(
     text: &str,
     images: &[(&str, u64)],
 ) -> anyhow::Result<u64> {
-    omp::submission_size_for_lengths(request_id, text, images)
+    Ok(
+        omp::submission_size_for_lengths(request_id, text, images)?.max(
+            claude::submission_size_for_lengths(request_id, text, images)?,
+        ),
+    )
 }

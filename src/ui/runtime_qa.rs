@@ -14,10 +14,12 @@ use gpui_kit::{
     TestAppContext, VisualTestContext, Window, WindowHandle,
     component::{Root, Theme, ThemeMode, WindowExt},
     px, size,
+    test::TestWindowExt,
 };
 use serde_json::json;
 use std::{
     collections::BTreeMap,
+    fs,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -64,14 +66,17 @@ fn set_dialog(
             .dialog
             .as_ref()
             .unwrap()
+            .read(cx)
             .fields
             .iter()
             .find(|field| field.key == key)
-            .unwrap();
-        field.input.update(cx, |input, cx| {
+            .unwrap()
+            .input
+            .clone();
+        field.update(cx, |input, cx| {
             input.set_value(value.to_owned(), window, cx)
         });
-        let focus = field.input.focus_handle(cx);
+        let focus = field.focus_handle(cx);
         focus.focus(window, cx);
     });
     cx.run_until_parked();
@@ -93,11 +98,14 @@ fn set_factory_field(
             .factory_form
             .as_ref()
             .unwrap()
+            .read(cx)
             .fields
             .iter()
             .find(|field| field.key == key)
-            .unwrap();
-        field.input.update(cx, |input, cx| {
+            .unwrap()
+            .input
+            .clone();
+        field.update(cx, |input, cx| {
             input.set_value(value.to_owned(), window, cx)
         });
     });
@@ -362,10 +370,15 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
                 })
                 .unwrap();
             }
-            let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
-            let thread = visual.debug_bounds("Thread").unwrap();
             for action in ["empty-new-conversation", "empty-new-factory"] {
-                let bounds = visual.debug_bounds(action).unwrap();
+                let (thread, bounds) = cx
+                    .update_window(fixture.window.into(), |_, window, _| {
+                        (
+                            window.find("Welcome").bounds(),
+                            window.find(action).bounds(),
+                        )
+                    })
+                    .unwrap();
                 assert!(
                     bounds.size.width < thread.size.width * 0.5,
                     "{action} stretches across the thread pane: {bounds:?}"
@@ -400,6 +413,229 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
         |cx| fixture.state.read(cx).factory_thread().is_some(),
     )
     .await;
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native live diff sidebar, no provider turn"]
+async fn conversation_diff_sidebar_tracks_working_tree(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let conversation = new_conversation(cx, &fixture).await;
+    let root = cx.read(|cx| fixture.state.read(cx).project().unwrap().root.clone());
+    fs::write(root.join("notes.txt"), "after\n").unwrap();
+    fs::write(root.join("sidebar-new.txt"), "visible\n").unwrap();
+
+    cx.dispatch_action(fixture.window.into(), commands::RefreshConversationDiff);
+    until(cx, "working tree diff", Duration::from_secs(5), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .conversation_diff(conversation)
+            .and_then(|diff| diff.result.as_ref())
+            .is_some_and(|result| {
+                result.as_ref().is_ok_and(|diff| {
+                    diff.patch.contains("-before")
+                        && diff.patch.contains("+after")
+                        && diff.patch.contains("+visible")
+                })
+            })
+    })
+    .await;
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    let composer = visual.debug_bounds("composer-content").unwrap();
+    let sidebar = visual.debug_bounds("conversation-diff-sidebar").unwrap();
+    assert!(sidebar.origin.x > composer.origin.x + composer.size.width);
+    assert!(visual.debug_bounds("conversation-diff-patch").is_some());
+
+    let other = new_conversation(cx, &fixture).await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.state.update(cx, |state, cx| {
+                state.select_thread(conversation);
+                cx.notify();
+            });
+            workspace.focus_region(Region::Thread, window, cx);
+        },
+    );
+
+    cx.dispatch_action(fixture.window.into(), commands::ToggleConversationDiffs);
+    until(cx, "collapsed diff sidebar", Duration::from_secs(5), |cx| {
+        !fixture.state.read(cx).conversation_diff_open(conversation)
+    })
+    .await;
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(visual.debug_bounds("conversation-diff-sidebar").is_none());
+    assert!(visual.debug_bounds("toggle-conversation-diffs").is_some());
+
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.state.update(cx, |state, cx| {
+                state.select_thread(other);
+                cx.notify();
+            });
+            workspace.focus_region(Region::Thread, window, cx);
+        },
+    );
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(
+        visual.debug_bounds("conversation-diff-sidebar").is_some(),
+        "collapsing one Conversation must not collapse another"
+    );
+
+    fs::write(root.join("notes.txt"), "before\n").unwrap();
+    fs::remove_file(root.join("sidebar-new.txt")).unwrap();
+    quit(cx, &fixture).await;
+}
+
+/// Opt-in comparative workload, not a wall-clock assertion in ordinary CI.
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; measures real input and navigation without provider turns"]
+async fn interaction_performance_workload(cx: &mut TestAppContext) {
+    fn report(label: &str, mut samples: Vec<f64>) {
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "PERF {label}: median={:.2}ms p95={:.2}ms max={:.2}ms",
+            samples[samples.len() / 2],
+            samples[samples.len() * 95 / 100],
+            samples[samples.len() - 1]
+        );
+    }
+    fn measure_keys(cx: &mut TestAppContext, window: WindowHandle<Root>, keys: &str) -> Vec<f64> {
+        (0..40)
+            .map(|_| {
+                let start = Instant::now();
+                cx.simulate_keystrokes(window.into(), keys);
+                start.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect()
+    }
+    let fixture = open_fixture(cx, None).await;
+    let hidden_threads: usize = std::env::var("DROSTJE_PERF_HIDDEN_THREADS")
+        .map(|value| {
+            value
+                .parse()
+                .expect("DROSTJE_PERF_HIDDEN_THREADS must be an integer")
+        })
+        .unwrap_or(0);
+    for _ in 0..hidden_threads {
+        new_conversation(cx, &fixture).await;
+    }
+    eprintln!("PERF hidden conversations: {hidden_threads}");
+    let first = new_conversation(cx, &fixture).await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.focus_composer(window, cx),
+    );
+    report("composer", measure_keys(cx, fixture.window, "x"));
+    until(cx, "workload draft", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).drafts[&DraftKey::Thread(first)].text == "x".repeat(40)
+    })
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-escape");
+    cx.dispatch_action(fixture.window.into(), commands::NewFactoryThread);
+    until(cx, "workload Factory form", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).factory_form.is_some()
+    })
+    .await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            let input = workspace
+                .factory_form
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .fields
+                .iter()
+                .find(|field| field.key == "source")
+                .unwrap()
+                .input
+                .clone();
+            input.update(cx, |input, cx| input.set_value(String::new(), window, cx));
+            input.focus_handle(cx).focus(window, cx);
+        },
+    );
+    report("factory-input", measure_keys(cx, fixture.window, "x"));
+    assert_eq!(
+        cx.read(|cx| fixture
+            .state
+            .read(cx)
+            .thread()
+            .unwrap()
+            .factory
+            .as_ref()
+            .unwrap()
+            .source
+            .clone()),
+        "x".repeat(40)
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-,");
+    until(cx, "workload Settings", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).dialog.is_some()
+    })
+    .await;
+    set_dialog(cx, fixture.window, &fixture.workspace, "nvim", "");
+    report("settings-input", measure_keys(cx, fixture.window, "x"));
+    assert_eq!(
+        cx.read(|cx| fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .fields
+            .iter()
+            .find(|field| field.key == "nvim")
+            .unwrap()
+            .input
+            .read(cx)
+            .value()
+            .to_string()),
+        "x".repeat(40)
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    report(
+        "tab-navigation",
+        measure_keys(cx, fixture.window, "ctrl-tab"),
+    );
     quit(cx, &fixture).await;
 }
 
@@ -719,6 +955,74 @@ async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
     })
     .unwrap();
 }
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native Settings selection"]
+async fn claude_code_project_default_creates_claude_conversation(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-,");
+    until(
+        cx,
+        "Settings conversation harness",
+        Duration::from_secs(5),
+        |cx| fixture.workspace.read(cx).dialog.is_some(),
+    )
+    .await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace
+                .dialog
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .select("interactive_harness")
+                .unwrap()
+                .clone()
+                .update(cx, |select, cx| {
+                    select.set_selected_value(&"claude-code".to_owned(), window, cx)
+                });
+        },
+    );
+    set_dialog(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        "claude",
+        "/nonexistent/drostje-qa-claude",
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-enter");
+    until(
+        cx,
+        "Claude Code default saved",
+        Duration::from_secs(5),
+        |cx| {
+            fixture.workspace.read(cx).dialog.is_none()
+                && fixture
+                    .state
+                    .read(cx)
+                    .project()
+                    .is_some_and(|project| project.defaults.interactive_harness == "claude-code")
+        },
+    )
+    .await;
+
+    let before = cx.read(|cx| fixture.state.read(cx).snapshot.threads.len());
+    cx.dispatch_action(fixture.window.into(), commands::NewConversation);
+    until(
+        cx,
+        "Claude Code conversation created",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).snapshot.threads.len() == before + 1,
+    )
+    .await;
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).thread().unwrap().harness.clone()),
+        "claude-code"
+    );
+    quit(cx, &fixture).await;
+}
 
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native Command/focus/theme integration"]
@@ -802,6 +1106,12 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     );
     let saved_root =
         cx.read(|cx| fixture.state.read(cx).snapshot.settings["factory_data_root"].clone());
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.within("settings-sidebar").click("0-0-2", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
     set_dialog(
         cx,
         fixture.window,
@@ -821,6 +1131,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
                 .dialog
                 .as_ref()
                 .is_some_and(|dialog| {
+                    let dialog = dialog.read(cx);
                     dialog.error.is_some()
                         && dialog.value("factory_data_root", cx) == "relative/path"
                 })
@@ -924,8 +1235,10 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
                 .dialog
                 .as_ref()
                 .unwrap()
+                .read(cx)
                 .select("theme_mode")
                 .unwrap()
+                .clone()
                 .update(cx, |select, cx| {
                     select.set_selected_value(&"light".to_owned(), window, cx)
                 });
@@ -953,8 +1266,10 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
                 .dialog
                 .as_ref()
                 .unwrap()
+                .read(cx)
                 .select("theme_mode")
                 .unwrap()
+                .clone()
                 .update(cx, |select, cx| {
                     select.set_selected_value(&"light".to_owned(), window, cx)
                 });
@@ -1031,9 +1346,17 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
                 })
                 .unwrap();
             }
-            let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
-            let thread = visual.debug_bounds("Thread").unwrap();
-            let composer = visual.debug_bounds("composer-content").unwrap();
+            let thread_id = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+            let (thread, composer) = cx
+                .update_window(fixture.window.into(), |_, window, _| {
+                    (
+                        window
+                            .find(gpui_kit::SharedString::from(format!("Thread:{thread_id}")))
+                            .bounds(),
+                        window.find("composer-content").bounds(),
+                    )
+                })
+                .unwrap();
             assert!(
                 f32::from(thread.size.width) >= font_size * 27.,
                 "{width}×{height} at {font_size}: {thread:?}"

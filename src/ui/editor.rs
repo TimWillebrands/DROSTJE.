@@ -99,10 +99,23 @@ impl PromptEditor {
                             match event {
                                 NvimViewEvent::DraftActivated(draft) => {
                                     this.active = Some(draft.key.clone());
-                                    this.state.update(cx, |state, cx| { state.record_draft(draft.clone()); cx.notify(); });
+                                    let id = match &draft.key {
+                                        DraftKey::Thread(id) | DraftKey::Extension { thread: id, .. } => *id,
+                                    };
+                                    this.state.update(cx, |state, cx| {
+                                        state.record_draft(draft.clone());
+                                        cx.emit(crate::app::PresentationChange::Draft(id));
+                                    });
                                 }
                                 NvimViewEvent::DraftChanged(draft) => {
-                                    this.state.update(cx, |state, cx| { state.record_draft(draft.clone()); cx.notify(); });
+                                    let id = match &draft.key {
+                                        DraftKey::Thread(id) | DraftKey::Extension { thread: id, .. } => *id,
+                                    };
+                                    this.state.update(cx, |state, cx| {
+                                        state.record_draft(draft.clone());
+                                        cx.emit(crate::app::PresentationChange::Draft(id));
+                                    });
+                                    return;
                                 }
                                 NvimViewEvent::CompositionChanged(composing) => {
                                     this.composition = *composing;
@@ -265,7 +278,9 @@ impl Render for PromptEditor {
             })
             .bg(cx.theme().background)
             .overflow_hidden()
-            .when_some(self.view.clone(), |surface, view| surface.child(view))
+            .when_some(self.view.clone(), |surface, view| {
+                surface.child(view.cached(StyleRefinement::default().size_full()))
+            })
             .when(self.view.is_none(), |surface| {
                 if let Some(error) = error {
                     surface.child(Alert::error("neovim-startup-error", error))
@@ -320,7 +335,11 @@ impl Workspace {
                 window,
                 |workspace, _, _: &PromptEditorChanged, window, cx| {
                     workspace.sync_session(window, cx);
-                    cx.notify();
+                    workspace.state.update(cx, |state, cx| {
+                        if let Some(id) = state.selected_thread {
+                            cx.emit(crate::app::PresentationChange::Draft(id));
+                        }
+                    });
                 },
             ));
             self.editor = Some(editor);

@@ -278,7 +278,9 @@ impl GridReducer {
                 let highlight = parse_highlight(&args[1])?;
                 map(&args[2], "terminal attributes")?;
                 array(&args[3], "highlight info")?;
-                Arc::make_mut(&mut self.staging.highlights).insert(id, highlight);
+                if self.staging.highlights.get(&id) != Some(&highlight) {
+                    Arc::make_mut(&mut self.staging.highlights).insert(id, highlight);
+                }
             }
             "mode_info_set" => {
                 let enabled = boolean(&args[0], "cursor style enabled")?;
@@ -419,7 +421,7 @@ impl GridReducer {
         if cells.is_empty() {
             return Ok(());
         }
-        let row = Arc::make_mut(&mut self.staging.rows[row]);
+        let row = &mut self.staging.rows[row];
         let mut hl_id = None;
         for (cell_index, value) in cells.iter().enumerate() {
             let cell = array(value, "cell")?;
@@ -442,10 +444,17 @@ impl GridReducer {
                 "cell {cell_index} ends at column {end}, beyond width {}",
                 self.staging.cols
             );
-            for destination in &mut row[col..end] {
-                destination.text.clear();
-                destination.text.push_str(text);
-                destination.hl_id = hl_id;
+            // Repeated redraws of identical cells retain the published row's
+            // identity, so downstream shape caches do not invalidate on a no-op.
+            if row[col..end]
+                .iter()
+                .any(|destination| destination.text != text || destination.hl_id != hl_id)
+            {
+                for destination in &mut Arc::make_mut(row)[col..end] {
+                    destination.text.clear();
+                    destination.text.push_str(text);
+                    destination.hl_id = hl_id;
+                }
             }
             col = end;
         }
@@ -890,6 +899,57 @@ mod tests {
                 blend: 25,
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn row_identity_survives_noop_redraws_but_changes_with_cell_content() -> Result<()> {
+        let mut reducer = GridReducer::new(Uuid::nil());
+        reducer.apply(&[
+            resize(4, 2),
+            line(
+                0,
+                0,
+                vec![
+                    vec!["界".into(), 7.into()],
+                    vec!["".into()],
+                    vec!["e\u{301}".into()],
+                ],
+            ),
+            highlight(7, attributes(&[("bold", true.into())])),
+            flush(),
+        ])?;
+        let original = reducer.snapshot();
+        reducer.apply(&[
+            line(
+                0,
+                0,
+                vec![
+                    vec!["界".into(), 7.into()],
+                    vec!["".into()],
+                    vec!["e\u{301}".into()],
+                ],
+            ),
+            highlight(7, attributes(&[("bold", true.into())])),
+            event("grid_cursor_goto", vec![1.into(), 1.into(), 2.into()]),
+            flush(),
+        ])?;
+        let cursor = reducer.snapshot();
+        assert_eq!(cursor.cursor, (1, 2));
+        assert!(Arc::ptr_eq(&original.rows[0], &cursor.rows[0]));
+        assert!(Arc::ptr_eq(&original.rows[1], &cursor.rows[1]));
+        assert!(Arc::ptr_eq(&original.highlights, &cursor.highlights));
+        reducer.apply(&[
+            line(0, 2, vec![vec!["changed".into(), 7.into()]]),
+            highlight(7, attributes(&[("italic", true.into())])),
+            flush(),
+        ])?;
+        let changed = reducer.snapshot();
+        assert!(!Arc::ptr_eq(&cursor.rows[0], &changed.rows[0]));
+        assert!(Arc::ptr_eq(&cursor.rows[1], &changed.rows[1]));
+        assert!(!Arc::ptr_eq(&cursor.highlights, &changed.highlights));
+        assert_eq!(original.rows[0][2].text, "e\u{301}");
+        assert_eq!(changed.rows[0][2].text, "changed");
         Ok(())
     }
 

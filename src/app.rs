@@ -1,5 +1,6 @@
 mod conversation;
 mod factory;
+mod project_diff;
 mod shutdown;
 use crate::harness::{
     self, ContentBlock, ConversationCommand, ConversationEvent, ConversationHandle,
@@ -8,6 +9,7 @@ use crate::harness::{
 use crate::{model::*, platform, store::Store};
 use anyhow::{Context as _, Result};
 use gpui_kit::*;
+pub use project_diff::{ProjectDiffState, ProjectDiffs};
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc};
 use std::{
@@ -15,6 +17,20 @@ use std::{
     path::PathBuf,
 };
 use uuid::Uuid;
+
+/// Content changes are separate from structural workspace invalidation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PresentationChange {
+    Draft(ThreadId),
+    Thread(ThreadId),
+    Transcript(ThreadId),
+    Diff(ProjectId),
+    Persistence,
+    Selection,
+    Projects,
+}
+
+impl EventEmitter<PresentationChange> for AppState {}
 
 pub struct ConversationSession {
     pub generation: Uuid,
@@ -34,11 +50,12 @@ pub struct ConversationSession {
     pub error: Option<String>,
     pub outcome: Option<TurnOutcome>,
     pub preparing: bool,
-    pub list: ListState,
+    pub transcript_revision: u64,
+    transcript_changes: VecDeque<(u64, Option<usize>)>,
     indices: HashMap<String, usize>,
     /// IDs of every `ContentBlock::ToolCall` seen, so their result messages fold
     /// into the call's card instead of rendering as separate rows.
-    tool_calls: HashSet<String>,
+    tool_calls: HashMap<String, usize>,
     tool_results: HashMap<String, usize>,
     submitted: HashMap<Uuid, DraftSnapshot>,
 }
@@ -62,44 +79,89 @@ impl ConversationSession {
             error: None,
             outcome: None,
             preparing: false,
-            list: ListState::new(0, ListAlignment::Bottom, px(500.)),
+            transcript_revision: 0,
+            transcript_changes: VecDeque::new(),
             indices: HashMap::new(),
-            tool_calls: HashSet::new(),
+            tool_calls: HashMap::new(),
             tool_results: HashMap::new(),
             submitted: HashMap::new(),
         }
     }
     fn message(&mut self, message: Message) {
+        let index = self
+            .indices
+            .get(&message.id)
+            .copied()
+            .unwrap_or(self.messages.len());
         for block in &message.content {
             if let ContentBlock::ToolCall { id, .. } = block {
-                self.tool_calls.insert(id.clone());
+                self.tool_calls.insert(id.clone(), index);
+                if let Some(result_index) = self.tool_results.get(id).copied() {
+                    self.record_transcript_change(Some(result_index));
+                }
             }
         }
-        let index = if let Some(index) = self.indices.get(&message.id).copied() {
-            self.messages[index] = Arc::new(message);
-            self.list.splice(index..index + 1, 1);
-            index
-        } else {
-            let index = self.messages.len();
+        if let Some(call_id) = &message.tool_call_id {
+            self.tool_results.insert(call_id.clone(), index);
+            if let Some(call_index) = self.tool_calls.get(call_id).copied() {
+                self.record_transcript_change(Some(call_index));
+            }
+        }
+        if index == self.messages.len() {
             self.indices.insert(message.id.clone(), index);
             self.messages.push(Arc::new(message));
-            self.list.splice(index..index, 1);
-            index
-        };
-        if let Some(call_id) = &self.messages[index].tool_call_id {
-            self.tool_results.insert(call_id.clone(), index);
+        } else {
+            self.messages[index] = Arc::new(message);
         }
+        self.record_transcript_change(Some(index));
     }
+
+    fn record_transcript_change(&mut self, index: Option<usize>) {
+        self.transcript_revision += 1;
+        if self.transcript_changes.len() == 512 {
+            self.transcript_changes.pop_front();
+        }
+        self.transcript_changes
+            .push_back((self.transcript_revision, index));
+    }
+
+    /// A lagging presentation resets once when its bounded change journal expires.
+    pub fn transcript_changes_since(
+        &self,
+        revision: u64,
+    ) -> Option<impl Iterator<Item = usize> + '_> {
+        if self
+            .transcript_changes
+            .front()
+            .is_some_and(|(first, _)| revision < first.saturating_sub(1))
+            || self
+                .transcript_changes
+                .iter()
+                .any(|(next, index)| *next > revision && index.is_none())
+        {
+            return None;
+        }
+        Some(
+            self.transcript_changes
+                .iter()
+                .filter_map(move |(next, index)| (*next > revision).then_some(*index).flatten()),
+        )
+    }
+
     fn reset_history(&mut self) {
         self.messages.clear();
         self.indices.clear();
         self.tool_calls.clear();
         self.tool_results.clear();
-        self.list.reset(0);
+        self.record_transcript_change(None);
     }
+    pub(super) fn mark_tool_changed(&mut self, call_id: &str) {
+        self.record_transcript_change(self.tool_calls.get(call_id).copied());
+    }
+
     /// True once the assistant message that issued this call has been seen.
     pub fn has_tool_call(&self, call_id: &str) -> bool {
-        self.tool_calls.contains(call_id)
+        self.tool_calls.contains_key(call_id)
     }
     /// The historical result message answering a tool call, if any.
     pub fn tool_result(&self, call_id: &str) -> Option<&Arc<Message>> {
@@ -124,7 +186,7 @@ impl Bootstrap {
         let store = Store::open(data_dir.clone())?;
         let mut snapshot = smol::block_on(store.snapshot())?;
         if !snapshot.settings.contains_key("executables") {
-            let value = json!({ "nvim": "", "omp": "", "factory": "" });
+            let value = json!({ "nvim": "", "omp": "", "claude": "", "factory": "" });
             smol::block_on(store.set_setting("executables".into(), value.clone()))?;
             snapshot.settings.insert("executables".into(), value);
         }
@@ -156,7 +218,7 @@ impl Bootstrap {
 }
 
 fn executable_diagnostics(settings: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
-    ["nvim", "omp", "factory"]
+    ["nvim", "omp", "claude", "factory"]
         .into_iter()
         .map(|name| {
             let explicit = settings
@@ -234,6 +296,7 @@ pub struct AppState {
     pub shutdown_complete: bool,
     pub shutdown_error: Option<String>,
     pub conversations: BTreeMap<ThreadId, ConversationSession>,
+    pub project_diffs: ProjectDiffs,
     pub drafts: HashMap<DraftKey, DraftSnapshot>,
     pub editor: Option<crate::neovim::NvimEditor>,
     pub editor_error: Option<String>,
@@ -402,21 +465,72 @@ impl AppState {
         })
         .detach();
         cx.spawn(async move |this, cx| {
-            while let Ok(first) = receiver.recv().await {
-                let mut batch = Vec::with_capacity(64);
-                batch.push(first);
-                while batch.len() < 64 {
-                    let Ok(event) = receiver.try_recv() else {
-                        break;
-                    };
-                    batch.push(event);
-                }
-                let _ = this.update(cx, |this, cx| {
-                    for event in batch {
-                        this.receive(event, cx);
+            let mut history: Option<(ThreadId, Uuid, std::vec::IntoIter<Message>, Option<String>)> =
+                None;
+            loop {
+                let first = if history.is_none() {
+                    match receiver.recv().await {
+                        Ok(event) => Some(event),
+                        Err(_) => break,
                     }
-                });
-                smol::future::yield_now().await;
+                } else {
+                    None
+                };
+                if this
+                    .update(cx, |this, cx| {
+                        let started = std::time::Instant::now();
+                        let mut first = first;
+                        for _ in 0..64 {
+                            let event = if let Some((id, generation, messages, cursor)) =
+                                history.as_mut()
+                            {
+                                let chunk = messages.by_ref().take(8).collect();
+                                let finished = messages.len() == 0;
+                                let event = AppEvent::Harness(
+                                    *id,
+                                    *generation,
+                                    ConversationEvent::History {
+                                        messages: chunk,
+                                        next_cursor: if finished { cursor.take() } else { None },
+                                    },
+                                );
+                                if finished {
+                                    history = None;
+                                }
+                                event
+                            } else {
+                                let Some(event) = first.take().or_else(|| receiver.try_recv().ok())
+                                else {
+                                    break;
+                                };
+                                if let AppEvent::Harness(
+                                    id,
+                                    generation,
+                                    ConversationEvent::History {
+                                        messages,
+                                        next_cursor,
+                                    },
+                                ) = event
+                                {
+                                    history =
+                                        Some((id, generation, messages.into_iter(), next_cursor));
+                                    continue;
+                                }
+                                event
+                            };
+                            this.receive(event, cx);
+                            if started.elapsed() >= std::time::Duration::from_millis(2) {
+                                break;
+                            }
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                // A timer crosses the executor turn; yield_now can immediately
+                // repoll this task while native input is still waiting.
+                smol::Timer::after(std::time::Duration::from_millis(1)).await;
             }
         })
         .detach();
@@ -459,6 +573,7 @@ impl AppState {
             pending_writes: 0,
             registering: false,
             conversations: BTreeMap::new(),
+            project_diffs: ProjectDiffs::default(),
             drafts: HashMap::new(),
             editor: None,
             editor_error: None,
@@ -485,7 +600,11 @@ impl AppState {
                 if let Err(error) = result {
                     self.storage_error = Some(error.clone());
                     self.notice(NoticeLevel::Error, error);
+                    cx.notify();
+                } else {
+                    cx.emit(PresentationChange::Persistence);
                 }
+                return;
             }
             AppEvent::StorageFailed(error) => {
                 self.storage_error = Some(error.clone());
@@ -539,6 +658,8 @@ impl AppState {
                 } else {
                     self.active_threads.remove(&thread_id);
                 }
+                cx.emit(PresentationChange::Thread(thread_id));
+                return;
             }
             AppEvent::FactorySnapshot(snapshot) => self.receive_factory(*snapshot),
             AppEvent::Notice(notice) => self.notice(notice.level, notice.text),
@@ -567,6 +688,9 @@ impl AppState {
                     }
                     (None, Err(_)) => {}
                 }
+                cx.emit(PresentationChange::Projects);
+                cx.emit(PresentationChange::Thread(id));
+                return;
             }
             AppEvent::Harness(id, generation, event) => {
                 if self
@@ -574,11 +698,27 @@ impl AppState {
                     .get(&id)
                     .is_some_and(|s| s.generation == generation)
                 {
+                    let project_rows_changed = matches!(
+                        &event,
+                        ConversationEvent::Ready { .. }
+                            | ConversationEvent::StateChanged(_)
+                            | ConversationEvent::TitleChanged(_)
+                            | ConversationEvent::UserRequest(_)
+                            | ConversationEvent::UserRequestDismissed { .. }
+                            | ConversationEvent::SubmissionAccepted { .. }
+                            | ConversationEvent::TurnSettled { .. }
+                            | ConversationEvent::Failed { .. }
+                    );
                     self.receive_conversation(id, event, cx);
+                    if project_rows_changed {
+                        cx.emit(PresentationChange::Projects);
+                    }
                 }
+                return;
             }
             AppEvent::HarnessDrained(reply) => {
                 let _ = reply.try_send(());
+                return;
             }
         }
         cx.notify();
@@ -670,6 +810,32 @@ impl AppState {
     pub fn factory_thread(&self) -> Option<&Thread> {
         self.thread()
             .filter(|thread| thread.kind == ThreadKind::Factory)
+    }
+    pub fn conversation_diff_open(&self, id: ThreadId) -> bool {
+        let id = id.to_string();
+        self.snapshot
+            .settings
+            .get("conversation_diff_open")
+            .and_then(Value::as_object)
+            .and_then(|threads| threads.get(&id))
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    }
+
+    pub fn set_conversation_diff_open(&mut self, id: ThreadId, open: bool) {
+        let mut threads = self
+            .snapshot
+            .settings
+            .get("conversation_diff_open")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if open {
+            threads.remove(&id.to_string());
+        } else {
+            threads.insert(id.to_string(), Value::Bool(false));
+        }
+        self.set_setting("conversation_diff_open", Value::Object(threads));
     }
     fn is_conversation(&self, id: ThreadId) -> bool {
         self.snapshot
@@ -806,7 +972,11 @@ impl AppState {
         let (title, harness, model, factory) = match kind {
             ThreadKind::Conversation => (
                 "New conversation",
-                "omp".into(),
+                if project.defaults.interactive_harness.trim().is_empty() {
+                    "omp".into()
+                } else {
+                    project.defaults.interactive_harness.clone()
+                },
                 project.defaults.interactive_model.clone(),
                 None,
             ),
@@ -951,6 +1121,7 @@ mod tests {
         session.message(result.clone());
         result.content = vec![ContentBlock::Text("final".into())];
         result.exit_code = Some(1);
+        let rendered_revision = session.transcript_revision;
         session.message(result);
         assert_eq!(session.messages.len(), 2);
         let found = session
@@ -958,9 +1129,49 @@ mod tests {
             .expect("result indexed by call id");
         assert_eq!(found.exit_code, Some(1));
         assert!(matches!(&found.content[..], [ContentBlock::Text(text)] if text == "final"));
+        let changed: std::collections::BTreeSet<_> = session
+            .transcript_changes_since(rendered_revision)
+            .unwrap()
+            .collect();
+        assert_eq!(changed, std::collections::BTreeSet::from([0, 1]));
         session.reset_history();
         assert!(!session.has_tool_call("call_1"));
         assert!(session.tool_result("call_1").is_none());
         assert!(session.messages.is_empty());
+    }
+
+    #[test]
+    fn lagging_transcript_resets_instead_of_reusing_stale_rows() {
+        let mut session = ConversationSession::new(None);
+        session.message(message(
+            "one",
+            "assistant",
+            vec![ContentBlock::Text("first".into())],
+        ));
+        let old_revision = session.transcript_revision;
+        for index in 0..513 {
+            session.message(message(
+                "one",
+                "assistant",
+                vec![ContentBlock::Text(index.to_string())],
+            ));
+        }
+        assert!(session.transcript_changes_since(old_revision).is_none());
+        let current = session.transcript_revision;
+        session.message(message(
+            "one",
+            "assistant",
+            vec![ContentBlock::Text("latest".into())],
+        ));
+        assert_eq!(
+            session
+                .transcript_changes_since(current)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        let current = session.transcript_revision;
+        session.reset_history();
+        assert!(session.transcript_changes_since(current).is_none());
     }
 }

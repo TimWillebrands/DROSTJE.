@@ -1,11 +1,11 @@
 use super::{
     commands::{self, *},
     conversation, factory,
-    settings::{Dialog, DialogKind},
+    settings::{DialogKind, SurfaceContent},
     sidebar::{self, Row},
 };
 use crate::{
-    app::{AppState, NoticeLevel},
+    app::{AppState, NoticeLevel, PresentationChange},
     model::{PaneDirection, ThreadId, ThreadKind},
 };
 use gpui_kit::{
@@ -104,12 +104,71 @@ type ThreadPanels = Rc<RefCell<BTreeMap<ThreadId, Entity<WorkspacePanel>>>>;
 const LAYOUT_VERSION: usize = 3;
 const OUTDATED_LAYOUT: &str = "Layout was saved by another version";
 
+/// Save acknowledgements repaint only their status, never the workspace shell.
+struct SaveStatus {
+    state: Entity<AppState>,
+    presentation: (usize, bool),
+    _subscriptions: Vec<Subscription>,
+}
+
+impl SaveStatus {
+    fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let presentation = Self::presentation(state.read(cx));
+        let subscriptions = vec![
+            cx.observe(&state, |this, _, cx| this.refresh(cx)),
+            cx.subscribe(&state, |this, _, _: &PresentationChange, cx| {
+                this.refresh(cx)
+            }),
+            cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()),
+        ];
+        Self {
+            state,
+            presentation,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn presentation(state: &AppState) -> (usize, bool) {
+        (
+            state.pending_writes,
+            state.storage_error.is_some() || state.shutdown_error.is_some(),
+        )
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        let next = Self::presentation(self.state.read(cx));
+        if next != self.presentation {
+            self.presentation = next;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for SaveStatus {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .gap_2()
+            .when(self.presentation.0 > 0, |view| {
+                view.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("Saving {} changes", self.presentation.0)),
+                )
+            })
+            .when(self.presentation.1, |view| {
+                view.child(Tag::danger().child("Unsaved changes"))
+            })
+    }
+}
+
 pub struct Workspace {
     pub state: Entity<AppState>,
     pub(super) dock: Entity<DockArea>,
     _skin: Rc<DockSkin>,
     projects: Entity<WorkspacePanel>,
     output: Entity<WorkspacePanel>,
+    save_status: Entity<SaveStatus>,
     /// Shared with the panel registry so a restored layout rebuilds into the same map.
     threads: ThreadPanels,
     welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>>,
@@ -118,7 +177,7 @@ pub struct Workspace {
     focus: FocusHandle,
     pub cursor: Option<Row>,
     pub palette: Option<Entity<Palette>>,
-    pub dialog: Option<Dialog>,
+    pub dialog: Option<Entity<SurfaceContent>>,
     pub(super) editor: Option<Entity<super::editor::PromptEditor>>,
     pub(super) editor_selection: Option<crate::model::DraftKey>,
     pub(super) editor_override: Option<(crate::model::DraftKey, String)>,
@@ -126,7 +185,7 @@ pub struct Workspace {
     pub expanded: std::collections::HashSet<String>,
     pub extension: Option<super::overlays::ExtensionForm>,
     pub tool_detail: Option<(crate::model::ThreadId, String)>,
-    pub factory_form: Option<super::factory_form::FactoryThreadForm>,
+    pub factory_form: Option<Entity<super::factory_form::FactoryThreadForm>>,
     pub(super) model_picker: Option<conversation::ModelPicker>,
     pub(super) detail_surface: Option<super::overlays::SurfaceKey>,
     pub(super) quit_requested: bool,
@@ -134,6 +193,7 @@ pub struct Workspace {
     seen_notice_sequence: u64,
     reopening: Option<Region>,
     dock_measurement: Rc<Cell<Option<Bounds<Pixels>>>>,
+    presented_thread: Option<ThreadId>,
     pub(super) _subscriptions: Vec<Subscription>,
 }
 impl Workspace {
@@ -181,12 +241,14 @@ impl Workspace {
         let (dock, skin) =
             DockSkin::dock_area("drostje-workspace", Some(LAYOUT_VERSION), window, cx);
         let saved = state.read(cx).snapshot.settings.get("layout").cloned();
+        let save_status = cx.new(|cx| SaveStatus::new(state.clone(), cx));
         let mut workspace = Self {
             state,
             dock,
             _skin: skin,
             projects,
             output,
+            save_status,
             threads,
             welcome,
             rebuilding: false,
@@ -202,6 +264,7 @@ impl Workspace {
             quit_requested: false,
             cursor: None,
             model_picker: None,
+            presented_thread: None,
             detail_surface: None,
             palette: None,
             dialog: None,
@@ -261,6 +324,32 @@ impl Workspace {
                 workspace.sync_model_picker(window, cx);
                 workspace.sync_detail_surface(window, cx);
                 workspace.show_notices(window, cx);
+                workspace.sync_selection_panels(cx);
+                workspace.sync_diff_interest(cx);
+                cx.notify();
+            },
+        ));
+        workspace._subscriptions.push(cx.subscribe_in(
+            &workspace.state,
+            window,
+            |workspace, _, event: &PresentationChange, window, cx| {
+                match *event {
+                    PresentationChange::Selection => {
+                        workspace.sync_session(window, cx);
+                        workspace.sync_factory_form(window, cx);
+                        workspace.sync_model_picker(window, cx);
+                        workspace.sync_selection_panels(cx);
+                        workspace.sync_diff_interest(cx);
+                    }
+                    PresentationChange::Thread(id)
+                        if workspace.state.read(cx).selected_thread == Some(id) =>
+                    {
+                        workspace.sync_model_picker(window, cx);
+                        workspace.sync_detail_surface(window, cx);
+                        workspace.show_notices(window, cx);
+                    }
+                    _ => return,
+                }
                 cx.notify();
             },
         ));
@@ -274,6 +363,7 @@ impl Workspace {
                     workspace.invalidate_panel_bounds(cx);
                     workspace.normalize_layout(workspace.reopening, window, cx);
                     workspace.schedule_layout_save(window, cx);
+                    workspace.sync_diff_interest(cx);
                 }
             },
         ));
@@ -303,6 +393,8 @@ impl Workspace {
         workspace.normalize_layout(None, window, cx);
         workspace.sync_factory_form(window, cx);
         workspace.sync_model_picker(window, cx);
+        workspace.sync_selection_panels(cx);
+        workspace.sync_diff_interest(cx);
         cx.defer_in(window, |workspace, window, cx| {
             workspace.show_notices(window, cx)
         });
@@ -344,7 +436,7 @@ impl Workspace {
                 None => count - 1,
             };
             state.select_thread(state.open_threads[next]);
-            cx.notify();
+            cx.emit(PresentationChange::Selection);
         });
         self.focus_region(Region::Thread, window, cx);
     }
@@ -496,6 +588,33 @@ impl Workspace {
         }
         cx.notify();
     }
+    fn sync_selection_panels(&mut self, cx: &mut Context<Self>) {
+        let selected = self.state.read(cx).selected_thread;
+        if selected != self.presented_thread {
+            for id in self.presented_thread.into_iter().chain(selected) {
+                if let Some(panel) = self.threads.borrow().get(&id) {
+                    panel.update(cx, |_, cx| cx.notify());
+                }
+            }
+            self.presented_thread = selected;
+            self.projects.update(cx, |_, cx| cx.notify());
+        }
+    }
+
+    fn sync_diff_interest(&mut self, cx: &mut Context<Self>) {
+        let dock = self.dock.read(cx);
+        let layout = dock.dump(cx);
+        let visible: Vec<_> = self
+            .threads
+            .borrow()
+            .iter()
+            .filter(|(_, panel)| panel_visible(panel, dock, &layout, cx))
+            .map(|(id, _)| *id)
+            .collect();
+        self.state
+            .update(cx, |state, cx| state.set_visible_conversations(visible, cx));
+    }
+
     /// A pane that gained focus (click, tab, Ctrl-W) is the selected thread.
     fn thread_focused(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         if self.rebuilding || self.state.read(cx).selected_thread == Some(id) {
@@ -513,7 +632,7 @@ impl Workspace {
         }
         self.state.update(cx, |state, cx| {
             state.select_thread(id);
-            cx.notify();
+            cx.emit(PresentationChange::Selection);
         });
         self.sync_session(window, cx);
         cx.notify();
@@ -861,24 +980,11 @@ impl Workspace {
         };
         let dock = self.dock.read(cx);
         let layout = dock.dump(cx);
-        let zoomed = dock.zoomed_group();
         let visible_bounds = |entity: &Entity<WorkspacePanel>| {
+            if !panel_visible(entity, dock, &layout, cx) {
+                return None;
+            }
             let panel = entity.read(cx);
-            if [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
-                .into_iter()
-                .flatten()
-                .any(|dock| !dock.open() && contains_kind(dock.panel(), panel.kind))
-            {
-                return None;
-            }
-            let group = panel.group.as_ref()?.upgrade()?;
-            let group = group.read(cx);
-            if group.is_collapsed()
-                || zoomed.is_some_and(|node| node != group.node())
-                || group.active_panel(cx)?.panel_id(cx) != PanelId::from(entity.entity_id())
-            {
-                return None;
-            }
             let bounds = panel.bounds.get()?;
             (bounds.size.width > px(0.)
                 && bounds.size.height > px(0.)
@@ -951,6 +1057,25 @@ impl Workspace {
             }
             Command::PasteImage => {
                 self.paste_image(window, cx);
+                None
+            }
+            Command::ToggleConversationDiffs => {
+                self.state.update(cx, |state, cx| {
+                    if let Some(id) = state.conversation_thread().map(|thread| thread.id) {
+                        let open = !state.conversation_diff_open(id);
+                        state.set_conversation_diff_open(id, open);
+                        cx.emit(PresentationChange::Thread(id));
+                    }
+                });
+                self.sync_diff_interest(cx);
+                None
+            }
+            Command::RefreshConversationDiff => {
+                self.state.update(cx, |state, cx| {
+                    if let Some(id) = state.conversation_thread().map(|thread| thread.id) {
+                        state.refresh_conversation_diff(id, cx);
+                    }
+                });
                 None
             }
             Command::AddProject => Some(DialogKind::AddProject),
@@ -1062,10 +1187,9 @@ impl Workspace {
         if self.detail_surface.is_some() || self.dialog.is_some() || self.palette.is_some() {
             return;
         }
-        self.dialog = Some(
-            self.state
-                .update(cx, |state, cx| Dialog::new(kind, state, window, cx)),
-        );
+        let state = self.state.clone();
+        let owner = cx.entity().downgrade();
+        self.dialog = Some(cx.new(|cx| SurfaceContent::new(kind, state, owner, window, cx)));
         super::settings::open_surface(cx.entity().downgrade(), window, cx);
         cx.notify();
     }
@@ -1092,7 +1216,8 @@ impl Workspace {
             palette.update(cx, |palette, cx| palette.dismiss(window, cx));
         }
         if let Some(dialog) = self.dialog.take() {
-            super::settings::close_surface(&dialog.kind, window, cx);
+            let kind = dialog.read(cx).kind.clone();
+            super::settings::close_surface(&kind, window, cx);
         }
         cx.notify();
     }
@@ -1105,56 +1230,24 @@ impl Workspace {
             return;
         };
         let result = self.state.update(cx, |state, cx| {
-            let result = dialog.apply(state, cx);
-            cx.notify();
+            let result = dialog.read(cx).apply(state, cx);
+            if result.is_ok() {
+                cx.notify();
+            }
             result
         });
         match result {
             Ok(true) => {
-                super::settings::close_surface(&dialog.kind, window, cx);
+                let kind = dialog.read(cx).kind.clone();
+                super::settings::close_surface(&kind, window, cx);
+                cx.notify();
             }
             Ok(false) => self.dialog = Some(dialog),
             Err(error) => {
-                let mut dialog = dialog;
-                dialog.set_error(&error);
+                dialog.update(cx, |dialog, cx| dialog.set_error(&error, cx));
                 self.dialog = Some(dialog);
             }
         }
-        cx.notify();
-    }
-    pub fn pick_project_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add Project".into()),
-        });
-        cx.spawn_in(window, async move |workspace, window| {
-            let result = picked.await;
-            let _ = workspace.update_in(window, |workspace, window, cx| {
-                match result {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.into_iter().next()
-                            && let Some(dialog) = &workspace.dialog
-                            && let Some(field) =
-                                dialog.fields.iter().find(|field| field.key == "path")
-                        {
-                            field.input.update(cx, |input, cx| {
-                                input.set_value(path.to_string_lossy().into_owned(), window, cx)
-                            });
-                        }
-                    }
-                    Ok(Ok(None)) => {}
-                    other => {
-                        if let Some(dialog) = &mut workspace.dialog {
-                            dialog.error = Some(format!("Folder picker failed: {other:?}"));
-                        }
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
     pub fn select_row(
         &mut self,
@@ -1170,7 +1263,7 @@ impl Workspace {
                 Row::Thread(id) if open => state.select_thread(id),
                 _ => {}
             }
-            cx.notify();
+            cx.emit(PresentationChange::Selection);
         });
         self.focus_region(Region::Projects, window, cx);
     }
@@ -1185,26 +1278,15 @@ impl Workspace {
             return;
         }
         let region = self.focused_region(window, cx);
-        if region == Region::Thread {
-            let state = self.state.read(cx);
-            if let Some(session) = self
-                .focused_thread(window, cx)
-                .and_then(|id| state.conversations.get(&id))
-            {
-                if endpoint {
-                    if delta < 0 {
-                        session.list.scroll_to_reveal_item(0);
-                    } else {
-                        session.list.scroll_to_end();
-                    }
-                } else {
-                    session
-                        .list
-                        .scroll_by(window.rem_size() * (delta as f32 * 2.25));
-                }
-                cx.notify();
-                return;
-            }
+        if region == Region::Thread
+            && let Some(transcript) = self
+                .focused_panel(window, cx)
+                .and_then(|panel| panel.read(cx).transcript.clone())
+        {
+            transcript.update(cx, |transcript, cx| {
+                transcript.scroll(delta, endpoint, window, cx)
+            });
+            return;
         }
         if region != Region::Projects {
             let Some(panel) = self.focused_panel(window, cx) else {
@@ -1224,7 +1306,7 @@ impl Workspace {
                     (offset.y - window.rem_size() * (delta as f32 * 2.25)).min(px(0.)),
                 ));
             }
-            cx.notify();
+            panel.update(cx, |_, cx| cx.notify());
             return;
         }
         let rows = sidebar::rows(self.state.read(cx));
@@ -1242,7 +1324,7 @@ impl Workspace {
         };
         self.cursor = rows.get(next).copied();
         self.projects.read(cx).scroll.scroll_to_item(next);
-        cx.notify();
+        self.projects.update(cx, |_, cx| cx.notify());
     }
     fn fold(&mut self, collapsed: bool, cx: &mut Context<Self>) {
         let id = match self.cursor {
@@ -1264,11 +1346,11 @@ impl Workspace {
                 } else {
                     state.collapsed.remove(&id);
                 }
-                cx.notify();
+                cx.emit(PresentationChange::Projects);
             });
             self.cursor = Some(Row::Project(id));
         }
-        cx.notify();
+        self.projects.update(cx, |_, cx| cx.notify());
     }
     fn open_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.navigation_blocked(window, cx) {
@@ -1355,8 +1437,6 @@ impl Render for Workspace {
             .project()
             .map(|project| project.name.clone())
             .unwrap_or_else(|| "DROSTJE.".into());
-        let pending =
-            (state.pending_writes > 0).then(|| format!("Saving {} changes", state.pending_writes));
         let palette_owner = owner.clone();
         let recovery_owner = owner.clone();
         let dismiss_recovery = owner.clone();
@@ -1430,6 +1510,12 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &PasteImage, w, cx| {
                     this.execute(Command::PasteImage, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleConversationDiffs, w, cx| {
+                    this.execute(Command::ToggleConversationDiffs, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RefreshConversationDiff, w, cx| {
+                    this.execute(Command::RefreshConversationDiff, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &OpenPalette, w, cx| this.open_palette(w, cx)))
                 .on_action(cx.listener(|this, _: &FocusProjects, w, cx| {
@@ -1508,18 +1594,7 @@ impl Render for Workspace {
                                 .text_ellipsis()
                                 .child(project_name),
                         )
-                        .when_some(pending, |bar, pending| {
-                            bar.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(pending),
-                            )
-                        })
-                        .when(
-                            state.storage_error.is_some() || state.shutdown_error.is_some(),
-                            |bar| bar.child(Tag::danger().child("Unsaved changes")),
-                        )
+                        .child(self.save_status.clone())
                         .child(
                             Button::new("workspace-palette")
                                 .small()
@@ -1609,7 +1684,11 @@ impl Render for Workspace {
                         .relative()
                         .flex_1()
                         .min_h_0()
-                        .child(self.dock.clone())
+                        .child(
+                            self.dock
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
+                        )
                         .child(
                             canvas(
                                 move |bounds, window, cx| {
@@ -1705,6 +1784,7 @@ pub struct WorkspacePanel {
     scroll: ScrollHandle,
     group: Option<WeakEntity<TabGroup>>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    transcript: Option<Entity<conversation::TranscriptView>>,
     _subscriptions: Vec<Subscription>,
 }
 impl WorkspacePanel {
@@ -1716,10 +1796,46 @@ impl WorkspacePanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        let mut subscriptions = vec![cx.observe(&state, |_, _, cx| cx.notify())];
-        if let Some(owner) = workspace.upgrade() {
-            subscriptions.push(cx.observe(&owner, |_, _, cx| cx.notify()));
-        }
+        let mut subscriptions = vec![
+            cx.observe(&state, |_, _, cx| cx.notify()),
+            cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()),
+            cx.subscribe(&state, |panel, _, event: &PresentationChange, cx| {
+                let affected = match (*event, panel.kind) {
+                    (
+                        PresentationChange::Draft(id) | PresentationChange::Thread(id),
+                        PanelKind::Thread(thread),
+                    ) => id == thread,
+                    (PresentationChange::Diff(project), PanelKind::Thread(thread)) => panel
+                        .state
+                        .read(cx)
+                        .snapshot
+                        .threads
+                        .iter()
+                        .any(|candidate| candidate.id == thread && candidate.project_id == project),
+                    (
+                        PresentationChange::Projects | PresentationChange::Selection,
+                        PanelKind::Projects,
+                    ) => true,
+                    _ => false,
+                };
+                if affected {
+                    cx.notify();
+                }
+            }),
+        ];
+        let transcript =
+            match kind {
+                PanelKind::Thread(id)
+                    if state.read(cx).snapshot.threads.iter().any(|thread| {
+                        thread.id == id && thread.kind == ThreadKind::Conversation
+                    }) =>
+                {
+                    Some(cx.new(|cx| {
+                        conversation::TranscriptView::new(id, state.clone(), workspace.clone(), cx)
+                    }))
+                }
+                _ => None,
+            };
         if let PanelKind::Thread(id) = kind {
             // Focus, however it arrived (click, tab, Ctrl-W), is what selects a thread.
             let owner = workspace.clone();
@@ -1735,6 +1851,7 @@ impl WorkspacePanel {
             scroll: ScrollHandle::new(),
             group: None,
             bounds: Rc::new(Cell::new(None)),
+            transcript,
             _subscriptions: subscriptions,
         }
     }
@@ -1872,7 +1989,7 @@ impl Focusable for WorkspacePanel {
 }
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
 impl Render for WorkspacePanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = self.workspace.upgrade().map(|owner| {
             let workspace = owner.read(cx);
             let state = self.state.read(cx);
@@ -1893,7 +2010,18 @@ impl Render for WorkspacePanel {
                     };
                     match thread.kind {
                         ThreadKind::Conversation => {
-                            conversation::render(state, id, &self.workspace, scroll, cx)
+                            if let Some(transcript) = &self.transcript {
+                                conversation::render(
+                                    state,
+                                    id,
+                                    &self.workspace,
+                                    scroll,
+                                    transcript,
+                                    cx,
+                                )
+                            } else {
+                                div().into_any_element()
+                            }
                         }
                         ThreadKind::Factory => {
                             if factory::launch_for(state, id).is_some() {
@@ -1901,15 +2029,11 @@ impl Render for WorkspacePanel {
                             } else if let Some(form) = workspace
                                 .factory_form
                                 .as_ref()
-                                .filter(|form| form.thread_id == id)
+                                .filter(|form| form.read(cx).thread_id == id)
                             {
-                                super::factory_form::render(
-                                    form,
-                                    workspace,
-                                    &self.workspace,
-                                    window,
-                                    cx,
-                                )
+                                form.clone()
+                                    .cached(StyleRefinement::default().size_full())
+                                    .into_any_element()
                             } else {
                                 div()
                                     .p_3()
@@ -1936,6 +2060,7 @@ impl Render for WorkspacePanel {
             .min_h_0()
             .id(SharedString::from(name.clone()))
             .debug_selector(move || name.clone())
+            .test_support()
             .key_context(self.kind.context())
             .track_focus(&self.focus)
             .bg(if self.kind == PanelKind::Projects {
@@ -1960,6 +2085,31 @@ impl Render for WorkspacePanel {
                 .size_full(),
             )
     }
+}
+
+fn panel_visible(
+    entity: &Entity<WorkspacePanel>,
+    dock: &DockArea,
+    layout: &DockAreaState,
+    cx: &App,
+) -> bool {
+    let panel = entity.read(cx);
+    if [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
+        .into_iter()
+        .flatten()
+        .any(|edge| !edge.open() && contains_kind(edge.panel(), panel.kind))
+    {
+        return false;
+    }
+    let Some(group) = panel.group.as_ref().and_then(WeakEntity::upgrade) else {
+        return false;
+    };
+    let group = group.read(cx);
+    !group.is_collapsed()
+        && dock.zoomed_group().is_none_or(|node| node == group.node())
+        && group
+            .active_panel(cx)
+            .is_some_and(|active| active.panel_id(cx) == PanelId::from(entity.entity_id()))
 }
 
 fn contains_panel(panel: &PanelState, name: &str) -> bool {
