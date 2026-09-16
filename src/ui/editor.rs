@@ -22,6 +22,7 @@ pub(super) struct PromptEditor {
     switching: bool,
     opening: bool,
     composition: bool,
+    window_inactive: bool,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     switch_task: Option<Task<()>>,
@@ -40,6 +41,7 @@ impl PromptEditor {
             switching: false,
             opening: false,
             composition: false,
+            window_inactive: false,
             focus: cx.focus_handle(),
             _subscriptions: Vec::new(),
             switch_task: None,
@@ -111,8 +113,12 @@ impl PromptEditor {
                                     let id = match &draft.key {
                                         DraftKey::Thread(id) | DraftKey::Extension { thread: id, .. } => *id,
                                     };
+                                    let unfocused = this.window_inactive || !this.focus_handle(cx).is_focused(window);
                                     this.state.update(cx, |state, cx| {
                                         state.record_draft(draft.clone());
+                                        if unfocused && state.commit_thread_edits(id) {
+                                            cx.emit(crate::app::PresentationChange::Persistence);
+                                        }
                                         cx.emit(crate::app::PresentationChange::Draft(id));
                                     });
                                     return;
@@ -132,6 +138,17 @@ impl PromptEditor {
                             }
                             cx.emit(PromptEditorChanged);
                             cx.notify();
+                        }));
+                        let focus = view.focus_handle(cx);
+                        this._subscriptions.push(cx.on_blur(&focus, window, |this, _, cx| {
+                            this.commit_on_focus_loss(cx);
+                        }));
+                        this._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+                            // An inactive window can retain the editor's focus handle.
+                            this.window_inactive = !window.is_window_active();
+                            if this.window_inactive {
+                                this.commit_on_focus_loss(cx);
+                            }
                         }));
                         if this.focus.is_focused(window) {
                             view.update(cx, |view, cx| view.focus(window, cx));
@@ -154,6 +171,24 @@ impl PromptEditor {
         });
         cx.emit(PromptEditorChanged);
         cx.notify();
+    }
+
+    fn commit_on_focus_loss(&mut self, cx: &mut Context<Self>) {
+        let Some(DraftKey::Thread(id)) = self.active.as_ref() else {
+            return;
+        };
+        let id = *id;
+        if self.switching {
+            // The switch owns the previous buffer's semantic snapshot and commit.
+            return;
+        }
+        // Do not take a semantic snapshot here: it exits insert mode. Late
+        // DraftChanged events commit after blur; IME recovery stays separate.
+        self.state.update(cx, |state, cx| {
+            if state.commit_thread_edits(id) {
+                cx.emit(crate::app::PresentationChange::Persistence);
+            }
+        });
     }
 
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -186,7 +221,17 @@ impl PromptEditor {
                 this.switching = false;
                 match result {
                     Ok(previous) => {
-                        if let Some(draft) = previous { this.state.update(cx, |state, _| state.record_draft(draft)); }
+                        if let Some(draft) = previous {
+                            this.state.update(cx, |state, cx| {
+                                let id = match &draft.key {
+                                    DraftKey::Thread(id) | DraftKey::Extension { thread: id, .. } => *id,
+                                };
+                                state.record_draft(draft);
+                                if state.commit_thread_edits(id) {
+                                    cx.emit(crate::app::PresentationChange::Persistence);
+                                }
+                            });
+                        }
                         this.active = desired.map(|(key, _)| key);
                         this.sync(window, cx);
                     }

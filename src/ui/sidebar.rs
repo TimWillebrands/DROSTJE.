@@ -1,5 +1,5 @@
 use super::{
-    commands::{CollapseProject, Command, ExpandProject, NewConversation},
+    commands::{CollapseProject, Command, ExpandProject},
     workspace::Workspace,
 };
 use crate::{
@@ -143,8 +143,13 @@ fn row_menu(
     match row {
         Row::Project(_) => menu
             .item(command_item(
-                "New conversation",
-                Command::NewConversation,
+                "New OMP conversation",
+                Command::NewOmpConversation,
+                state,
+            ))
+            .item(command_item(
+                "New Claude Code conversation",
+                Command::NewClaudeCodeConversation,
                 state,
             ))
             .item(command_item(
@@ -291,25 +296,32 @@ pub fn render(
                                     .icon(IconName::Plus)
                                     .debug_selector(move || format!("new-conversation-{id}"))
                                     .disabled(project.archived || state.storage_error.is_some())
-                                    .tooltip_with_action(
-                                        if project.archived {
-                                            "Archived project is read-only"
-                                        } else {
-                                            "New conversation"
-                                        },
-                                        &NewConversation,
-                                        Some("Workspace"),
-                                    )
-                                    .on_click(
-                                        move |_, window, cx| {
-                                            cx.stop_propagation();
-                                            // Select the clicked project first so the
-                                            // shared Action targets this row, not the
-                                            // keyboard cursor.
+                                    .tooltip(if project.archived {
+                                        "Archived project is read-only"
+                                    } else {
+                                        "New conversation…"
+                                    })
+                                    .dropdown_menu(
+                                        move |menu, window, cx| {
                                             let _ = new_owner.update(cx, |workspace, cx| {
                                                 workspace.select_row(row, false, window, cx)
                                             });
-                                            window.dispatch_action(Box::new(NewConversation), cx);
+                                            let Some(workspace) = new_owner.upgrade() else {
+                                                return menu;
+                                            };
+                                            let state = workspace.read(cx).state.read(cx);
+                                            menu.item(command_item(
+                                                "OMP",
+                                                Command::NewOmpConversation,
+                                                state,
+                                            ))
+                                            .item(
+                                                command_item(
+                                                    "Claude Code",
+                                                    Command::NewClaudeCodeConversation,
+                                                    state,
+                                                ),
+                                            )
                                         },
                                     ),
                                 ),
@@ -448,8 +460,20 @@ pub fn render(
                             };
                             let state = workspace.read(cx).state.read(cx);
                             menu.item(
-                                command_item("Conversation", Command::NewConversation, state)
-                                    .icon(IconName::Bot),
+                                command_item(
+                                    "OMP conversation",
+                                    Command::NewOmpConversation,
+                                    state,
+                                )
+                                .icon(IconName::Bot),
+                            )
+                            .item(
+                                command_item(
+                                    "Claude Code conversation",
+                                    Command::NewClaudeCodeConversation,
+                                    state,
+                                )
+                                .icon(IconName::Bot),
                             )
                             .item(
                                 command_item("Factory", Command::NewFactoryThread, state)

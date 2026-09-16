@@ -17,6 +17,8 @@ gpui_kit::actions!(
     [
         AddProject,
         NewConversation,
+        NewOmpConversation,
+        NewClaudeCodeConversation,
         NewFactoryThread,
         RenameProject,
         ArchiveProject,
@@ -35,6 +37,8 @@ gpui_kit::actions!(
         ToggleProjects,
         ToggleOutput,
         ToggleConversationDiffs,
+        ToggleTaskList,
+        ToggleBackgroundJobs,
         RefreshConversationDiff,
         RestartEditor,
         CancelEditorCommand,
@@ -66,6 +70,8 @@ gpui_kit::actions!(
 pub enum Command {
     AddProject,
     NewConversation,
+    NewOmpConversation,
+    NewClaudeCodeConversation,
     NewFactoryThread,
     RenameProject,
     ArchiveProject,
@@ -85,15 +91,19 @@ pub enum Command {
     ToggleOutput,
     RestartEditor,
     ToggleConversationDiffs,
+    ToggleTaskList,
+    ToggleBackgroundJobs,
     RefreshConversationDiff,
     CancelEditorCommand,
     CopyDraftRecovery,
     PasteImage,
 }
 impl Command {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 29] = [
         Self::AddProject,
         Self::NewConversation,
+        Self::NewOmpConversation,
+        Self::NewClaudeCodeConversation,
         Self::NewFactoryThread,
         Self::RenameProject,
         Self::ArchiveProject,
@@ -112,6 +122,8 @@ impl Command {
         Self::ToggleProjects,
         Self::ToggleOutput,
         Self::ToggleConversationDiffs,
+        Self::ToggleTaskList,
+        Self::ToggleBackgroundJobs,
         Self::RefreshConversationDiff,
         Self::RestartEditor,
         Self::CancelEditorCommand,
@@ -123,6 +135,8 @@ impl Command {
         match self {
             Self::AddProject => "Add project…",
             Self::NewConversation => "New conversation",
+            Self::NewOmpConversation => "New OMP conversation",
+            Self::NewClaudeCodeConversation => "New Claude Code conversation",
             Self::NewFactoryThread => "New Factory thread",
             Self::RenameProject => "Rename project…",
             Self::ArchiveProject => "Archive project…",
@@ -141,6 +155,8 @@ impl Command {
             Self::ToggleProjects => "Toggle projects",
             Self::ToggleOutput => "Toggle output",
             Self::ToggleConversationDiffs => "Toggle conversation changes",
+            Self::ToggleTaskList => "Toggle task list",
+            Self::ToggleBackgroundJobs => "Toggle background jobs",
             Self::RefreshConversationDiff => "Refresh conversation changes",
             Self::RestartEditor => "Restart Neovim editor",
             Self::CancelEditorCommand => "Cancel editor command",
@@ -153,6 +169,8 @@ impl Command {
         match self {
             Self::AddProject => Box::new(AddProject),
             Self::NewConversation => Box::new(NewConversation),
+            Self::NewOmpConversation => Box::new(NewOmpConversation),
+            Self::NewClaudeCodeConversation => Box::new(NewClaudeCodeConversation),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::RenameProject => Box::new(RenameProject),
             Self::ArchiveProject => Box::new(ArchiveProject),
@@ -172,6 +190,8 @@ impl Command {
             Self::ToggleOutput => Box::new(ToggleOutput),
             Self::RestartEditor => Box::new(RestartEditor),
             Self::ToggleConversationDiffs => Box::new(ToggleConversationDiffs),
+            Self::ToggleTaskList => Box::new(ToggleTaskList),
+            Self::ToggleBackgroundJobs => Box::new(ToggleBackgroundJobs),
             Self::RefreshConversationDiff => Box::new(RefreshConversationDiff),
             Self::CancelEditorCommand => Box::new(CancelEditorCommand),
             Self::CopyDraftRecovery => Box::new(CopyDraftRecovery),
@@ -190,7 +210,10 @@ impl Command {
             Self::AddProject if state.storage_error.is_some() => {
                 Some("Storage is not writable.".into())
             }
-            Self::NewConversation | Self::RenameProject => state.mutable_project_reason(),
+            Self::NewConversation
+            | Self::NewOmpConversation
+            | Self::NewClaudeCodeConversation
+            | Self::RenameProject => state.mutable_project_reason(),
             Self::ArchiveProject => state.archive_project_reason(),
             Self::RenameThread => state
                 .mutable_project_reason()
@@ -215,7 +238,10 @@ impl Command {
                         None => Some("The project working tree has not been inspected.".into()),
                     })
             }),
-            Self::ToggleConversationDiffs | Self::RefreshConversationDiff
+            Self::ToggleConversationDiffs
+            | Self::ToggleTaskList
+            | Self::ToggleBackgroundJobs
+            | Self::RefreshConversationDiff
                 if state.conversation_thread().is_none() =>
             {
                 Some("Select a conversation first.".into())
@@ -610,6 +636,16 @@ impl Render for Palette {
             .on_action(cx.listener(|this, _: &NewConversation, w, cx| {
                 this.run(PaletteTarget::Command(Command::NewConversation), w, cx)
             }))
+            .on_action(cx.listener(|this, _: &NewOmpConversation, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewOmpConversation), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewClaudeCodeConversation, w, cx| {
+                this.run(
+                    PaletteTarget::Command(Command::NewClaudeCodeConversation),
+                    w,
+                    cx,
+                )
+            }))
             .on_action(cx.listener(|this, _: &NewFactoryThread, w, cx| {
                 this.run(PaletteTarget::Command(Command::NewFactoryThread), w, cx)
             }))
@@ -664,6 +700,12 @@ impl Render for Palette {
                     w,
                     cx,
                 )
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTaskList, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleTaskList), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBackgroundJobs, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleBackgroundJobs), w, cx)
             }))
             .on_action(cx.listener(|this, _: &RefreshConversationDiff, w, cx| {
                 this.run(

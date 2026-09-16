@@ -246,7 +246,7 @@ impl AppState {
                     if thread.draft != draft.text {
                         thread.draft = draft.text;
                         thread.updated_at = platform::now();
-                        self.save_thread(thread);
+                        self.edit_thread(thread);
                     }
                 }
             }

@@ -1273,6 +1273,9 @@ impl EntityInputHandler for NvimView {
             }
         } else {
             self.send(NvimCommand::Input(text.replace('<', "<LT>")), cx);
+            // The flushed grid, not queued input, changes the display. Invalidating
+            // here forces GPUI to draw the old grid before dispatching the next key.
+            return;
         }
         cx.notify();
     }
@@ -2416,6 +2419,66 @@ mod tests {
                 "Native Neovim operation timed out"
             );
         }
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires installed Neovim; isolated native typing and flushed grids"]
+    async fn native_typing_bursts_reach_the_flushed_grid(cx: &mut TestAppContext) {
+        cx.dispatcher.allow_parking();
+        let path = crate::platform::resolve_executable("nvim", None).unwrap();
+        let editor = NvimEditor::open(NvimConfig::new(path)).await.unwrap();
+        let key = DraftKey::Thread(uuid::Uuid::new_v4());
+        editor.open_draft(key.clone(), String::new()).await.unwrap();
+        editor.focus_draft(key).await.unwrap();
+        editor
+            .try_command(NvimCommand::Input("<Esc>i".into()))
+            .unwrap();
+        cx.update(gpui_kit::init);
+        cx.update(crate::ui::commands::bind_keys);
+        let mut view = None;
+        let window = cx.add_window(|window, cx| {
+            let entity = cx.new(|cx| NvimView::new(editor.clone(), window, cx));
+            entity.update(cx, |view, cx| view.focus(window, cx));
+            view = Some(entity.clone());
+            Root::new(entity, window, cx)
+        });
+        let view = view.unwrap();
+        until(cx, &view, |view| view.enabled()).await;
+        let mut expected = String::new();
+        for burst in ["gghjkl", "burst", "visible"] {
+            // No waits, snapshots or extra key are needed to make the final
+            // character visible. Dispatch reaches the native input handler.
+            for character in burst.chars() {
+                cx.update_window(window.into(), |_, window, cx| {
+                    assert!(window.dispatch_keystroke(
+                        gpui_kit::Keystroke::parse(&character.to_string()).unwrap(),
+                        cx,
+                    ));
+                    assert!(!window.has_pending_keystrokes());
+                })
+                .unwrap();
+            }
+            expected.push_str(burst);
+            until(cx, &view, |view| {
+                view.draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.text == expected)
+                    && view.grid.rows.iter().any(|row| {
+                        row.iter()
+                            .map(|cell| cell.text.as_str())
+                            .collect::<String>()
+                            .contains(&expected)
+                    })
+            })
+            .await;
+            cx.read(|cx| {
+                let view = view.read(cx);
+                assert!(view.error.is_none());
+                assert!(!view.has_composition());
+                assert!(view.recovery_text().is_empty());
+            });
+        }
+        editor.shutdown().await.unwrap();
     }
 
     #[gpui_kit::test]

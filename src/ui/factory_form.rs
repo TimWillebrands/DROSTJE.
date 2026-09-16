@@ -156,7 +156,7 @@ impl FactoryThreadForm {
             subscriptions.push(cx.subscribe_in(
                 &field.input,
                 window,
-                move |form, input, event: &InputEvent, _, cx| {
+                move |form, input, event: &InputEvent, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         let value = input.read(cx).value().to_string();
                         form.config_changed(
@@ -169,6 +169,11 @@ impl FactoryThreadForm {
                             },
                             cx,
                         );
+                        if !input.focus_handle(cx).is_focused(window) {
+                            form.commit_edits(cx);
+                        }
+                    } else if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        form.commit_edits(cx);
                     }
                 },
             ));
@@ -186,6 +191,7 @@ impl FactoryThreadForm {
                     FactorySourceKind::WorkItem
                 };
                 form.config_changed(move |config| config.source_kind = kind, cx);
+                form.commit_edits(cx);
             },
         ));
         subscriptions.push(cx.subscribe_in(
@@ -197,8 +203,14 @@ impl FactoryThreadForm {
                 };
                 let value = value.clone();
                 form.config_changed(move |config| config.harness = value, cx);
+                form.commit_edits(cx);
             },
         ));
+        subscriptions.push(cx.observe_window_activation(window, |form, window, cx| {
+            if !window.is_window_active() {
+                form.commit_edits(cx);
+            }
+        }));
         subscriptions.push(cx.observe(&state, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()));
         subscriptions.push(
@@ -235,7 +247,7 @@ impl FactoryThreadForm {
         cx: &mut Context<Self>,
     ) {
         let thread_id = self.thread_id;
-        let config = self.state.update(cx, |state, cx| {
+        let config = self.state.update(cx, |state, _| {
             if state.pending_factory.contains(&thread_id) {
                 return None;
             }
@@ -252,8 +264,7 @@ impl FactoryThreadForm {
                 return Some(config);
             }
             thread.updated_at = platform::now();
-            state.save_thread(thread);
-            cx.emit(PresentationChange::Persistence);
+            state.edit_thread(thread);
             Some(config)
         });
         if let Some(config) = config {
@@ -283,6 +294,14 @@ impl FactoryThreadForm {
                 cx.notify();
             }
         }
+    }
+
+    fn commit_edits(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if state.commit_thread_edits(self.thread_id) {
+                cx.emit(PresentationChange::Persistence);
+            }
+        });
     }
 }
 

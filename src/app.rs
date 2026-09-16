@@ -1,5 +1,6 @@
 mod conversation;
 mod factory;
+mod persistence;
 mod project_diff;
 mod shutdown;
 use crate::harness::{
@@ -57,6 +58,11 @@ pub struct ConversationSession {
     /// into the call's card instead of rendering as separate rows.
     tool_calls: HashMap<String, usize>,
     tool_results: HashMap<String, usize>,
+    /// Every tool call in the order the assistant issued it, as `(tool name, call id)`,
+    /// so presentation can find the latest call of one tool without scanning messages.
+    tool_call_order: Vec<(String, String)>,
+    /// Indices of harness-injected `custom` messages (job notices and the like).
+    notice_indices: Vec<usize>,
     submitted: HashMap<Uuid, DraftSnapshot>,
 }
 impl ConversationSession {
@@ -84,6 +90,8 @@ impl ConversationSession {
             indices: HashMap::new(),
             tool_calls: HashMap::new(),
             tool_results: HashMap::new(),
+            tool_call_order: Vec::new(),
+            notice_indices: Vec::new(),
             submitted: HashMap::new(),
         }
     }
@@ -94,7 +102,10 @@ impl ConversationSession {
             .copied()
             .unwrap_or(self.messages.len());
         for block in &message.content {
-            if let ContentBlock::ToolCall { id, .. } = block {
+            if let ContentBlock::ToolCall { id, name, .. } = block {
+                if !self.tool_calls.contains_key(id) {
+                    self.tool_call_order.push((name.clone(), id.clone()));
+                }
                 self.tool_calls.insert(id.clone(), index);
                 if let Some(result_index) = self.tool_results.get(id).copied() {
                     self.record_transcript_change(Some(result_index));
@@ -109,6 +120,9 @@ impl ConversationSession {
         }
         if index == self.messages.len() {
             self.indices.insert(message.id.clone(), index);
+            if message.role == "custom" {
+                self.notice_indices.push(index);
+            }
             self.messages.push(Arc::new(message));
         } else {
             self.messages[index] = Arc::new(message);
@@ -153,6 +167,8 @@ impl ConversationSession {
         self.indices.clear();
         self.tool_calls.clear();
         self.tool_results.clear();
+        self.tool_call_order.clear();
+        self.notice_indices.clear();
         self.record_transcript_change(None);
     }
     pub(super) fn mark_tool_changed(&mut self, call_id: &str) {
@@ -168,6 +184,24 @@ impl ConversationSession {
         self.tool_results
             .get(call_id)
             .and_then(|index| self.messages.get(*index))
+    }
+    /// Tool calls in issue order as `(tool name, call id)`.
+    pub fn tool_call_order(&self) -> &[(String, String)] {
+        &self.tool_call_order
+    }
+    /// The `ContentBlock::ToolCall` for a call id, once its message has been seen.
+    pub fn tool_call_block(&self, call_id: &str) -> Option<&ContentBlock> {
+        let message = self.messages.get(*self.tool_calls.get(call_id)?)?;
+        message
+            .content
+            .iter()
+            .find(|block| matches!(block, ContentBlock::ToolCall { id, .. } if id == call_id))
+    }
+    /// Harness-injected `custom` messages in transcript order.
+    pub fn notices(&self) -> impl Iterator<Item = &Arc<Message>> {
+        self.notice_indices
+            .iter()
+            .filter_map(|index| self.messages.get(*index))
     }
 }
 
@@ -237,7 +271,10 @@ fn executable_diagnostics(settings: &BTreeMap<String, Value>) -> BTreeMap<String
 
 enum Write {
     Project(Project),
-    Thread(Thread, Option<async_channel::Sender<Result<(), String>>>),
+    Thread(
+        Box<Thread>,
+        Option<async_channel::Sender<Result<(), String>>>,
+    ),
     Setting(String, Value),
     Flush(async_channel::Sender<Result<(), String>>),
 }
@@ -288,6 +325,8 @@ pub struct AppState {
     pub notice_sequence: u64,
     pub storage_error: Option<String>,
     pub pending_writes: usize,
+    /// Changed in memory; no persistence work is queued until a commit boundary.
+    edited_threads: HashSet<ThreadId>,
     pub registering: bool,
     pub active_threads: HashSet<ThreadId>,
     pub owned_launches: HashSet<LaunchId>,
@@ -429,32 +468,7 @@ impl AppState {
                 None
             }
         };
-        smol::spawn(async move {
-            while let Ok(request) = requests.recv().await {
-                let result = match request {
-                    Write::Project(project) => store.save_project(project).await,
-                    Write::Thread(thread, reply) => {
-                        let result = store
-                            .save_thread(thread)
-                            .await
-                            .map_err(|error| format!("{error:#}"));
-                        if let Some(reply) = reply {
-                            let _ = reply.send(result.clone()).await;
-                        }
-                        result.map_err(anyhow::Error::msg)
-                    }
-                    Write::Setting(key, value) => store.set_setting(key, value).await,
-                    Write::Flush(reply) => {
-                        let result = store.flush().await.map_err(|e| format!("{e:#}"));
-                        let _ = reply.send(result).await;
-                        continue;
-                    }
-                }
-                .map_err(|e| format!("{e:#}"));
-                let _ = completed.send(AppEvent::WriteFinished(result)).await;
-            }
-        })
-        .detach();
+        smol::spawn(persistence::run(store, requests, completed)).detach();
         let failed = events.clone();
         smol::spawn(async move {
             while let Ok(message) = failures.recv().await {
@@ -571,6 +585,7 @@ impl AppState {
             notices,
             storage_error: None,
             pending_writes: 0,
+            edited_threads: HashSet::new(),
             registering: false,
             conversations: BTreeMap::new(),
             project_diffs: ProjectDiffs::default(),
@@ -735,14 +750,18 @@ impl AppState {
         });
     }
 
-    fn enqueue(&mut self, request: Write) {
+    fn enqueue(&mut self, request: Write) -> bool {
         if self.storage_error.is_some() {
-            return;
+            return false;
         }
         match self.writes.try_send(request) {
-            Ok(()) => self.pending_writes += 1,
+            Ok(()) => {
+                self.pending_writes += 1;
+                true
+            }
             Err(error) => {
                 self.storage_error = Some(error.to_string());
+                false
             }
         }
     }
@@ -767,12 +786,53 @@ impl AppState {
     }
 
     pub fn save_thread(&mut self, thread: Thread) {
+        if self.storage_error.is_none() {
+            self.edited_threads.remove(&thread.id);
+        }
         if let Some(old) = self.snapshot.threads.iter_mut().find(|t| t.id == thread.id) {
             *old = thread.clone();
         } else {
             self.snapshot.threads.push(thread.clone());
         }
-        self.enqueue(Write::Thread(thread, None));
+        self.enqueue(Write::Thread(Box::new(thread), None));
+    }
+
+    /// Typing changes memory only: no timer, write request, or save notification.
+    pub fn edit_thread(&mut self, thread: Thread) {
+        let id = thread.id;
+        if let Some(old) = self.snapshot.threads.iter_mut().find(|t| t.id == id) {
+            *old = thread;
+        } else {
+            self.snapshot.threads.push(thread);
+        }
+        self.edited_threads.insert(id);
+    }
+
+    pub fn commit_thread_edits(&mut self, id: ThreadId) -> bool {
+        if self.storage_error.is_some() || !self.edited_threads.remove(&id) {
+            return false;
+        }
+        let Some(thread) = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .cloned()
+        else {
+            return false;
+        };
+        let queued = self.enqueue(Write::Thread(Box::new(thread), None));
+        if !queued {
+            self.edited_threads.insert(id);
+        }
+        queued
+    }
+
+    fn commit_all_thread_edits(&mut self) {
+        let ids: Vec<_> = self.edited_threads.iter().copied().collect();
+        for id in ids {
+            self.commit_thread_edits(id);
+        }
     }
 
     /// A persistence acknowledgement in the same queue as draft edits and layout changes.
@@ -790,7 +850,9 @@ impl AppState {
         if let Some(error) = &self.storage_error {
             let _ = reply.try_send(Err(error.clone()));
         } else {
-            self.enqueue(Write::Thread(thread, Some(reply)));
+            self.edited_threads.remove(&thread.id);
+            self.commit_all_thread_edits();
+            self.enqueue(Write::Thread(Box::new(thread), Some(reply)));
         }
         result
     }
@@ -906,6 +968,9 @@ impl AppState {
         self.selected_project = Some(id);
         self.set_setting("selected_project", json!(id));
         if self.thread().is_some_and(|t| t.project_id != id) {
+            if let Some(previous) = self.selected_thread {
+                self.commit_thread_edits(previous);
+            }
             self.selected_thread = None;
             self.set_setting("selected_thread", Value::Null);
             self.select_launch_output(None);
@@ -925,6 +990,11 @@ impl AppState {
             })
             .flatten();
         self.selected_project = Some(thread.project_id);
+        if self.selected_thread != Some(id)
+            && let Some(previous) = self.selected_thread
+        {
+            self.commit_thread_edits(previous);
+        }
         self.selected_thread = Some(id);
         if !self.open_threads.contains(&id) {
             self.open_threads.push(id);
@@ -935,6 +1005,7 @@ impl AppState {
         self.select_launch_output(launch_id);
     }
     pub fn close_thread(&mut self, id: ThreadId) {
+        self.commit_thread_edits(id);
         let closed_ix = self.open_threads.iter().position(|open| *open == id);
         if let Some(ix) = closed_ix {
             self.open_threads.remove(ix);
@@ -964,6 +1035,20 @@ impl AppState {
         }
     }
     pub fn new_thread(&mut self, kind: ThreadKind) -> Result<()> {
+        self.new_thread_with_harness(kind, None)
+    }
+    pub fn new_conversation(&mut self, harness: &str) -> Result<()> {
+        anyhow::ensure!(
+            harness::CONVERSATION_HARNESSES.contains(&harness),
+            "Unsupported conversation harness: {harness}"
+        );
+        self.new_thread_with_harness(ThreadKind::Conversation, Some(harness))
+    }
+    fn new_thread_with_harness(
+        &mut self,
+        kind: ThreadKind,
+        conversation_harness: Option<&str>,
+    ) -> Result<()> {
         if let Some(reason) = self.mutable_project_reason() {
             anyhow::bail!(reason);
         }
@@ -972,11 +1057,13 @@ impl AppState {
         let (title, harness, model, factory) = match kind {
             ThreadKind::Conversation => (
                 "New conversation",
-                if project.defaults.interactive_harness.trim().is_empty() {
-                    "omp".into()
-                } else {
-                    project.defaults.interactive_harness.clone()
-                },
+                conversation_harness.map(str::to_owned).unwrap_or_else(|| {
+                    if project.defaults.interactive_harness.trim().is_empty() {
+                        "omp".into()
+                    } else {
+                        project.defaults.interactive_harness.clone()
+                    }
+                }),
                 project.defaults.interactive_model.clone(),
                 None,
             ),
@@ -1112,6 +1199,26 @@ mod tests {
         ));
         assert!(session.has_tool_call("call_1"));
         assert!(session.tool_result("call_1").is_none());
+        assert_eq!(
+            session.tool_call_order(),
+            &[("bash".to_owned(), "call_1".to_owned())]
+        );
+        assert!(matches!(
+            session.tool_call_block("call_1"),
+            Some(ContentBlock::ToolCall { name, .. }) if name == "bash"
+        ));
+        // A streamed update of the same assistant message does not repeat the call.
+        session.message(message(
+            "assistant:1",
+            "assistant",
+            vec![ContentBlock::ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                intent: None,
+                input: Value::Null,
+            }],
+        ));
+        assert_eq!(session.tool_call_order().len(), 1);
         let mut result = message(
             "toolResult:2",
             "toolResult",
@@ -1134,10 +1241,20 @@ mod tests {
             .unwrap()
             .collect();
         assert_eq!(changed, std::collections::BTreeSet::from([0, 1]));
+        session.message(message(
+            "custom:9",
+            "custom",
+            vec![ContentBlock::Text(
+                "<system-notice>x</system-notice>".into(),
+            )],
+        ));
+        assert_eq!(session.notices().count(), 1);
         session.reset_history();
         assert!(!session.has_tool_call("call_1"));
         assert!(session.tool_result("call_1").is_none());
         assert!(session.messages.is_empty());
+        assert!(session.tool_call_order().is_empty());
+        assert_eq!(session.notices().count(), 0);
     }
 
     #[test]

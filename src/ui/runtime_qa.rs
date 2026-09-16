@@ -247,8 +247,8 @@ async fn quit(cx: &mut TestAppContext, fixture: &Fixture) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; sidebar '+' and clipboard paste against a real store"]
-async fn project_plus_starts_conversation_and_clipboard_image_attaches(cx: &mut TestAppContext) {
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; sidebar harness picker and clipboard paste against a real store"]
+async fn project_plus_picks_harness_and_clipboard_image_attaches(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let project = cx.read(|cx| fixture.state.read(cx).snapshot.projects[0].id);
     let count = cx.read(|cx| fixture.state.read(cx).snapshot.threads.len());
@@ -267,9 +267,21 @@ async fn project_plus_starts_conversation_and_clipboard_image_attaches(cx: &mut 
         .debug_bounds(selector)
         .expect("project row shows its '+'");
     visual.simulate_click(plus.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).snapshot.threads.len()),
+        count,
+        "opening the picker must not create a conversation"
+    );
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).selected_project),
+        Some(project),
+        "the clicked project owns the picker action"
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "down down enter");
     until(
         cx,
-        "'+' created a conversation",
+        "picker created a Claude Code conversation",
         Duration::from_secs(5),
         |cx| {
             let state = fixture.state.read(cx);
@@ -280,6 +292,16 @@ async fn project_plus_starts_conversation_and_clipboard_image_attaches(cx: &mut 
         },
     )
     .await;
+    assert_eq!(
+        cx.read(|cx| fixture
+            .state
+            .read(cx)
+            .conversation_thread()
+            .unwrap()
+            .harness
+            .clone()),
+        "claude-code"
+    );
     let conversation = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
     assert!(cx.read(|cx| fixture.state.read(cx).selected_project == Some(project)));
 
@@ -520,6 +542,234 @@ async fn conversation_diff_sidebar_tracks_working_tree(cx: &mut TestAppContext) 
     quit(cx, &fixture).await;
 }
 
+async fn wait_for_saved_thread(
+    cx: &mut TestAppContext,
+    fixture: &Fixture,
+    id: ThreadId,
+    matches: impl Fn(&crate::model::Thread) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        cx.run_until_parked();
+        let saved = fixture.store.snapshot().await.unwrap();
+        if saved
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .is_some_and(&matches)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "latest thread edit was not committed: {:?}",
+            saved.threads.iter().find(|thread| thread.id == id)
+        );
+        smol::Timer::after(Duration::from_millis(20)).await;
+    }
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; typing stays local until focus loss or quit"]
+async fn typing_saves_on_focus_loss_and_quit_not_idle(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    cx.update_window(fixture.window.into(), |_, window, _| {
+        window.activate_window()
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let id = new_conversation(cx, &fixture).await;
+    until(
+        cx,
+        "initial persistence and harness",
+        Duration::from_secs(15),
+        |cx| {
+            let state = fixture.state.read(cx);
+            state.pending_writes == 0
+                && state.conversations.get(&id).is_some_and(|session| {
+                    !matches!(session.state, crate::harness::ConversationState::Starting)
+                })
+        },
+    )
+    .await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.focus_composer(window, cx);
+        },
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "a b c");
+    until(cx, "in-memory typing", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).drafts[&DraftKey::Thread(id)].text == "abc"
+    })
+    .await;
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("save-indicator").is_none(),
+            "typing must not start saving or show an active-save indicator"
+        );
+    })
+    .unwrap();
+    smol::Timer::after(Duration::from_millis(1800)).await;
+    cx.run_until_parked();
+    let saved = fixture.store.snapshot().await.unwrap();
+    assert_eq!(
+        saved
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .unwrap()
+            .draft,
+        "",
+        "pausing while focused must not save the draft"
+    );
+
+    // Include a final keystroke immediately before focus loss: the semantic
+    // snapshot must include it even if its normal draft event arrives later.
+    cx.simulate_keystrokes(fixture.window.into(), "d cmd-escape");
+    wait_for_saved_thread(cx, &fixture, id, |thread| thread.draft == "abcd").await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.focus_composer(window, cx);
+        },
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "e");
+    VisualTestContext::from_window(fixture.window.into(), cx).deactivate_window();
+    wait_for_saved_thread(cx, &fixture, id, |thread| thread.draft == "abcde").await;
+    cx.update_window(fixture.window.into(), |_, window, _| {
+        window.activate_window()
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(fixture.window.into(), "f");
+    until(
+        cx,
+        "latest unsaved revision",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(id)].text == "abcdef",
+    )
+    .await;
+    quit(cx, &fixture).await;
+    let saved = fixture.store.snapshot().await.unwrap();
+    assert_eq!(
+        saved
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .unwrap()
+            .draft,
+        "abcdef"
+    );
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; Factory input commits on blur and Return"]
+async fn factory_typing_stays_local_until_focus_loss_or_commit(cx: &mut TestAppContext) {
+    fn focus_field(cx: &mut TestAppContext, fixture: &Fixture, key: &str) {
+        update_workspace(
+            cx,
+            fixture.window,
+            &fixture.workspace,
+            |workspace, window, cx| {
+                let input = workspace
+                    .factory_form
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .input(key)
+                    .clone();
+                input.focus_handle(cx).focus(window, cx);
+            },
+        );
+        cx.run_until_parked();
+    }
+    let fixture = open_fixture(cx, None).await;
+    cx.update_window(fixture.window.into(), |_, window, _| {
+        window.activate_window()
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.dispatch_action(fixture.window.into(), commands::NewFactoryThread);
+    until(cx, "Factory form ready", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).factory_form.is_some()
+            && fixture.state.read(cx).pending_writes == 0
+    })
+    .await;
+    let id = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+    focus_field(cx, &fixture, "source");
+    cx.simulate_keystrokes(fixture.window.into(), "a b c");
+    assert_eq!(
+        cx.read(|cx| fixture
+            .state
+            .read(cx)
+            .thread()
+            .unwrap()
+            .factory
+            .as_ref()
+            .unwrap()
+            .source
+            .clone()),
+        "abc"
+    );
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("save-indicator").is_none(),
+            "editing a Factory field must not show an active-save indicator"
+        );
+    })
+    .unwrap();
+    smol::Timer::after(Duration::from_millis(1800)).await;
+    cx.run_until_parked();
+    let saved = fixture.store.snapshot().await.unwrap();
+    assert_eq!(
+        saved
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .unwrap()
+            .factory
+            .as_ref()
+            .unwrap()
+            .source,
+        ""
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "d cmd-1");
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        let input = fixture
+            .workspace
+            .read(cx)
+            .factory_form
+            .as_ref()
+            .unwrap()
+            .read(cx)
+            .input("source");
+        assert!(
+            !input.focus_handle(cx).is_focused(window),
+            "source still focused: {:?}",
+            window.context_stack()
+        );
+    })
+    .unwrap();
+    wait_for_saved_thread(cx, &fixture, id, |thread| {
+        thread.factory.as_ref().unwrap().source == "abcd"
+    })
+    .await;
+    focus_field(cx, &fixture, "model");
+    cx.simulate_keystrokes(fixture.window.into(), "m enter");
+    wait_for_saved_thread(cx, &fixture, id, |thread| {
+        thread.factory.as_ref().unwrap().model == "m"
+    })
+    .await;
+    quit(cx, &fixture).await;
+}
+
 /// Opt-in comparative workload, not a wall-clock assertion in ordinary CI.
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; measures real input and navigation without provider turns"]
@@ -567,6 +817,26 @@ async fn interaction_performance_workload(cx: &mut TestAppContext) {
     })
     .await;
     cx.simulate_keystrokes(fixture.window.into(), "cmd-escape");
+    cx.dispatch_action(fixture.window.into(), commands::FocusProjects);
+    let mut pane_samples = Vec::new();
+    for _ in 0..40 {
+        for (keys, expected) in [
+            ("ctrl-w l", Region::Thread),
+            ("ctrl-w h", Region::Projects),
+        ] {
+            let start = Instant::now();
+            cx.simulate_keystrokes(fixture.window.into(), keys);
+            let actual = update_workspace(
+                cx,
+                fixture.window,
+                &fixture.workspace,
+                |workspace, window, cx| workspace.focused_region(window, cx),
+            );
+            pane_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(actual, expected, "pane chord must take effect immediately");
+        }
+    }
+    report("pane-navigation", pane_samples);
     cx.dispatch_action(fixture.window.into(), commands::NewFactoryThread);
     until(cx, "workload Factory form", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).factory_form.is_some()
@@ -699,6 +969,18 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
             .drafts
             .contains_key(&DraftKey::Thread(factory))
     }));
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.state.update(cx, |state, cx| {
+                state.select_thread(first);
+                cx.notify();
+            });
+            workspace.focus_region(Region::Thread, window, cx);
+        },
+    );
     until(
         cx,
         "Factory input persistence",
@@ -728,18 +1010,6 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
         "alpha GAMMA\n"
     );
 
-    update_workspace(
-        cx,
-        fixture.window,
-        &fixture.workspace,
-        |workspace, window, cx| {
-            workspace.state.update(cx, |state, cx| {
-                state.select_thread(first);
-                cx.notify();
-            });
-            workspace.focus_region(Region::Thread, window, cx);
-        },
-    );
     until(cx, "Conversation restored", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).editor_selection == Some(DraftKey::Thread(first))
     })
@@ -956,65 +1226,36 @@ async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
     .unwrap();
 }
 #[gpui_kit::test]
-#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native Settings selection"]
-async fn claude_code_project_default_creates_claude_conversation(cx: &mut TestAppContext) {
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native palette command"]
+async fn claude_code_conversation_is_visible_and_actionable(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-,");
-    until(
-        cx,
-        "Settings conversation harness",
-        Duration::from_secs(5),
-        |cx| fixture.workspace.read(cx).dialog.is_some(),
-    )
-    .await;
-    update_workspace(
-        cx,
-        fixture.window,
-        &fixture.workspace,
-        |workspace, window, cx| {
-            workspace
-                .dialog
-                .as_ref()
-                .unwrap()
+    assert_eq!(
+        cx.read(|cx| {
+            fixture
+                .state
                 .read(cx)
-                .select("interactive_harness")
+                .project()
                 .unwrap()
+                .defaults
+                .interactive_harness
                 .clone()
-                .update(cx, |select, cx| {
-                    select.set_selected_value(&"claude-code".to_owned(), window, cx)
-                });
-        },
+        }),
+        "omp"
     );
-    set_dialog(
-        cx,
-        fixture.window,
-        &fixture.workspace,
-        "claude",
-        "/nonexistent/drostje-qa-claude",
+    let before = cx.read(|cx| fixture.state.read(cx).snapshot.threads.len());
+    open_palette(cx, &fixture).await;
+    cx.simulate_keystrokes(
+        fixture.window.into(),
+        "n e w space c l a u d e space c o d e space c o n v e r s a t i o n enter",
     );
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-enter");
     until(
         cx,
-        "Claude Code default saved",
+        "visible Claude Code conversation command",
         Duration::from_secs(5),
         |cx| {
-            fixture.workspace.read(cx).dialog.is_none()
-                && fixture
-                    .state
-                    .read(cx)
-                    .project()
-                    .is_some_and(|project| project.defaults.interactive_harness == "claude-code")
+            fixture.workspace.read(cx).palette.is_none()
+                && fixture.state.read(cx).snapshot.threads.len() == before + 1
         },
-    )
-    .await;
-
-    let before = cx.read(|cx| fixture.state.read(cx).snapshot.threads.len());
-    cx.dispatch_action(fixture.window.into(), commands::NewConversation);
-    until(
-        cx,
-        "Claude Code conversation created",
-        Duration::from_secs(5),
-        |cx| fixture.state.read(cx).snapshot.threads.len() == before + 1,
     )
     .await;
     assert_eq!(

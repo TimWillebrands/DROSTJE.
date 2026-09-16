@@ -111,6 +111,89 @@ fn parse_task_result(block: &str) -> Option<JobResult> {
         full_output,
     })
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    /// A background agent; carries the agent kind (`task`, `scout`, `reviewer`, …).
+    Agent(String),
+    Shell,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobStart {
+    pub id: String,
+    pub kind: JobKind,
+    /// The agent's name or the shell command.
+    pub label: String,
+}
+/// Jobs a tool result reports as started: `task` spawns agents and lists them
+/// as `` - `Name` (job `Id`) ``; `bash` with `async` answers
+/// `Backgrounded as job bg_N; …`.
+pub fn job_starts(tool: &str, input: &Value, result: &str) -> Vec<JobStart> {
+    match tool {
+        "task" => {
+            let agent = result
+                .lines()
+                .next()
+                .and_then(|line| line.split_once(" using "))
+                .and_then(|(_, rest)| rest.split(['.', ' ']).next())
+                .filter(|agent| !agent.is_empty())
+                .unwrap_or("task")
+                .to_owned();
+            result
+                .lines()
+                .filter_map(|line| {
+                    let (name, rest) = line.strip_prefix("- `")?.split_once('`')?;
+                    let (id, _) = rest.strip_prefix(" (job `")?.split_once('`')?;
+                    Some(JobStart {
+                        id: id.to_owned(),
+                        kind: JobKind::Agent(agent.clone()),
+                        label: name.to_owned(),
+                    })
+                })
+                .collect()
+        }
+        "bash" => result
+            .trim_start()
+            .strip_prefix("Backgrounded as job ")
+            .and_then(|rest| rest.split([';', ' ', '\n']).next())
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                vec![JobStart {
+                    id: id.to_owned(),
+                    kind: JobKind::Shell,
+                    label: input["command"].as_str().unwrap_or("").to_owned(),
+                }]
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+/// Job ids a `hub` snapshot reports as settled: every `### id [type] — status`
+/// entry outside the “Still Running” section, plus explicit cancellations.
+pub fn settled_job_ids(tool: &str, result: &str) -> Vec<String> {
+    if tool != "hub" {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    let mut still_running = false;
+    for line in result.lines() {
+        if let Some(heading) = line.strip_prefix("## ") {
+            still_running = heading.starts_with("Still Running");
+            continue;
+        }
+        if still_running {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("### ")
+            && let Some((id, tail)) = rest.split_once(" [")
+            && tail.contains("] — ")
+        {
+            ids.push(id.to_owned());
+        } else if let Some(rest) = line.strip_prefix("- Cancelled background job ") {
+            ids.push(rest.trim_end_matches('.').to_owned());
+        }
+    }
+    ids
+}
 fn attribute(head: &str, name: &str) -> Option<String> {
     attribute_in(head, name)
 }
@@ -127,8 +210,52 @@ fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JobNotice, JobOutput};
-    use serde_json::json;
+    use super::{JobKind, JobNotice, JobOutput, JobStart, job_starts, settled_job_ids};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn task_and_async_bash_results_name_the_jobs_they_started() {
+        let task = "Spawned 3 background agents using reviewer. Each result auto-delivers on yield.\n- `ComplexityReview` (job `ComplexityReview`)\n- `SpecReview` (job `job_7`)\nDM these ids via `hub`.";
+        assert_eq!(
+            job_starts("task", &Value::Null, task),
+            vec![
+                JobStart {
+                    id: "ComplexityReview".into(),
+                    kind: JobKind::Agent("reviewer".into()),
+                    label: "ComplexityReview".into()
+                },
+                JobStart {
+                    id: "job_7".into(),
+                    kind: JobKind::Agent("reviewer".into()),
+                    label: "SpecReview".into()
+                },
+            ]
+        );
+        assert_eq!(
+            job_starts(
+                "bash",
+                &json!({"command":"cargo test","async":true}),
+                "Backgrounded as job bg_1; result will be delivered automatically."
+            ),
+            vec![JobStart {
+                id: "bg_1".into(),
+                kind: JobKind::Shell,
+                label: "cargo test".into()
+            }]
+        );
+        assert!(job_starts("bash", &json!({"command":"ls"}), "file\n").is_empty());
+        assert!(job_starts("hub", &Value::Null, "- `X` (job `X`)").is_empty());
+    }
+
+    #[test]
+    fn hub_snapshots_settle_jobs_outside_the_running_section() {
+        let text = "## Still Running (1)\n\n- `Slow` [task] — Slow\n\n## Completed (2)\n\n### bg_19 [bash] — completed\nLabel: cargo check\n### SpecReview [task] — completed\n\n## Cancelled (1)\n\n- Cancelled background job bg_3.\n\n### bg_3 [bash] — cancelled\n";
+        assert_eq!(
+            settled_job_ids("hub", text),
+            ["bg_19", "SpecReview", "bg_3", "bg_3"]
+        );
+        assert!(settled_job_ids("bash", text).is_empty());
+    }
 
     #[test]
     fn task_result_with_structured_output() {

@@ -8,7 +8,8 @@ pub(super) struct Shutdown {
 }
 
 impl Shutdown {
-    pub(super) fn new(state: &AppState) -> Self {
+    pub(super) fn new(state: &mut AppState) -> Self {
+        state.commit_all_thread_edits();
         Self {
             editor: state.editor.clone(),
             sessions: state

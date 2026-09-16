@@ -107,7 +107,7 @@ const OUTDATED_LAYOUT: &str = "Layout was saved by another version";
 /// Save acknowledgements repaint only their status, never the workspace shell.
 struct SaveStatus {
     state: Entity<AppState>,
-    presentation: (usize, bool),
+    presentation: (bool, bool),
     _subscriptions: Vec<Subscription>,
 }
 
@@ -128,9 +128,9 @@ impl SaveStatus {
         }
     }
 
-    fn presentation(state: &AppState) -> (usize, bool) {
+    fn presentation(state: &AppState) -> (bool, bool) {
         (
-            state.pending_writes,
+            state.pending_writes > 0,
             state.storage_error.is_some() || state.shutdown_error.is_some(),
         )
     }
@@ -148,12 +148,14 @@ impl Render for SaveStatus {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_2()
-            .when(self.presentation.0 > 0, |view| {
+            .when(self.presentation.0, |view| {
                 view.child(
                     div()
+                        .id("save-indicator")
+                        .test_support()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!("Saving {} changes", self.presentation.0)),
+                        .child("Saving changes…"),
                 )
             })
             .when(self.presentation.1, |view| {
@@ -893,6 +895,22 @@ impl Workspace {
             _ => None,
         }
     }
+    /// Fold or unfold one of the conversation's sticky docks (task list, background jobs).
+    fn toggle_dock(&mut self, dock: &str, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id)
+        else {
+            return;
+        };
+        let key = format!("{dock}:{id}");
+        if !self.expanded.remove(&key) {
+            self.expanded.insert(key);
+        }
+        cx.notify();
+    }
     pub fn focus_region(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
         // A thread selected in this same update has no panel until the sync runs.
         if region == Region::Thread {
@@ -1027,6 +1045,8 @@ impl Workspace {
                 | Command::PreviousThread
                 | Command::CloseThread
                 | Command::NewConversation
+                | Command::NewOmpConversation
+                | Command::NewClaudeCodeConversation
                 | Command::NewFactoryThread
         ) && self
             .editor
@@ -1070,6 +1090,14 @@ impl Workspace {
                 self.sync_diff_interest(cx);
                 None
             }
+            Command::ToggleTaskList => {
+                self.toggle_dock("dock-todo", cx);
+                None
+            }
+            Command::ToggleBackgroundJobs => {
+                self.toggle_dock("dock-jobs", cx);
+                None
+            }
             Command::RefreshConversationDiff => {
                 self.state.update(cx, |state, cx| {
                     if let Some(id) = state.conversation_thread().map(|thread| thread.id) {
@@ -1100,14 +1128,21 @@ impl Workspace {
                 .selected_thread
                 .map(DialogKind::ArchiveThread),
             Command::Settings => Some(DialogKind::Settings(self.state.read(cx).selected_project)),
-            Command::NewConversation | Command::NewFactoryThread => {
-                let kind = if command == Command::NewConversation {
-                    crate::model::ThreadKind::Conversation
-                } else {
-                    crate::model::ThreadKind::Factory
-                };
+            Command::NewConversation
+            | Command::NewOmpConversation
+            | Command::NewClaudeCodeConversation
+            | Command::NewFactoryThread => {
                 self.state.update(cx, |state, cx| {
-                    if let Err(error) = state.new_thread(kind) {
+                    let result = if command == Command::NewConversation {
+                        state.new_thread(ThreadKind::Conversation)
+                    } else if command == Command::NewOmpConversation {
+                        state.new_conversation("omp")
+                    } else if command == Command::NewClaudeCodeConversation {
+                        state.new_conversation("claude-code")
+                    } else {
+                        state.new_thread(ThreadKind::Factory)
+                    };
+                    if let Err(error) = result {
                         state.notice(crate::app::NoticeLevel::Error, format!("{error:#}"));
                     }
                     cx.notify();
@@ -1463,6 +1498,12 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &NewConversation, w, cx| {
                     this.execute(Command::NewConversation, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &NewOmpConversation, w, cx| {
+                    this.execute(Command::NewOmpConversation, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &NewClaudeCodeConversation, w, cx| {
+                    this.execute(Command::NewClaudeCodeConversation, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &RenameProject, w, cx| {
                     this.execute(Command::RenameProject, w, cx)
                 }))
@@ -1513,6 +1554,12 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &ToggleConversationDiffs, w, cx| {
                     this.execute(Command::ToggleConversationDiffs, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleTaskList, w, cx| {
+                    this.execute(Command::ToggleTaskList, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleBackgroundJobs, w, cx| {
+                    this.execute(Command::ToggleBackgroundJobs, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &RefreshConversationDiff, w, cx| {
                     this.execute(Command::RefreshConversationDiff, w, cx)

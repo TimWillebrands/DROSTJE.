@@ -2,12 +2,38 @@ use std::{collections::BTreeMap, path::Path, rc::Rc};
 
 use anyhow::{Result, bail};
 use gpui_kit::{
-    component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry, highlighter::HighlightTheme},
+    component::{
+        Theme, ThemeConfig, ThemeMode, ThemeRegistry, ThemeSet, highlighter::HighlightTheme,
+    },
     *,
 };
 use serde_json::Value;
 
 use crate::app::{AppState, NoticeLevel};
+
+/// Themes shipped with DROSTJE., modelled on Zed's One Light and One Dark so
+/// text stays muted instead of near-black. They are the fallback for every
+/// mode and are listed before registry themes. Kit's registry is not told
+/// about them: `ThemeRegistry::load_themes_from_str` entries are dropped on
+/// every directory reload, so bundled themes live here instead.
+const BUNDLED_THEMES: &str = include_str!("../../assets/themes/drostje.json");
+
+fn parse_bundled() -> BTreeMap<ThemeMode, Rc<ThemeConfig>> {
+    let set: ThemeSet =
+        serde_json::from_str(BUNDLED_THEMES).expect("assets/themes/drostje.json is valid Kit JSON");
+    let mut bundled = BTreeMap::new();
+    for theme in set.themes {
+        bundled.insert(theme.mode, Rc::new(theme));
+    }
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        assert!(
+            bundled.contains_key(&mode),
+            "assets/themes/drostje.json bundles one {} theme",
+            mode.name()
+        );
+    }
+    bundled
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Appearance {
@@ -74,12 +100,38 @@ struct AppliedTheme {
     dark: Value,
 }
 
-#[derive(Default)]
 struct Coordinator {
     preferences: Preferences,
+    bundled: BTreeMap<ThemeMode, Rc<ThemeConfig>>,
     native_appearance: Option<Appearance>,
     applied: Option<AppliedTheme>,
     warnings: Vec<String>,
+}
+
+impl Coordinator {
+    fn new(preferences: Preferences) -> Self {
+        Self {
+            preferences,
+            bundled: parse_bundled(),
+            native_appearance: None,
+            applied: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn bundled(&self, mode: ThemeMode) -> &Rc<ThemeConfig> {
+        &self.bundled[&mode]
+    }
+}
+
+/// A bundled theme wins over a registry theme of the same name so a stray
+/// file cannot replace the defaults; other registry themes are found by name.
+fn find_theme<'a>(name: &str, cx: &'a App) -> Option<&'a Rc<ThemeConfig>> {
+    cx.global::<Coordinator>()
+        .bundled
+        .values()
+        .find(|theme| theme.name.as_ref() == name)
+        .or_else(|| ThemeRegistry::global(cx).themes().get(name))
 }
 
 impl Global for Coordinator {}
@@ -98,10 +150,9 @@ pub fn initialize(
     data_dir: Option<&Path>,
     cx: &mut App,
 ) {
-    cx.set_global(Coordinator {
-        preferences: settings.map(Preferences::from_settings).unwrap_or_default(),
-        ..Default::default()
-    });
+    cx.set_global(Coordinator::new(
+        settings.map(Preferences::from_settings).unwrap_or_default(),
+    ));
     cx.set_global(InitialLoad {
         finished: data_dir.is_none(),
         error: None,
@@ -128,12 +179,16 @@ pub fn initial_load_finished(cx: &App) -> bool {
         .is_none_or(|load| load.finished)
 }
 
+/// Bundled theme first, then registry themes in Kit's order, without repeats.
 pub fn theme_names(mode: ThemeMode, cx: &App) -> Vec<String> {
-    ThemeRegistry::global(cx)
+    let bundled = cx.global::<Coordinator>().bundled(mode).name.clone();
+    let registry = ThemeRegistry::global(cx)
         .sorted_themes()
         .into_iter()
-        .filter(|theme| theme.mode == mode)
-        .map(|theme| theme.name.to_string())
+        .filter(|theme| theme.mode == mode && theme.name != bundled)
+        .map(|theme| theme.name.to_string());
+    std::iter::once(bundled.to_string())
+        .chain(registry)
         .collect()
 }
 
@@ -170,7 +225,7 @@ pub fn validate_preferences(
         if Some(name) == saved {
             continue;
         }
-        let Some(theme) = ThemeRegistry::global(cx).themes().get(name) else {
+        let Some(theme) = find_theme(name, cx) else {
             bail!(
                 "The theme “{name}” is unavailable. Choose an installed {} theme.",
                 mode.name()
@@ -189,13 +244,9 @@ fn resolve(
     cx: &App,
     warnings: &mut Vec<String>,
 ) -> Rc<ThemeConfig> {
-    let registry = ThemeRegistry::global(cx);
-    let fallback = match mode {
-        ThemeMode::Light => registry.default_light_theme(),
-        ThemeMode::Dark => registry.default_dark_theme(),
-    };
+    let fallback = cx.global::<Coordinator>().bundled(mode);
     if let Some(name) = name {
-        let selected = registry.themes().get(name);
+        let selected = find_theme(name, cx);
         if let Some(theme) = selected.filter(|theme| theme.mode == mode) {
             return theme.clone();
         }
@@ -380,4 +431,81 @@ pub fn attach_recovery(window: &mut Window, cx: &mut App) -> Subscription {
     window.observe_window_appearance(|window, cx| {
         apply(Some(window), cx);
     })
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `use super::*`: the Kit facade exports a `test` macro that would
+    // shadow `#[test]`.
+    use super::parse_bundled;
+    use gpui_kit::component::ThemeMode;
+
+    #[test]
+    fn bundled_themes_parse_with_muted_text() {
+        let bundled = parse_bundled();
+        let light = &bundled[&ThemeMode::Light];
+        let dark = &bundled[&ThemeMode::Dark];
+        assert_eq!(light.name.as_ref(), "DROSTJE. Light");
+        assert_eq!(dark.name.as_ref(), "DROSTJE. Dark");
+        // Zed One Light / One Dark text, not Kit's neutral-950 / neutral-50.
+        assert_eq!(light.colors.foreground.as_deref(), Some("#242529"));
+        assert_eq!(light.colors.background.as_deref(), Some("#fafafa"));
+        assert_eq!(light.colors.muted_foreground.as_deref(), Some("#58585a"));
+        assert_eq!(dark.colors.foreground.as_deref(), Some("#dce0e5"));
+        assert_eq!(dark.colors.background.as_deref(), Some("#282c33"));
+        assert_eq!(dark.colors.muted_foreground.as_deref(), Some("#a9afbc"));
+        for theme in [light, dark] {
+            assert!(theme.is_default, "{} marks itself default", theme.name);
+            // Kit 0.6.1 drops the flattened `editor.*` / status colors of a
+            // highlight block while parsing (its own default does too), so
+            // only the syntax table is asserted here.
+            let highlight = theme.highlight.as_ref().expect("bundled syntax colors");
+            assert!(highlight.syntax.keyword.is_some());
+            assert!(highlight.syntax.string.is_some());
+        }
+    }
+}
+
+#[cfg(all(test, feature = "runtime-qa"))]
+mod runtime_tests {
+    use super::{initialize, resolve, theme_names, validate_preferences};
+    use gpui_kit::{
+        Hsla, TestAppContext,
+        component::{Theme, ThemeMode},
+        rgb,
+    };
+
+    #[gpui_kit::test]
+    fn bundled_themes_are_the_fallback_and_listed_first(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            initialize(None, None, cx);
+
+            assert_eq!(theme_names(ThemeMode::Light, cx)[0], "DROSTJE. Light");
+            assert_eq!(theme_names(ThemeMode::Dark, cx)[0], "DROSTJE. Dark");
+            assert!(theme_names(ThemeMode::Light, cx).contains(&"Default Light".to_owned()));
+
+            let theme = Theme::global(cx);
+            assert_eq!(theme.light_theme.name.as_ref(), "DROSTJE. Light");
+            assert_eq!(theme.dark_theme.name.as_ref(), "DROSTJE. Dark");
+            let expected: Hsla = if theme.mode.is_dark() {
+                rgb(0xdce0e5).into()
+            } else {
+                rgb(0x242529).into()
+            };
+            assert_eq!(theme.foreground, expected);
+
+            validate_preferences("light", Some("DROSTJE. Light"), Some("DROSTJE. Dark"), cx)
+                .expect("bundled names validate");
+            validate_preferences("light", Some("Default Light"), None, cx)
+                .expect("Kit defaults stay selectable");
+            assert!(validate_preferences("light", Some("Missing"), None, cx).is_err());
+            assert!(validate_preferences("light", Some("DROSTJE. Dark"), None, cx).is_err());
+
+            let mut warnings = Vec::new();
+            let resolved = resolve(Some("Missing"), ThemeMode::Light, cx, &mut warnings);
+            assert_eq!(resolved.name.as_ref(), "DROSTJE. Light");
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+        });
+    }
 }

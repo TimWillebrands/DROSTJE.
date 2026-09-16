@@ -133,6 +133,62 @@ fn immediately_snapshot_and_switch_after_modal_typing() {
 }
 
 #[test]
+#[ignore = "requires a real Neovim executable; measures isolated input-to-grid delivery"]
+fn queued_typing_burst_reaches_grid_without_snapshot_or_redraw() {
+    smol::block_on(async {
+        let runtime = Runtime::start().await;
+        let key = runtime.draft("").await;
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL";
+        let sentinel = "BURST-COMPLETED";
+        let expected = format!("{}{sentinel}", format!("{line}\n").repeat(8));
+        let started = std::time::Instant::now();
+        for character in expected.chars() {
+            if character == '\n' {
+                runtime.keys("<CR>").await;
+            } else {
+                runtime.keys(&character.to_string()).await;
+            }
+        }
+        let queued = std::time::Instant::now();
+        // Observe only published flushes. A snapshot sends modal input markers,
+        // which could hide a redraw that stalls until another command arrives.
+        // The generous bound tolerates loaded CI while catching human-visible
+        // stalls; this is not a microbenchmark of each RPC round trip.
+        let deadline = queued + Duration::from_millis(750);
+        let expected_lines: Vec<_> = expected.lines().collect();
+        loop {
+            let caught_up = runtime.grid.lock().as_ref().is_some_and(|grid| {
+                grid.rows.len() >= expected_lines.len()
+                    && grid.rows.iter().zip(&expected_lines).all(|(row, expected)| {
+                        let text: String = row.iter().map(|cell| cell.text.as_str()).collect();
+                        text.trim_end() == *expected
+                    })
+            });
+            if caught_up {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued burst did not reach a flushed grid within 750ms; diagnostics: {:?}",
+                runtime.diagnostics.lock()
+            );
+            smol::Timer::after(Duration::from_millis(1)).await;
+        }
+        let published = std::time::Instant::now();
+        eprintln!(
+            "{} individual input commands: queued in {:?}, grid caught up in {:?}, total {:?}",
+            expected.chars().count(),
+            queued.duration_since(started),
+            published.duration_since(queued),
+            published.duration_since(started)
+        );
+        assert_eq!(runtime.editor.snapshot(key).await.unwrap().text, expected);
+        assert!(runtime.diagnostics.lock().is_empty());
+        runtime.close().await;
+    });
+}
+
+#[test]
 #[ignore = "requires a real Neovim executable; spawns disposable isolated processes"]
 fn ordered_paste_unicode_resize_and_revision_safe_clear() {
     smol::block_on(async {
