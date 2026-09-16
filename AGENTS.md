@@ -1,8 +1,8 @@
 # AGENTS.md — Drost
 
 Drost is a macOS desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.1"`) that
-drives local coding agents (OMP over native RPC), edits prompts in a native
-GPUI Kit Editor, and dispatches work to the Compliance Software Factory CLI. The README
+drives local coding agents (OMP over native RPC), edits prompts in embedded
+Neovim within a GPUI Kit-styled composer, and dispatches work to the Compliance Software Factory CLI. The README
 is Dutch and user-facing; code, comments, commits, docs and UI strings are
 English. `DROST_APPLICATION_PLAN.md` records the original scope; the README
 documents the current thread workflow and shortcuts.
@@ -22,7 +22,7 @@ cargo clippy --all-targets                 # ~45 warnings today; do not add any
 cargo run                                  # real app; set DROST_DATA_DIR for a scratch data dir
 
 # Opt-in native editor/window tests, isolated temp state:
-cargo test --features runtime-qa native_composition_is_recovery_only_until_committed -- --nocapture
+cargo test --features runtime-qa native_composition_is_recovery_only_until_committed -- --ignored --nocapture
 cargo test --features runtime-qa --lib workspace_actions_with_real_backends -- --ignored --nocapture
 ```
 

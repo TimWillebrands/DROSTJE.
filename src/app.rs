@@ -1,12 +1,9 @@
 mod conversation;
 mod factory;
 mod shutdown;
-use crate::{
-    harness::{
-        self, ConversationCommand, ConversationEvent, ConversationHandle, ConversationState,
-        Message, ModelChoice, ToolActivity, TurnOutcome, UserAnswer, UserRequest,
-    },
-    neovim::{DraftKey, DraftSnapshot, NvimEditor},
+use crate::harness::{
+    self, ConversationCommand, ConversationEvent, ConversationHandle, ConversationState, Message,
+    ModelChoice, ToolActivity, TurnOutcome, UserAnswer, UserRequest,
 };
 use crate::{model::*, platform, store::Store};
 use anyhow::{Context as _, Result};
@@ -94,7 +91,7 @@ impl Bootstrap {
         let store = Store::open(data_dir.clone())?;
         let mut snapshot = smol::block_on(store.snapshot())?;
         if !snapshot.settings.contains_key("executables") {
-            let value = json!({ "omp": "", "nvim": "", "factory": "" });
+            let value = json!({ "nvim": "", "omp": "", "factory": "" });
             smol::block_on(store.set_setting("executables".into(), value.clone()))?;
             snapshot.settings.insert("executables".into(), value);
         }
@@ -126,7 +123,7 @@ impl Bootstrap {
 }
 
 fn executable_diagnostics(settings: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
-    ["omp", "nvim", "factory"]
+    ["nvim", "omp", "factory"]
         .into_iter()
         .map(|name| {
             let explicit = settings
@@ -186,6 +183,7 @@ pub struct AppState {
     pub snapshot: WorkspaceSnapshot,
     pub selected_project: Option<ProjectId>,
     pub selected_thread: Option<ThreadId>,
+    pub open_threads: Vec<ThreadId>,
     pub selected_launch: Option<LaunchId>,
     pub show_archived: bool,
     pub collapsed: HashSet<ProjectId>,
@@ -203,8 +201,8 @@ pub struct AppState {
     pub shutdown_complete: bool,
     pub shutdown_error: Option<String>,
     pub conversations: BTreeMap<ThreadId, ConversationSession>,
-    pub editor: Option<NvimEditor>,
     pub drafts: HashMap<DraftKey, DraftSnapshot>,
+    pub editor: Option<crate::neovim::NvimEditor>,
     pub editor_error: Option<String>,
     pub factory: Option<crate::factory::FactoryManager>,
     pub factory_runs: BTreeMap<LaunchId, crate::factory::FactorySnapshot>,
@@ -250,6 +248,20 @@ impl AppState {
                     })
                     .map(|thread| thread.id)
             });
+        let mut open_threads: Vec<ThreadId> = snapshot
+            .settings
+            .get("open_threads")
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        open_threads.retain(|id| {
+            seen.insert(*id) && snapshot.threads.iter().any(|thread| thread.id == *id)
+        });
+        if let Some(id) = selected_thread
+            && !open_threads.contains(&id)
+        {
+            open_threads.push(id);
+        }
         let selected_project = selected_thread
             .and_then(|id| {
                 snapshot
@@ -385,12 +397,11 @@ impl AppState {
                 state.shutting_down = true;
                 Some(shutdown::Shutdown::new(state))
             });
-            let mut async_cx = cx.to_async();
             async move {
                 // Last-resort best effort for platform termination that bypasses
                 // Drost's quit action. Normal quit has already completed cleanup.
                 if let Some(shutdown) = shutdown {
-                    if let Err(error) = shutdown.run(state, &mut async_cx, true).await {
+                    if let Err(error) = shutdown.run(true).await {
                         eprintln!("Forced platform shutdown: {error:#}");
                     }
                 }
@@ -403,6 +414,7 @@ impl AppState {
             snapshot,
             selected_project,
             selected_thread,
+            open_threads,
             selected_launch,
             show_archived,
             collapsed: HashSet::new(),
@@ -414,8 +426,8 @@ impl AppState {
             pending_writes: 0,
             registering: false,
             conversations: BTreeMap::new(),
-            editor: None,
             drafts: HashMap::new(),
+            editor: None,
             editor_error: None,
             shutting_down: false,
             shutdown_complete: false,
@@ -715,11 +727,20 @@ impl AppState {
             .flatten();
         self.selected_project = Some(thread.project_id);
         self.selected_thread = Some(id);
+        if !self.open_threads.contains(&id) {
+            self.open_threads.push(id);
+            self.set_setting("open_threads", json!(self.open_threads));
+        }
         self.set_setting("selected_thread", json!(id));
         self.set_setting("selected_project", json!(self.selected_project));
         self.select_launch_output(launch_id);
     }
     pub fn close_thread(&mut self, id: ThreadId) {
+        let closed_ix = self.open_threads.iter().position(|open| *open == id);
+        if let Some(ix) = closed_ix {
+            self.open_threads.remove(ix);
+            self.set_setting("open_threads", json!(self.open_threads));
+        }
         if self.is_conversation(id) && !self.active_threads.contains(&id) {
             if let Some(session) = self.conversations.remove(&id) {
                 if let Some(commands) = session.commands {
@@ -728,9 +749,19 @@ impl AppState {
             }
         }
         if self.selected_thread == Some(id) {
-            self.selected_thread = None;
-            self.set_setting("selected_thread", Value::Null);
-            self.select_launch_output(None);
+            if let Some(next) = closed_ix
+                .and_then(|ix| {
+                    self.open_threads
+                        .get(ix.min(self.open_threads.len().saturating_sub(1)))
+                })
+                .copied()
+            {
+                self.select_thread(next);
+            } else {
+                self.selected_thread = None;
+                self.set_setting("selected_thread", Value::Null);
+                self.select_launch_output(None);
+            }
         }
     }
     pub fn new_thread(&mut self, kind: ThreadKind) -> Result<()> {

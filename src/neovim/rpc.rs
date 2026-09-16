@@ -84,22 +84,13 @@ impl Rpc {
     pub fn spawn(config: &NvimConfig) -> Result<Self> {
         let mut command = Command::new(&config.executable);
         command
-            .args([
-                "--embed",
-                "--clean",
-                "-u",
-                "NONE",
-                "-i",
-                "NONE",
-                "--noplugin",
-                "-n",
-            ])
+            .args(["--embed", "-u", "NONE", "-i", "NONE", "--noplugin", "-n"])
             .env_remove("NVIM")
             .env_remove("NVIM_LISTEN_ADDRESS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // The only pre-exec operation is async-signal-safe; we own this child's group.
+        // SAFETY: The only pre-exec operation is async-signal-safe; we own this child's group.
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -144,15 +135,12 @@ impl Rpc {
                     while let Ok(message) = writer_queue.recv_blocking() {
                         match message {
                             Outgoing::Frame(frame) => {
-                                if !stack.is_empty() {
-                                    if let Some(values) = frame.as_array() {
-                                        if values.first().and_then(Value::as_u64) == Some(0) {
-                                            if let Some(id) = values.get(1).and_then(Value::as_u64)
-                                            {
-                                                stack.push(CallFrame::Client { id, done: false });
-                                            }
-                                        }
-                                    }
+                                if !stack.is_empty()
+                                    && let Some(values) = frame.as_array()
+                                    && values.first().and_then(Value::as_u64) == Some(0)
+                                    && let Some(id) = values.get(1).and_then(Value::as_u64)
+                                {
+                                    stack.push(CallFrame::Client { id, done: false });
                                 }
                                 rmpv::encode::write_value(&mut writer, &frame)?;
                                 writer.flush()?;

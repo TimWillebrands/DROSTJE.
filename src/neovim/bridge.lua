@@ -26,15 +26,6 @@ function bridge.attach(buf)
     vim.keymap.set(mode, '<F24>', '<Cmd>lua drost.snapshot()<CR>',
       { buffer = buf, silent = true, nowait = true })
   end
-  for key, direction in pairs({ h = 'left', j = 'down', k = 'up', l = 'right' }) do
-    local function focus_pane()
-      notify('drost_focus_pane', api.nvim_get_current_buf(), direction)
-    end
-    for _, chord in ipairs({ '<C-w>' .. key, '<C-w><C-' .. key .. '>' }) do
-      vim.keymap.set('n', chord, focus_pane,
-        { buffer = buf, silent = true, nowait = true })
-    end
-  end
 end
 for _, mode in ipairs({ 'n', 'i', 'x', 's', 'o' }) do
   vim.keymap.set(mode, '<F23>', '<Cmd>lua drost.drain()<CR>', { silent = true, nowait = true })
@@ -65,23 +56,25 @@ vim.opt.number = false
 vim.opt.relativenumber = false
 vim.opt.showtabline = 0
 vim.opt.laststatus = 0
-vim.opt.showmode = false
-vim.opt.ruler = false
-vim.opt.fillchars:append({ eob = ' ' })
 vim.opt.mouse = 'a'
 vim.opt.termguicolors = true
 vim.opt.swapfile = false
 vim.opt.undofile = false
 vim.opt.hidden = true
 vim.opt.shortmess:append('I')
-vim.opt.guicursor = 'n-v-c:block,i-ci-ve:ver25,r-cr:hor20,o:hor50,a:Cursor-blinkwait700-blinkoff400-blinkon250'
-function bridge.apply_theme(theme)
-  vim.opt.background = theme.dark and 'dark' or 'light'
-  api.nvim_set_hl(0, 'Normal', { fg = theme.foreground, bg = theme.background })
-  api.nvim_set_hl(0, 'NormalFloat', { fg = theme.popover_foreground, bg = theme.popover })
-  api.nvim_set_hl(0, 'Visual', { bg = theme.selection })
-  api.nvim_set_hl(0, 'Cursor', { fg = theme.background, bg = theme.caret })
-  api.nvim_set_hl(0, 'Search', { fg = theme.primary_foreground, bg = theme.primary })
+vim.opt.guicursor = 'n-v-c:block,i-ci-ve:ver25,r-cr:hor20,o:hor50,a:Cursor/lCursor-blinkwait700-blinkoff400-blinkon250'
+function bridge.theme(foreground, background, selection, caret)
+  for _, group in ipairs({ 'Normal', 'NormalFloat', 'NormalNC' }) do
+    api.nvim_set_hl(0, group, { fg = foreground, bg = background })
+  end
+  api.nvim_set_hl(0, 'Visual', { fg = foreground, bg = selection })
+  api.nvim_set_hl(0, 'VisualNOS', { fg = foreground, bg = selection })
+  api.nvim_set_hl(0, 'Cursor', { fg = background, bg = caret })
+  api.nvim_set_hl(0, 'lCursor', { fg = background, bg = caret })
+  api.nvim_set_hl(0, 'Search', { fg = background, bg = caret })
+  api.nvim_set_hl(0, 'IncSearch', { fg = background, bg = caret })
+  api.nvim_set_hl(0, 'CurSearch', { fg = background, bg = caret })
+  return true
 end
 api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI', 'BufEnter' }, {
   callback = function()

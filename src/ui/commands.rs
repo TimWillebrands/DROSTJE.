@@ -23,6 +23,8 @@ gpui_kit::actions!(
         RenameThread,
         ArchiveThread,
         CloseThread,
+        NextThread,
+        PreviousThread,
         ShowArchived,
         RefreshFactoryRuns,
         Settings,
@@ -32,6 +34,9 @@ gpui_kit::actions!(
         FocusOutput,
         ToggleProjects,
         ToggleOutput,
+        RestartEditor,
+        CancelEditorCommand,
+        CopyDraftRecovery,
         OpenPalette,
         FocusLeft,
         FocusDown,
@@ -64,6 +69,8 @@ pub enum Command {
     RenameThread,
     ArchiveThread,
     CloseThread,
+    NextThread,
+    PreviousThread,
     ShowArchived,
     RefreshFactoryRuns,
     Settings,
@@ -73,9 +80,12 @@ pub enum Command {
     FocusOutput,
     ToggleProjects,
     ToggleOutput,
+    RestartEditor,
+    CancelEditorCommand,
+    CopyDraftRecovery,
 }
 impl Command {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 22] = [
         Self::AddProject,
         Self::NewConversation,
         Self::NewFactoryThread,
@@ -84,6 +94,8 @@ impl Command {
         Self::RenameThread,
         Self::ArchiveThread,
         Self::CloseThread,
+        Self::NextThread,
+        Self::PreviousThread,
         Self::ShowArchived,
         Self::RefreshFactoryRuns,
         Self::Settings,
@@ -93,6 +105,9 @@ impl Command {
         Self::FocusOutput,
         Self::ToggleProjects,
         Self::ToggleOutput,
+        Self::RestartEditor,
+        Self::CancelEditorCommand,
+        Self::CopyDraftRecovery,
     ];
 
     pub fn label(self) -> &'static str {
@@ -105,6 +120,8 @@ impl Command {
             Self::RenameThread => "Rename thread…",
             Self::ArchiveThread => "Archive thread…",
             Self::CloseThread => "Close thread",
+            Self::NextThread => "Next thread",
+            Self::PreviousThread => "Previous thread",
             Self::ShowArchived => "Show archived threads",
             Self::RefreshFactoryRuns => "Refresh Factory runs",
             Self::Settings => "Settings…",
@@ -114,6 +131,9 @@ impl Command {
             Self::FocusOutput => "Focus output",
             Self::ToggleProjects => "Toggle projects",
             Self::ToggleOutput => "Toggle output",
+            Self::RestartEditor => "Restart Neovim editor",
+            Self::CancelEditorCommand => "Cancel editor command",
+            Self::CopyDraftRecovery => "Copy draft recovery",
         }
     }
 
@@ -127,6 +147,8 @@ impl Command {
             Self::RenameThread => Box::new(RenameThread),
             Self::ArchiveThread => Box::new(ArchiveThread),
             Self::CloseThread => Box::new(CloseThread),
+            Self::NextThread => Box::new(NextThread),
+            Self::PreviousThread => Box::new(PreviousThread),
             Self::ShowArchived => Box::new(ShowArchived),
             Self::RefreshFactoryRuns => Box::new(RefreshFactoryRuns),
             Self::Settings => Box::new(Settings),
@@ -136,6 +158,9 @@ impl Command {
             Self::FocusOutput => Box::new(FocusOutput),
             Self::ToggleProjects => Box::new(ToggleProjects),
             Self::ToggleOutput => Box::new(ToggleOutput),
+            Self::RestartEditor => Box::new(RestartEditor),
+            Self::CancelEditorCommand => Box::new(CancelEditorCommand),
+            Self::CopyDraftRecovery => Box::new(CopyDraftRecovery),
         }
     }
 
@@ -163,6 +188,9 @@ impl Command {
                 }),
             Self::ArchiveThread => state.archive_thread_reason(),
             Self::CloseThread if state.thread().is_none() => Some("Select a thread first.".into()),
+            Self::NextThread | Self::PreviousThread if state.open_threads.len() < 2 => {
+                Some("Open at least two threads.".into())
+            }
             Self::NewFactoryThread => state.mutable_project_reason().or_else(|| {
                 state
                     .selected_project
@@ -180,23 +208,23 @@ impl Command {
 pub fn bind_keys(cx: &mut App) {
     let workspace = Some("Workspace && !Command && !PopupMenu && !Sheet && !Dialog");
     let command = Some("DrostPalette");
-    let navigation = Some(
-        "Workspace && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog && !NvimEditor",
-    );
-    let list = Some(
-        "List && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog && !NvimEditor",
-    );
+    let navigation =
+        Some("Workspace && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
+    let list =
+        Some("List && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
     let projects = Some(
-        "ProjectsList && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog && !NvimEditor",
+        "ProjectsList && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog",
     );
-    let thread = Some(
-        "Thread && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog && !NvimEditor",
-    );
+    let thread =
+        Some("Thread && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
     let submit = Some(
-        "(Thread || NvimEditor || FactoryThreadForm) && !Command && !PopupMenu && !Sheet && !Dialog",
+        "(Thread || PromptEditor || FactoryThreadForm) && !Command && !PopupMenu && !Sheet && !Dialog",
     );
     cx.bind_keys(vec![
         KeyBinding::new("cmd-shift-p", OpenPalette, workspace),
+        KeyBinding::new("ctrl-tab", NextThread, workspace),
+        KeyBinding::new("ctrl-shift-tab", PreviousThread, workspace),
+        KeyBinding::new("cmd-w", CloseThread, workspace),
         KeyBinding::new("cmd-1", FocusProjects, workspace),
         KeyBinding::new("cmd-2", FocusThread, workspace),
         KeyBinding::new("cmd-3", FocusOutput, workspace),
@@ -215,6 +243,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-n", NewConversation, command),
         KeyBinding::new("cmd-shift-n", NewFactoryThread, command),
         KeyBinding::new("cmd-,", Settings, command),
+        KeyBinding::new("ctrl-tab", NextThread, command),
+        KeyBinding::new("ctrl-shift-tab", PreviousThread, command),
+        KeyBinding::new("cmd-w", CloseThread, command),
         KeyBinding::new("ctrl-w h", FocusLeft, navigation),
         KeyBinding::new("ctrl-w j", FocusDown, navigation),
         KeyBinding::new("ctrl-w k", FocusUp, navigation),
@@ -244,18 +275,33 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "cmd-escape",
             LeaveEditor,
-            Some("NvimEditor && !Dialog && !Sheet"),
+            Some("PromptEditor && !Dialog && !Sheet"),
         ),
         KeyBinding::new("cmd-enter", Submit, submit),
         KeyBinding::new(
+            "cmd-enter",
+            Submit,
+            Some("Input && PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog"),
+        ),
+        KeyBinding::new(
             "cmd-.",
             Interrupt,
-            Some("(Thread || NvimEditor) && !Command && !PopupMenu && !Sheet && !Dialog"),
+            Some("Input && PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog"),
+        ),
+        KeyBinding::new(
+            "cmd-.",
+            Interrupt,
+            Some("(Thread || PromptEditor) && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
             "cmd-enter",
             Confirm,
             Some("DrostForm && !Command && !PopupMenu"),
+        ),
+        KeyBinding::new(
+            "cmd-enter",
+            Confirm,
+            Some("Input && PromptEditor && DrostForm && !Command && !PopupMenu"),
         ),
     ]);
 }
@@ -521,6 +567,12 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &CloseThread, w, cx| {
                 this.run(PaletteTarget::Command(Command::CloseThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextThread, w, cx| {
+                this.run(PaletteTarget::Command(Command::NextThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PreviousThread, w, cx| {
+                this.run(PaletteTarget::Command(Command::PreviousThread), w, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowArchived, w, cx| {
                 this.run(PaletteTarget::Command(Command::ShowArchived), w, cx)

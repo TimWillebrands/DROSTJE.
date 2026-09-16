@@ -6,6 +6,35 @@ use uuid::Uuid;
 pub type ProjectId = Uuid;
 pub type ThreadId = Uuid;
 pub type LaunchId = Uuid;
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DraftKey {
+    Thread(Uuid),
+    Extension { thread: Uuid, request: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftRevision {
+    pub generation: Uuid,
+    pub changedtick: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftSnapshot {
+    pub key: DraftKey,
+    pub generation: Uuid,
+    pub changedtick: u64,
+    pub text: String,
+    /// Zero-based buffer row and UTF-8 byte column (not screen cells).
+    pub cursor: (usize, usize),
+}
+impl DraftSnapshot {
+    pub fn revision(&self) -> DraftRevision {
+        DraftRevision {
+            generation: self.generation,
+            changedtick: self.changedtick,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

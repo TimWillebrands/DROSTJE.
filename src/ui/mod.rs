@@ -3,6 +3,7 @@ pub mod conversation;
 pub mod editor;
 pub mod factory;
 pub mod factory_form;
+mod nvim;
 pub mod overlays;
 pub mod settings;
 pub mod sidebar;

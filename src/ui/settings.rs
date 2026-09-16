@@ -2,13 +2,15 @@ use super::{theme, workspace::Workspace};
 use crate::{app::AppState, model::ModelKey, platform};
 use gpui_kit::{
     component::{
-        ActiveTheme, Disableable, Sizable, StyledExt, ThemeMode, ThemeRegistry, WindowExt,
+        ActiveTheme, Disableable, Sizable, ThemeMode, ThemeRegistry, WindowExt,
+        alert::Alert,
         button::{Button, ButtonVariants},
         form::{Field as FormField, Form},
         h_flex,
         input::{Input, InputState},
         searchable_list::SearchableListItem,
         select::{Select, SelectState},
+        setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
         v_flex,
     },
     prelude::FluentBuilder,
@@ -100,6 +102,7 @@ pub struct Dialog {
     error_field: Option<&'static str>,
     selects: Vec<SelectField>,
     surface_id: Uuid,
+    settings_id: SharedString,
     hosted: bool,
 }
 impl Dialog {
@@ -140,8 +143,8 @@ impl Dialog {
             ),
             DialogKind::Settings(project) => {
                 for (key, label) in [
-                    ("omp", "OMP executable (blank: discover on PATH)"),
                     ("nvim", "Neovim executable (blank: discover on PATH)"),
+                    ("omp", "OMP executable (blank: discover on PATH)"),
                     ("factory", "Factory executable (blank: discover on PATH)"),
                 ] {
                     field(
@@ -288,13 +291,15 @@ impl Dialog {
             }
             _ => {}
         }
+        let surface_id = Uuid::new_v4();
         Self {
             kind,
             fields,
             error: None,
             error_field: None,
             selects,
-            surface_id: Uuid::new_v4(),
+            surface_id,
+            settings_id: format!("drost-settings-{surface_id}").into(),
             hosted: false,
         }
     }
@@ -481,7 +486,10 @@ impl Dialog {
                     .map_err(|error| field_error("theme_light", format!("{error:#}")))?;
                 theme::validate_preferences(&mode, None, dark.as_deref(), cx)
                     .map_err(|error| field_error("theme_dark", format!("{error:#}")))?;
-                state.set_setting("executables", json!({ "omp": self.value("omp", cx), "nvim": self.value("nvim", cx), "factory": self.value("factory", cx) }));
+                state.set_setting(
+                    "executables",
+                    json!({ "nvim": self.value("nvim", cx), "omp": self.value("omp", cx), "factory": self.value("factory", cx) }),
+                );
                 state.set_setting("factory_data_root", json!(root));
                 state.set_setting("theme_mode", json!(mode));
                 state.set_setting("theme_light", json!(light));
@@ -523,7 +531,7 @@ impl Dialog {
         }
     }
 
-    fn form_field(&self, key: &str, readonly: bool, cx: &App) -> FormField {
+    fn field_content(&self, key: &str, readonly: bool, cx: &App) -> (&'static str, AnyElement) {
         let (label, control) =
             if let Some(field) = self.selects.iter().find(|field| field.key == key) {
                 (
@@ -566,7 +574,8 @@ impl Dialog {
             }
             _ => None,
         };
-        FormField::new().label(label).child(
+        (
+            label,
             v_flex()
                 .key_context("NativeInput")
                 .w_full()
@@ -574,18 +583,201 @@ impl Dialog {
                 .child(control)
                 .when(self.error_field == Some(key), |view| {
                     view.when_some(self.error.clone(), |view, error| {
-                        view.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                        view.child(
+                            Alert::error(SharedString::from(format!("field-error-{key}")), error)
+                                .small(),
+                        )
                     })
                 })
                 .when_some(warning, |view, warning| {
                     view.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().warning)
-                            .child(warning),
+                        Alert::warning(SharedString::from(format!("field-warning-{key}")), warning)
+                            .small(),
                     )
-                }),
+                })
+                .into_any_element(),
         )
+    }
+
+    fn form_field(&self, key: &str, readonly: bool, cx: &App) -> FormField {
+        let (label, control) = self.field_content(key, readonly, cx);
+        FormField::new().label(label).child(control)
+    }
+
+    fn setting_item(
+        &self,
+        key: &'static str,
+        group: &'static str,
+        readonly: bool,
+        owner: &WeakEntity<Workspace>,
+    ) -> Option<SettingItem> {
+        let label = self
+            .selects
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| field.label)
+            .or_else(|| {
+                self.fields
+                    .iter()
+                    .find(|field| field.key == key)
+                    .map(|field| field.label)
+            })?;
+        let owner = owner.clone();
+        let id = self.surface_id;
+        Some(
+            SettingItem::new(
+                label,
+                SettingField::render(move |options, _, cx| {
+                    let Some(owner) = owner.upgrade() else {
+                        return div().into_any_element();
+                    };
+                    let workspace = owner.read(cx);
+                    let Some(dialog) = workspace
+                        .dialog
+                        .as_ref()
+                        .filter(|dialog| dialog.surface_id == id)
+                    else {
+                        return div().into_any_element();
+                    };
+                    dialog.field_content(key, options.is_disabled(), cx).1
+                }),
+            )
+            .keywords([key, group])
+            .layout(Axis::Vertical)
+            .disabled(readonly),
+        )
+    }
+
+    fn settings_body(
+        &self,
+        project_id: Option<Uuid>,
+        state: &AppState,
+        owner: &WeakEntity<Workspace>,
+        _: &App,
+    ) -> AnyElement {
+        let readonly = state.storage_error.is_some();
+        let fields = |title: &'static str, keys: &[&'static str]| {
+            SettingGroup::new().title(title).items(
+                keys.iter()
+                    .filter_map(|key| self.setting_item(key, title, readonly, owner)),
+            )
+        };
+        let theme_dir = state.data_dir.join("themes");
+        let appearance = fields("Appearance", &["theme_mode", "theme_light", "theme_dark"])
+            .item(
+                SettingItem::new(
+                    "Theme files",
+                    SettingField::render(move |_, _, _| {
+                        let theme_dir = theme_dir.clone();
+                        Button::new("open-theme-folder")
+                            .small()
+                            .label("Open folder")
+                            .on_click(move |_, _, cx| cx.reveal_path(&theme_dir))
+                    }),
+                )
+                .description(format!(
+                    "Themes: {}. Add GPUI Kit ThemeSet JSON files with a themes array. Use unique theme names; duplicate names use the registry’s first entry.",
+                    state.data_dir.join("themes").display()
+                ))
+                .keywords(["appearance", "theme", "folder"]),
+            );
+        let tools = fields("Tools", &["nvim", "omp", "factory"])
+            .description("Drost does not install, authenticate, or upgrade tools.");
+        let factory = fields(
+            "Factory defaults",
+            &[
+                "factory_data_root",
+                "factory_harness",
+                "factory_model",
+                "factory_thought_level",
+                "factory_target_branch",
+            ],
+        );
+        let mut project = fields("Project defaults", &["provider", "model"]);
+        if let Some(selected) = project_id.and_then(|id| {
+            state
+                .snapshot
+                .projects
+                .iter()
+                .find(|project| project.id == id)
+        }) {
+            project = project.description(format!(
+                "{}{}",
+                selected.name,
+                if selected.archived {
+                    " (archived, read-only)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if !self.fields.iter().any(|field| field.key == "provider") {
+            project = project.item(
+                SettingItem::render(|_, _, cx| {
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Select an active project to edit its conversation and Factory defaults.")
+                })
+                .keywords(["project", "defaults", "conversation", "factory", "archived"]),
+            );
+        }
+        let mut diagnostics = SettingGroup::new()
+            .title("Diagnostics")
+            .description(format!(
+                "Application data: {}. OMP runs with local user privileges. Factory uses its configured sandbox policy.",
+                state.data_dir.display()
+            ));
+        for (name, title) in [("nvim", "Neovim"), ("omp", "OMP"), ("factory", "Factory")] {
+            let status = state
+                .diagnostics
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| "Not inspected".into());
+            let owner = owner.clone();
+            diagnostics = diagnostics.item(
+                SettingItem::new(
+                    title,
+                    SettingField::render(move |_, _, _| {
+                        let owner = owner.clone();
+                        Button::new(SharedString::from(format!("refresh-diagnostics-{name}")))
+                            .small()
+                            .label("Refresh diagnostics")
+                            .on_click(move |_, _, cx| {
+                                let _ = owner.update(cx, |workspace, cx| {
+                                    workspace.state.read(cx).refresh_diagnostics()
+                                });
+                            })
+                    }),
+                )
+                .description(status)
+                .keywords([name, "diagnostics", "setup", "retry"]),
+            );
+        }
+        // Settings retains search/navigation internally; draft controls remain owned by Dialog.
+        let settings = Settings::new(self.settings_id.clone()).page(
+            SettingPage::new("Settings")
+                .default_open(true)
+                .resettable(false)
+                .groups([appearance, tools, factory, project, diagnostics]),
+        );
+        v_flex()
+            .id("dialog-body")
+            .key_context("NativeInput")
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .child(div().flex_1().min_h_0().min_w_0().child(settings))
+            // Search may hide the invalid field, so keep its validation result visible.
+            .when_some(self.error.clone(), |view, error| {
+                view.child(Alert::error("settings-validation", error).small())
+            })
+            .when(readonly, |view| {
+                view.child(Alert::error("settings-storage-error",
+                    "Storage is not writable. Changes are disabled; existing drafts remain in memory.").small())
+            })
+            .into_any_element()
     }
 
     fn body(&self, state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> AnyElement {
@@ -593,111 +785,7 @@ impl Dialog {
         let mut body = v_flex().id("dialog-body").w_full().gap_5().pb_4();
         match self.kind {
             DialogKind::Settings(project_id) => {
-                let theme_dir = state.data_dir.join("themes");
-                let open_dir = theme_dir.clone();
-                body = body
-                    .child(section("Appearance")
-                        .child(Form::new()
-                            .child(self.form_field("theme_mode", readonly, cx))
-                            .child(self.form_field("theme_light", readonly, cx))
-                            .child(self.form_field("theme_dark", readonly, cx)))
-                        .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                            .child(format!("Themes: {}", theme_dir.display())))
-                        .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                            .child("Add GPUI Kit ThemeSet JSON files with a themes array. Use unique theme names; duplicate names use the registry’s first entry."))
-                        .child(Button::new("open-theme-folder").small().label("Open folder")
-                            .on_click(move |_, _, cx| { cx.reveal_path(&open_dir); })))
-                    .child(section("Tools")
-                        .child(Form::new()
-                            .child(self.form_field("omp", readonly, cx))
-                            .child(self.form_field("nvim", readonly, cx))
-                            .child(self.form_field("factory", readonly, cx)))
-                        .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                            .child("Drost does not install, authenticate, or upgrade tools.")));
-                let mut factory = section("Factory defaults")
-                    .child(Form::new().child(self.form_field("factory_data_root", readonly, cx)));
-                if self.select("factory_harness").is_some() {
-                    factory = factory.child(
-                        Form::new()
-                            .child(self.form_field("factory_harness", readonly, cx))
-                            .child(self.form_field("factory_model", readonly, cx))
-                            .child(self.form_field("factory_thought_level", readonly, cx))
-                            .child(self.form_field("factory_target_branch", readonly, cx)),
-                    );
-                }
-                body = body.child(factory);
-                let project = project_id.and_then(|id| {
-                    state
-                        .snapshot
-                        .projects
-                        .iter()
-                        .find(|project| project.id == id)
-                });
-                let mut defaults = section("Project defaults");
-                if let Some(project) = project {
-                    defaults = defaults.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{}{}",
-                                project.name,
-                                if project.archived {
-                                    " (archived, read-only)"
-                                } else {
-                                    ""
-                                }
-                            )),
-                    );
-                }
-                defaults = if self.fields.iter().any(|field| field.key == "provider") {
-                    defaults.child(
-                        Form::new()
-                            .child(self.form_field("provider", readonly, cx))
-                            .child(self.form_field("model", readonly, cx)),
-                    )
-                } else {
-                    defaults.child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child("Select an active project to edit its conversation and Factory defaults."))
-                };
-                body = body.child(defaults);
-                let mut diagnostics = section("Diagnostics")
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child(format!("Application data: {}", state.data_dir.display())))
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child("OMP and Neovim run with local user privileges. Factory uses its configured sandbox policy."));
-                for name in ["omp", "nvim", "factory"] {
-                    diagnostics = diagnostics.child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().text_sm().font_medium().child(name.to_uppercase()))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        state
-                                            .diagnostics
-                                            .get(name)
-                                            .cloned()
-                                            .unwrap_or_else(|| "Not inspected".into()),
-                                    ),
-                            ),
-                    );
-                }
-                let owner = owner.clone();
-                body = body.child(
-                    diagnostics.child(
-                        Button::new("refresh-diagnostics")
-                            .small()
-                            .label("Refresh diagnostics")
-                            .on_click(move |_, _, cx| {
-                                let _ = owner.update(cx, |workspace, cx| {
-                                    workspace.state.read(cx).refresh_diagnostics()
-                                });
-                            }),
-                    ),
-                );
+                return self.settings_body(project_id, state, owner, cx);
             }
             DialogKind::AddProject => {
                 let owner = owner.clone();
@@ -719,13 +807,12 @@ impl Dialog {
         }
         body.when(self.error_field.is_none(), |view| {
             view.when_some(self.error.clone(), |view, error| {
-                view.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                view.child(Alert::error("form-validation", error).small())
             })
         })
         .when(readonly, |view| {
-            view.child(div().text_sm().text_color(cx.theme().danger).child(
-                "Storage is not writable. Changes are disabled; existing drafts remain in memory.",
-            ))
+            view.child(Alert::error("form-storage-error",
+                "Storage is not writable. Changes are disabled; existing drafts remain in memory.").small())
         })
         .into_any_element()
     }
@@ -764,13 +851,6 @@ fn theme_choices(mode: ThemeMode, selected: &str, cx: &App) -> Vec<Choice> {
     choices
 }
 
-fn section(title: &'static str) -> Div {
-    v_flex()
-        .w_full()
-        .gap_3()
-        .child(div().font_semibold().child(title))
-}
-
 struct SurfaceContent {
     owner: WeakEntity<Workspace>,
     id: Uuid,
@@ -794,6 +874,9 @@ impl Render for SurfaceContent {
         let id = self.id;
         div()
             .w_full()
+            .when(matches!(dialog.kind, DialogKind::Settings(_)), |view| {
+                view.size_full().min_h_0().min_w_0().overflow_hidden()
+            })
             .key_context("DrostForm")
             .on_action(move |_: &super::commands::Confirm, window, cx| {
                 cx.stop_propagation();
@@ -945,8 +1028,9 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                     let close = host_owner.clone();
                     sheet
                         .title(title)
-                        .size((window.rem_size() * 42.).min(window.viewport_size().width))
+                        .size((window.rem_size() * 56.).min(window.viewport_size().width))
                         .resizable(false)
+                        .px_0()
                         .child(content.clone())
                         .footer(footer(&host_owner, id, cx))
                         .on_close(move |_, _, cx| clear_surface(&close, id, cx))

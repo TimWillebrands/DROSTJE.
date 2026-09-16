@@ -13,8 +13,8 @@ Een **drost** (of drossaard, als je het deftig wilt zeggen) was vroeger de rentm
 ## Wat je ermee doet
 
 - 🗂️ **Je projecten bij elkaar houden.** Gewoon je bestaande git-repo's, geen gedoe.
-- 💬 **Kletsen met een coding agent.** Eén live gesprek, met geschiedenis, plaatjes en tools die je ziet werken.
-- ⌨️ **Écht in Neovim typen.** Geen Vim-imitatie, maar de echte. `ciw`, `dd`, `u`, het doet het allemaal.
+- **Meerdere threads openhouden.** Conversations en Factory-threads staan naast elkaar in tabs; de open tabs worden bewaard.
+- **Prompts met Neovim schrijven.** Echte normal-, insert- en visual-modi, operators, registers en undo/redo, ingebed in de bestaande composer zonder regelnummers of terminalvenster.
 - **Factory-runs starten.** Een bestaande User Story of PRD/issues-map kiezen, launch-parameters instellen en daarna de native events en resultaten volgen.
 - 📜 **Terugzien wat er gebeurd is.** Elke run blijft bewaard, ook als je DROSTJE. tussendoor even dichtdoet.
 
@@ -35,18 +35,20 @@ Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor
 
 De standaardmap is `~/Library/Application Support/Drost`. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
 
-Kies in Settings zo nodig expliciete executable-paden en de gedeelde Factory-data-root. OMP en Neovim draaien met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
+Kies in Settings zo nodig expliciete executable-paden en de gedeelde Factory-data-root. OMP draait met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
 
 ### Threads en werkruimte
 
 Projects bevat één gedeelde lijst met twee soorten threads:
 
-- **Conversation:** een interactieve OMP-sessie met geschiedenis en een echte Neovim-composer. Het model kies je onderaan de composer.
+- **Conversation:** een interactieve OMP-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Het model kies je onderaan de composer.
 - **Factory:** parameters voor een bestaande Azure DevOps User Story of een bestaande PRD/issues-map. `Advanced` bevat de branch en het optionele thought level. `Start run` slaat de definitieve configuratie eerst op; een opslagfout start niets.
 
 Na de eerste duurzame launch wordt de Factory-thread een alleen-lezen monitor met native events, resultaten en ruwe details. Ook een geweigerde launch blijft als historie bewaard. Een volgende poging begint in een **nieuwe Factory-thread**. Er is geen taakpakket-generator, handoff vanuit een bericht of Factory-composer.
 
-De werkruimte heeft Projects links, de geselecteerde Thread centraal en een optioneel Output-dock onderaan. Je kunt de native docks verplaatsen, groeperen en schalen; de indeling wordt bewaard. `Close thread` sluit de geselecteerde weergave en eventueel een inactieve Conversation-sessie, niet de historie of een onafhankelijke Factory-run.
+De werkruimte heeft Projects links, threadtabs centraal en een optioneel Output-dock onderaan. Je kunt de native docks verplaatsen, groeperen en schalen; de indeling wordt bewaard. Conversations en Factory-threads blijven tegelijk open in de tabstrip van het Thread-dock; bij te veel tabs biedt het overloopmenu toegang tot de rest. `Close thread` sluit alleen die tab en eventueel een inactieve Conversation-sessie, niet de historie of een lopende turn of Factory-run. Bij sluiten van de actieve tab wordt een aangrenzende tab geselecteerd. Concepttekst blijft behouden bij wisselen, sluiten en opnieuw openen.
+
+Zonder geopende thread zie je compacte startacties in het midden; een lege tabstrip wordt niet getoond. Opslagstatus staat in de titelbalk, niet in een aparte onderbalk. Output blijft bereikbaar via de dockkop, `Cmd-J` en de command palette.
 
 ### Toetsenbord
 
@@ -56,20 +58,26 @@ De werkruimte heeft Projects links, de geselecteerde Thread centraal en een opti
 |`Cmd-N` / `Cmd-Shift-N`|Nieuwe Conversation / Factory-thread|
 |`Cmd-1` / `Cmd-2` / `Cmd-3`|Focus Projects / Thread / Output; opent zo nodig het dock|
 |`Cmd-B` / `Cmd-J`|Projects / Output tonen of verbergen|
+|`Ctrl-Tab` / `Ctrl-Shift-Tab`|Volgende / vorige open threadtab|
+|`Cmd-W`|Huidige threadtab sluiten|
 |`Ctrl-W`, daarna `h/j/k/l`|Naar een zichtbaar aangrenzend paneel; tweede toets mag ook met Control|
 |`j/k`, pijlen, `gg/G`, `h/l`, Return|Navigeren, springen, invouwen/uitvouwen en openen in Projects|
-|`i` in een Conversation|Focus naar de Neovim-composer|
+|`i` in een Conversation|Focus naar de prompteditor|
 |`Cmd-Enter`|Prompt versturen, Factory-configuratie starten of formulier bevestigen|
 |`Cmd-.`|Interactieve turn onderbreken|
-|`Cmd-Escape`|Van Neovim terug naar Thread|
+|`Cmd-Escape`|Van de prompteditor terug naar Thread|
 |`Cmd-,`|Settings|
 |Escape|Bovenste menu of venster sluiten; in de palette eerst de zoektekst wissen|
 
-Neovim houdt zijn eigen insert-/command-line-betekenis van `Ctrl-W`; Return blijft daar een nieuwe regel. Directionele paneeltoetsen verlaten geen invoerveld of dialoog. In Neovim normal mode werken de paneelchords zonder je tekst te veranderen.
+In insert-modus voegt Return een nieuwe regel toe; alleen `Cmd-Enter` verstuurt. Escape schakelt binnen de editor de Neovim-modus terug; `Cmd-Escape` verlaat de editor. Moties, operators, visual-selectie, registers, zoeken en undo/redo worden door Neovim uitgevoerd. `Cmd-C/X/V` gebruikt het systeemklembord. Directionele paneeltoetsen nemen geen editorinvoer over.
+
+Versturen neemt een gecontroleerde snapshot nadat Neovim de eerdere invoer verwerkt heeft. Tijdens actieve tekstcompositie of een onvoltooide Neovim-opdracht wordt niet verstuurd of naar een andere draft gewisseld. Onvoltooide IME-tekst blijft aparte recoverytekst; die wordt nooit automatisch verstuurd of in een projectbestand geschreven.
+
+Ontbreekt Neovim of valt het proces weg, dan verschijnt een fout zonder terugval naar een tweede editor. De command palette biedt `Restart Neovim editor`, `Cancel editor command` en `Copy draft recovery`. Herstart herstelt laatst waargenomen concepttekst, niet nog onbevestigde toetsaanslagen; registers en undo-historie van het oude proces gaan verloren. Annuleren bewaart onvoltooide compositietekst apart voor herstel. Een aangepast Neovim-pad geldt bij de volgende appstart, of bij opnieuw proberen na een mislukte eerste editorstart.
 
 ### Uiterlijk
 
-Settings biedt **System**, **Light** en **Dark**, met een afzonderlijke themakeuze per modus. Save past de keuze toe; Cancel verandert het uiterlijk niet. De Neovim-grid volgt dezelfde kleuren en monospace-typografie.
+Settings groepeert de bestaande instellingen en kan zoeken op naam, beschrijving en groep. Het biedt **System**, **Light** en **Dark**, met een afzonderlijke themakeuze per modus. Save past de keuze toe; Cancel verandert het uiterlijk niet. De Neovim-prompteditor volgt dezelfde achtergrond-, tekst-, selectie- en cursorkleuren en het monospace-lettertype.
 
 Eigen thema's staan in `<DROST_DATA_DIR>/themes` (standaard `~/Library/Application Support/Drost/themes`). Settings toont de map en kan die openen. Gebruik GPUI Kit `ThemeSet`-JSON: een object met een `themes`-array; iedere entry heeft een unieke `name` en `mode` (`light` of `dark`). Dit is niet het losse Zed-themaformaat. Alleen Default Light en Default Dark zijn ingebouwd.
 
@@ -77,15 +85,17 @@ Toegevoegde en gewijzigde bestanden worden opnieuw geladen. Ontbreekt het gekoze
 
 ### Vereisten en controle
 
-Getest met GPUI Kit `0.6.1`, OMP `18.2.0` (native RPC v2) en Neovim `0.12.3` op macOS. OMP-authenticatie en modeltoegang moeten al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
+GPUI Kit is vastgezet op `0.6.1`. De prompteditor vereist een geïnstalleerde Neovim met de benodigde embedded-RPC- en UI-API's; getest met **Neovim 0.12.3** op macOS. Het pad wordt via PATH ontdekt of expliciet in Settings opgegeven. Drost start Neovim zonder gebruikers-init, plugins, ShaDa, swap- of undobestanden en gebruikt alleen eigen scratchbuffers. Dit is geen OS-sandbox: expliciete Neovim-opdrachten draaien met je lokale rechten.
+
+De OMP-integratie is getest met `18.2.0` (native RPC v2); authenticatie en modeltoegang moeten al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
 
 `Check readiness` toont echte `factory doctor --harness …`-uitvoer. Een Factory-thread gebruikt `opencode` (standaard), `codex` of `claude-code`; interactieve Conversations blijven OMP gebruiken. Een ongeldige of niet-ondersteunde keuze blijft zichtbaar en moet vóór Start worden aangepast. DROSTJE. voert geen upgrades of authenticatie uit.
 
 ```sh
 cargo check --all-targets
 cargo test
-NVIM=/opt/homebrew/bin/nvim cargo test --test neovim_runtime -- --ignored --nocapture
-NVIM=/opt/homebrew/bin/nvim cargo test --lib nested_clipboard_replies_unwind_in_reverse_order -- --ignored --nocapture
+cargo test --test neovim_runtime -- --ignored --nocapture
+cargo test --features runtime-qa native_composition_is_recovery_only_until_committed -- --ignored --nocapture
 ```
 
 ### Expliciete desktop-QA
@@ -95,12 +105,14 @@ Maak eerst de wegwerp-repository `FX` uit [het applicatieplan](DROST_APPLICATION
 ```sh
 export DROST_RUNTIME_FIXTURE="$FX"
 cargo test --features runtime-qa --lib workspace_actions_with_real_backends -- --ignored --nocapture
+cargo test --features runtime-qa --lib editor_startup_failure_and_restart_preserve_draft -- --ignored --nocapture
 cargo test --features runtime-qa --lib thread_workspace_keyboard_and_themes -- --ignored --nocapture
+cargo test --features runtime-qa --lib empty_workspace_actions_stay_compact -- --ignored --nocapture
 cargo test --features runtime-qa --lib orderly_quit_flushes_before_platform_deadline -- --ignored --nocapture
 cargo test --features runtime-qa --lib factory_start_requires_persisted_configuration -- --ignored --nocapture
 ```
 
-Deze scenario's versturen geen provider-turns en starten geen remote Factory-run. Ze controleren echte Neovim-draftwissels, beide threadsoorten, native palette-/focusgedrag, themawijzigingen, veilige afsluiting en de opslagbarrière vóór Factory Start.
+Deze scenario's versturen geen provider-turns en starten geen remote Factory-run. Ze controleren native draftwissels, nieuwe regels, bescherming tegen verouderde acknowledgements, openen/sluiten/herstellen van threadtabs, beide threadsoorten, palette-/focusgedrag, themawijzigingen, veilige afsluiting en de opslagbarrière vóór Factory Start.
 
 Gebruik de door de eerste QA-test gemelde datamap als `DROST_QA_DATA` voor layout/herstart-controle:
 
@@ -114,7 +126,7 @@ Een eerdere echte OpenCode-proef heeft dispatch, sandbox-initialisatie en GUI-he
 
 ## Onder de motorkap
 
-Rust + GPUI, macOS. Gesprekken lopen via OMP, tekst typ je in een ingebedde Neovim, en klussen gaan via de `factory` CLI naar de Compliance Software Factory. Nodig: Rust, `nvim`, `omp`, `factory`.
+Rust + GPUI, macOS. Gesprekken lopen via OMP, prompttekst bewerk je met ingebedde Neovim binnen de GPUI Kit-composer, en klussen gaan via de `factory` CLI naar de Compliance Software Factory. Nodig: Rust, `nvim`, `omp`, `factory`.
 
 ---
 

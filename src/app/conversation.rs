@@ -255,7 +255,7 @@ impl AppState {
         if thread.kind != ThreadKind::Conversation {
             return;
         }
-        if self.storage_error.is_some() || self.editor_error.is_some() {
+        if self.storage_error.is_some() || self.editor.is_none() || self.editor_error.is_some() {
             self.submission_failed(id, "Storage or editor is unavailable".into());
             return;
         }
@@ -453,27 +453,21 @@ impl AppState {
                                                     .snapshot
                                                     .threads
                                                     .iter()
-                                                    .find(|t| {
-                                                        t.id == id
-                                                            && t.kind == ThreadKind::Conversation
-                                                    })
+                                                    .find(|thread| thread.id == id)
                                                     .cloned()
-                                                {
-                                                    if thread
+                                                    && thread
                                                         .attachments
                                                         .iter()
                                                         .map(|image| image.id)
-                                                        .collect::<Vec<_>>()
-                                                        == sent_ids
-                                                    {
-                                                        thread.attachments.clear();
-                                                        this.save_thread(thread);
-                                                    }
+                                                        .eq(sent_ids.iter().copied())
+                                                {
+                                                    thread.attachments.clear();
+                                                    this.save_thread(thread);
                                                 }
                                             }
                                             Ok(false) => {}
                                             Err(error) => this.notice(
-                                                NoticeLevel::Error,
+                                                NoticeLevel::Warning,
                                                 format!("Submitted text retained: {error:#}"),
                                             ),
                                         }
@@ -526,31 +520,42 @@ impl AppState {
                 }
             }
             ConversationEvent::EditorTextRequested(text) => {
-                if let (Some(editor), Some(draft)) = (
-                    self.editor.clone(),
-                    self.drafts.get(&DraftKey::Thread(id)).cloned(),
-                ) {
-                    if draft.text.is_empty() {
-                        let generation = session.generation;
-                        cx.spawn(async move |this, cx| {
-                        let result = editor.replace_if_revision(draft.key.clone(), draft.revision(), text.clone()).await;
+                let replacement = self.editor.clone().zip(
+                    self.drafts
+                        .get(&DraftKey::Thread(id))
+                        .filter(|draft| draft.text.is_empty())
+                        .cloned(),
+                );
+                if let Some((editor, draft)) = replacement {
+                    let generation = session.generation;
+                    cx.spawn(async move |this, cx| {
+                        let result = editor
+                            .replace_if_revision(draft.key.clone(), draft.revision(), text.clone())
+                            .await;
                         if !matches!(result, Ok(true)) {
                             let _ = this.update(cx, |state, cx| {
-                                if let Some(session) = state.conversations.get_mut(&id).filter(|session| session.generation == generation) {
-                                    session.widgets.insert("Proposed editor replacement — review before replacing your draft".into(), vec![text]);
+                                if let Some(session) = state
+                                    .conversations
+                                    .get_mut(&id)
+                                    .filter(|session| session.generation == generation)
+                                {
+                                    session.widgets.insert(
+                                        "Proposed editor replacement — review before replacing your draft"
+                                            .into(),
+                                        vec![text],
+                                    );
                                 }
-                                if let Err(error) = result { state.notice(NoticeLevel::Error, format!("Could not set editor text: {error:#}")); }
+                                if let Err(error) = result {
+                                    state.notice(
+                                        NoticeLevel::Warning,
+                                        format!("Could not set editor text: {error:#}"),
+                                    );
+                                }
                                 cx.notify();
                             });
                         }
-                    }).detach();
-                    } else {
-                        session.widgets.insert(
-                            "Proposed editor replacement — review before replacing your draft"
-                                .into(),
-                            vec![text],
-                        );
-                    }
+                    })
+                    .detach();
                 } else {
                     session.widgets.insert(
                         "Proposed editor replacement — review before replacing your draft".into(),

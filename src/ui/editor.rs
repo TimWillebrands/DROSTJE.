@@ -1,13 +1,280 @@
-use super::workspace::{Region, Workspace};
+use super::{
+    nvim::{NvimView, NvimViewEvent},
+    workspace::{Region, Workspace},
+};
 use crate::{
-    app::{AppEvent, NoticeLevel, WorkspaceNotice},
+    app::{AppState, NoticeLevel},
     model::*,
-    neovim::{DraftKey, NvimConfig, NvimEditor, NvimView, NvimViewEvent},
+    neovim::{NvimConfig, NvimEditor},
     platform,
 };
-use gpui_kit::component::WindowExt;
+use gpui_kit::component::{ActiveTheme, alert::Alert, label::Label};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::Value;
+
+/// Owns activation and presentation; Neovim owns every editing revision.
+pub(super) struct PromptEditor {
+    state: Entity<AppState>,
+    view: Option<Entity<NvimView>>,
+    desired: Option<(DraftKey, String)>,
+    active: Option<DraftKey>,
+    switching: bool,
+    opening: bool,
+    composition: bool,
+    focus: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+    switch_task: Option<Task<()>>,
+}
+
+pub(super) struct PromptEditorChanged;
+impl EventEmitter<PromptEditorChanged> for PromptEditor {}
+
+impl PromptEditor {
+    fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        Self {
+            state,
+            view: None,
+            desired: None,
+            active: None,
+            switching: false,
+            opening: false,
+            composition: false,
+            focus: cx.focus_handle(),
+            _subscriptions: Vec::new(),
+            switch_task: None,
+        }
+    }
+
+    pub fn active_key(&self) -> Option<&DraftKey> {
+        self.active.as_ref()
+    }
+
+    pub fn has_composition(&self) -> bool {
+        self.composition
+    }
+
+    pub fn recovery_text(&self, cx: &App) -> String {
+        self.view
+            .as_ref()
+            .map(|view| view.read(cx).recovery_text())
+            .unwrap_or_default()
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle(cx).focus(window, cx);
+    }
+
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.opening || self.view.is_some() {
+            return;
+        }
+        self.opening = true;
+        let explicit = self
+            .state
+            .read(cx)
+            .snapshot
+            .settings
+            .get("executables")
+            .and_then(|value| value.get("nvim"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .map(str::to_owned);
+        cx.spawn_in(window, async move |this, window| {
+            let result = async {
+                let path = smol::unblock(move || platform::resolve_executable("nvim", explicit.as_deref())).await?;
+                NvimEditor::open(NvimConfig::new(path)).await
+            }.await;
+            let _ = this.update_in(window, |this, window, cx| {
+                this.opening = false;
+                match result {
+                    Ok(editor) => {
+                        this.state.update(cx, |state, cx| {
+                            state.editor = Some(editor.clone());
+                            state.editor_error = None;
+                            cx.notify();
+                        });
+                        let view = cx.new(|cx| NvimView::new(editor, window, cx));
+                        this._subscriptions.push(cx.subscribe_in(&view, window, |this, _, event: &NvimViewEvent, window, cx| {
+                            match event {
+                                NvimViewEvent::DraftActivated(draft) => {
+                                    this.active = Some(draft.key.clone());
+                                    this.state.update(cx, |state, cx| { state.record_draft(draft.clone()); cx.notify(); });
+                                }
+                                NvimViewEvent::DraftChanged(draft) => {
+                                    this.state.update(cx, |state, cx| { state.record_draft(draft.clone()); cx.notify(); });
+                                }
+                                NvimViewEvent::CompositionChanged(composing) => {
+                                    this.composition = *composing;
+                                    if !composing { this.sync(window, cx); }
+                                }
+                                NvimViewEvent::Ready => {
+                                    this.state.update(cx, |state, cx| { state.editor_error = None; cx.notify(); });
+                                    this.sync(window, cx);
+                                }
+                                NvimViewEvent::Failed(error) => this.failed(error.clone(), cx),
+                                NvimViewEvent::InputRejected(error) => this.state.update(cx, |state, cx| {
+                                    state.notice(NoticeLevel::Warning, format!("Editor input: {error}")); cx.notify();
+                                }),
+                            }
+                            cx.emit(PromptEditorChanged);
+                            cx.notify();
+                        }));
+                        if this.focus.is_focused(window) {
+                            view.update(cx, |view, cx| view.focus(window, cx));
+                        }
+                        this.view = Some(view);
+                        this.sync(window, cx);
+                    }
+                    Err(error) => this.failed(format!("Neovim could not start: {error:#}. Configure Neovim in Settings, then restart the editor."), cx),
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn failed(&mut self, error: String, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.editor_error = Some(error.clone());
+            state.notice(NoticeLevel::Error, error);
+            cx.notify();
+        });
+        cx.emit(PromptEditorChanged);
+        cx.notify();
+    }
+
+    fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.switching
+            || self.has_composition()
+            || self.state.read(cx).editor_error.is_some()
+            || self.desired.as_ref().map(|(key, _)| key) == self.active.as_ref()
+        {
+            return;
+        }
+        let Some(editor) = self.state.read(cx).editor.clone() else {
+            return;
+        };
+        let desired = self.desired.clone();
+        let previous = self.active.clone();
+        self.switching = true;
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.set_writable(false, cx));
+        }
+        self.switch_task = Some(cx.spawn_in(window, async move |this, window| {
+            let result = async {
+                let previous = if let Some(key) = previous { Some(editor.snapshot(key).await?) } else { None };
+                if let Some((key, text)) = &desired {
+                    editor.open_draft(key.clone(), text.clone()).await?;
+                    editor.focus_draft(key.clone()).await?;
+                }
+                Ok::<_, anyhow::Error>(previous)
+            }.await;
+            let _ = this.update_in(window, |this, window, cx| {
+                this.switching = false;
+                match result {
+                    Ok(previous) => {
+                        if let Some(draft) = previous { this.state.update(cx, |state, _| state.record_draft(draft)); }
+                        this.active = desired.map(|(key, _)| key);
+                        this.sync(window, cx);
+                    }
+                    Err(error) => this.failed(format!("Draft switch cancelled: {error:#}. Cancel the editor command or restart Neovim."), cx),
+                }
+                cx.emit(PromptEditorChanged);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn activate(
+        &mut self,
+        desired: Option<(DraftKey, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.desired = desired;
+        self.sync(window, cx);
+    }
+
+    pub fn snapshot(
+        &self,
+        key: &DraftKey,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = anyhow::Result<DraftSnapshot>> + use<> {
+        let key = key.clone();
+        let editor = self.state.read(cx).editor.clone();
+        let blocked =
+            self.has_composition() || self.switching || self.active.as_ref() != Some(&key);
+        async move {
+            anyhow::ensure!(
+                !blocked,
+                "Wait for draft activation and complete or cancel input composition"
+            );
+            editor
+                .ok_or_else(|| anyhow::anyhow!("Neovim is not available; restart the editor"))?
+                .snapshot(key)
+                .await
+        }
+    }
+}
+
+impl Focusable for PromptEditor {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.view
+            .as_ref()
+            .map(|view| view.focus_handle(cx))
+            .unwrap_or_else(|| self.focus.clone())
+    }
+}
+
+impl Render for PromptEditor {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
+        let writable =
+            !self.switching
+                && self.active.as_ref().is_some_and(|key| {
+                    let (DraftKey::Thread(id) | DraftKey::Extension { thread: id, .. }) = key;
+                    !state.shutting_down
+                        && state.storage_error.is_none()
+                        && state.editor_error.is_none()
+                        && state.snapshot.threads.iter().any(|thread| {
+                            thread.id == *id
+                                && !thread.archived
+                                && state.snapshot.projects.iter().any(|project| {
+                                    project.id == thread.project_id && !project.archived
+                                })
+                        })
+                });
+        let error = state.editor_error.clone();
+        if let Some(view) = &self.view {
+            view.update(cx, |view, cx| view.set_writable(writable, cx));
+        }
+        div()
+            .id("prompt-editor")
+            .key_context("NativeInput PromptEditor")
+            .track_focus(&self.focus)
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(if self.focus_handle(cx).is_focused(window) {
+                cx.theme().ring
+            } else {
+                cx.theme().input
+            })
+            .bg(cx.theme().background)
+            .overflow_hidden()
+            .when_some(self.view.clone(), |surface, view| surface.child(view))
+            .when(self.view.is_none(), |surface| {
+                if let Some(error) = error {
+                    surface.child(Alert::error("neovim-startup-error", error))
+                } else {
+                    surface.child(Label::new("Starting Neovim…"))
+                }
+            })
+    }
+}
 
 impl Workspace {
     fn can_edit_conversation(&self, id: ThreadId, cx: &App) -> bool {
@@ -26,114 +293,39 @@ impl Workspace {
             })
     }
 
-    fn has_conversation_editor(&self, cx: &App) -> bool {
-        let state = self.state.read(cx);
-        state.conversation_thread().is_some()
-            || self.editor_override.as_ref().is_some_and(|(key, _)| {
-                matches!(key, DraftKey::Extension { thread, .. }
-                if state.snapshot.threads.iter().any(|candidate| {
-                    candidate.id == *thread && candidate.kind == ThreadKind::Conversation
-                }))
-            })
-    }
-
     pub fn start_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.opening_editor
-            || self.editor.is_some()
-            || self.state.read(cx).shutting_down
-            || !self.has_conversation_editor(cx)
-        {
-            return;
-        }
-        self.opening_editor = true;
-        let explicit = self
-            .state
-            .read(cx)
-            .snapshot
-            .settings
-            .get("executables")
-            .and_then(|v| v.get("nvim"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let initial_theme = super::theme::nvim_theme(cx);
-        cx.spawn_in(window, async move |workspace, window| {
-            let result = async {
-                let executable = smol::unblock(move || platform::resolve_executable("nvim", explicit.as_deref())).await?;
-                let mut config = NvimConfig::new(executable);
-                config.initial_theme = Some(initial_theme);
-                NvimEditor::open(config).await
-            }.await;
-            let _ = workspace.update_in(window, |workspace, window, cx| {
-                workspace.opening_editor = false;
-                match result {
-                    Ok(editor) => {
-                        workspace.state.update(cx, |state, cx| { state.editor = Some(editor.clone()); state.editor_error = None; cx.notify(); });
-                        let view = cx.new(|cx| NvimView::new(editor, window, cx));
-                        let recovery_view = view.clone();
-                        let recovery_state = workspace.state.clone();
-                        App::on_app_quit(cx, move |cx| {
-                            let text = recovery_view.read(cx).recovery_text();
-                            let key = recovery_view.read(cx).active_key().cloned();
-                            if !recovery_state.read(cx).shutdown_complete && !text.is_empty() { recovery_state.update(cx, |state, _| state.set_setting("recovered_composition", serde_json::json!({ "key": key, "text": text }))); }
-                            async {}
-                        }).detach();
-                        workspace._subscriptions.push(cx.observe_in(&view, window, |_, _, _, cx| cx.notify()));
-                        workspace._subscriptions.push(cx.subscribe_in(&view, window, |workspace, _, event: &NvimViewEvent, window, cx| {
-                            match event {
-                                NvimViewEvent::DraftChanged(draft) | NvimViewEvent::DraftActivated(draft) => workspace.state.update(cx, |state, cx| { state.record_draft(draft.clone()); cx.notify(); }),
-                                NvimViewEvent::Ready => { workspace.state.update(cx, |state, cx| { state.editor_error = None; cx.notify(); }); workspace.editor_selection = None; workspace.sync_session(window, cx); }
-                                NvimViewEvent::Failed(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(error.clone()); state.notice(NoticeLevel::Error, format!("Neovim: {error}")); cx.notify(); }),
-                                NvimViewEvent::InputRejected(error) => workspace.state.update(cx, |state, cx| { state.notice(NoticeLevel::Warning, format!("Editor input: {error}")); cx.notify(); }),
-                                NvimViewEvent::CompositionChanged(false) => workspace.sync_session(window, cx),
-                                NvimViewEvent::FocusPane { key, generation, direction } => {
-                                    let state = workspace.state.read(cx);
-                                    let current = workspace.editor_selection.as_ref() == Some(key)
-                                        && state.drafts.get(key).is_some_and(|draft| draft.generation == *generation)
-                                        && !state.shutting_down;
-                                    let focused = workspace.editor.as_ref().is_some_and(|view| {
-                                        let view = view.read(cx);
-                                        view.active_key() == Some(key)
-                                            && view.focus_handle(cx).is_focused(window)
-                                            && !view.has_composition()
-                                    });
-                                    if current && focused && !window.has_active_dialog(cx) && !window.has_active_sheet(cx) {
-                                        workspace.spatial_focus(*direction, window, cx);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            cx.notify();
-                        }));
-                        workspace.editor = Some(view);
-                        workspace.editor_theme = Some(initial_theme);
-                        workspace.sync_editor_theme(window, cx);
-                        workspace.sync_session(window, cx);
-                    }
-                    Err(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(format!("{error:#}")); state.notice(NoticeLevel::Error, format!("Neovim could not start: {error:#}. Configure its executable in Settings.")); cx.notify(); }),
+        if self.editor.is_none() && !self.state.read(cx).shutting_down {
+            let state = self.state.clone();
+            let editor = cx.new(|cx| PromptEditor::new(state, cx));
+            editor.update(cx, |editor, cx| editor.start(window, cx));
+            let recovery_editor = editor.clone();
+            let recovery_state = self.state.clone();
+            App::on_app_quit(cx, move |cx| {
+                let editor = recovery_editor.read(cx);
+                let text = editor.recovery_text(cx);
+                let key = editor.active_key().cloned();
+                if !recovery_state.read(cx).shutdown_complete && !text.is_empty() {
+                    recovery_state.update(cx, |state, _| {
+                        state.set_setting(
+                            "recovered_composition",
+                            serde_json::json!({ "key": key, "text": text }),
+                        );
+                    });
                 }
-                cx.notify();
-            });
-        }).detach();
-    }
-
-    pub(super) fn sync_editor_theme(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.state.read(cx).editor.clone() else {
-            return;
-        };
-        let palette = super::theme::nvim_theme(cx);
-        if self.editor_theme.as_ref() == Some(&palette) {
-            return;
+                async {}
+            })
+            .detach();
+            self._subscriptions.push(cx.subscribe_in(
+                &editor,
+                window,
+                |workspace, _, _: &PromptEditorChanged, window, cx| {
+                    workspace.sync_session(window, cx);
+                    cx.notify();
+                },
+            ));
+            self.editor = Some(editor);
         }
-        match editor
-            .commands
-            .try_send(crate::neovim::NvimCommand::SetTheme(palette))
-        {
-            Ok(()) => self.editor_theme = Some(palette),
-            Err(error) => self.state.update(cx, |state, cx| {
-                state.editor_error = Some(format!("Editor theme update failed: {error}"));
-                cx.notify();
-            }),
-        }
+        self.sync_session(window, cx);
     }
 
     pub fn sync_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -151,72 +343,37 @@ impl Workspace {
             self.extension = None;
             self.editor_override = None;
         }
-        let selected = self
+        if let Some(id) = self
             .state
             .read(cx)
             .conversation_thread()
-            .map(|thread| thread.id);
-        if let Some(id) = selected {
+            .map(|thread| thread.id)
+        {
             self.state
                 .update(cx, |state, _| state.ensure_conversation(id));
         }
-        if self.editor_switching || self.state.read(cx).editor_error.is_some() {
+        let desired = self.editor_override.clone().or_else(|| {
+            self.state
+                .read(cx)
+                .conversation_thread()
+                .filter(|thread| !thread.archived)
+                .map(|thread| {
+                    let key = DraftKey::Thread(thread.id);
+                    let text = if self.editor_selection.as_ref() == Some(&key) {
+                        String::new()
+                    } else {
+                        thread.draft.clone()
+                    };
+                    (key, text)
+                })
+        });
+        if self.editor.is_none() {
             return;
         }
-        let desired = self
-            .editor_override
-            .as_ref()
-            .filter(|(key, _)| {
-                matches!(key, DraftKey::Extension { thread, .. }
-                if self.state.read(cx).snapshot.threads.iter().any(|candidate| {
-                    candidate.id == *thread && candidate.kind == ThreadKind::Conversation
-                }))
-            })
-            .cloned()
-            .or_else(|| {
-                self.state
-                    .read(cx)
-                    .conversation_thread()
-                    .filter(|thread| !thread.archived)
-                    .map(|thread| (DraftKey::Thread(thread.id), thread.draft.clone()))
-            });
-        if desired.is_some() && self.editor.is_none() {
-            self.start_editor(window, cx);
+        if let Some(editor) = &self.editor {
+            editor.update(cx, |editor, cx| editor.activate(desired, window, cx));
+            self.editor_selection = editor.read(cx).active_key().cloned();
         }
-        if desired.as_ref().map(|(key, _)| key) == self.editor_selection.as_ref() {
-            return;
-        }
-        let Some(editor) = self.state.read(cx).editor.clone() else {
-            return;
-        };
-        if self
-            .editor
-            .as_ref()
-            .is_some_and(|view| view.read(cx).has_composition())
-        {
-            return;
-        }
-        let previous = self.editor_selection.clone();
-        self.editor_switching = true;
-        cx.spawn_in(window, async move |workspace, window| {
-            let result = async {
-                let snapshot = if let Some(key) = previous { Some(editor.snapshot(key).await?) } else { None };
-                if let Some((key, text)) = &desired { editor.open_draft(key.clone(), text.clone()).await?; editor.focus_draft(key.clone()).await?; }
-                Ok::<_, anyhow::Error>(snapshot)
-            }.await;
-            let _ = workspace.update_in(window, |workspace, window, cx| {
-                workspace.editor_switching = false;
-                match result {
-                    Ok(snapshot) => {
-                        if let Some(snapshot) = snapshot { workspace.state.update(cx, |state, cx| { state.record_draft(snapshot); cx.notify(); }); }
-                        workspace.editor_selection = desired.map(|(key, _)| key);
-                        workspace.sync_session(window, cx);
-                    }
-                    Err(error) => workspace.state.update(cx, |state, cx| { state.editor_error = Some(format!("{error:#}")); state.notice(NoticeLevel::Error, format!("Draft switch cancelled: {error:#}. Cancel the editor command or restart Neovim.")); cx.notify(); }),
-                }
-                cx.notify();
-            });
-        }).detach();
     }
 
     pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -236,29 +393,8 @@ impl Workspace {
             self.start_editor(window, cx);
         }
     }
-    pub fn restart_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.read(cx).shutting_down || !self.has_conversation_editor(cx) {
-            return;
-        }
-        let Some(editor) = self.state.read(cx).editor.clone() else {
-            self.start_editor(window, cx);
-            return;
-        };
-        let events = self.state.read(cx).events.clone();
-        smol::spawn(async move {
-            if let Err(error) = editor.restart().await {
-                let _ = events
-                    .send(AppEvent::Notice(WorkspaceNotice {
-                        level: NoticeLevel::Error,
-                        text: format!("Editor restart failed: {error:#}"),
-                    }))
-                    .await;
-            }
-        })
-        .detach();
-    }
     pub fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.extension.is_some() && self.has_conversation_editor(cx) {
+        if self.extension.is_some() {
             self.confirm_extension(window, cx);
             return;
         }
@@ -270,10 +406,7 @@ impl Workspace {
         else {
             return;
         };
-        if self.editor_switching
-            || self.editor_selection != Some(DraftKey::Thread(id))
-            || self.editor_override.is_some()
-        {
+        if self.editor_selection != Some(DraftKey::Thread(id)) || self.editor_override.is_some() {
             self.state.update(cx, |state, cx| {
                 state.notice(
                     NoticeLevel::Warning,
@@ -290,23 +423,12 @@ impl Workspace {
             });
             return;
         }
-        if self
-            .editor
-            .as_ref()
-            .is_some_and(|view| view.read(cx).has_composition())
-        {
-            self.state.update(cx, |state, cx| {
-                state.notice(
-                    NoticeLevel::Warning,
-                    "Complete or cancel input composition before sending",
-                );
-                cx.notify();
-            });
-            return;
-        }
-        let Some(editor) = self.state.read(cx).editor.clone() else {
+        let Some(editor) = self.editor.clone() else {
             return;
         };
+        let snapshot = editor.update(cx, |editor, cx| {
+            editor.snapshot(&DraftKey::Thread(id), window, cx)
+        });
         self.state.update(cx, |state, cx| {
             if let Some(session) = state.conversations.get_mut(&id) {
                 session.preparing = true;
@@ -316,26 +438,21 @@ impl Workspace {
             cx.notify();
         });
         cx.spawn_in(window, async move |workspace, window| {
-            let result = editor.snapshot(DraftKey::Thread(id)).await;
-            let _ = workspace.update_in(window, |workspace, window, cx| {
-                workspace.state.update(cx, |state, cx| match result {
-                    Ok(snapshot) => state.submit_snapshot(id, snapshot, cx),
-                    Err(error) => {
-                        state.submission_failed(id, format!("Nothing was sent: {error:#}"));
-                        cx.notify();
+            let result = snapshot.await;
+            let _ = workspace.update_in(window, |workspace, _, cx| {
+                workspace.state.update(cx, |state, cx| {
+                    match result {
+                        Ok(snapshot) => state.submit_snapshot(id, snapshot, cx),
+                        Err(error) => {
+                            state.submission_failed(id, format!("Nothing was sent: {error:#}"))
+                        }
                     }
+                    cx.notify();
                 });
-                if workspace.state.read(cx).selected_thread == Some(id)
-                    && workspace.editor_selection == Some(DraftKey::Thread(id))
-                {
-                    if let Some(view) = &workspace.editor {
-                        view.update(cx, |view, cx| view.focus(window, cx));
-                    }
-                }
-                cx.notify();
             });
         })
         .detach();
+        editor.update(cx, |editor, cx| editor.focus(window, cx));
     }
 
     pub fn restore_submitted(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
@@ -377,44 +494,82 @@ impl Workspace {
         if !self.can_edit_conversation(id, cx) {
             return;
         }
-        let Some(editor) = self.state.read(cx).editor.clone() else {
-            self.start_editor(window, cx);
+        let Some(view) = self.editor.clone() else {
             return;
         };
-        let approval = window.prompt(PromptLevel::Warning, "Replace this conversation draft?", Some("This explicitly replaces its current draft. New typing after this review will not be overwritten."), &["Replace Draft", "Cancel"], cx);
+        let Some(editor) = self.state.read(cx).editor.clone() else {
+            return;
+        };
+        let key = DraftKey::Thread(id);
+        let reviewed = view.update(cx, |view, cx| view.snapshot(&key, window, cx));
+        let reviewed_attachments: Vec<_> = self
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .into_iter()
+            .flat_map(|thread| &thread.attachments)
+            .map(|image| image.id)
+            .collect();
         cx.spawn_in(window, async move |workspace, window| {
-            if approval.await != Ok(0) {
-                return;
-            }
-            if !workspace
-                .update_in(window, |workspace, _, cx| {
-                    workspace.can_edit_conversation(id, cx)
-                })
-                .unwrap_or(false)
-            {
-                return;
-            }
             let result = async {
-                let snapshot = editor.snapshot(DraftKey::Thread(id)).await?;
-                let replaced = editor
-                    .replace_if_revision(snapshot.key.clone(), snapshot.revision(), text)
-                    .await?;
+                let reviewed = reviewed.await?;
+                let approval = workspace.update_in(window, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        "Replace this conversation draft?",
+                        Some("New typing after this review will not be overwritten."),
+                        &["Replace draft", "Cancel"],
+                        cx,
+                    )
+                })?;
+                if approval.await != Ok(0) {
+                    return Ok(false);
+                }
+                let unchanged = workspace.update_in(window, |workspace, _, cx| {
+                    workspace.can_edit_conversation(id, cx)
+                        && workspace
+                            .state
+                            .read(cx)
+                            .snapshot
+                            .threads
+                            .iter()
+                            .find(|thread| thread.id == id)
+                            .is_some_and(|thread| {
+                                thread
+                                    .attachments
+                                    .iter()
+                                    .map(|image| image.id)
+                                    .eq(reviewed_attachments.iter().copied())
+                            })
+                })?;
+                anyhow::ensure!(unchanged, "The draft or attachments are no longer editable");
                 anyhow::ensure!(
-                    replaced,
-                    "Draft changed during replacement; the newer text was preserved"
+                    editor
+                        .replace_if_revision(key, reviewed.revision(), text)
+                        .await?,
+                    "Draft changed during review; newer text was preserved"
                 );
-                Ok::<_, anyhow::Error>(())
+                Ok::<_, anyhow::Error>(true)
             }
             .await;
             let _ = workspace.update_in(window, |workspace, window, cx| {
-                if !workspace.can_edit_conversation(id, cx) {
-                    return;
-                }
                 workspace.state.update(cx, |state, cx| {
                     match result {
-                        Ok(()) => {
-                            if let Some(mut thread) =
-                                state.snapshot.threads.iter().find(|t| t.id == id).cloned()
+                        Ok(true) => {
+                            if let Some(mut thread) = state
+                                .snapshot
+                                .threads
+                                .iter()
+                                .find(|thread| thread.id == id)
+                                .cloned()
+                                && thread
+                                    .attachments
+                                    .iter()
+                                    .map(|image| image.id)
+                                    .eq(reviewed_attachments.iter().copied())
                             {
                                 if let Some(attachments) = attachments {
                                     thread.attachments = attachments;
@@ -425,19 +580,16 @@ impl Workspace {
                                 state.save_thread(thread);
                             }
                         }
+                        Ok(false) => {}
                         Err(error) => state.notice(
-                            NoticeLevel::Error,
+                            NoticeLevel::Warning,
                             format!("Draft was not replaced: {error:#}"),
                         ),
                     }
                     cx.notify();
                 });
-                if workspace.state.read(cx).selected_thread == Some(id)
-                    && workspace.editor_selection == Some(DraftKey::Thread(id))
-                {
-                    if let Some(view) = &workspace.editor {
-                        view.update(cx, |view, cx| view.focus(window, cx));
-                    }
+                if workspace.editor_selection == Some(DraftKey::Thread(id)) {
+                    view.update(cx, |view, cx| view.focus(window, cx));
                 }
             });
         })
@@ -533,14 +685,17 @@ impl Workspace {
         if !self.can_edit_conversation(thread.id, cx) {
             return;
         }
-        let Some(editor) = self.state.read(cx).editor.clone() else {
+        let Some(editor) = self.editor.clone() else {
             return;
         };
+        let snapshot = editor.update(cx, |editor, cx| {
+            editor.snapshot(&DraftKey::Thread(thread.id), window, cx)
+        });
         let data = self.state.read(cx).data_dir.clone();
         let original_ids: Vec<_> = thread.attachments.iter().map(|image| image.id).collect();
         cx.spawn_in(window, async move |workspace, window| {
             let result = async {
-                let snapshot = editor.snapshot(DraftKey::Thread(thread.id)).await?;
+                let snapshot = snapshot.await?;
                 smol::unblock(move || crate::attachments::optimize(uuid::Uuid::new_v4(), &snapshot.text, &thread.attachments, &data)).await
             }.await;
             let _ = workspace.update_in(window, |workspace, _, cx| {
@@ -563,12 +718,57 @@ impl Workspace {
 }
 
 impl Workspace {
-    pub fn cancel_editor_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.read(cx).shutting_down || !self.has_conversation_editor(cx) {
+    pub fn restart_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.editor.clone() else {
+            self.start_editor(window, cx);
             return;
-        }
+        };
+        let Some(editor) = self.state.read(cx).editor.clone() else {
+            view.update(cx, |view, cx| view.start(window, cx));
+            return;
+        };
+        view.update(cx, |view, _| {
+            // Cancel queued continuations before restarting the RPC generation.
+            view.switch_task = None;
+            view.switching = false;
+        });
+        self.state.update(cx, |state, cx| {
+            state.editor_error = Some("Restarting Neovim…".into());
+            cx.notify();
+        });
+        cx.spawn_in(window, async move |workspace, window| {
+            let result = editor.restart().await;
+            let _ = workspace.update_in(window, |workspace, window, cx| match result {
+                Ok(()) => {
+                    workspace.state.update(cx, |state, cx| {
+                        state.editor_error = None;
+                        cx.notify();
+                    });
+                    view.update(cx, |view, cx| view.sync(window, cx));
+                }
+                Err(error) => view.update(cx, |view, cx| {
+                    view.failed(format!("Neovim restart failed: {error:#}"), cx)
+                }),
+            });
+        })
+        .detach();
+    }
+
+    pub fn cancel_editor_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = &self.editor {
-            view.update(cx, |view, cx| view.cancel_composition(window, cx));
+            let recovery = view.read(cx).recovery_text(cx);
+            let key = view.read(cx).active_key().cloned();
+            if !recovery.is_empty() {
+                self.state.update(cx, |state, _| {
+                    state.set_setting(
+                        "recovered_composition",
+                        serde_json::json!({ "key": key, "text": recovery }),
+                    )
+                });
+            }
+            if let Some(surface) = view.read(cx).view.clone() {
+                surface.update(cx, |surface, cx| surface.cancel_composition(window, cx));
+            }
         }
         let Some(editor) = self.state.read(cx).editor.clone() else {
             return;
@@ -581,7 +781,7 @@ impl Workspace {
                         Ok(()) => state.editor_error = None,
                         Err(error) => state.notice(
                             NoticeLevel::Error,
-                            format!("Editor requires restart: {error:#}"),
+                            format!("Neovim requires restart: {error:#}"),
                         ),
                     }
                     cx.notify();
@@ -591,13 +791,14 @@ impl Workspace {
         })
         .detach();
     }
+
     pub fn copy_draft_recovery(&self, cx: &mut App) {
         let state = self.state.read(cx);
         let text = serde_json::json!({
             "threads": state.snapshot.threads,
             "editor_buffers": state.drafts.values().map(|draft| serde_json::json!({ "key": format!("{:?}", draft.key), "text": draft.text })).collect::<Vec<_>>(),
             "saved_uncommitted_preedit": state.snapshot.settings.get("recovered_composition"),
-            "current_uncommitted_preedit": self.editor.as_ref().map(|view| view.read(cx).recovery_text()),
+            "current_uncommitted_preedit": self.editor.as_ref().map(|view| view.read(cx).recovery_text(cx)),
         });
         cx.write_to_clipboard(ClipboardItem::new_string(
             serde_json::to_string_pretty(&text).unwrap_or_else(|_| text.to_string()),
@@ -612,7 +813,7 @@ impl Workspace {
     ) {
         self.flush_layout(cx);
         if let Some(view) = &self.editor {
-            let text = view.read(cx).recovery_text();
+            let text = view.read(cx).recovery_text(cx);
             let key = view.read(cx).active_key().cloned();
             if !text.is_empty() {
                 self.state.update(cx, |state, _| {
@@ -624,8 +825,32 @@ impl Workspace {
             }
         }
         self.focus_region(Region::Thread, window, cx);
-        self.state
-            .update(cx, |state, cx| state.begin_shutdown(allow_data_loss, cx));
+        let editor = self.state.read(cx).editor.clone();
+        cx.spawn_in(window, async move |workspace, window| {
+            let snapshots = if let Some(editor) = &editor {
+                editor.persistence_barrier().await
+            } else { Ok(Vec::new()) };
+            if snapshots.is_err() && !allow_data_loss
+                && let Some(editor) = &editor { let _ = editor.resume_input().await; }
+            let _ = workspace.update_in(window, |workspace, _, cx| {
+                workspace.quit_requested = false;
+                workspace.state.update(cx, |state, cx| {
+                    match snapshots {
+                        Ok(drafts) => {
+                            for draft in drafts { state.record_draft(draft); }
+                            state.begin_shutdown(allow_data_loss, cx);
+                        }
+                        Err(_) if allow_data_loss => state.begin_shutdown(true, cx),
+                        Err(error) => {
+                            let error = format!("Quit cancelled: {error:#}. Complete or cancel composition, or copy draft recovery before quitting.");
+                            state.shutdown_error = Some(error.clone());
+                            state.notice(NoticeLevel::Error, error);
+                            cx.notify();
+                        }
+                    }
+                });
+            });
+        }).detach();
     }
 
     pub fn quit_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {

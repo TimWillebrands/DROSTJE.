@@ -1,8 +1,7 @@
-//! Opt-in native component QA with real isolated Neovim; never submits provider turns.
+//! Opt-in native component QA with isolated state; never submits provider turns.
 use crate::{
     app::{AppState, Bootstrap},
-    model::{ThreadId, ThreadKind},
-    neovim::DraftKey,
+    model::{DraftKey, ThreadId, ThreadKind},
     platform,
     store::Store,
     ui::{
@@ -114,6 +113,14 @@ struct Fixture {
 }
 
 async fn open_fixture(cx: &mut TestAppContext, data: Option<PathBuf>) -> Fixture {
+    open_fixture_with_editor(cx, data, None).await
+}
+
+async fn open_fixture_with_editor(
+    cx: &mut TestAppContext,
+    data: Option<PathBuf>,
+    executable: Option<&str>,
+) -> Fixture {
     cx.dispatcher.allow_parking();
     let fixture = PathBuf::from(
         std::env::var_os("DROST_RUNTIME_FIXTURE")
@@ -131,13 +138,12 @@ async fn open_fixture(cx: &mut TestAppContext, data: Option<PathBuf>) -> Fixture
     );
     let data = data.unwrap_or_else(|| fixture.join(format!("drost-qa-{}", Uuid::new_v4())));
     let store = Store::open(data.clone()).unwrap();
-    store
-        .set_setting(
-            "executables".into(),
-            json!({"nvim":"/opt/homebrew/bin/nvim"}),
-        )
-        .await
-        .unwrap();
+    if let Some(executable) = executable {
+        store
+            .set_setting("executables".into(), json!({"nvim": executable}))
+            .await
+            .unwrap();
+    }
     store
         .set_setting(
             "factory_data_root".into(),
@@ -233,10 +239,77 @@ async fn quit(cx: &mut TestAppContext, fixture: &Fixture) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires real Neovim and disposable DROST_RUNTIME_FIXTURE; no provider or Factory turns"]
+#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; native empty-state layout and keyboard"]
+async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    for (mode, expected) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
+        fixture.state.update(cx, |state, cx| {
+            state.set_setting("theme_mode", json!(mode));
+            cx.notify();
+        });
+        until(cx, "empty workspace theme", Duration::from_secs(5), |cx| {
+            Theme::global(cx).mode == expected
+        })
+        .await;
+        for (width, height) in [(1440., 900.), (900., 600.)] {
+            cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.update_window(fixture.window.into(), |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+            }
+            let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+            let thread = visual.debug_bounds("Thread").unwrap();
+            for action in ["empty-new-conversation", "empty-new-factory"] {
+                let bounds = visual.debug_bounds(action).unwrap();
+                assert!(
+                    bounds.size.width < thread.size.width * 0.5,
+                    "{action} stretches across the thread pane: {bounds:?}"
+                );
+                assert!(thread.contains(&bounds.center()));
+                assert!(bounds.center().y > thread.origin.y + thread.size.height * 0.3);
+                assert!(bounds.center().y < thread.origin.y + thread.size.height * 0.7);
+            }
+        }
+    }
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-n");
+    until(
+        cx,
+        "empty-state conversation action",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).conversation_thread().is_some(),
+    )
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-w");
+    until(
+        cx,
+        "return to empty workspace",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).selected_thread.is_none(),
+    )
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-shift-n");
+    until(
+        cx,
+        "empty-state Factory action",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).factory_thread().is_some(),
+    )
+    .await;
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; no provider or Factory turns"]
 async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let first = new_conversation(cx, &fixture).await;
+    let before_typing =
+        cx.read(|cx| fixture.state.read(cx).drafts[&DraftKey::Thread(first)].revision());
     update_workspace(
         cx,
         fixture.window,
@@ -245,12 +318,24 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
     );
     cx.simulate_keystrokes(
         fixture.window.into(),
-        "a l p h a space b e t a escape 0 w c i w shift-g shift-a shift-m shift-m shift-a escape",
+        "a l p h a space b e t a escape 0 w c i w shift-g shift-a shift-m shift-m shift-a enter",
     );
     let editor = cx.read(|cx| fixture.state.read(cx).editor.clone().unwrap());
+    assert!(
+        !editor
+            .replace_if_revision(DraftKey::Thread(first), before_typing, String::new())
+            .await
+            .unwrap()
+    );
+    until(cx, "Neovim committed edit", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).drafts[&DraftKey::Thread(first)].text == "alpha GAMMA\n"
+    })
+    .await;
     assert_eq!(
-        editor.snapshot(DraftKey::Thread(first)).await.unwrap().text,
-        "alpha GAMMA"
+        cx.read(|cx| fixture.state.read(cx).drafts[&DraftKey::Thread(first)]
+            .text
+            .clone()),
+        "alpha GAMMA\n"
     );
 
     cx.dispatch_action(fixture.window.into(), commands::NewFactoryThread);
@@ -304,7 +389,7 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
             .find(|thread| thread.id == first)
             .unwrap()
             .draft,
-        "alpha GAMMA"
+        "alpha GAMMA\n"
     );
 
     update_workspace(
@@ -324,8 +409,52 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
     })
     .await;
     assert_eq!(
-        editor.snapshot(DraftKey::Thread(first)).await.unwrap().text,
-        "alpha GAMMA"
+        cx.read(|cx| fixture.state.read(cx).drafts[&DraftKey::Thread(first)]
+            .text
+            .clone()),
+        "alpha GAMMA\n"
+    );
+    // The dock's thread tabs retain both kinds; cycling never rewrites either draft.
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).open_threads.clone()),
+        vec![first, factory]
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "ctrl-tab");
+    until(cx, "next thread tab", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).selected_thread == Some(factory)
+    })
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "ctrl-shift-tab");
+    until(cx, "previous thread tab", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).selected_thread == Some(first)
+    })
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-w");
+    until(
+        cx,
+        "closing selects adjacent tab",
+        Duration::from_secs(5),
+        |cx| {
+            fixture.state.read(cx).selected_thread == Some(factory)
+                && fixture.state.read(cx).open_threads == vec![factory]
+        },
+    )
+    .await;
+    fixture.state.update(cx, |state, cx| {
+        state.select_thread(first);
+        state.select_thread(first);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).open_threads.clone()),
+        vec![factory, first]
+    );
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).drafts[&DraftKey::Thread(first)]
+            .text
+            .clone()),
+        "alpha GAMMA\n"
     );
     update_workspace(
         cx,
@@ -340,16 +469,146 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
     );
     quit(cx, &fixture).await;
     println!("DROST_QA_DATA={}", fixture.data.display());
+    assert_eq!(
+        fixture.store.snapshot().await.unwrap().settings["open_threads"],
+        json!([factory, first])
+    );
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROST_RUNTIME_FIXTURE and installed Neovim; no provider turns"]
+async fn editor_startup_failure_and_restart_preserve_draft(cx: &mut TestAppContext) {
+    let fixture = open_fixture_with_editor(cx, None, Some("/nonexistent/drost-qa-neovim")).await;
+    cx.dispatch_action(fixture.window.into(), commands::NewConversation);
+    let id = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+    until(
+        cx,
+        "missing Neovim setup error",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).editor_error.is_some(),
+    )
+    .await;
+    assert!(cx.read(|cx| fixture.state.read(cx).editor.is_none()));
+    let executable = platform::resolve_executable("nvim", None).unwrap();
+    fixture.state.update(cx, |state, cx| {
+        state.set_setting("executables", json!({"nvim": executable}));
+        cx.notify();
+    });
+    cx.dispatch_action(fixture.window.into(), commands::RestartEditor);
+    until(
+        cx,
+        "configured Neovim activation",
+        Duration::from_secs(5),
+        |cx| {
+            fixture.workspace.read(cx).editor_selection == Some(DraftKey::Thread(id))
+                && fixture.state.read(cx).editor_error.is_none()
+        },
+    )
+    .await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.focus_composer(window, cx),
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "s a f e escape");
+    until(cx, "committed Neovim draft", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).drafts[&DraftKey::Thread(id)].text == "safe"
+    })
+    .await;
+    let editor = cx.read(|cx| fixture.state.read(cx).editor.clone().unwrap());
+    editor
+        .try_command(crate::neovim::NvimCommand::Input(":qa!<CR>".into()))
+        .unwrap();
+    until(cx, "Neovim process failure", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).editor_error.is_some()
+    })
+    .await;
+    assert!(editor.snapshot(DraftKey::Thread(id)).await.is_err());
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).drafts[&DraftKey::Thread(id)]
+            .text
+            .clone()),
+        "safe"
+    );
+    cx.dispatch_action(fixture.window.into(), commands::RestartEditor);
+    until(cx, "Neovim recovery", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).editor_error.is_none()
+            && fixture.workspace.read(cx).editor_selection == Some(DraftKey::Thread(id))
+    })
+    .await;
+    assert_eq!(
+        editor.snapshot(DraftKey::Thread(id)).await.unwrap().text,
+        "safe"
+    );
+    cx.dispatch_action(fixture.window.into(), commands::NewConversation);
+    let second = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.sync_session(window, cx);
+        },
+    );
+    cx.dispatch_action(fixture.window.into(), commands::RestartEditor);
+    until(
+        cx,
+        "restart during draft activation",
+        Duration::from_secs(5),
+        |cx| {
+            fixture.state.read(cx).editor_error.is_none()
+                && fixture.workspace.read(cx).editor_selection == Some(DraftKey::Thread(second))
+        },
+    )
+    .await;
+    assert_eq!(
+        editor.snapshot(DraftKey::Thread(id)).await.unwrap().text,
+        "safe"
+    );
+    assert_eq!(
+        editor
+            .snapshot(DraftKey::Thread(second))
+            .await
+            .unwrap()
+            .text,
+        ""
+    );
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.focus_composer(window, cx),
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-escape");
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        let focus = fixture
+            .workspace
+            .read(cx)
+            .editor
+            .as_ref()
+            .unwrap()
+            .focus_handle(cx);
+        assert!(!focus.is_focused(window));
+    })
+    .unwrap();
+    quit(cx, &fixture).await;
+    assert_eq!(
+        fixture
+            .store
+            .snapshot()
+            .await
+            .unwrap()
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .unwrap()
+            .draft,
+        "safe"
+    );
 }
 
 async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
-    until(
-        cx,
-        "draft switch before palette",
-        Duration::from_secs(5),
-        |cx| !fixture.workspace.read(cx).editor_switching,
-    )
-    .await;
     cx.simulate_keystrokes(fixture.window.into(), "cmd-shift-p");
     until(cx, "palette opened", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).palette.is_some()
@@ -362,7 +621,7 @@ async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires real Neovim and disposable DROST_RUNTIME_FIXTURE; native Command/focus/theme integration"]
+#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; native Command/focus/theme integration"]
 async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let conversation = new_conversation(cx, &fixture).await;
@@ -441,6 +700,41 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
             .has_active_sheet(cx))
             .unwrap()
     );
+    let saved_root =
+        cx.read(|cx| fixture.state.read(cx).snapshot.settings["factory_data_root"].clone());
+    set_dialog(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        "factory_data_root",
+        "relative/path",
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-enter");
+    until(
+        cx,
+        "Settings validation retains input",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| {
+                    dialog.error.is_some()
+                        && dialog.value("factory_data_root", cx) == "relative/path"
+                })
+        },
+    )
+    .await;
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).snapshot.settings["factory_data_root"].clone()),
+        saved_root
+    );
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
     cx.simulate_keystrokes(fixture.window.into(), "escape");
     until(cx, "Settings dismissed", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).dialog.is_none()
@@ -719,7 +1013,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires real Neovim; exercises orderly quit against a real SQLite write lock"]
+#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; exercises orderly quit against a real SQLite write lock"]
 async fn orderly_quit_flushes_before_platform_deadline(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     new_conversation(cx, &fixture).await;
@@ -766,16 +1060,6 @@ async fn orderly_quit_flushes_before_platform_deadline(cx: &mut TestAppContext) 
             .get("quit_marker"),
         Some(&json!("durable-before-platform-quit"))
     );
-    assert!(cx.read(|cx| {
-        fixture
-            .state
-            .read(cx)
-            .editor
-            .as_ref()
-            .unwrap()
-            .commands
-            .is_closed()
-    }));
 }
 
 #[gpui_kit::test]
@@ -798,7 +1082,6 @@ async fn layout_and_factory_runtime_recovery(cx: &mut TestAppContext) {
     );
     assert!(cx.read(|cx| fixture.state.read(cx).thread().unwrap().kind == ThreadKind::Factory));
     assert!(cx.read(|cx| fixture.state.read(cx).conversations.is_empty()));
-    assert!(cx.read(|cx| fixture.workspace.read(cx).editor.is_none()));
     for launch in &saved.launches {
         until(
             cx,
@@ -870,10 +1153,7 @@ async fn factory_start_requires_persisted_configuration(cx: &mut TestAppContext)
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     fixture.state.update(cx, |state, cx| {
-        state.set_setting(
-            "executables",
-            json!({"nvim":"/opt/homebrew/bin/nvim","factory":executable}),
-        );
+        state.set_setting("executables", json!({"factory":executable}));
         cx.notify();
     });
     cx.dispatch_action(fixture.window.into(), commands::NewFactoryThread);

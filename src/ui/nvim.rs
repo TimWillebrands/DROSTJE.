@@ -1,13 +1,11 @@
-use super::grid::{GridSnapshot, Highlight, HighlightedChunk};
-use super::{
-    ClipboardContent, DraftKey, DraftRevision, DraftSnapshot, NvimCommand, NvimEditor, NvimEvent,
+use crate::model::{DraftKey, DraftRevision, DraftSnapshot};
+use crate::neovim::grid::{GridSnapshot, Highlight, HighlightedChunk};
+use crate::neovim::{ClipboardContent, NvimCommand, NvimEditor, NvimEvent};
+use gpui_kit::{
+    component::{ActiveTheme, alert::Alert, label::Label},
+    prelude::*,
+    *,
 };
-use crate::model::PaneDirection;
-use gpui_kit::component::{
-    ActiveTheme, Sizable, Theme,
-    button::{Button, ButtonVariants},
-};
-use gpui_kit::{prelude::*, *};
 use std::{collections::VecDeque, ops::Range, sync::Arc, time::Instant};
 
 #[derive(Clone, Debug)]
@@ -15,11 +13,6 @@ pub enum NvimViewEvent {
     Ready,
     DraftChanged(DraftSnapshot),
     DraftActivated(DraftSnapshot),
-    FocusPane {
-        key: DraftKey,
-        generation: uuid::Uuid,
-        direction: PaneDirection,
-    },
     Failed(String),
     InputRejected(String),
     CompositionChanged(bool),
@@ -71,6 +64,7 @@ pub struct NvimView {
     grid: Arc<GridSnapshot>,
     draft: Option<DraftSnapshot>,
     ready: bool,
+    writable: bool,
     error: Option<String>,
     diagnostic: Option<String>,
     composition: Option<Composition>,
@@ -78,9 +72,9 @@ pub struct NvimView {
     recovery: String,
     bounds: Option<Bounds<Pixels>>,
     cell: Size<Pixels>,
-    font: Font,
     font_size: Pixels,
-    scale_factor: f32,
+    font: Font,
+    theme_colors: Option<[u32; 4]>,
     frame: Option<Frame>,
     requested_size: Option<(u32, u32)>,
     blink_epoch: Instant,
@@ -96,7 +90,6 @@ impl NvimView {
     pub fn new(editor: NvimEditor, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
         let subscriptions = vec![
-            cx.observe_global::<Theme>(|_, cx| cx.notify()),
             cx.on_focus(&focus_handle, window, |this, _, cx| {
                 this.blink_epoch = Instant::now();
                 this.send(NvimCommand::Focus(true), cx);
@@ -139,16 +132,17 @@ impl NvimView {
             grid: Arc::new(GridSnapshot::default()),
             draft: None,
             ready: false,
+            writable: true,
             error: None,
             diagnostic: None,
             composition: None,
             pending_compositions: VecDeque::new(),
             recovery: String::new(),
             bounds: None,
-            cell: size(px(1.), px(1.)),
-            font: font(cx.theme().mono_font_family.clone()),
+            cell: size(cx.theme().mono_font_size, cx.theme().mono_font_size),
             font_size: cx.theme().mono_font_size,
-            scale_factor: 0.,
+            font: font(cx.theme().mono_font_family.clone()),
+            theme_colors: None,
             frame: None,
             requested_size: None,
             blink_epoch: Instant::now(),
@@ -159,26 +153,6 @@ impl NvimView {
         }
     }
 
-    pub fn editor(&self) -> NvimEditor {
-        self.editor.clone()
-    }
-
-    pub fn mode(&self) -> &str {
-        &self.grid.mode
-    }
-
-    pub fn draft_revision(&self) -> Option<DraftRevision> {
-        self.draft.as_ref().map(DraftSnapshot::revision)
-    }
-
-    pub fn active_key(&self) -> Option<&DraftKey> {
-        self.draft.as_ref().map(|draft| &draft.key)
-    }
-
-    pub fn latest_snapshot(&self) -> Option<&DraftSnapshot> {
-        self.draft.as_ref()
-    }
-
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
     }
@@ -187,10 +161,6 @@ impl NvimView {
         self.composition.is_some()
             || !self.pending_compositions.is_empty()
             || !self.recovery.is_empty()
-    }
-
-    pub fn recoverable_composition(&self) -> &str {
-        &self.recovery
     }
 
     /// Separately persist this on quit if the semantic draft barrier refuses an
@@ -222,8 +192,24 @@ impl NvimView {
         self.discard_composition(cx);
     }
 
+    /// Deliberate read-only states drop new native input rather than retaining it
+    /// as failed composition. Existing composition remains separately recoverable.
+    pub fn set_writable(&mut self, writable: bool, cx: &mut Context<Self>) {
+        if self.writable == writable {
+            return;
+        }
+        self.writable = writable;
+        self.dragging = None;
+        self.scroll_remainder = point(0., 0.);
+        if !writable && let Some(composition) = self.composition.as_mut() {
+            composition.recoverable = true;
+        }
+        cx.notify();
+    }
+
     fn enabled(&self) -> bool {
-        self.ready
+        self.writable
+            && self.ready
             && self.error.is_none()
             && !self.grid.rows.is_empty()
             && self
@@ -307,26 +293,6 @@ impl NvimView {
                 self.blink_epoch = Instant::now();
                 cx.emit(NvimViewEvent::DraftActivated(draft));
             }
-            NvimEvent::FocusPane {
-                key,
-                generation,
-                direction,
-            } => {
-                if self.ready
-                    && self.error.is_none()
-                    && !self.has_composition()
-                    && self
-                        .draft
-                        .as_ref()
-                        .is_some_and(|draft| draft.key == key && draft.generation == generation)
-                {
-                    cx.emit(NvimViewEvent::FocusPane {
-                        key,
-                        generation,
-                        direction,
-                    });
-                }
-            }
             NvimEvent::ClipboardGet { reply } => {
                 let content = cx
                     .read_from_clipboard()
@@ -360,6 +326,13 @@ impl NvimView {
                 self.error = None;
                 self.diagnostic = None;
                 self.requested_size = None;
+                if let Some(composition) = self.composition.as_mut() {
+                    // A restarted process cannot commit a previous generation's preedit.
+                    composition.recoverable = true;
+                }
+                if self.has_composition() {
+                    self.send(NvimCommand::SetComposition(true), cx);
+                }
                 cx.emit(NvimViewEvent::Ready);
             }
         }
@@ -531,6 +504,9 @@ impl NvimView {
             cx.stop_propagation();
             return;
         }
+        if !self.writable {
+            return;
+        }
         if key.key == "f23" || key.key == "f24" {
             window.prevent_default();
             cx.stop_propagation();
@@ -669,32 +645,49 @@ impl NvimView {
     }
 
     fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let font = font(cx.theme().mono_font_family.clone());
-        let font_size = cx.theme().mono_font_size;
-        let scale = window.scale_factor();
-        if font != self.font || font_size != self.font_size || scale != self.scale_factor {
-            let text_system = window.text_system();
-            let font_id = text_system.resolve_font(&font);
-            // The canvas is a raster cell grid: round metrics to physical pixels,
-            // independently of UI control typography and inherited line height.
-            let height = ((text_system.ascent(font_id, font_size)
-                + text_system.descent(font_id, font_size))
-            .max(font_size)
-                * scale)
-                .ceil()
-                / scale;
-            let width = (text_system.layout_width(font_id, font_size, 'M') * scale).ceil() / scale;
+        let theme = cx.theme();
+        let background = theme.background.to_rgb();
+        let colors = [
+            u32::from(background.blend(theme.foreground.to_rgb())) >> 8,
+            u32::from(background) >> 8,
+            u32::from(background.blend(theme.selection.to_rgb())) >> 8,
+            u32::from(background.blend(theme.caret.to_rgb())) >> 8,
+        ];
+        let font = font(theme.mono_font_family.clone());
+        if self.font != font {
             self.font = font;
-            self.font_size = font_size;
-            self.scale_factor = scale;
-            self.cell = size(width.max(px(1.)), height.max(px(1.)));
             self.frame = None;
         }
+        if self.ready
+            && self.theme_colors != Some(colors)
+            && self.send(
+                NvimCommand::Theme {
+                    foreground: colors[0],
+                    background: colors[1],
+                    selection: colors[2],
+                    caret: colors[3],
+                },
+                cx,
+            )
+        {
+            self.theme_colors = Some(colors);
+        }
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let cell_height = window.line_height();
         if self.frame.is_none()
+            || font_size != self.font_size
+            || cell_height != self.cell.height
             || self
                 .bounds
                 .is_none_or(|previous| previous.size != bounds.size)
         {
+            self.font_size = font_size;
+            let run = text_run(&self.grid, &self.font, 0, 1);
+            let width = window
+                .text_system()
+                .shape_line("M".into(), font_size, &[run], None)
+                .width();
+            self.cell = size(width.max(px(1.)), cell_height.max(px(1.)));
             let visible_rows = (bounds.size.height / self.cell.height).floor().max(1.) as usize;
             self.frame = Some(make_frame(
                 &self.grid,
@@ -763,7 +756,12 @@ impl NvimView {
             return;
         };
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            window.paint_quad(fill(bounds, rgb(self.grid.default_bg)));
+            let background = if self.grid.rows.is_empty() {
+                cx.theme().background
+            } else {
+                rgb(self.grid.default_bg).into()
+            };
+            window.paint_quad(fill(bounds, background));
             for (rect, color) in &frame.backgrounds {
                 window.paint_quad(fill(
                     Bounds::new(bounds.origin + rect.origin, rect.size),
@@ -902,29 +900,28 @@ impl NvimView {
             _ => Bounds::new(origin, size(width, self.cell.height)),
         };
         window.paint_quad(fill(cursor, color));
-        if shape == "block" && self.grid.cmdline.is_empty() {
-            if let Some(cell) = self
+        if shape == "block"
+            && self.grid.cmdline.is_empty()
+            && let Some(cell) = self
                 .grid
                 .rows
                 .get(self.grid.cursor.0)
                 .and_then(|row| row.get(self.grid.cursor.1))
-            {
-                if !cell.text.is_empty() {
-                    let mut run = text_run(&self.grid, &self.font, cell.hl_id, cell.text.len());
-                    run.color = if style.is_some_and(|style| style.attr_id != 0) {
-                        fg
-                    } else {
-                        bg
-                    };
-                    let line = window.text_system().shape_line(
-                        cell.text.clone().into(),
-                        self.font_size,
-                        &[run],
-                        None,
-                    );
-                    let _ = line.paint(origin, self.cell.height, TextAlign::Left, None, window, cx);
-                }
-            }
+            && !cell.text.is_empty()
+        {
+            let mut run = text_run(&self.grid, &self.font, cell.hl_id, cell.text.len());
+            run.color = if style.is_some_and(|style| style.attr_id != 0) {
+                fg
+            } else {
+                bg
+            };
+            let line = window.text_system().shape_line(
+                cell.text.clone().into(),
+                self.font_size,
+                &[run],
+                None,
+            );
+            let _ = line.paint(origin, self.cell.height, TextAlign::Left, None, window, cx);
         }
         if shape == "block" {
             let layout = self.frame.as_ref().and_then(|frame| {
@@ -1006,6 +1003,9 @@ impl EntityInputHandler for NvimView {
     }
 
     fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.writable {
+            return;
+        }
         if self
             .composition
             .as_ref()
@@ -1016,10 +1016,11 @@ impl EntityInputHandler for NvimView {
     }
 
     fn paste(&mut self, item: ClipboardItem, _: &mut Window, cx: &mut Context<Self>) {
-        if self.enabled() && !self.has_composition() {
-            if let Some(text) = item.text() {
-                self.send(NvimCommand::Paste(text), cx);
-            }
+        if self.enabled()
+            && !self.has_composition()
+            && let Some(text) = item.text()
+        {
+            self.send(NvimCommand::Paste(text), cx);
         }
     }
 
@@ -1030,7 +1031,15 @@ impl EntityInputHandler for NvimView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.enabled() {
+        if !self.writable {
+            return;
+        }
+        if !self.enabled()
+            || self
+                .composition
+                .as_ref()
+                .is_some_and(|composition| composition.recoverable)
+        {
             self.retain_native(range, text, None, cx);
             return;
         }
@@ -1069,7 +1078,15 @@ impl EntityInputHandler for NvimView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.enabled() {
+        if !self.writable {
+            return;
+        }
+        if !self.enabled()
+            || self
+                .composition
+                .as_ref()
+                .is_some_and(|composition| composition.recoverable)
+        {
             self.retain_native(range, text, selection, cx);
             return;
         }
@@ -1244,6 +1261,9 @@ impl EntityInputHandler for NvimView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.enabled() {
+            return;
+        }
         if let Some(composition) = self.composition.as_mut() {
             let start = range.start.saturating_sub(composition.range.start);
             let end = range.end.saturating_sub(composition.range.start);
@@ -1278,10 +1298,12 @@ impl Render for NvimView {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .key_context("NvimEditor")
+            .key_context("NativeInput PromptEditor")
             .track_focus(&self.focus_handle)
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
+            .text_color(cx.theme().foreground)
+            .bg(cx.theme().background)
             .on_key_down(cx.listener(Self::key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::mouse_down))
@@ -1315,94 +1337,43 @@ impl Render for NvimView {
                 .min_h_0(),
             );
         if let Some(error) = self.error.as_ref() {
+            surface = surface.child(Alert::error("nvim-error", error.clone()).banner());
+        } else if !self.writable {
             surface = surface.child(
-                div()
-                    .p_2()
-                    .text_color(cx.theme().danger)
-                    .child(error.clone())
-                    .child(
-                        Button::new("nvim-restart")
-                            .small()
-                            .ghost()
-                            .label("Restart editor")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let editor = this.editor.clone();
-                                cx.spawn(async move |this, cx| {
-                                    if let Err(error) = editor.restart().await {
-                                        let _ = this.update(cx, |this, cx| {
-                                            this.fail(format!("{error:#}"), cx)
-                                        });
-                                    }
-                                })
-                                .detach();
-                            })),
-                    ),
+                Label::new("Editor is read-only")
+                    .text_color(cx.theme().muted_foreground)
+                    .p_2(),
             );
         } else if !self.enabled() {
             surface = surface.child(
-                div()
-                    .p_2()
+                Label::new("Waiting for Neovim’s initial grid…")
                     .text_color(cx.theme().muted_foreground)
-                    .child("Waiting for Neovim's initial grid…"),
+                    .p_2(),
             );
         }
         if let Some(diagnostic) = self.diagnostic.as_ref() {
             surface = surface.child(
-                div()
-                    .p_2()
-                    .text_color(cx.theme().warning)
-                    .child(diagnostic.clone())
-                    .child(
-                        Button::new("nvim-dismiss-diagnostic")
-                            .small()
-                            .ghost()
-                            .label("Dismiss")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.diagnostic = None;
-                                cx.notify();
-                            })),
-                    ),
+                Alert::warning("nvim-diagnostic", diagnostic.clone())
+                    .banner()
+                    .on_close(cx.listener(|this, _, _, cx| {
+                        this.diagnostic = None;
+                        cx.notify();
+                    })),
             );
         }
-        if self.has_composition() {
-            let recovery = if let Some(composition) = self.composition.as_ref() {
-                format!("{}{}", self.recovery, composition.text)
-            } else {
-                self.recovery.clone()
-            };
-            if !self.recovery.is_empty()
-                || self
-                    .composition
-                    .as_ref()
-                    .is_some_and(|composition| composition.recoverable)
-            {
-                surface = surface.child(
-                    div()
-                        .p_2()
-                        .text_color(cx.theme().warning)
-                        .child("Uncommitted composition retained")
-                        .child(
-                            Button::new("nvim-copy-composition")
-                                .small()
-                                .ghost()
-                                .label("Copy composition")
-                                .on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        recovery.clone(),
-                                    ))
-                                }),
-                        )
-                        .child(
-                            Button::new("nvim-cancel-composition")
-                                .small()
-                                .ghost()
-                                .label("Cancel composition")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.cancel_composition(window, cx)
-                                })),
-                        ),
-                );
-            }
+        if !self.recovery.is_empty()
+            || self
+                .composition
+                .as_ref()
+                .is_some_and(|composition| composition.recoverable)
+        {
+            surface = surface.child(
+                Alert::warning(
+                    "nvim-composition-recovery",
+                    "Uncommitted composition retained. Copy it before cancelling or restarting.",
+                )
+                .banner(),
+            );
         }
         surface
     }
@@ -1575,25 +1546,24 @@ fn clipboard_content(item: &ClipboardItem) -> Option<ClipboardContent> {
     if let Some(metadata) = item
         .metadata()
         .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
-    {
-        if let (Some(regtype), Some(lines)) = (
+        && let (Some(regtype), Some(lines)) = (
             metadata["drost_nvim_register"].as_str(),
             metadata["lines"].as_array(),
-        ) {
-            let lines: Option<Vec<String>> = lines
-                .iter()
-                .map(|line| line.as_str().map(str::to_owned))
-                .collect();
-            if let Some(lines) = lines {
-                let content = ClipboardContent {
-                    lines,
-                    regtype: regtype.into(),
-                };
-                if content.text() == text
-                    && (regtype == "v" || regtype == "V" || regtype.starts_with('\u{16}'))
-                {
-                    return Some(content);
-                }
+        )
+    {
+        let lines: Option<Vec<String>> = lines
+            .iter()
+            .map(|line| line.as_str().map(str::to_owned))
+            .collect();
+        if let Some(lines) = lines {
+            let content = ClipboardContent {
+                lines,
+                regtype: regtype.into(),
+            };
+            if content.text() == text
+                && (regtype == "v" || regtype == "V" || regtype.starts_with('\u{16}'))
+            {
+                return Some(content);
             }
         }
     }
@@ -1706,10 +1676,24 @@ fn make_frame(
     for (row_index, row) in grid.rows.iter().enumerate() {
         for (column, value) in row.iter().enumerate() {
             let origin = point(cell.width * column as f32, cell.height * row_index as f32);
-            frame
-                .backgrounds
-                .push((Bounds::new(origin, cell), colors(grid, value.hl_id).1));
-            if value.text.is_empty() {
+            let background = colors(grid, value.hl_id).1;
+            if background != rgb(grid.default_bg).into() {
+                if let Some((rect, previous)) = frame.backgrounds.last_mut()
+                    && *previous == background
+                    && rect.top() == origin.y
+                    && rect.right() == origin.x
+                {
+                    rect.size.width += cell.width;
+                } else {
+                    frame
+                        .backgrounds
+                        .push((Bounds::new(origin, cell), background));
+                }
+            }
+            let decorated = grid.highlights.get(&value.hl_id).is_some_and(|highlight| {
+                highlight.underline || highlight.undercurl || highlight.strikethrough
+            });
+            if value.text.is_empty() || (!decorated && value.text == " ") {
                 continue;
             }
             // One Neovim cell can contain a base character plus combining marks;
@@ -1808,4 +1792,157 @@ fn chunk_range(chunks: &[HighlightedChunk], range: Range<usize>) -> Vec<Highligh
         }
     }
     result
+}
+
+#[cfg(all(test, feature = "runtime-qa"))]
+mod tests {
+    use super::{DraftKey, Instant, NvimCommand, NvimEditor, NvimView};
+    use crate::neovim::NvimConfig;
+    use gpui_kit::component::Root;
+    use gpui_kit::{AppContext, Entity, EntityInputHandler, TestAppContext};
+    use std::time::Duration;
+
+    async fn until(
+        cx: &mut TestAppContext,
+        view: &Entity<NvimView>,
+        predicate: impl Fn(&NvimView) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            if cx.read(|cx| predicate(view.read(cx))) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Neovim view did not reach expected state: {:?}",
+                cx.read(|cx| {
+                    let view = view.read(cx);
+                    (
+                        view.ready,
+                        view.writable,
+                        view.error.clone(),
+                        view.draft.clone(),
+                        view.grid.generation,
+                        view.grid.rows.len(),
+                    )
+                })
+            );
+            smol::Timer::after(Duration::from_millis(10)).await;
+        }
+    }
+    async fn service<T>(cx: &mut TestAppContext, future: impl Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if let Some(result) = smol::future::or(async { Some(future.as_mut().await) }, async {
+                smol::Timer::after(Duration::from_millis(10)).await;
+                None
+            })
+            .await
+            {
+                return result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Native Neovim operation timed out"
+            );
+        }
+    }
+
+    #[gpui_kit::test]
+    #[ignore = "requires installed Neovim; isolated native input and real editing"]
+    async fn native_composition_is_recovery_only_until_committed(cx: &mut TestAppContext) {
+        cx.dispatcher.allow_parking();
+        let path = crate::platform::resolve_executable("nvim", None).unwrap();
+        let editor = NvimEditor::open(NvimConfig::new(path)).await.unwrap();
+        let key = DraftKey::Thread(uuid::Uuid::new_v4());
+        editor
+            .open_draft(key.clone(), "before".into())
+            .await
+            .unwrap();
+        editor.focus_draft(key.clone()).await.unwrap();
+        let initial = editor.snapshot(key.clone()).await.unwrap();
+        editor
+            .try_command(NvimCommand::Input("<Esc>A".into()))
+            .unwrap();
+        cx.update(gpui_kit::init);
+        let mut view = None;
+        let window = cx.add_window(|window, cx| {
+            let entity = cx.new(|cx| NvimView::new(editor.clone(), window, cx));
+            entity.update(cx, |view, cx| view.focus(window, cx));
+            view = Some(entity.clone());
+            Root::new(entity, window, cx)
+        });
+        let view = view.unwrap();
+        until(cx, &view, |view| {
+            view.enabled() && view.draft.as_ref().is_some_and(|draft| draft.cursor.1 == 6)
+        })
+        .await;
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(Some(6..6), "仮😀", Some(3..3), window, cx);
+                assert_eq!(view.recovery_text(), "仮😀");
+                assert!(view.has_composition());
+            })
+        })
+        .unwrap();
+        assert!(editor.snapshot(key.clone()).await.is_err());
+        assert!(
+            editor
+                .replace_if_revision(key.clone(), initial.revision(), "unsafe".into())
+                .await
+                .is_err()
+        );
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.replace_text_in_range(None, "確定😀", window, cx);
+            })
+        })
+        .unwrap();
+        let committed = service(cx, editor.snapshot(key.clone())).await.unwrap();
+        assert_eq!(committed.text, "before確定😀");
+        until(cx, &view, |view| !view.has_composition()).await;
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_writable(false, cx);
+                view.replace_text_in_range(None, "discard", window, cx);
+                view.replace_and_mark_text_in_range(None, "discard", None, window, cx);
+                assert!(view.recovery_text().is_empty());
+                view.set_writable(true, cx);
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            editor.snapshot(key.clone()).await.unwrap().text,
+            committed.text
+        );
+        until(cx, &view, |view| {
+            view.draft
+                .as_ref()
+                .is_some_and(|draft| draft.text == committed.text)
+        })
+        .await;
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.replace_and_mark_text_in_range(None, "retained", None, window, cx);
+            })
+        })
+        .unwrap();
+        assert_eq!(cx.read(|cx| view.read(cx).recovery_text()), "retained");
+        editor.restart().await.unwrap();
+        until(cx, &view, |view| view.ready && view.error.is_none()).await;
+        assert_eq!(cx.read(|cx| view.read(cx).recovery_text()), "retained");
+        assert!(editor.snapshot(key.clone()).await.is_err());
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.cancel_composition(window, cx);
+            })
+        })
+        .unwrap();
+        assert_eq!(editor.snapshot(key).await.unwrap().text, committed.text);
+        editor.persistence_barrier().await.unwrap();
+        editor.shutdown().await.unwrap();
+    }
 }

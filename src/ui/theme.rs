@@ -2,17 +2,12 @@ use std::{collections::BTreeMap, path::Path, rc::Rc};
 
 use anyhow::{Result, bail};
 use gpui_kit::{
-    component::{
-        ActiveTheme, Theme, ThemeConfig, ThemeMode, ThemeRegistry, highlighter::HighlightTheme,
-    },
+    component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry, highlighter::HighlightTheme},
     *,
 };
 use serde_json::Value;
 
-use crate::{
-    app::{AppState, NoticeLevel},
-    neovim::NvimTheme,
-};
+use crate::app::{AppState, NoticeLevel};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Appearance {
@@ -385,25 +380,4 @@ pub fn attach_recovery(window: &mut Window, cx: &mut App) -> Subscription {
     window.observe_window_appearance(|window, cx| {
         apply(Some(window), cx);
     })
-}
-
-/// Neovim paints RGB cells, not GPUI overlays. Composite translucent text,
-/// selection and caret colors on their actual opaque surfaces before packing.
-pub fn nvim_theme(cx: &App) -> NvimTheme {
-    let theme = cx.theme();
-    let background = theme.background.to_rgb().alpha(1.);
-    let popover = background.blend(theme.popover.to_rgb());
-    let primary = background.blend(theme.primary.to_rgb());
-    let rgb = |color: Rgba| u32::from(color) >> 8;
-    NvimTheme {
-        dark: theme.mode.is_dark(),
-        background: rgb(background),
-        foreground: rgb(background.blend(theme.foreground.to_rgb())),
-        popover: rgb(popover),
-        popover_foreground: rgb(popover.blend(theme.popover_foreground.to_rgb())),
-        selection: rgb(background.blend(theme.selection.to_rgb())),
-        caret: rgb(background.blend(theme.caret.to_rgb())),
-        primary: rgb(primary),
-        primary_foreground: rgb(primary.blend(theme.primary_foreground.to_rgb())),
-    }
 }

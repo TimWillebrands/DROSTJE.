@@ -1,10 +1,9 @@
 use super::{
     ClipboardContent, DraftKey, DraftRevision, DraftSnapshot, NvimCommand, NvimConfig, NvimEditor,
-    NvimEvent, NvimTheme,
+    NvimEvent,
     grid::GridReducer,
     rpc::{self, Incoming, Rpc},
 };
-use crate::model::PaneDirection;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_channel::{Receiver, Sender};
 use rmpv::Value;
@@ -110,11 +109,11 @@ impl Events {
             NvimEvent::ClipboardGet { reply } => {
                 // A clipboard read must never overtake a pending native write.
                 self.flush();
-                if let Err(error) = self.sender.try_send(NvimEvent::ClipboardGet { reply }) {
-                    if let NvimEvent::ClipboardGet { reply } = error.into_inner() {
-                        let _ = reply
-                            .try_send(Err("Native clipboard callback queue unavailable".into()));
-                    }
+                if let Err(error) = self.sender.try_send(NvimEvent::ClipboardGet { reply })
+                    && let NvimEvent::ClipboardGet { reply } = error.into_inner()
+                {
+                    let _ =
+                        reply.try_send(Err("Native clipboard callback queue unavailable".into()));
                 }
                 return;
             }
@@ -140,25 +139,25 @@ impl Events {
                 return;
             }
         }
-        if let Some(draft) = self.activated.take() {
-            if let Err(error) = self.sender.try_send(NvimEvent::DraftActivated(draft)) {
-                if let NvimEvent::DraftActivated(draft) = error.into_inner() {
-                    self.activated = Some(draft);
-                }
-                return;
-            }
+        if let Some(draft) = self.activated.take()
+            && let Err(error) = self.sender.try_send(NvimEvent::DraftActivated(draft))
+            && let NvimEvent::DraftActivated(draft) = error.into_inner()
+        {
+            self.activated = Some(draft);
+            return;
         }
-        if let Some(grid) = self.grid.take() {
-            if let Err(error) = self.sender.try_send(NvimEvent::Grid(grid)) {
-                if let NvimEvent::Grid(grid) = error.into_inner() {
-                    self.grid = Some(grid);
-                }
-                return;
-            }
+        if let Some(grid) = self.grid.take()
+            && let Err(error) = self.sender.try_send(NvimEvent::Grid(grid))
+            && let NvimEvent::Grid(grid) = error.into_inner()
+        {
+            self.grid = Some(grid);
+            return;
         }
         let keys: Vec<_> = self.drafts.keys().cloned().collect();
         for key in keys {
-            let draft = self.drafts.remove(&key).unwrap();
+            let Some(draft) = self.drafts.remove(&key) else {
+                continue;
+            };
             if let Err(error) = self.sender.try_send(NvimEvent::DraftChanged(draft)) {
                 if let NvimEvent::DraftChanged(draft) = error.into_inner() {
                     self.drafts.insert(key, draft);
@@ -174,7 +173,6 @@ impl Events {
 
 struct Session {
     config: NvimConfig,
-    theme: Option<NvimTheme>,
     rpc: Option<Rpc>,
     generation: Uuid,
     channel: u64,
@@ -188,13 +186,13 @@ struct Session {
     vim_entered: bool,
     composition: bool,
     frozen: bool,
+    theme: Option<[u32; 4]>,
     failed: Option<String>,
 }
 impl Session {
     fn new(config: NvimConfig, events: Sender<NvimEvent>) -> Self {
         let generation = Uuid::new_v4();
         Self {
-            theme: config.initial_theme,
             config,
             rpc: None,
             generation,
@@ -209,6 +207,7 @@ impl Session {
             vim_entered: false,
             composition: false,
             frozen: false,
+            theme: None,
             failed: None,
         }
     }
@@ -329,8 +328,8 @@ impl Session {
             vec![self.channel.into(), self.generation.to_string().into()],
         )
         .await?;
-        if let Some(theme) = self.theme {
-            self.apply_theme(theme).await?;
+        if let Some(colors) = self.theme {
+            self.apply_theme(colors).await?;
         }
         self.call("nvim_command", vec!["redraw!".into()]).await?;
         let deadline = Instant::now() + RPC_TIMEOUT;
@@ -339,27 +338,18 @@ impl Session {
         }
         Ok(())
     }
+    async fn apply_theme(&mut self, colors: [u32; 4]) -> Result<()> {
+        self.lua(
+            "return drost.theme(...)",
+            colors.into_iter().map(Value::from).collect(),
+        )
+        .await?;
+        self.call("nvim_command", vec!["redraw!".into()]).await?;
+        Ok(())
+    }
     async fn lua(&mut self, code: &str, args: Vec<Value>) -> Result<Value> {
         self.call("nvim_exec_lua", vec![code.into(), Value::Array(args)])
             .await
-    }
-    async fn apply_theme(&mut self, theme: NvimTheme) -> Result<()> {
-        self.lua(
-            "local theme=...; drost.apply_theme(theme)",
-            vec![rpc::dictionary([
-                ("dark", theme.dark.into()),
-                ("background", theme.background.into()),
-                ("foreground", theme.foreground.into()),
-                ("popover", theme.popover.into()),
-                ("popover_foreground", theme.popover_foreground.into()),
-                ("selection", theme.selection.into()),
-                ("caret", theme.caret.into()),
-                ("primary", theme.primary.into()),
-                ("primary_foreground", theme.primary_foreground.into()),
-            ])],
-        )
-        .await?;
-        Ok(())
     }
     async fn call(&mut self, method: &str, args: Vec<Value>) -> Result<Value> {
         self.call_until(method, args, Instant::now() + RPC_TIMEOUT)
@@ -458,7 +448,10 @@ impl Session {
                 "nvim_buf_changedtick_event" => {
                     ensure!(args.len() >= 2, "Malformed changedtick notification");
                     if let Some(key) = self.key_for(&args[0])? {
-                        let draft = self.drafts.get_mut(&key).unwrap();
+                        let draft = self
+                            .drafts
+                            .get_mut(&key)
+                            .context("Neovim draft is no longer available")?;
                         draft.snapshot.changedtick =
                             args[1].as_u64().context("Invalid changedtick")?;
                         self.events
@@ -466,25 +459,21 @@ impl Session {
                     }
                 }
                 "nvim_buf_detach_event" => {
-                    if let Some(buffer) = args.first() {
-                        if self.key_for(buffer)?.is_some() {
-                            bail!(
-                                "Neovim detached a Drost scratch buffer; restart to restore its retained draft"
-                            );
-                        }
+                    if let Some(buffer) = args.first()
+                        && self.key_for(buffer)?.is_some()
+                    {
+                        bail!(
+                            "Neovim detached a Drost scratch buffer; restart to restore its retained draft"
+                        );
                     }
                 }
                 "drost_vim_enter"
                 | "drost_drain"
                 | "drost_snapshot"
                 | "drost_cursor"
-                | "drost_focus_pane"
                 | "drost_clipboard_set" => {
-                    if args
-                        .first()
-                        .and_then(Value::as_str)
-                        .and_then(|value| Uuid::parse_str(value).ok())
-                        != Some(self.generation)
+                    if args.first().and_then(Value::as_str)
+                        != Some(self.generation.to_string().as_str())
                     {
                         return Ok(());
                     }
@@ -494,13 +483,14 @@ impl Session {
                             ensure!(args.len() >= 3, "Malformed input-drain callback");
                             let sequence = args[1].as_u64().context("Invalid drain sequence")?;
                             let mode = args[2].as_str().context("Invalid drain mode")?.to_owned();
-                            if let Some(marker) = &mut self.marker {
-                                if marker.kind == MarkerKind::Drain && marker.sequence == sequence {
-                                    marker.response = Some(MarkerResponse {
-                                        mode,
-                                        snapshot: None,
-                                    });
-                                }
+                            if let Some(marker) = &mut self.marker
+                                && marker.kind == MarkerKind::Drain
+                                && marker.sequence == sequence
+                            {
+                                marker.response = Some(MarkerResponse {
+                                    mode,
+                                    snapshot: None,
+                                });
                             }
                         }
                         "drost_snapshot" => {
@@ -528,12 +518,18 @@ impl Session {
                                 text: lines.join("\n"),
                                 cursor,
                             };
-                            let draft = self.drafts.get_mut(&key).unwrap();
+                            let draft = self
+                                .drafts
+                                .get_mut(&key)
+                                .context("Neovim draft is no longer available")?;
                             draft.snapshot = snapshot.clone();
                             draft.lines = lines;
                             draft.pending_lines = None;
                             self.events.emit(NvimEvent::DraftChanged(snapshot.clone()));
-                            self.marker.as_mut().unwrap().response = Some(MarkerResponse {
+                            self.marker
+                                .as_mut()
+                                .context("Neovim snapshot marker is no longer active")?
+                                .response = Some(MarkerResponse {
                                 mode,
                                 snapshot: Some(snapshot),
                             });
@@ -541,35 +537,16 @@ impl Session {
                         "drost_cursor" => {
                             ensure!(args.len() >= 4, "Malformed cursor callback");
                             if let Some(key) = self.key_for(&args[1])? {
-                                let draft = self.drafts.get_mut(&key).unwrap();
+                                let draft = self
+                                    .drafts
+                                    .get_mut(&key)
+                                    .context("Neovim draft is no longer available")?;
                                 let tick =
                                     args[2].as_u64().context("Invalid cursor changedtick")?;
                                 if tick == draft.snapshot.changedtick {
                                     draft.snapshot.cursor = parse_cursor(&args[3])?;
                                     self.events
                                         .emit(NvimEvent::DraftChanged(draft.snapshot.clone()));
-                                }
-                            }
-                        }
-                        "drost_focus_pane" => {
-                            ensure!(args.len() == 3, "Malformed pane-focus callback");
-                            let direction = match args[2].as_str() {
-                                Some("left") => PaneDirection::Left,
-                                Some("down") => PaneDirection::Down,
-                                Some("up") => PaneDirection::Up,
-                                Some("right") => PaneDirection::Right,
-                                _ => bail!("Invalid pane-focus direction"),
-                            };
-                            if let Some(key) = self.key_for(&args[1])? {
-                                if self.active.as_ref() == Some(&key)
-                                    && !self.composition
-                                    && !self.frozen
-                                {
-                                    self.events.emit(NvimEvent::FocusPane {
-                                        key,
-                                        generation: self.generation,
-                                        direction,
-                                    });
                                 }
                             }
                         }
@@ -620,7 +597,10 @@ impl Session {
         let last = args[3].as_i64().context("Invalid last changed line")?;
         let replacement = strings(&args[4])?;
         let more = args[5].as_bool().context("Invalid buffer chunk flag")?;
-        let draft = self.drafts.get_mut(&key).unwrap();
+        let draft = self
+            .drafts
+            .get_mut(&key)
+            .context("Neovim draft is no longer available")?;
         let lines = draft
             .pending_lines
             .get_or_insert_with(|| draft.lines.clone());
@@ -635,7 +615,10 @@ impl Session {
         );
         lines.splice(first..last, replacement);
         if !more {
-            draft.lines = draft.pending_lines.take().unwrap();
+            draft.lines = draft
+                .pending_lines
+                .take()
+                .context("Neovim line update is incomplete")?;
             if draft.lines.is_empty() {
                 draft.lines.push(String::new());
             }
@@ -730,7 +713,10 @@ impl Session {
             !mode.starts_with('c') && !mode.starts_with('r'),
             "Complete or cancel the Neovim command line before submitting or switching drafts"
         );
-        self.drafts.get_mut(&key).unwrap().insert = mode.starts_with('i');
+        self.drafts
+            .get_mut(&key)
+            .context("Neovim draft is no longer available")?
+            .insert = mode.starts_with('i');
         let snapshot = self
             .marker(MarkerKind::Snapshot)
             .await?
@@ -770,9 +756,11 @@ impl Session {
             },
         );
         self.lua("local b=...; vim.bo[b].buftype='nofile'; vim.bo[b].bufhidden='hide'; vim.bo[b].swapfile=false; vim.bo[b].undofile=false; drost.attach(b)", vec![handle.clone()]).await?;
+        // Keep the retained recovery text until the seed write succeeds. An
+        // initial empty-buffer notification would erase it on a failed restart.
         self.call(
             "nvim_buf_attach",
-            vec![handle.clone(), true.into(), Value::Map(vec![])],
+            vec![handle.clone(), false.into(), Value::Map(vec![])],
         )
         .await?;
         self.call(
@@ -810,7 +798,10 @@ impl Session {
             text: lines.join("\n"),
             cursor,
         };
-        let draft = self.drafts.get_mut(key).unwrap();
+        let draft = self
+            .drafts
+            .get_mut(key)
+            .context("Neovim draft is no longer available")?;
         draft.snapshot = snapshot.clone();
         draft.lines = lines;
         draft.pending_lines = None;
@@ -857,7 +848,11 @@ impl Session {
         }
         let mut snapshot = self.drafts[&key].snapshot.clone();
         snapshot.cursor = (row, col);
-        self.drafts.get_mut(&key).unwrap().snapshot.cursor = (row, col);
+        self.drafts
+            .get_mut(&key)
+            .context("Neovim draft is no longer available")?
+            .snapshot
+            .cursor = (row, col);
         self.events.emit(NvimEvent::DraftActivated(snapshot));
         Ok(())
     }
@@ -1154,14 +1149,30 @@ impl Session {
                 }
                 let _ = reply.try_send(result);
             }
-            NvimCommand::SetTheme(theme) => {
-                self.theme = Some(theme);
-                if let Err(error) = self.apply_theme(theme).await {
-                    self.fail(format!("Editor theme could not be applied: {error:#}"));
-                }
-            }
             NvimCommand::ResumeInput => self.frozen = false,
             NvimCommand::SetComposition(value) => self.composition = value,
+            NvimCommand::Theme {
+                foreground,
+                background,
+                selection,
+                caret,
+            } => {
+                let colors = [foreground, background, selection, caret];
+                if colors.iter().any(|color| *color > 0xffffff) {
+                    self.events.emit(NvimEvent::InputRejected(
+                        "Neovim theme colors must be packed 24-bit RGB".into(),
+                    ));
+                    return;
+                }
+                self.theme = Some(colors);
+                // Theme updates are non-editing and remain valid while input is
+                // frozen. Retain the newest colors through failed restarts.
+                if self.failed.is_none()
+                    && let Err(error) = self.apply_theme(colors).await
+                {
+                    self.fail(format!("Could not apply editor theme: {error:#}"));
+                }
+            }
             NvimCommand::OpenDraft { key, text, reply } => {
                 let result = async {
                     self.available()?;

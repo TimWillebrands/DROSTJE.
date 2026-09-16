@@ -1311,7 +1311,7 @@ mod tests {
             ])?;
             let before = reducer.snapshot();
             reducer
-                .apply(&[bad.clone()])
+                .apply(std::slice::from_ref(&bad))
                 .expect_err("malformed redraw must fail");
             let after = reducer.snapshot();
             assert_eq!(

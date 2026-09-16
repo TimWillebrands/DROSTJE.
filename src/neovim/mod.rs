@@ -1,45 +1,12 @@
 //! One real, isolated Neovim instance per workspace window.
 pub mod grid;
-pub mod input;
 mod rpc;
 mod session;
 
+use crate::model::{DraftKey, DraftRevision, DraftSnapshot};
 use anyhow::{Result, anyhow};
 use async_channel::{Receiver, Sender};
-pub use input::{NvimView, NvimViewEvent};
-use serde::{Deserialize, Serialize};
 use std::{ops::Range, path::PathBuf, sync::Arc};
-use uuid::Uuid;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum DraftKey {
-    Thread(Uuid),
-    Extension { thread: Uuid, request: String },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DraftRevision {
-    pub generation: Uuid,
-    pub changedtick: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DraftSnapshot {
-    pub key: DraftKey,
-    pub generation: Uuid,
-    pub changedtick: u64,
-    pub text: String,
-    /// Zero-based buffer row and UTF-8 byte column (not screen cells).
-    pub cursor: (usize, usize),
-}
-impl DraftSnapshot {
-    pub fn revision(&self) -> DraftRevision {
-        DraftRevision {
-            generation: self.generation,
-            changedtick: self.changedtick,
-        }
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardContent {
@@ -57,26 +24,11 @@ impl ClipboardContent {
     }
 }
 
-/// Opaque RGB colors resolved from the workspace's active theme.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NvimTheme {
-    pub dark: bool,
-    pub background: u32,
-    pub foreground: u32,
-    pub popover: u32,
-    pub popover_foreground: u32,
-    pub selection: u32,
-    pub caret: u32,
-    pub primary: u32,
-    pub primary_foreground: u32,
-}
-
 #[derive(Clone, Debug)]
 pub struct NvimConfig {
     pub executable: PathBuf,
     pub cols: u32,
     pub rows: u32,
-    pub initial_theme: Option<NvimTheme>,
 }
 impl NvimConfig {
     pub fn new(executable: PathBuf) -> Self {
@@ -84,7 +36,6 @@ impl NvimConfig {
             executable,
             cols: 80,
             rows: 12,
-            initial_theme: None,
         }
     }
 }
@@ -93,11 +44,6 @@ pub enum NvimEvent {
     Grid(Arc<grid::GridSnapshot>),
     DraftChanged(DraftSnapshot),
     DraftActivated(DraftSnapshot),
-    FocusPane {
-        key: DraftKey,
-        generation: Uuid,
-        direction: crate::model::PaneDirection,
-    },
     ClipboardGet {
         reply: Sender<std::result::Result<ClipboardContent, String>>,
     },
@@ -124,8 +70,14 @@ pub enum NvimCommand {
         cols: u32,
         rows: u32,
     },
+    /// Packed 24-bit RGB colors from the current kit theme.
+    Theme {
+        foreground: u32,
+        background: u32,
+        selection: u32,
+        caret: u32,
+    },
     Focus(bool),
-    SetTheme(NvimTheme),
     SetComposition(bool),
     Replace {
         key: DraftKey,

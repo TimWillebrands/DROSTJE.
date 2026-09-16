@@ -1,8 +1,7 @@
 use super::workspace::Workspace;
 use crate::{
     harness::{UserAnswer, UserRequest, UserRequestKind},
-    model::ThreadId,
-    neovim::DraftKey,
+    model::{DraftKey, ThreadId},
 };
 use gpui_kit::{
     component::{
@@ -23,8 +22,8 @@ pub struct ExtensionForm {
     pub thread: ThreadId,
     pub request: UserRequest,
     pub input: Option<Entity<InputState>>,
-    pub pending: bool,
     error: Option<String>,
+    submitting: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -44,13 +43,12 @@ struct DetailContent {
 impl Workspace {
     fn extension_busy(&self, cx: &App) -> bool {
         self.extension.as_ref().is_some_and(|form| {
-            form.pending
+            form.submitting
                 || (form.request.kind == UserRequestKind::Editor
-                    && (self.editor_switching
-                        || self
-                            .editor
-                            .as_ref()
-                            .is_some_and(|editor| editor.read(cx).has_composition())))
+                    && self
+                        .editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.read(cx).has_composition()))
         })
     }
 
@@ -61,7 +59,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.state.read(cx).shutting_down || self.extension.is_some() {
+        if self.state.read(cx).shutting_down
+            || self.extension.is_some()
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).has_composition())
+        {
             return;
         }
         if !self
@@ -97,8 +101,8 @@ impl Workspace {
             thread,
             request,
             input,
-            pending: false,
             error: None,
+            submitting: false,
         });
         // Open before focusing the input/editor so Root remembers the actual trigger.
         self.sync_detail_surface(window, cx);
@@ -157,25 +161,33 @@ impl Workspace {
             self.close_extension(false, window, cx);
             return;
         }
-        let Some(editor) = self.state.read(cx).editor.clone() else {
+        let Some(editor) = self.editor.clone() else {
             return;
         };
-        form.pending = true;
-        form.error = None;
+        let key = DraftKey::Extension {
+            thread: id,
+            request: request_id.clone(),
+        };
+        if editor.read(cx).active_key() != Some(&key) {
+            form.error = Some("Complete or cancel composition in the previous draft first".into());
+            cx.notify();
+            return;
+        }
+        let result = editor.update(cx, |editor, cx| editor.snapshot(&key, window, cx));
+        form.submitting = true;
         cx.notify();
         cx.spawn_in(window, async move |workspace, window| {
-            let result = editor
-                .snapshot(DraftKey::Extension {
-                    thread: id,
-                    request: request_id.clone(),
-                })
-                .await;
+            let result = result.await;
             let _ = workspace.update_in(window, |workspace, window, cx| {
-                // A dismissed request's late snapshot must never close a newer surface.
-                if !workspace.extension.as_ref().is_some_and(|form| {
-                    form.thread == id && form.request.id == request_id && form.pending
-                }) {
+                if !workspace
+                    .extension
+                    .as_ref()
+                    .is_some_and(|form| form.thread == id && form.request.id == request_id)
+                {
                     return;
+                }
+                if let Some(form) = &mut workspace.extension {
+                    form.submitting = false;
                 }
                 let still_pending = workspace
                     .state
@@ -197,16 +209,8 @@ impl Workspace {
                     }
                     Err(error) => {
                         if let Some(form) = &mut workspace.extension {
-                            form.pending = false;
                             form.error = Some(format!("Extension answer was not sent: {error:#}"));
                         }
-                        workspace.state.update(cx, |state, cx| {
-                            state.notice(
-                                crate::app::NoticeLevel::Error,
-                                format!("Extension answer was not sent: {error:#}"),
-                            );
-                            cx.notify();
-                        });
                         cx.notify();
                     }
                 }
@@ -345,15 +349,11 @@ impl Workspace {
                                 .child(
                                     Button::new("confirm-extension")
                                         .primary()
-                                        .label(if extension.is_some_and(|form| form.pending) {
-                                            "Reading editor snapshot…"
-                                        } else {
-                                            "Send answer"
-                                        })
+                                        .label("Send answer")
                                         .disabled(
                                             busy || workspace.is_some_and(|workspace| {
                                                 workspace.editor_override.is_some()
-                                                    && workspace.state.read(cx).editor.is_none()
+                                                    && workspace.editor.is_none()
                                             }),
                                         )
                                         .on_click(move |_, window, cx| {
@@ -463,11 +463,9 @@ impl Render for DetailContent {
                     .overflow_y_scroll();
                 if let Some(input) = &form.input {
                     body = body.child(
-                        Field::new().label("Answer").child(
-                            div()
-                                .key_context("NativeInput")
-                                .child(Input::new(input).disabled(form.pending)),
-                        ),
+                        Field::new()
+                            .label("Answer")
+                            .child(div().key_context("NativeInput").child(Input::new(input))),
                     );
                 } else if let Some(editor) = &workspace.editor {
                     body = body.child(
@@ -478,22 +476,6 @@ impl Render for DetailContent {
                 }
                 if let Some(error) = &form.error {
                     body = body.child(div().text_color(cx.theme().danger).child(error.clone()));
-                }
-                if let Some(error) = &workspace.state.read(cx).editor_error {
-                    let restart = self.owner.clone();
-                    body = body
-                        .child(div().text_color(cx.theme().danger).child(error.clone()))
-                        .child(
-                            Button::new("extension-restart-editor")
-                                .small()
-                                .label("Restart editor")
-                                .disabled(form.pending)
-                                .on_click(move |_, window, cx| {
-                                    let _ = restart.update(cx, |workspace, cx| {
-                                        workspace.restart_editor(window, cx)
-                                    });
-                                }),
-                        );
                 }
                 body.into_any_element()
             }

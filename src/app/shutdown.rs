@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct Shutdown {
-    editor: Option<NvimEditor>,
+    editor: Option<crate::neovim::NvimEditor>,
     sessions: Vec<(bool, async_channel::Sender<ConversationCommand>)>,
     drains: Vec<async_channel::Receiver<()>>,
     writes: async_channel::Sender<Write>,
@@ -30,33 +30,7 @@ impl Shutdown {
         }
     }
 
-    pub(super) async fn run(
-        self,
-        state: Entity<AppState>,
-        cx: &mut AsyncApp,
-        allow_data_loss: bool,
-    ) -> Result<()> {
-        if let Some(editor) = &self.editor {
-            match editor.persistence_barrier().await {
-                Ok(drafts) => cx.update(|cx| {
-                    state.update(cx, |state, cx| {
-                        for draft in drafts {
-                            state.record_draft(draft);
-                        }
-                        cx.notify();
-                    })
-                }),
-                Err(error) => {
-                    if !allow_data_loss {
-                        let _ = editor.resume_input().await;
-                        return Err(error.context("Final editor snapshot failed; cancel the editor command or copy draft recovery before quitting"));
-                    }
-                    eprintln!(
-                        "Quitting with retained cached drafts after explicit confirmation: {error:#}"
-                    );
-                }
-            }
-        }
+    pub(super) async fn run(self, allow_data_loss: bool) -> Result<()> {
         for (active, commands) in &self.sessions {
             if *active {
                 let _ = commands.send(ConversationCommand::Interrupt).await;
@@ -79,8 +53,12 @@ impl Shutdown {
         };
         if let Err(error) = flushed {
             if !allow_data_loss {
-                if let Some(editor) = &self.editor {
-                    let _ = editor.resume_input().await;
+                if let Some(editor) = &self.editor
+                    && let Err(resume_error) = editor.resume_input().await
+                {
+                    return Err(error.context(format!(
+                        "Final persistence failed and Neovim input could not resume: {resume_error:#}; copy draft recovery before quitting"
+                    )));
                 }
                 return Err(
                     error.context("Final persistence failed; copy draft recovery before quitting")
@@ -90,10 +68,10 @@ impl Shutdown {
                 "Quitting without a successful final flush after explicit confirmation: {error:#}"
             );
         }
-        if let Some(editor) = self.editor {
-            if let Err(error) = editor.shutdown().await {
-                eprintln!("Neovim shutdown: {error:#}");
-            }
+        if let Some(editor) = self.editor
+            && let Err(error) = editor.shutdown().await
+        {
+            eprintln!("Neovim shutdown: {error:#}");
         }
         Ok(())
     }
@@ -102,6 +80,8 @@ impl Shutdown {
 impl AppState {
     /// Run while the foreground event loop and windows still exist. GPUI's final
     /// platform shutdown hook allows only 200ms, not enough for durable I/O or RPC.
+    /// The caller must quiesce Neovim and record its persistence-barrier snapshots
+    /// before starting shutdown so the final flush includes every live draft.
     pub fn begin_shutdown(&mut self, allow_data_loss: bool, cx: &mut Context<Self>) {
         if self.shutting_down {
             return;
@@ -109,9 +89,8 @@ impl AppState {
         self.shutting_down = true;
         self.shutdown_error = None;
         let shutdown = Shutdown::new(self);
-        let state = cx.entity();
         cx.spawn(async move |this, cx| {
-            let result = shutdown.run(state, cx, allow_data_loss).await;
+            let result = shutdown.run(allow_data_loss).await;
             let _ = this.update(cx, |state, cx| match result {
                 Ok(()) => {
                     state.factory = None;

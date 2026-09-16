@@ -10,9 +10,18 @@ use crate::{
 use gpui_kit::{
     component::{
         ActiveTheme, Disableable, IconName, Sizable,
+        alert::Alert,
+        attachment::{
+            Attachment, AttachmentActions, AttachmentContent, AttachmentDescription,
+            AttachmentMedia, AttachmentTitle,
+        },
+        bubble::{Bubble, BubbleVariant},
         button::{Button, ButtonVariants},
         h_flex,
         menu::{DropdownMenu, PopupMenuItem},
+        message::{
+            Message as MessageView, MessageAlignment, MessageContent, MessageFooter, MessageHeader,
+        },
         searchable_list::SearchableListItem,
         select::{Select, SelectEvent, SelectState},
         text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, markdown, markdown_ast},
@@ -213,45 +222,54 @@ pub fn markdown_text(text: String) -> impl IntoElement {
 pub fn image_thumbnail(
     image: &ImageAttachment,
     owner: &WeakEntity<Workspace>,
-    cx: &App,
+    _cx: &App,
 ) -> AnyElement {
     let preview = image.clone();
     let owner = owner.clone();
-    v_flex()
-        .gap_1()
-        .child(
-            div()
-                .id(SharedString::from(format!("image-{}", image.id)))
-                .cursor_default()
-                .child(
-                    img(image.path.clone())
-                        .w(rems(8.))
-                        .h(rems(6.))
-                        .object_fit(ObjectFit::Contain),
-                )
-                .on_click(move |_, window, cx| {
-                    let _ = owner.update(cx, |workspace, cx| {
-                        workspace.image_preview = Some(preview.clone());
-                        workspace.sync_detail_surface(window, cx);
-                        cx.notify();
-                    });
-                }),
+    let open_preview = move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+        cx.stop_propagation();
+        let _ = owner.update(cx, |workspace, cx| {
+            workspace.image_preview = Some(preview.clone());
+            workspace.sync_detail_surface(window, cx);
+            cx.notify();
+        });
+    };
+    Attachment::new()
+        .id(SharedString::from(format!("image-{}", image.id)))
+        .media(
+            AttachmentMedia::new().w(rems(8.)).h(rems(6.)).child(
+                img(image.path.clone())
+                    .w_full()
+                    .h_full()
+                    .object_fit(ObjectFit::Contain),
+            ),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!(
-                    "{} × {} · {}{}",
-                    image.width,
-                    image.height,
+        .content(
+            AttachmentContent::new()
+                .title(AttachmentTitle::new(format!(
+                    "{} × {}",
+                    image.width, image.height
+                )))
+                .description(AttachmentDescription::new(format!(
+                    "{}{}",
                     image.mime,
                     if image.original.is_some() {
                         " · prepared"
                     } else {
                         ""
                     }
-                )),
+                ))),
+        )
+        .on_click(open_preview.clone())
+        .actions(
+            AttachmentActions::new().child(
+                Button::new(SharedString::from(format!("preview-image-{}", image.id)))
+                    .small()
+                    .ghost()
+                    .label("Preview")
+                    .tooltip("Preview image")
+                    .on_click(open_preview),
+            ),
         )
         .into_any_element()
 }
@@ -300,15 +318,16 @@ pub(super) fn block(
                 .into_any_element()
         }
         ContentBlock::Image(image) => image_thumbnail(image, owner, cx),
-        ContentBlock::ImageError(error) => div()
-            .text_color(cx.theme().danger)
-            .child(format!("Image unavailable: {error}"))
-            .into_any_element(),
+        ContentBlock::ImageError(error) => Alert::error(
+            SharedString::from(identity),
+            format!("Image unavailable: {error}"),
+        )
+        .small()
+        .into_any_element(),
     }
 }
 fn message(
     message: Arc<Message>,
-    index: usize,
     id: ThreadId,
     owner: &WeakEntity<Workspace>,
     cx: &App,
@@ -319,6 +338,7 @@ fn message(
     let expanded = owner
         .upgrade()
         .is_some_and(|owner| owner.read(cx).expanded.contains(&raw_key));
+    let user_message = message.role == "user";
     let tool_result = message.role == "toolResult";
     let result_key = format!("tool-result:{id}:{}", message.id);
     let show_result = !tool_result
@@ -326,92 +346,84 @@ fn message(
             .upgrade()
             .is_some_and(|owner| owner.read(cx).expanded.contains(&result_key));
     let menu_owner = owner.clone();
-    let mut body = v_flex()
-        .gap_2()
-        .py_3()
-        .id(SharedString::from(format!("message-{id}-{}", message.id)))
-        .child(
-            h_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(message.role.clone()),
-                )
-                .child(
-                    Button::new(("message-actions", index))
-                        .small()
-                        .ghost()
-                        .icon(IconName::Ellipsis)
-                        .tooltip("Message actions")
-                        .dropdown_menu(move |menu, _, _| {
-                            let copy_message = copy_message.clone();
-                            let owner = menu_owner.clone();
-                            let key = raw_key.clone();
-                            let result_owner = menu_owner.clone();
-                            let result_key = result_key.clone();
-                            menu.item(PopupMenuItem::new("Copy").on_click(move |_, _, cx| {
-                                let copy = copy_message
-                                    .content
-                                    .iter()
-                                    .filter_map(|block| match block {
-                                        ContentBlock::Text(text) => Some(text.as_str()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n\n");
-                                cx.write_to_clipboard(ClipboardItem::new_string(copy));
-                            }))
-                            .when(tool_result, |menu| {
-                                menu.item(
-                                    PopupMenuItem::new(if show_result {
-                                        "Collapse tool result"
-                                    } else {
-                                        "Show tool result"
-                                    })
-                                    .on_click(
-                                        move |_, _, cx| {
-                                            let _ = result_owner.update(cx, |workspace, cx| {
-                                                if !workspace.expanded.remove(&result_key) {
-                                                    workspace.expanded.insert(result_key.clone());
-                                                }
-                                                cx.notify();
-                                            });
-                                        },
-                                    ),
-                                )
-                            })
-                            .when(has_raw, |menu| {
-                                menu.item(PopupMenuItem::new("Diagnostic payload").on_click(
-                                    move |_, _, cx| {
-                                        let _ = owner.update(cx, |workspace, cx| {
-                                            if !workspace.expanded.remove(&key) {
-                                                workspace.expanded.insert(key.clone());
-                                            }
-                                            cx.notify();
-                                        });
-                                    },
-                                ))
-                            })
-                        }),
-                ),
-        );
+    let actions = Button::new(SharedString::from(format!(
+        "message-actions-{id}-{}",
+        message.id
+    )))
+    .small()
+    .ghost()
+    .icon(IconName::Ellipsis)
+    .tooltip("Message actions")
+    .dropdown_menu(move |menu, _, _| {
+        let copy_message = copy_message.clone();
+        let owner = menu_owner.clone();
+        let key = raw_key.clone();
+        let result_owner = menu_owner.clone();
+        let result_key = result_key.clone();
+        menu.item(PopupMenuItem::new("Copy").on_click(move |_, _, cx| {
+            let copy = copy_message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            cx.write_to_clipboard(ClipboardItem::new_string(copy));
+        }))
+        .when(tool_result, |menu| {
+            menu.item(
+                PopupMenuItem::new(if show_result {
+                    "Collapse tool result"
+                } else {
+                    "Show tool result"
+                })
+                .on_click(move |_, _, cx| {
+                    let _ = result_owner.update(cx, |workspace, cx| {
+                        if !workspace.expanded.remove(&result_key) {
+                            workspace.expanded.insert(result_key.clone());
+                        }
+                        cx.notify();
+                    });
+                }),
+            )
+        })
+        .when(has_raw, |menu| {
+            menu.item(
+                PopupMenuItem::new("Diagnostic payload").on_click(move |_, _, cx| {
+                    let _ = owner.update(cx, |workspace, cx| {
+                        if !workspace.expanded.remove(&key) {
+                            workspace.expanded.insert(key.clone());
+                        }
+                        cx.notify();
+                    });
+                }),
+            )
+        })
+    });
+    let mut content = MessageContent::new();
     if show_result {
-        for (part, content) in message.content.iter().enumerate() {
-            body = body.child(block(
-                content,
-                format!("{id}:{}:{part}", message.id),
-                owner,
-                cx,
-            ));
+        for (part, item) in message.content.iter().enumerate() {
+            let rendered = block(item, format!("{id}:{}:{part}", message.id), owner, cx);
+            content = if user_message && matches!(item, ContentBlock::Text(_)) {
+                content.bubble(
+                    Bubble::new()
+                        .with_variant(BubbleVariant::Secondary)
+                        .child(rendered),
+                )
+            } else if matches!(item, ContentBlock::Image(_)) {
+                content.child(rendered)
+            } else {
+                content.child(div().w_full().min_w_0().child(rendered))
+            };
         }
     }
     if expanded {
         if let Some(raw) = &message.raw {
-            body = body.child(
+            content = content.child(
                 div()
+                    .min_w_0()
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
                     .whitespace_normal()
@@ -419,7 +431,32 @@ fn message(
             );
         }
     }
-    inset(body)
+    inset(
+        div()
+            .w_full()
+            .min_w_0()
+            .id(SharedString::from(format!("message-{id}-{}", message.id)))
+            .child(
+                MessageView::new()
+                    .py_3()
+                    .alignment(if user_message {
+                        MessageAlignment::End
+                    } else {
+                        MessageAlignment::Start
+                    })
+                    .header(
+                        MessageHeader::new()
+                            .content_inset(user_message)
+                            .child(message.role.clone()),
+                    )
+                    .content(content)
+                    .footer(
+                        MessageFooter::new()
+                            .content_inset(user_message)
+                            .child(actions),
+                    ),
+            ),
+    )
 }
 
 pub fn render(
@@ -450,50 +487,80 @@ pub fn render(
                 }
             });
         });
-    let Some(project) = state.project() else {
+    let (Some(project), Some(thread)) = (state.project(), state.conversation_thread()) else {
+        let has_project = state.project().is_some();
+        let actions = h_flex()
+            .gap_2()
+            .flex_wrap()
+            .justify_center()
+            .when(has_project, |row| {
+                row.child(
+                    button(
+                        "empty-new-conversation",
+                        Command::NewConversation,
+                        owner,
+                        state,
+                    )
+                    .outline()
+                    .debug_selector(|| "empty-new-conversation".into()),
+                )
+                .child(
+                    button("empty-new-factory", Command::NewFactoryThread, owner, state)
+                        .outline()
+                        .debug_selector(|| "empty-new-factory".into()),
+                )
+            })
+            .when(!has_project, |row| {
+                row.child(
+                    button("empty-add-project", Command::AddProject, owner, state)
+                        .outline()
+                        .debug_selector(|| "empty-add-project".into()),
+                )
+            });
         return root
+            .items_center()
+            .justify_center()
+            .p_6()
             .child(
-                div()
-                    .p_5()
-                    .child("Register a Git working tree to start coding."),
+                v_flex()
+                    .w_full()
+                    .max_w(rems(30.))
+                    .items_center()
+                    .gap_3()
+                    .text_center()
+                    .child(div().text_lg().child(if has_project {
+                        "No thread selected"
+                    } else {
+                        "Open a project"
+                    }))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if has_project {
+                                "Choose a thread from Projects, or start a new one."
+                            } else {
+                                "Add a Git working tree to start a Conversation or Factory thread."
+                            }),
+                    )
+                    .child(actions),
             )
-            .child(button(
-                "empty-add-project",
-                Command::AddProject,
-                owner,
-                state,
-            ))
-            .into_any_element();
-    };
-    let Some(thread) = state.conversation_thread() else {
-        return root
-            .child("Start a Conversation or Factory thread")
-            .child(button(
-                "empty-new-conversation",
-                Command::NewConversation,
-                owner,
-                state,
-            ))
-            .child(button(
-                "empty-new-factory",
-                Command::NewFactoryThread,
-                owner,
-                state,
-            ))
             .into_any_element();
     };
     let id = thread.id;
     if let Some(Err(error)) = state.repositories.get(&project.id) {
         root = root.child(
-            div()
-                .text_color(cx.theme().danger)
-                .child(format!("Root unavailable: {error}")),
+            Alert::error(
+                "conversation-root-error",
+                format!("Root unavailable: {error}"),
+            )
+            .small(),
         );
     }
     if let Some(session) = state.conversations.get(&id) {
         if let Some(error) = &session.error {
             root = root.child(inset(
-                div().text_color(cx.theme().danger).child(error.clone()),
+                Alert::error("conversation-session-error", error.clone()).small(),
             ));
         }
         let state_entity = owner.upgrade().map(|owner| owner.read(cx).state.clone());
@@ -506,7 +573,7 @@ pub fn render(
                     .and_then(|session| session.messages.get(index))
                     .cloned();
                 current
-                    .map(|current| message(current, index, id, &history_owner, cx))
+                    .map(|current| message(current, id, &history_owner, cx))
                     .unwrap_or_else(|| div().into_any_element())
             })
             .flex_1()
@@ -733,7 +800,9 @@ pub fn render(
     }
     if let Some(workspace) = owner.upgrade() {
         if let Some(editor) = workspace.read(cx).editor.clone() {
-            if workspace.read(cx).editor_override.is_none() {
+            if workspace.read(cx).editor_override.is_none()
+                && workspace.read(cx).editor_selection == Some(crate::model::DraftKey::Thread(id))
+            {
                 composer = composer.child(
                     div()
                         .h(rems(8.))
@@ -746,41 +815,6 @@ pub fn render(
                 );
             }
         }
-    }
-    if let Some(error) = &state.editor_error {
-        let restart = owner.clone();
-        let recovery = owner.clone();
-        composer = composer.child(
-            v_flex()
-                .gap_1()
-                .child(div().text_color(cx.theme().danger).child(error.clone()))
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new("recover-editor")
-                                .small()
-                                .ghost()
-                                .label("Restart editor")
-                                .on_click(move |_, window, cx| {
-                                    let _ = restart.update(cx, |workspace, cx| {
-                                        workspace.restart_editor(window, cx)
-                                    });
-                                }),
-                        )
-                        .child(
-                            Button::new("recover-editor-copy")
-                                .small()
-                                .ghost()
-                                .label("Copy recovery")
-                                .on_click(move |_, _, cx| {
-                                    let _ = recovery.update(cx, |workspace, cx| {
-                                        workspace.copy_draft_recovery(cx)
-                                    });
-                                }),
-                        ),
-                ),
-        );
     }
     let active = state.active_threads.contains(&id);
     let mut controls = h_flex().flex_wrap().flex_shrink_0().gap_1();
@@ -852,8 +886,6 @@ pub fn render(
                 .dropdown_menu(move |menu, _, _| {
                     let details = menu_owner.clone();
                     let optimize = menu_owner.clone();
-                    let restart = menu_owner.clone();
-                    let cancel = menu_owner.clone();
                     let recovery = menu_owner.clone();
                     menu.item(PopupMenuItem::new("Thread details").on_click(
                         move |_, window, cx| {
@@ -871,19 +903,6 @@ pub fn render(
                                 });
                             }),
                     )
-                    .item(
-                        PopupMenuItem::new("Restart editor").on_click(move |_, window, cx| {
-                            let _ = restart
-                                .update(cx, |workspace, cx| workspace.restart_editor(window, cx));
-                        }),
-                    )
-                    .item(PopupMenuItem::new("Cancel editor command").on_click(
-                        move |_, window, cx| {
-                            let _ = cancel.update(cx, |workspace, cx| {
-                                workspace.cancel_editor_command(window, cx)
-                            });
-                        },
-                    ))
                     .item(
                         PopupMenuItem::new("Copy recovery").on_click(move |_, _, cx| {
                             let _ = recovery
@@ -924,14 +943,14 @@ pub fn render(
                 }),
         );
     }
-    // A definite bounded height propagates through the inset wrapper so Neovim shrinks,
+    // A definite bounded height propagates through the inset wrapper so the editor shrinks,
     // rather than overflowing the actions or introducing a second transcript scroller.
-    let preferred_height =
-        11. + if thread.attachments.is_empty() {
+    let preferred_height = 11.
+        + if thread.attachments.is_empty() {
             0.
         } else {
             9.
-        } + if state.editor_error.is_some() { 4. } else { 0. };
+        };
     root.child(
         h_flex()
             .w_full()
