@@ -1,4 +1,4 @@
-use drost::{
+use drostje::{
     factory::{
         FactoryLaunchSpec, FactoryManager, FactorySource, Liveness, ReportedState, check_readiness,
     },
@@ -23,7 +23,7 @@ use uuid::Uuid;
 struct TempDirectory(PathBuf);
 impl TempDirectory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("drost-factory-launch-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("drostje-factory-launch-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         Self(fs::canonicalize(path).unwrap())
     }
@@ -55,9 +55,9 @@ impl Fixture {
             &repo,
             &[
                 "-c",
-                "user.name=Drost",
+                "user.name=DROSTJE.",
                 "-c",
-                "user.email=drost@example.invalid",
+                "user.email=drostje@example.invalid",
                 "-c",
                 "commit.gpgsign=false",
                 "commit",
@@ -65,7 +65,7 @@ impl Fixture {
                 "Factory launcher fixture",
             ],
         );
-        let data = directory.0.join("drost-data");
+        let data = directory.0.join("drostje-data");
         let store = Store::open(data.clone()).unwrap();
         let project = Project {
             id: Uuid::new_v4(),
@@ -176,7 +176,7 @@ esac
     }
 
     async fn disable_storage(&self) {
-        let blocker = Connection::open(self.data.join("drost.sqlite3")).unwrap();
+        let blocker = Connection::open(self.data.join("drostje.sqlite3")).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert!(
             self.store

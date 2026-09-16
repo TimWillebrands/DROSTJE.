@@ -432,7 +432,7 @@ impl AppState {
             });
             async move {
                 // Last-resort best effort for platform termination that bypasses
-                // Drost's quit action. Normal quit has already completed cleanup.
+                // the DROSTJE. quit action. Normal quit has already completed cleanup.
                 if let Some(shutdown) = shutdown {
                     if let Err(error) = shutdown.run(true).await {
                         eprintln!("Forced platform shutdown: {error:#}");

@@ -1,7 +1,7 @@
 local channel, generation = ...
 local api = vim.api
 local bridge = { sequence = 0, generation = generation, channel = channel }
-_G.drost = bridge
+_G.drostje = bridge
 
 local function notify(name, ...)
   vim.rpcnotify(channel, name, generation, ...)
@@ -13,22 +13,22 @@ local function cursor(buf)
 end
 function bridge.drain()
   bridge.sequence = bridge.sequence + 1
-  notify('drost_drain', bridge.sequence, vim.fn.mode(1))
+  notify('drostje_drain', bridge.sequence, vim.fn.mode(1))
 end
 function bridge.snapshot()
   local buf = api.nvim_get_current_buf()
   bridge.sequence = bridge.sequence + 1
-  notify('drost_snapshot', bridge.sequence, buf, api.nvim_buf_get_changedtick(buf),
+  notify('drostje_snapshot', bridge.sequence, buf, api.nvim_buf_get_changedtick(buf),
     api.nvim_buf_get_lines(buf, 0, -1, true), cursor(buf), vim.fn.mode(1))
 end
 function bridge.attach(buf)
   for _, mode in ipairs({ 'n', 'i', 'x', 's' }) do
-    vim.keymap.set(mode, '<F24>', '<Cmd>lua drost.snapshot()<CR>',
+    vim.keymap.set(mode, '<F24>', '<Cmd>lua drostje.snapshot()<CR>',
       { buffer = buf, silent = true, nowait = true })
   end
 end
 for _, mode in ipairs({ 'n', 'i', 'x', 's', 'o' }) do
-  vim.keymap.set(mode, '<F23>', '<Cmd>lua drost.drain()<CR>', { silent = true, nowait = true })
+  vim.keymap.set(mode, '<F23>', '<Cmd>lua drostje.drain()<CR>', { silent = true, nowait = true })
 end
 vim.keymap.set('c', '<F23>', function()
   bridge.drain()
@@ -38,14 +38,14 @@ end, { expr = true, silent = true, nowait = true })
 -- RPC requests are deliberately uncached. The host services these on GPUI's
 -- thread while its MessagePack reader remains free to handle nested requests.
 vim.g.clipboard = {
-  name = 'Drost native clipboard',
+  name = 'DROSTJE. native clipboard',
   copy = {
-    ['+'] = function(lines, regtype) notify('drost_clipboard_set', lines, regtype) end,
-    ['*'] = function(lines, regtype) notify('drost_clipboard_set', lines, regtype) end,
+    ['+'] = function(lines, regtype) notify('drostje_clipboard_set', lines, regtype) end,
+    ['*'] = function(lines, regtype) notify('drostje_clipboard_set', lines, regtype) end,
   },
   paste = {
-    ['+'] = function() return vim.rpcrequest(channel, 'drost_clipboard_get') end,
-    ['*'] = function() return vim.rpcrequest(channel, 'drost_clipboard_get') end,
+    ['+'] = function() return vim.rpcrequest(channel, 'drostje_clipboard_get') end,
+    ['*'] = function() return vim.rpcrequest(channel, 'drostje_clipboard_get') end,
   },
   cache_enabled = 0,
 }
@@ -79,7 +79,7 @@ end
 api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI', 'BufEnter' }, {
   callback = function()
     local buf = api.nvim_get_current_buf()
-    notify('drost_cursor', buf, api.nvim_buf_get_changedtick(buf), cursor(buf))
+    notify('drostje_cursor', buf, api.nvim_buf_get_changedtick(buf), cursor(buf))
   end,
 })
 return true

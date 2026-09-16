@@ -21,7 +21,7 @@ pub fn run() {
             error.downcast_ref::<store::StoreError>(),
             Some(store::StoreError::InstanceInUse(_))
         ) {
-            eprintln!("Drost is already using this data directory: {error:#}");
+            eprintln!("DROSTJE. is already using this data directory: {error:#}");
             return;
         }
     }
@@ -36,13 +36,13 @@ pub fn run() {
             Err(_) => ui::theme::initialize(None, None, cx),
         }
         if let Err(error) = platform::set_application_icon() {
-            eprintln!("Could not set the Drost application icon: {error:#}");
+            eprintln!("Could not set the DROSTJE. application icon: {error:#}");
         }
         ui::commands::bind_keys(cx);
-        cx.set_menus(vec![Menu::new("Drost").items([
+        cx.set_menus(vec![Menu::new("DROSTJE.").items([
             MenuItem::action("Settings…", ui::commands::Settings),
             MenuItem::separator(),
-            MenuItem::action("Quit Drost", ui::commands::Quit),
+            MenuItem::action("Quit DROSTJE.", ui::commands::Quit),
         ])]);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
@@ -80,7 +80,7 @@ pub fn run() {
                 Ok(_) => {
                     cx.update(|cx| cx.activate(true));
                 }
-                Err(error) => eprintln!("Could not open Drost: {error:#}"),
+                Err(error) => eprintln!("Could not open DROSTJE.: {error:#}"),
             }
         })
         .detach();

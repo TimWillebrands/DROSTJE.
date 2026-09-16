@@ -449,7 +449,7 @@ impl Render for DetailContent {
                 let answer_key = self.key.clone();
                 let mut body = v_flex()
                     .id("extension-body")
-                    .key_context("DrostForm ExtensionRequest")
+                    .key_context("DrostjeForm ExtensionRequest")
                     .on_action(move |_: &super::commands::Confirm, window, cx| {
                         cx.stop_propagation();
                         let _ = answer.update(cx, |workspace, cx| {

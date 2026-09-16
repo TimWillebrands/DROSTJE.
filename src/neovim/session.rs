@@ -23,7 +23,7 @@ pub(super) async fn open(config: NvimConfig) -> Result<NvimEditor> {
     let (events, event_rx) = async_channel::bounded(128);
     let (ready, initialized) = async_channel::bounded(1);
     std::thread::Builder::new()
-        .name("drost-nvim-session".into())
+        .name("drostje-nvim-session".into())
         .spawn(move || {
             smol::block_on(async move {
                 let mut session = Session::new(config, events);
@@ -297,7 +297,7 @@ impl Session {
         self.call(
             "nvim_set_client_info",
             vec![
-                "Drost".into(),
+                "DROSTJE.".into(),
                 rpc::dictionary([("major", 0.into()), ("minor", 1.into())]),
                 "ui".into(),
                 Value::Map(vec![]),
@@ -305,7 +305,7 @@ impl Session {
             ],
         )
         .await?;
-        self.lua("local c,g=...; if vim.v.vim_did_enter == 1 then vim.rpcnotify(c,'drost_vim_enter',g) else vim.api.nvim_create_autocmd('VimEnter',{once=true,callback=function() vim.rpcnotify(c,'drost_vim_enter',g) end}) end", vec![self.channel.into(), self.generation.to_string().into()]).await?;
+        self.lua("local c,g=...; if vim.v.vim_did_enter == 1 then vim.rpcnotify(c,'drostje_vim_enter',g) else vim.api.nvim_create_autocmd('VimEnter',{once=true,callback=function() vim.rpcnotify(c,'drostje_vim_enter',g) end}) end", vec![self.channel.into(), self.generation.to_string().into()]).await?;
         self.call(
             "nvim_ui_attach",
             vec![
@@ -340,7 +340,7 @@ impl Session {
     }
     async fn apply_theme(&mut self, colors: [u32; 4]) -> Result<()> {
         self.lua(
-            "return drost.theme(...)",
+            "return drostje.theme(...)",
             colors.into_iter().map(Value::from).collect(),
         )
         .await?;
@@ -429,7 +429,7 @@ impl Session {
             Incoming::Response { .. } => {}
             Incoming::Failed(error) => bail!(error),
             Incoming::Request { id, method, args } => {
-                if method == "drost_clipboard_get" && args.is_empty() {
+                if method == "drostje_clipboard_get" && args.is_empty() {
                     let (reply, result) = async_channel::bounded(1);
                     self.rpc()?.reply_later(id, result);
                     self.events.emit(NvimEvent::ClipboardGet { reply });
@@ -463,23 +463,23 @@ impl Session {
                         && self.key_for(buffer)?.is_some()
                     {
                         bail!(
-                            "Neovim detached a Drost scratch buffer; restart to restore its retained draft"
+                            "Neovim detached a DROSTJE. scratch buffer; restart to restore its retained draft"
                         );
                     }
                 }
-                "drost_vim_enter"
-                | "drost_drain"
-                | "drost_snapshot"
-                | "drost_cursor"
-                | "drost_clipboard_set" => {
+                "drostje_vim_enter"
+                | "drostje_drain"
+                | "drostje_snapshot"
+                | "drostje_cursor"
+                | "drostje_clipboard_set" => {
                     if args.first().and_then(Value::as_str)
                         != Some(self.generation.to_string().as_str())
                     {
                         return Ok(());
                     }
                     match method.as_str() {
-                        "drost_vim_enter" => self.vim_entered = true,
-                        "drost_drain" => {
+                        "drostje_vim_enter" => self.vim_entered = true,
+                        "drostje_drain" => {
                             ensure!(args.len() >= 3, "Malformed input-drain callback");
                             let sequence = args[1].as_u64().context("Invalid drain sequence")?;
                             let mode = args[2].as_str().context("Invalid drain mode")?.to_owned();
@@ -493,7 +493,7 @@ impl Session {
                                 });
                             }
                         }
-                        "drost_snapshot" => {
+                        "drostje_snapshot" => {
                             ensure!(args.len() >= 7, "Malformed snapshot callback");
                             let sequence = args[1].as_u64().context("Invalid snapshot sequence")?;
                             if !self.marker.as_ref().is_some_and(|marker| {
@@ -534,7 +534,7 @@ impl Session {
                                 snapshot: Some(snapshot),
                             });
                         }
-                        "drost_cursor" => {
+                        "drostje_cursor" => {
                             ensure!(args.len() >= 4, "Malformed cursor callback");
                             if let Some(key) = self.key_for(&args[1])? {
                                 let draft = self
@@ -550,7 +550,7 @@ impl Session {
                                 }
                             }
                         }
-                        "drost_clipboard_set" => {
+                        "drostje_clipboard_set" => {
                             ensure!(args.len() >= 3, "Malformed clipboard notification");
                             let regtype = args[2]
                                 .as_str()
@@ -755,7 +755,7 @@ impl Session {
                 insert,
             },
         );
-        self.lua("local b=...; vim.bo[b].buftype='nofile'; vim.bo[b].bufhidden='hide'; vim.bo[b].swapfile=false; vim.bo[b].undofile=false; drost.attach(b)", vec![handle.clone()]).await?;
+        self.lua("local b=...; vim.bo[b].buftype='nofile'; vim.bo[b].bufhidden='hide'; vim.bo[b].swapfile=false; vim.bo[b].undofile=false; drostje.attach(b)", vec![handle.clone()]).await?;
         // Keep the retained recovery text until the seed write succeeds. An
         // initial empty-buffer notification would erase it on a failed restart.
         self.call(

@@ -44,10 +44,10 @@ CREATE UNIQUE INDEX factory_launches_factory_thread ON factory_launches(factory_
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("Another Drost instance owns {0}; close it before reopening this workspace")]
+    #[error("Another DROSTJE. instance owns {0}; close it before reopening this workspace")]
     InstanceInUse(PathBuf),
     #[error(
-        "Database schema {found} is unsupported (this Drost supports {supported}); the database was not changed"
+        "Database schema {found} is unsupported (this DROSTJE. supports {supported}); the database was not changed"
     )]
     UnsupportedSchema { found: i64, supported: i64 },
     #[error("Cannot recover workspace at {path}: {reason}. The database was not replaced or reset")]
@@ -93,12 +93,12 @@ impl Store {
             .with_context(|| format!("Create application data directory {}", data_dir.display()))?;
         let data_dir = fs::canonicalize(&data_dir).context("Resolve application data directory")?;
         let lock = acquire_lock(&data_dir)?;
-        let database = data_dir.join("drost.sqlite3");
+        let database = data_dir.join("drostje.sqlite3");
         let (commands, receiver) = async_channel::bounded(64);
         let (failure_sender, failures) = async_channel::bounded(1);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         thread::Builder::new()
-            .name("drost-storage".into())
+            .name("drostje-storage".into())
             .spawn(move || {
                 let _lock = lock;
                 match open_database(&database) {

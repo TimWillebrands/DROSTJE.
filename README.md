@@ -31,9 +31,9 @@ Een **drost** (of drossaard, als je het deftig wilt zeggen) was vroeger de rentm
 cargo run
 ```
 
-Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor testen)? Zet `DROST_DATA_DIR`.
+Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor testen)? Zet `DROSTJE_DATA_DIR`.
 
-De standaardmap is `~/Library/Application Support/Drost`. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
+De standaardmap is `~/Library/Application Support/Drostje`. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
 
 Kies in Settings zo nodig expliciete executable-paden en de gedeelde Factory-data-root. OMP draait met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
 
@@ -80,13 +80,13 @@ Ontbreekt Neovim of valt het proces weg, dan verschijnt een fout zonder terugval
 
 Settings groepeert de bestaande instellingen en kan zoeken op naam, beschrijving en groep. Het biedt **System**, **Light** en **Dark**, met een afzonderlijke themakeuze per modus. Save past de keuze toe; Cancel verandert het uiterlijk niet. De Neovim-prompteditor volgt dezelfde achtergrond-, tekst-, selectie- en cursorkleuren en het monospace-lettertype.
 
-Eigen thema's staan in `<DROST_DATA_DIR>/themes` (standaard `~/Library/Application Support/Drost/themes`). Settings toont de map en kan die openen. Gebruik GPUI Kit `ThemeSet`-JSON: een object met een `themes`-array; iedere entry heeft een unieke `name` en `mode` (`light` of `dark`). Dit is niet het losse Zed-themaformaat. Alleen Default Light en Default Dark zijn ingebouwd.
+Eigen thema's staan in `<DROSTJE_DATA_DIR>/themes` (standaard `~/Library/Application Support/Drostje/themes`). Settings toont de map en kan die openen. Gebruik GPUI Kit `ThemeSet`-JSON: een object met een `themes`-array; iedere entry heeft een unieke `name` en `mode` (`light` of `dark`). Dit is niet het losse Zed-themaformaat. Alleen Default Light en Default Dark zijn ingebouwd.
 
-Toegevoegde en gewijzigde bestanden worden opnieuw geladen. Ontbreekt het gekozen thema, dan gebruikt Drost een standaardthema met een waarschuwing; de opgeslagen naam blijft behouden zodat herstel van het bestand de keuze kan herstellen. Gebruik unieke namen om dubbele registry-entries te vermijden.
+Toegevoegde en gewijzigde bestanden worden opnieuw geladen. Ontbreekt het gekozen thema, dan gebruikt DROSTJE. een standaardthema met een waarschuwing; de opgeslagen naam blijft behouden zodat herstel van het bestand de keuze kan herstellen. Gebruik unieke namen om dubbele registry-entries te vermijden.
 
 ### Vereisten en controle
 
-GPUI Kit is vastgezet op `0.6.1`. De prompteditor vereist een geïnstalleerde Neovim met de benodigde embedded-RPC- en UI-API's; getest met **Neovim 0.12.3** op macOS. Het pad wordt via PATH ontdekt of expliciet in Settings opgegeven. Drost start Neovim zonder gebruikers-init, plugins, ShaDa, swap- of undobestanden en gebruikt alleen eigen scratchbuffers. Dit is geen OS-sandbox: expliciete Neovim-opdrachten draaien met je lokale rechten.
+GPUI Kit is vastgezet op `0.6.1`. De prompteditor vereist een geïnstalleerde Neovim met de benodigde embedded-RPC- en UI-API's; getest met **Neovim 0.12.3** op macOS. Het pad wordt via PATH ontdekt of expliciet in Settings opgegeven. DROSTJE. start Neovim zonder gebruikers-init, plugins, ShaDa, swap- of undobestanden en gebruikt alleen eigen scratchbuffers. Dit is geen OS-sandbox: expliciete Neovim-opdrachten draaien met je lokale rechten.
 
 De OMP-integratie is getest met `18.2.0` (native RPC v2); authenticatie en modeltoegang moeten al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
 
@@ -101,10 +101,10 @@ cargo test --features runtime-qa native_composition_is_recovery_only_until_commi
 
 ### Expliciete desktop-QA
 
-Maak eerst de wegwerp-repository `FX` uit [het applicatieplan](DROST_APPLICATION_PLAN.md). De normale tests gebruiken geen betaalde provider-turns. De onderstaande GPUI-QA gebruikt echte geïsoleerde processen, maar vervangt geen visuele of OS-inputcontrole.
+Maak eerst de wegwerp-repository `FX` uit [het applicatieplan](DROSTJE_APPLICATION_PLAN.md). De normale tests gebruiken geen betaalde provider-turns. De onderstaande GPUI-QA gebruikt echte geïsoleerde processen, maar vervangt geen visuele of OS-inputcontrole.
 
 ```sh
-export DROST_RUNTIME_FIXTURE="$FX"
+export DROSTJE_RUNTIME_FIXTURE="$FX"
 cargo test --features runtime-qa --lib workspace_actions_with_real_backends -- --ignored --nocapture
 cargo test --features runtime-qa --lib editor_startup_failure_and_restart_preserve_draft -- --ignored --nocapture
 cargo test --features runtime-qa --lib thread_workspace_keyboard_and_themes -- --ignored --nocapture
@@ -115,7 +115,7 @@ cargo test --features runtime-qa --lib factory_start_requires_persisted_configur
 
 Deze scenario's versturen geen provider-turns en starten geen remote Factory-run. Ze controleren native draftwissels, nieuwe regels, bescherming tegen verouderde acknowledgements, openen/sluiten/herstellen van threadtabs, beide threadsoorten, palette-/focusgedrag, themawijzigingen, veilige afsluiting en de opslagbarrière vóór Factory Start.
 
-Gebruik de door de eerste QA-test gemelde datamap als `DROST_QA_DATA` voor layout/herstart-controle:
+Gebruik de door de eerste QA-test gemelde datamap als `DROSTJE_QA_DATA` voor layout/herstart-controle:
 
 ```sh
 cargo test --features runtime-qa --lib layout_and_factory_runtime_recovery -- --ignored --nocapture

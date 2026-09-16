@@ -298,7 +298,7 @@ pub(super) async fn open(mut config: ConversationConfig) -> Result<ConversationH
     smol::unblock(move || -> Result<()> {
         let child = prepare(&mut config)?;
         std::thread::Builder::new()
-            .name("drost-omp".into())
+            .name("drostje-omp".into())
             .spawn(move || {
                 let mut actor = Actor::new(config, child, input, output);
                 if let Err(error) = actor.run() {

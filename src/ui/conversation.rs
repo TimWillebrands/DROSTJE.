@@ -174,7 +174,7 @@ fn inset(content: impl IntoElement) -> AnyElement {
 struct InertResources;
 impl MarkdownPlugin for InertResources {
     fn name(&self) -> &str {
-        "drost-inert-resources"
+        "drostje-inert-resources"
     }
     fn is_block(&self) -> bool {
         true
@@ -525,7 +525,7 @@ enum ToolOutcome {
     Running,
     Succeeded,
     Failed,
-    /// No result was recorded and nothing is running; Drost does not guess.
+    /// No result was recorded and nothing is running; DROSTJE. does not guess.
     Unknown,
 }
 

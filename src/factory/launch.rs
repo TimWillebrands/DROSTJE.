@@ -57,7 +57,7 @@ impl FactoryManager {
         let (updates, events) = async_channel::unbounded();
         let worker_commands = commands.clone();
         thread::Builder::new()
-            .name("drost-factory".into())
+            .name("drostje-factory".into())
             .spawn(move || {
                 Actor::new(store, data_dir, launches, updates).run(receiver, worker_commands);
             })
@@ -254,7 +254,7 @@ impl Actor {
         // remains alive after this handle closes; the reaper owns no Store handle.
         for (_, mut child) in self.children {
             let _ = thread::Builder::new()
-                .name("drost-factory-reaper".into())
+                .name("drostje-factory-reaper".into())
                 .spawn(move || {
                     let _ = child.wait();
                 });
@@ -274,7 +274,8 @@ impl Actor {
             "Factory launch {} already exists; a re-dispatch needs a new launch ID",
             spec.id
         );
-        let data_dir = fs::canonicalize(&self.data_dir).context("Resolve Drost data directory")?;
+        let data_dir =
+            fs::canonicalize(&self.data_dir).context("Resolve DROSTJE. data directory")?;
         let spec = normalize_spec(spec, &data_dir)?;
         self.wait_children();
         self.scan()?;
@@ -317,7 +318,7 @@ impl Actor {
         // and is the only external process scheduled before the final spawn gate.
         let sender = commands.clone();
         let started = thread::Builder::new()
-            .name("drost-factory-readiness".into())
+            .name("drostje-factory-readiness".into())
             .spawn(move || {
                 let result = doctor(
                     spec.executable.as_deref().expect("normalized executable"),
@@ -404,7 +405,7 @@ impl Actor {
         };
         let message = format!("{error:#}");
         if let Ok(mut log) = append_log(&launch_dir(&pending.spec).join("stderr.log")) {
-            let _ = writeln!(log, "Drost: process not spawned: {message}");
+            let _ = writeln!(log, "DROSTJE.: process not spawned: {message}");
             let _ = log.sync_all();
         }
         let mut launch = self.launches[&id].clone();

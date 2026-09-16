@@ -913,7 +913,7 @@ pub fn render(
     if folder {
         source = source
             .description(
-                "Existing PRD/issues folder. Drost does not generate or edit its contents.",
+                "Existing PRD/issues folder. DROSTJE. does not generate or edit its contents.",
             )
             .child(
                 Button::new("factory-pick-folder")
@@ -1114,7 +1114,7 @@ pub fn render(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child("Factory runs independently and continues after Drost closes."),
+                        .child("Factory runs independently and continues after DROSTJE. closes."),
                 ),
         )
         .into_any_element()

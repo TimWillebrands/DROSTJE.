@@ -1,5 +1,5 @@
 use anyhow::Result;
-use drost::{
+use drostje::{
     model::{
         FactoryLaunch, FactorySourceKind, FactoryThreadConfig, ImageAttachment, ModelKey, Project,
         ProjectDefaults, Thread, ThreadKind,
@@ -21,7 +21,7 @@ struct TempDirectory(PathBuf);
 
 impl TempDirectory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("drost-store-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("drostje-store-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -227,7 +227,7 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
         ] {
             assert_eq!(fs::read(file).unwrap(), b"retained original bytes");
         }
-        let database = Connection::open(directory.0.join("drost.sqlite3")).unwrap();
+        let database = Connection::open(directory.0.join("drostje.sqlite3")).unwrap();
         assert_eq!(
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
@@ -241,7 +241,7 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
 fn incompatible_schema_is_refused_without_changing_database_bytes() {
     for version in [1, 3] {
         let directory = TempDirectory::new();
-        let path = directory.0.join("drost.sqlite3");
+        let path = directory.0.join("drostje.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
@@ -266,7 +266,7 @@ fn incompatible_schema_is_refused_without_changing_database_bytes() {
 #[test]
 fn corrupt_database_is_refused_without_replacement() {
     let directory = TempDirectory::new();
-    let path = directory.0.join("drost.sqlite3");
+    let path = directory.0.join("drostje.sqlite3");
     let original =
         b"This is not SQLite, and it must not be replaced with an empty workspace.\0\xff";
     fs::write(&path, original).unwrap();
@@ -281,7 +281,7 @@ fn corrupt_database_is_refused_without_replacement() {
 #[test]
 fn initialization_refuses_nonempty_unversioned_schema() {
     let directory = TempDirectory::new();
-    let path = directory.0.join("drost.sqlite3");
+    let path = directory.0.join("drostje.sqlite3");
     let connection = Connection::open(&path).unwrap();
     connection.execute_batch("CREATE TABLE valuable_data(payload TEXT); INSERT INTO valuable_data VALUES ('retain me');").unwrap();
     drop(connection);
@@ -336,7 +336,7 @@ fn write_failure_is_sticky_preserves_durable_draft_and_blocks_side_effects() {
         store.save_project(project.clone()).await.unwrap();
         store.save_thread(thread.clone()).await.unwrap();
         let durable_draft = thread.draft.clone();
-        let blocker = Connection::open(directory.0.join("drost.sqlite3")).unwrap();
+        let blocker = Connection::open(directory.0.join("drostje.sqlite3")).unwrap();
         blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
         thread.draft = "Newer text still held in the editor after the failed save".into();
         assert!(store.save_thread(thread.clone()).await.is_err());
@@ -452,7 +452,7 @@ fn invalid_associations_are_rejected_without_poisoning_healthy_storage() {
 }
 
 fn assert_recovery_unchanged(directory: &Path) {
-    let path = directory.join("drost.sqlite3");
+    let path = directory.join("drostje.sqlite3");
     let before = fs::read(&path).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let error = loop {
@@ -542,7 +542,7 @@ fn malformed_v2_shapes_and_ownership_are_refused_without_repairing_data() {
             }
             store.save_launch(launch(&project, &owner)).await.unwrap();
             store.flush().await.unwrap();
-            let connection = Connection::open(directory.0.join("drost.sqlite3")).unwrap();
+            let connection = Connection::open(directory.0.join("drostje.sqlite3")).unwrap();
             connection.execute_batch(corruption).unwrap();
             connection
                 .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")

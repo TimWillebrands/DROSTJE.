@@ -303,7 +303,7 @@ impl NvimView {
             }
             NvimEvent::ClipboardSet(content) => {
                 // Native metadata is owned by the clipboard item, not a stale text cache.
-                let metadata = serde_json::json!({"drost_nvim_register": content.regtype, "lines": content.lines});
+                let metadata = serde_json::json!({"drostje_nvim_register": content.regtype, "lines": content.lines});
                 cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
                     content.text(),
                     metadata,
@@ -1563,7 +1563,7 @@ fn clipboard_content(item: &ClipboardItem) -> Option<ClipboardContent> {
         .metadata()
         .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
         && let (Some(regtype), Some(lines)) = (
-            metadata["drost_nvim_register"].as_str(),
+            metadata["drostje_nvim_register"].as_str(),
             metadata["lines"].as_array(),
         )
     {

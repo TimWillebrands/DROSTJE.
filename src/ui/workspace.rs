@@ -178,7 +178,8 @@ impl Workspace {
                 },
             );
         }
-        let (dock, skin) = DockSkin::dock_area("drost-workspace", Some(LAYOUT_VERSION), window, cx);
+        let (dock, skin) =
+            DockSkin::dock_area("drostje-workspace", Some(LAYOUT_VERSION), window, cx);
         let saved = state.read(cx).snapshot.settings.get("layout").cloned();
         let mut workspace = Self {
             state,
@@ -1353,7 +1354,7 @@ impl Render for Workspace {
         let project_name = state
             .project()
             .map(|project| project.name.clone())
-            .unwrap_or_else(|| "Drost".into());
+            .unwrap_or_else(|| "DROSTJE.".into());
         let pending =
             (state.pending_writes > 0).then(|| format!("Saving {} changes", state.pending_writes));
         let palette_owner = owner.clone();
@@ -2063,12 +2064,12 @@ impl Render for Recovery {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let copy = self.error.clone();
         v_flex().size_full().bg(cx.theme().background).text_color(cx.theme().foreground)
-            .child(TitleBar::new().child("Drost"))
+            .child(TitleBar::new().child("DROSTJE."))
             .child(v_flex().flex_1().p_8().gap_4()
-                .child(div().text_xl().child("Drost could not open its workspace"))
-                .child("The database has not been replaced or reset. Quit Drost before inspecting or restoring a backup. A newer schema requires a compatible Drost version; a corrupt database requires recovery from a known-good backup.")
+                .child(div().text_xl().child("DROSTJE. could not open its workspace"))
+                .child("The database has not been replaced or reset. Quit DROSTJE. before inspecting or restoring a backup. A newer schema requires a compatible DROSTJE. version; a corrupt database requires recovery from a known-good backup.")
                 .child(div().font_family(cx.theme().mono_font_family.clone()).text_color(cx.theme().danger).child(self.error.clone()))
                 .child(h_flex().gap_2().child(Button::new("copy-recovery-error").label("Copy error").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))))
-                    .child(Button::new("quit-recovery").label("Quit Drost").on_click(|_, _, cx| cx.quit()))))
+                    .child(Button::new("quit-recovery").label("Quit DROSTJE.").on_click(|_, _, cx| cx.quit()))))
     }
 }

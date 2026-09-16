@@ -6,7 +6,7 @@ use std::{
     process::Command,
 };
 
-const APPLICATION_ICON: &[u8] = include_bytes!("../assets/drost-app-icon.png");
+const APPLICATION_ICON: &[u8] = include_bytes!("../assets/drostje-app-icon.png");
 
 #[cfg(target_os = "macos")]
 pub fn set_application_icon() -> Result<()> {
@@ -43,9 +43,9 @@ fn absolute(path: PathBuf) -> Result<PathBuf> {
     }
 }
 pub fn data_dir() -> Result<PathBuf> {
-    absolute(match env::var_os("DROST_DATA_DIR") {
+    absolute(match env::var_os("DROSTJE_DATA_DIR") {
         Some(p) => p.into(),
-        None => home()?.join("Library/Application Support/Drost"),
+        None => home()?.join("Library/Application Support/Drostje"),
     })
 }
 pub fn factory_data_root() -> Result<PathBuf> {

@@ -123,8 +123,8 @@ async fn open_fixture_with_editor(
 ) -> Fixture {
     cx.dispatcher.allow_parking();
     let fixture = PathBuf::from(
-        std::env::var_os("DROST_RUNTIME_FIXTURE")
-            .expect("Set DROST_RUNTIME_FIXTURE to a disposable fixture"),
+        std::env::var_os("DROSTJE_RUNTIME_FIXTURE")
+            .expect("Set DROSTJE_RUNTIME_FIXTURE to a disposable fixture"),
     );
     let repository = platform::inspect_repository(&fixture.join("target-repo")).unwrap();
     assert!(
@@ -136,7 +136,7 @@ async fn open_fixture_with_editor(
         std::fs::read_to_string(repository.root.join("notes.txt")).unwrap(),
         "before\n"
     );
-    let data = data.unwrap_or_else(|| fixture.join(format!("drost-qa-{}", Uuid::new_v4())));
+    let data = data.unwrap_or_else(|| fixture.join(format!("drostje-qa-{}", Uuid::new_v4())));
     let store = Store::open(data.clone()).unwrap();
     if let Some(executable) = executable {
         store
@@ -239,7 +239,7 @@ async fn quit(cx: &mut TestAppContext, fixture: &Fixture) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; sidebar '+' and clipboard paste against a real store"]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; sidebar '+' and clipboard paste against a real store"]
 async fn project_plus_starts_conversation_and_clipboard_image_attaches(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let project = cx.read(|cx| fixture.state.read(cx).snapshot.projects[0].id);
@@ -339,7 +339,7 @@ async fn project_plus_starts_conversation_and_clipboard_image_attaches(cx: &mut 
 }
 
 #[gpui_kit::test]
-#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; native empty-state layout and keyboard"]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native empty-state layout and keyboard"]
 async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     for (mode, expected) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
@@ -404,7 +404,7 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; no provider or Factory turns"]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; no provider or Factory turns"]
 async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let first = new_conversation(cx, &fixture).await;
@@ -568,7 +568,7 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
         },
     );
     quit(cx, &fixture).await;
-    println!("DROST_QA_DATA={}", fixture.data.display());
+    println!("DROSTJE_QA_DATA={}", fixture.data.display());
     assert_eq!(
         fixture.store.snapshot().await.unwrap().settings["open_threads"],
         json!([factory, first])
@@ -576,9 +576,9 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires disposable DROST_RUNTIME_FIXTURE and installed Neovim; no provider turns"]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE and installed Neovim; no provider turns"]
 async fn editor_startup_failure_and_restart_preserve_draft(cx: &mut TestAppContext) {
-    let fixture = open_fixture_with_editor(cx, None, Some("/nonexistent/drost-qa-neovim")).await;
+    let fixture = open_fixture_with_editor(cx, None, Some("/nonexistent/drostje-qa-neovim")).await;
     cx.dispatch_action(fixture.window.into(), commands::NewConversation);
     let id = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
     until(
@@ -721,7 +721,7 @@ async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; native Command/focus/theme integration"]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native Command/focus/theme integration"]
 async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let conversation = new_conversation(cx, &fixture).await;
@@ -1113,7 +1113,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-#[ignore = "requires disposable DROST_RUNTIME_FIXTURE; exercises orderly quit against a real SQLite write lock"]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; exercises orderly quit against a real SQLite write lock"]
 async fn orderly_quit_flushes_before_platform_deadline(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     new_conversation(cx, &fixture).await;
@@ -1129,7 +1129,7 @@ async fn orderly_quit_flushes_before_platform_deadline(cx: &mut TestAppContext) 
         |cx| fixture.workspace.read(cx).dialog.is_some(),
     )
     .await;
-    let connection = rusqlite::Connection::open(fixture.data.join("drost.sqlite3")).unwrap();
+    let connection = rusqlite::Connection::open(fixture.data.join("drostje.sqlite3")).unwrap();
     connection.execute_batch("BEGIN IMMEDIATE").unwrap();
     fixture.state.update(cx, |state, _| {
         state.set_setting("quit_marker", json!("durable-before-platform-quit"))
@@ -1163,10 +1163,10 @@ async fn orderly_quit_flushes_before_platform_deadline(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
-#[ignore = "requires persisted disposable DROST_QA_DATA; observer only, no Factory dispatch"]
+#[ignore = "requires persisted disposable DROSTJE_QA_DATA; observer only, no Factory dispatch"]
 async fn layout_and_factory_runtime_recovery(cx: &mut TestAppContext) {
-    let data = PathBuf::from(std::env::var_os("DROST_QA_DATA").unwrap());
-    let root = PathBuf::from(std::env::var_os("DROST_RUNTIME_FIXTURE").unwrap());
+    let data = PathBuf::from(std::env::var_os("DROSTJE_QA_DATA").unwrap());
+    let root = PathBuf::from(std::env::var_os("DROSTJE_RUNTIME_FIXTURE").unwrap());
     assert!(
         std::fs::canonicalize(&data)
             .unwrap()
@@ -1269,7 +1269,7 @@ async fn factory_start_requires_persisted_configuration(cx: &mut TestAppContext)
         |cx| fixture.state.read(cx).pending_writes == 0,
     )
     .await;
-    let blocker = rusqlite::Connection::open(fixture.data.join("drost.sqlite3")).unwrap();
+    let blocker = rusqlite::Connection::open(fixture.data.join("drostje.sqlite3")).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
     cx.dispatch_action(fixture.window.into(), commands::Submit);
     until(cx, "final write refused", Duration::from_secs(10), |cx| {

@@ -1,6 +1,6 @@
-# AGENTS.md — Drost
+# AGENTS.md — DROSTJE.
 
-Drost is a macOS desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.1"`) that
+DROSTJE. is a macOS desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.1"`) that
 drives local coding agents (OMP over native RPC), edits prompts in embedded
 Neovim within a GPUI Kit-styled composer, and dispatches work to the Compliance Software Factory CLI. The README
 is Dutch and user-facing; code, comments, commits, docs and UI strings are
@@ -18,7 +18,7 @@ cargo test                                 # no provider calls, no paid turns
 cargo test <name> -- --nocapture           # one test
 cargo fmt                                  # run on files you touched
 cargo clippy --all-targets                 # ~45 warnings today; do not add any
-cargo run                                  # real app; set DROST_DATA_DIR for a scratch data dir
+cargo run                                  # real app; set DROSTJE_DATA_DIR for a scratch data dir
 
 # Opt-in native editor/window tests, isolated temp state:
 cargo test --features runtime-qa native_composition_is_recovery_only_until_committed -- --ignored --nocapture
@@ -46,14 +46,14 @@ Dependencies point downward; a lower module never imports a higher one.
 
 - No process, file, or network I/O in `render` or on the GPUI thread. Background executors do the work; results come back with a revision/identity and stale results are dropped.
 - Do not add a plugin registry, generic transport, or second harness abstraction. The seam is a concrete handle (`harness::open` → `ConversationHandle`).
-- Drost never guesses outcomes: unknown stays `Unknown`, exit 0 without a terminal event is not success, nothing auto-retries or auto-resends.
+- DROSTJE. never guesses outcomes: unknown stays `Unknown`, exit 0 without a terminal event is not success, nothing auto-retries or auto-resends.
 
 ## UI: keyboard-first, gpui-kit components
 
 Design and cleanup rules for UI live in the project skill
 `.agents/skills/gpui-kit-ui/` (`SKILL.md`, `COMPONENTS.md`, `CLEANUP.md`,
 `scripts/audit.sh`). Read it before touching `src/ui/`; this section holds
-only what is specific to Drost.
+only what is specific to DROSTJE.
 
 - GPUI is reached only through the facade: `use gpui_kit::*;` for GPUI itself, `gpui_kit::component::<module>::<Type>` for components, `gpui_kit::actions!` for actions. Never add `gpui`, `gpui-component` or `gpui-base` as direct dependencies, and never import Zed's crates.
 - Exact signatures live in the pinned source under `~/.cargo/registry/src/*/gpui-component-0.6.1/src` and `gpui-base-0.6.1/src`; search there; never infer an API from Zed's crates or older gpui examples.

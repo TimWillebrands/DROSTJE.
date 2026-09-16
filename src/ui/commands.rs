@@ -13,7 +13,7 @@ use std::rc::Rc;
 use uuid::Uuid;
 
 gpui_kit::actions!(
-    drost,
+    drostje,
     [
         AddProject,
         NewConversation,
@@ -223,10 +223,10 @@ impl Command {
 
 pub fn bind_keys(cx: &mut App) {
     let workspace = Some("Workspace && !Command && !PopupMenu && !Sheet && !Dialog");
-    let command = Some("DrostPalette");
+    let command = Some("DrostjePalette");
     let navigation =
         Some("Workspace && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
-    // The prompt buffer is the one native input whose Ctrl-W is Drost's, not the
+    // The prompt buffer is the one native input whose Ctrl-W belongs to DROSTJE., not to the
     // editor's: a single-window Neovim has no window to move to.
     let editor_navigation = Some("PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog");
     let list =
@@ -325,12 +325,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "cmd-enter",
             Confirm,
-            Some("DrostForm && !Command && !PopupMenu"),
+            Some("DrostjeForm && !Command && !PopupMenu"),
         ),
         KeyBinding::new(
             "cmd-enter",
             Confirm,
-            Some("Input && PromptEditor && DrostForm && !Command && !PopupMenu"),
+            Some("Input && PromptEditor && DrostjeForm && !Command && !PopupMenu"),
         ),
     ]);
 }
@@ -572,7 +572,7 @@ impl Render for Palette {
                 let _ = cancel_owner.update(cx, |palette, cx| palette.cleanup(cx));
             });
         div()
-            .key_context("DrostPalette")
+            .key_context("DrostjePalette")
             .on_action(cx.listener(|this, _: &AddProject, w, cx| {
                 this.run(PaletteTarget::Command(Command::AddProject), w, cx)
             }))

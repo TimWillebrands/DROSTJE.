@@ -127,7 +127,7 @@ impl Rpc {
         };
         let writer_state = shared.clone();
         thread::Builder::new()
-            .name("drost-nvim-writer".into())
+            .name("drostje-nvim-writer".into())
             .spawn(move || {
                 let mut writer = BufWriter::new(stdin);
                 let mut stack: Vec<CallFrame> = Vec::new();
@@ -208,7 +208,7 @@ impl Rpc {
         let reader_state = shared.clone();
         let server_order = outgoing.clone();
         thread::Builder::new()
-            .name("drost-nvim-reader".into())
+            .name("drostje-nvim-reader".into())
             .spawn(move || {
                 let mut reader = BufReader::new(stdout);
                 let result = (|| -> Result<()> {
@@ -275,7 +275,7 @@ impl Rpc {
             })?;
         let stderr_state = shared.clone();
         thread::Builder::new()
-            .name("drost-nvim-stderr".into())
+            .name("drostje-nvim-stderr".into())
             .spawn(move || {
                 let mut bytes = [0; 2048];
                 while let Ok(count) = stderr.read(&mut bytes) {
@@ -441,7 +441,7 @@ mod runtime_tests {
     async fn request(rpc: &Rpc) -> Result<u64> {
         loop {
             match next(rpc).await? {
-                Incoming::Request { id, method, .. } if method == "drost_clipboard_get" => {
+                Incoming::Request { id, method, .. } if method == "drostje_clipboard_get" => {
                     return Ok(id);
                 }
                 Incoming::Notification(method, args) if method == "nvim_error_event" => {
@@ -477,7 +477,7 @@ mod runtime_tests {
                 )
                 .await?;
             response(&rpc, id).await.context("UI attachment")?;
-            let code = "return vim.rpcrequest(..., 'drost_clipboard_get')";
+            let code = "return vim.rpcrequest(..., 'drostje_clipboard_get')";
             let outer_call = rpc
                 .call(
                     "nvim_exec_lua",

@@ -941,7 +941,7 @@ impl Workspace {
         };
         let answer = window.prompt(
             PromptLevel::Warning,
-            "Quit Drost?",
+            "Quit DROSTJE.?",
             Some(message),
             &["Cancel", "Quit"],
             cx,

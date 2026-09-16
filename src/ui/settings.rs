@@ -299,7 +299,7 @@ impl Dialog {
             error_field: None,
             selects,
             surface_id,
-            settings_id: format!("drost-settings-{surface_id}").into(),
+            settings_id: format!("drostje-settings-{surface_id}").into(),
             hosted: false,
         }
     }
@@ -682,7 +682,7 @@ impl Dialog {
                 .keywords(["appearance", "theme", "folder"]),
             );
         let tools = fields("Tools", &["nvim", "omp", "factory"])
-            .description("Drost does not install, authenticate, or upgrade tools.");
+            .description("DROSTJE. does not install, authenticate, or upgrade tools.");
         let factory = fields(
             "Factory defaults",
             &[
@@ -791,7 +791,7 @@ impl Dialog {
                 let owner = owner.clone();
                 body = body
                     .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child("Register a working tree. Drost does not clone, modify, or delete its files."))
+                        .child("Register a working tree. DROSTJE. does not clone, modify, or delete its files."))
                     .child(Form::new().child(self.form_field("path", readonly, cx)))
                     .child(Button::new("choose-project-folder").small().disabled(readonly)
                         .label("Choose folder…").on_click(move |_, window, cx| {
@@ -877,7 +877,7 @@ impl Render for SurfaceContent {
             .when(matches!(dialog.kind, DialogKind::Settings(_)), |view| {
                 view.size_full().min_h_0().min_w_0().overflow_hidden()
             })
-            .key_context("DrostForm")
+            .key_context("DrostjeForm")
             .on_action(move |_: &super::commands::Confirm, window, cx| {
                 cx.stop_propagation();
                 confirm_surface(&owner, id, window, cx);

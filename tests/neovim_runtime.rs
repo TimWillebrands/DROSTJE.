@@ -1,8 +1,8 @@
 //! Opt-in, disposable real-process checks. No init, plugins, provider calls or
 //! personal ShaDa are used. Run with NVIM=/opt/homebrew/bin/nvim cargo test
 //! --test neovim_runtime -- --ignored --nocapture.
-use drost::model::DraftKey;
-use drost::neovim::{
+use drostje::model::DraftKey;
+use drostje::neovim::{
     ClipboardContent, NvimCommand, NvimConfig, NvimEditor, NvimEvent, grid::GridSnapshot,
 };
 use parking_lot::Mutex;
@@ -18,7 +18,7 @@ struct Runtime {
 }
 impl Runtime {
     async fn start() -> Self {
-        let directory = std::env::temp_dir().join(format!("drost-nvim-{}", Uuid::new_v4()));
+        let directory = std::env::temp_dir().join(format!("drostje-nvim-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let executable = std::env::var_os("NVIM")
             .map(PathBuf::from)

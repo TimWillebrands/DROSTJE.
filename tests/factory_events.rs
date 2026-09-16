@@ -1,4 +1,4 @@
-use drost::{
+use drostje::{
     factory::{
         EventEntry, FactoryLaunchSpec, FactorySnapshot, FactorySource, Liveness, ReportedState,
         TaskSnapshot,
@@ -23,7 +23,7 @@ use events::{EventTracker, read_text};
 struct TempDirectory(PathBuf);
 impl TempDirectory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("drost-factory-events-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("drostje-factory-events-{}", Uuid::new_v4()));
         fs::create_dir(&path).unwrap();
         Self(fs::canonicalize(path).unwrap())
     }

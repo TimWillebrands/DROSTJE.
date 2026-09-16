@@ -1,4 +1,4 @@
-use drost::attachments;
+use drostje::attachments;
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use std::{fs, path::PathBuf};
 use uuid::Uuid;
@@ -6,7 +6,7 @@ use uuid::Uuid;
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("drost-images-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("drostje-images-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
@@ -58,7 +58,7 @@ fn explicit_optimization_retains_original_and_flattens_transparency() {
     );
     assert_eq!(fs::read(&attachment.path).unwrap(), original_bytes);
     assert!(
-        drost::harness::submission_size(request_id, "Describe this", &prepared).unwrap()
+        drostje::harness::submission_size(request_id, "Describe this", &prepared).unwrap()
             <= attachments::FRAME_LIMIT
     );
 }
