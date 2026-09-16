@@ -1,4 +1,5 @@
 use super::*;
+use crate::titles;
 
 impl AppState {
     pub fn ensure_conversation(&mut self, id: ThreadId) {
@@ -315,6 +316,7 @@ impl AppState {
         );
         thread.updated_at = platform::now();
         let images = thread.attachments.clone();
+        let wants_title = titles::accepts_generated_title(&thread) && !draft.text.trim().is_empty();
         let saved = self.persist_thread(thread);
         let sender = self.events.clone();
         cx.spawn(async move |this, cx| {
@@ -327,6 +329,9 @@ impl AppState {
                 commands.send(ConversationCommand::Submit { request_id, text, images }).await.context("Harness disconnected before submission")?;
                 Ok::<_, anyhow::Error>(())
             }.await;
+            if result.is_ok() && wants_title {
+                let _ = this.update(cx, |this, cx| this.generate_title(id, draft.text.clone(), false, cx));
+            }
             if let Err(error) = result {
                 let _ = sender.send(AppEvent::Harness(id, generation, ConversationEvent::Failed { request_id: Some(request_id), message: format!("{error:#}") })).await;
             }
@@ -341,6 +346,144 @@ impl AppState {
             });
         }).detach();
     }
+    pub fn regenerate_title_reason(&self) -> Option<String> {
+        let Some(thread) = self.conversation_thread() else {
+            return Some("Select a conversation first.".into());
+        };
+        if !titles::accepts_regenerated_title(thread) {
+            return Some("Archived threads are read-only.".into());
+        }
+        if let Some(error) = &self.storage_error {
+            return Some(format!("Storage is not writable: {error}"));
+        }
+        if self.titling.contains(&thread.id) {
+            return Some("A title is being generated.".into());
+        }
+        let Some(session) = self.conversations.get(&thread.id) else {
+            return Some("Open the conversation first.".into());
+        };
+        if !session
+            .messages
+            .iter()
+            .any(|message| message.role == "user")
+        {
+            return Some("Send a prompt first.".into());
+        }
+        None
+    }
+
+    /// Renames the selected Conversation from all of its user prompts, replacing any title.
+    pub fn regenerate_title(&mut self, cx: &mut Context<Self>) {
+        if let Some(reason) = self.regenerate_title_reason() {
+            self.notice(NoticeLevel::Warning, reason);
+            return;
+        }
+        let Some(id) = self.conversation_thread().map(|thread| thread.id) else {
+            return;
+        };
+        let prompt = self
+            .conversations
+            .get(&id)
+            .map(|session| {
+                titles::conversation_prompt(
+                    session
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == "user")
+                        .flat_map(|message| &message.content)
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        }),
+                )
+            })
+            .unwrap_or_default();
+        if prompt.is_empty() {
+            self.notice(
+                NoticeLevel::Warning,
+                "This conversation has no text prompts to name it from.",
+            );
+            return;
+        }
+        self.generate_title(id, prompt, true, cx);
+    }
+
+    /// Names a Conversation from `prompt` with a local Ollama model. Automatic requests
+    /// (`replace == false`) keep a title set meanwhile and stay silent without Ollama.
+    fn generate_title(
+        &mut self,
+        id: ThreadId,
+        prompt: String,
+        replace: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shutting_down || !self.titling.insert(id) {
+            return;
+        }
+        let model = self
+            .snapshot
+            .settings
+            .get(titles::MODEL_SETTING)
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let host = titles::server_host();
+        cx.emit(PresentationChange::Thread(id));
+        cx.spawn(async move |this, cx| {
+            let request_host = host.clone();
+            let result = smol::unblock(move || {
+                titles::generate_title(&request_host, model.as_deref(), &prompt)
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.titling.remove(&id);
+                match result {
+                    Ok(Some(title)) => this.apply_generated_title(id, title, replace, cx),
+                    Ok(None) if replace => this.notice(
+                        NoticeLevel::Warning,
+                        format!("No title generated: Ollama is not reachable at {host} or has no installed models."),
+                    ),
+                    Ok(None) => {}
+                    Err(error) => this.notice(
+                        NoticeLevel::Warning,
+                        format!("Could not generate a conversation title: {error:#}. Check the title model in Settings."),
+                    ),
+                }
+                cx.emit(PresentationChange::Thread(id));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_generated_title(
+        &mut self,
+        id: ThreadId,
+        title: String,
+        replace: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let accepts = if replace {
+            titles::accepts_regenerated_title
+        } else {
+            titles::accepts_generated_title
+        };
+        let Some(mut thread) = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == id && accepts(t))
+            .cloned()
+        else {
+            return;
+        };
+        if self.storage_error.is_some() || thread.title == title {
+            return;
+        }
+        thread.title = title;
+        self.save_thread(thread);
+        cx.emit(PresentationChange::Thread(id));
+    }
+
     pub fn submission_failed(&mut self, id: ThreadId, error: String) {
         if !self.is_conversation(id) {
             return;

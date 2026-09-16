@@ -1070,6 +1070,11 @@ impl Workspace {
                 self.toggle_dock("dock-jobs", cx);
                 None
             }
+            Command::RegenerateTitle => {
+                self.state
+                    .update(cx, |state, cx| state.regenerate_title(cx));
+                None
+            }
             Command::RefreshConversationDiff => {
                 self.state.update(cx, |state, cx| {
                     if let Some(id) = state.conversation_thread().map(|thread| thread.id) {
@@ -1555,6 +1560,9 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &ToggleBackgroundJobs, w, cx| {
                     this.execute(Command::ToggleBackgroundJobs, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RegenerateTitle, w, cx| {
+                    this.execute(Command::RegenerateTitle, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &RefreshConversationDiff, w, cx| {
                     this.execute(Command::RefreshConversationDiff, w, cx)

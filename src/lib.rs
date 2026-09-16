@@ -6,6 +6,7 @@ pub mod model;
 pub mod neovim;
 pub mod platform;
 pub mod store;
+pub mod titles;
 pub mod ui;
 
 use gpui_kit::{

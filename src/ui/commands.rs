@@ -23,6 +23,7 @@ gpui_kit::actions!(
         RenameProject,
         ArchiveProject,
         RenameThread,
+        RegenerateTitle,
         ArchiveThread,
         CloseThread,
         NextThread,
@@ -77,6 +78,7 @@ pub enum Command {
     RenameProject,
     ArchiveProject,
     RenameThread,
+    RegenerateTitle,
     ArchiveThread,
     CloseThread,
     NextThread,
@@ -101,7 +103,7 @@ pub enum Command {
     PasteImage,
 }
 impl Command {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::AddProject,
         Self::NewConversation,
         Self::NewOmpConversation,
@@ -110,6 +112,7 @@ impl Command {
         Self::RenameProject,
         Self::ArchiveProject,
         Self::RenameThread,
+        Self::RegenerateTitle,
         Self::ArchiveThread,
         Self::CloseThread,
         Self::NextThread,
@@ -144,6 +147,7 @@ impl Command {
             Self::RenameProject => "Rename project…",
             Self::ArchiveProject => "Archive project…",
             Self::RenameThread => "Rename thread…",
+            Self::RegenerateTitle => "Regenerate conversation title",
             Self::ArchiveThread => "Archive thread…",
             Self::CloseThread => "Close thread",
             Self::NextThread => "Next thread",
@@ -179,6 +183,7 @@ impl Command {
             Self::RenameProject => Box::new(RenameProject),
             Self::ArchiveProject => Box::new(ArchiveProject),
             Self::RenameThread => Box::new(RenameThread),
+            Self::RegenerateTitle => Box::new(RegenerateTitle),
             Self::ArchiveThread => Box::new(ArchiveThread),
             Self::CloseThread => Box::new(CloseThread),
             Self::NextThread => Box::new(NextThread),
@@ -229,6 +234,7 @@ impl Command {
                     }
                     _ => None,
                 }),
+            Self::RegenerateTitle => state.regenerate_title_reason(),
             Self::ArchiveThread => state.archive_thread_reason(),
             Self::CloseThread if state.thread().is_none() => Some("Select a thread first.".into()),
             Self::NextThread | Self::PreviousThread if state.open_threads.len() < 2 => {
@@ -696,6 +702,9 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &RenameThread, w, cx| {
                 this.run(PaletteTarget::Command(Command::RenameThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RegenerateTitle, w, cx| {
+                this.run(PaletteTarget::Command(Command::RegenerateTitle), w, cx)
             }))
             .on_action(cx.listener(|this, _: &ArchiveThread, w, cx| {
                 this.run(PaletteTarget::Command(Command::ArchiveThread), w, cx)

@@ -188,6 +188,17 @@ impl SurfaceContent {
                             .unwrap_or("")
                             .into(),
                     );
+                    field(
+                        crate::titles::MODEL_SETTING,
+                        "Ollama title model (blank: first installed model)",
+                        state
+                            .snapshot
+                            .settings
+                            .get(crate::titles::MODEL_SETTING)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .into(),
+                    );
                     if let Some(project) = project.and_then(|id| {
                         state
                             .snapshot
@@ -640,6 +651,10 @@ impl SurfaceContent {
                     }),
                 );
                 state.set_setting("factory_data_root", json!(root));
+                state.set_setting(
+                    crate::titles::MODEL_SETTING,
+                    json!(self.value(crate::titles::MODEL_SETTING, cx)),
+                );
                 state.set_setting("theme_mode", json!(mode));
                 state.set_setting("theme_light", json!(light));
                 state.set_setting("theme_dark", json!(dark));
@@ -834,6 +849,12 @@ impl SurfaceContent {
             );
         let tools = fields("Tools", &["nvim", "omp", "claude", "factory"])
             .description("DROSTJE. does not install, authenticate, or upgrade tools.");
+        let titles = fields("Conversation titles", &[crate::titles::MODEL_SETTING]).description(
+            format!(
+                "A local Ollama model names a new conversation from its first prompt. Without Ollama at {}, titles stay unchanged.",
+                crate::titles::server_host()
+            ),
+        );
         let factory = fields(
             "Factory defaults",
             &[
@@ -918,7 +939,7 @@ impl SurfaceContent {
             SettingPage::new("Settings")
                 .default_open(true)
                 .resettable(false)
-                .groups([appearance, tools, factory, project, diagnostics]),
+                .groups([appearance, tools, titles, factory, project, diagnostics]),
         );
         v_flex()
             .id("dialog-body")

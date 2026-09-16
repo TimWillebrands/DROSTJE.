@@ -350,6 +350,8 @@ pub struct AppState {
     pub factory_text_path: Option<PathBuf>,
     pub factory_text_generation: Uuid,
     pub pending_factory: HashSet<ThreadId>,
+    /// Conversations with a title request in flight; at most one each.
+    titling: HashSet<ThreadId>,
     writes: async_channel::Sender<Write>,
 }
 
@@ -606,6 +608,7 @@ impl AppState {
             factory_text_path: None,
             factory_text_generation: Uuid::new_v4(),
             pending_factory: HashSet::new(),
+            titling: HashSet::new(),
             active_threads: HashSet::new(),
             owned_launches: HashSet::new(),
             events,
@@ -1082,7 +1085,7 @@ impl AppState {
         let timestamp = platform::now();
         let (title, harness, model, factory) = match kind {
             ThreadKind::Conversation => (
-                "New conversation",
+                crate::titles::DEFAULT_CONVERSATION_TITLE,
                 conversation_harness.map(str::to_owned).unwrap_or_else(|| {
                     if project.defaults.interactive_harness.trim().is_empty() {
                         "omp".into()
