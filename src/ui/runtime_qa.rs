@@ -202,7 +202,7 @@ async fn open_fixture_with_editor(
             "path",
             &repository.root.to_string_lossy(),
         );
-        cx.simulate_keystrokes(window.into(), "cmd-enter");
+        cx.simulate_keystrokes(window.into(), "secondary-enter");
         until(cx, "project registration", Duration::from_secs(10), |cx| {
             state.read(cx).snapshot.projects.len() == 1
         })
@@ -326,7 +326,7 @@ async fn project_plus_picks_harness_and_clipboard_image_attaches(cx: &mut TestAp
         &fixture.workspace,
         |workspace, window, cx| workspace.focus_region(Region::Thread, window, cx),
     );
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-v");
+    cx.simulate_keystrokes(fixture.window.into(), commands::PASTE_IMAGE_KEY);
     until(cx, "pasted image attached", Duration::from_secs(10), |cx| {
         fixture
             .state
@@ -411,7 +411,7 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
             }
         }
     }
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-n");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-n");
     until(
         cx,
         "empty-state conversation action",
@@ -419,7 +419,7 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
         |cx| fixture.state.read(cx).conversation_thread().is_some(),
     )
     .await;
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-w");
+    cx.simulate_keystrokes(fixture.window.into(), commands::CLOSE_THREAD_KEY);
     until(
         cx,
         "return to empty workspace",
@@ -427,7 +427,7 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
         |cx| fixture.state.read(cx).selected_thread.is_none(),
     )
     .await;
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-shift-n");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-shift-n");
     until(
         cx,
         "empty-state Factory action",
@@ -473,9 +473,16 @@ async fn conversation_diff_sidebar_tracks_working_tree(cx: &mut TestAppContext) 
         .unwrap();
     }
     let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
-    let composer = visual.debug_bounds("composer-content").unwrap();
+    let composer = visual.debug_bounds("composer-row").unwrap();
     let sidebar = visual.debug_bounds("conversation-diff-sidebar").unwrap();
-    assert!(sidebar.origin.x > composer.origin.x + composer.size.width);
+    assert!(
+        sidebar.origin.y + sidebar.size.height <= composer.origin.y,
+        "the changes sidebar stops above the composer"
+    );
+    assert!(
+        composer.origin.x + composer.size.width >= sidebar.origin.x + sidebar.size.width,
+        "the composer spans the full pane width beneath the sidebar"
+    );
     assert!(visual.debug_bounds("conversation-diff-patch").is_some());
 
     let other = new_conversation(cx, &fixture).await;
@@ -816,14 +823,11 @@ async fn interaction_performance_workload(cx: &mut TestAppContext) {
         fixture.state.read(cx).drafts[&DraftKey::Thread(first)].text == "x".repeat(40)
     })
     .await;
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-escape");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-escape");
     cx.dispatch_action(fixture.window.into(), commands::FocusProjects);
     let mut pane_samples = Vec::new();
     for _ in 0..40 {
-        for (keys, expected) in [
-            ("ctrl-w l", Region::Thread),
-            ("ctrl-w h", Region::Projects),
-        ] {
+        for (keys, expected) in [("ctrl-w l", Region::Thread), ("ctrl-w h", Region::Projects)] {
             let start = Instant::now();
             cx.simulate_keystrokes(fixture.window.into(), keys);
             let actual = update_workspace(
@@ -876,7 +880,7 @@ async fn interaction_performance_workload(cx: &mut TestAppContext) {
             .clone()),
         "x".repeat(40)
     );
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-,");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-,");
     until(cx, "workload Settings", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).dialog.is_some()
     })
@@ -1035,7 +1039,7 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
         fixture.state.read(cx).selected_thread == Some(first)
     })
     .await;
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-w");
+    cx.simulate_keystrokes(fixture.window.into(), commands::CLOSE_THREAD_KEY);
     until(
         cx,
         "closing selects adjacent tab",
@@ -1186,7 +1190,7 @@ async fn editor_startup_failure_and_restart_preserve_draft(cx: &mut TestAppConte
         &fixture.workspace,
         |workspace, window, cx| workspace.focus_composer(window, cx),
     );
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-escape");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-escape");
     cx.update_window(fixture.window.into(), |_, window, cx| {
         let focus = fixture
             .workspace
@@ -1215,7 +1219,7 @@ async fn editor_startup_failure_and_restart_preserve_draft(cx: &mut TestAppConte
 }
 
 async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-shift-p");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-shift-p");
     until(cx, "palette opened", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).palette.is_some()
     })
@@ -1284,7 +1288,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         "name",
         "Factory needle",
     );
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-enter");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
     update_workspace(
         cx,
         fixture.window,
@@ -1360,7 +1364,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         "factory_data_root",
         "relative/path",
     );
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-enter");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
     until(
         cx,
         "Settings validation retains input",
@@ -1429,9 +1433,9 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     })
     .await;
     for (key, region) in [
-        ("cmd-1", Region::Projects),
-        ("cmd-2", Region::Thread),
-        ("cmd-3", Region::Output),
+        ("secondary-1", Region::Projects),
+        ("secondary-2", Region::Thread),
+        ("secondary-3", Region::Output),
     ] {
         cx.simulate_keystrokes(fixture.window.into(), key);
         assert_eq!(
@@ -1459,7 +1463,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         .unwrap();
     }
     // Editing appearance is transactional: neither a choice nor Cancel previews it.
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-,");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-,");
     until(
         cx,
         "Settings appearance controls",
@@ -1493,7 +1497,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     })
     .await;
     assert_eq!(cx.read(|cx| Theme::global(cx).mode), ThemeMode::Dark);
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-,");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-,");
     until(cx, "Settings reopened", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).dialog.is_some()
     })
@@ -1525,7 +1529,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         .unwrap();
         cx.run_until_parked();
     }
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-enter");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
     cx.run_until_parked();
     until(cx, "appearance saved", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).dialog.is_none() && Theme::global(cx).mode == ThemeMode::Light
@@ -1617,7 +1621,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
             );
         }
     }
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-1");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-1");
     for _ in 0..3 {
         cx.run_until_parked();
         cx.update_window(fixture.window.into(), |_, window, cx| {
@@ -1685,7 +1689,7 @@ async fn orderly_quit_flushes_before_platform_deadline(cx: &mut TestAppContext) 
         fixture.state.read(cx).pending_writes == 0
     })
     .await;
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-,");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-,");
     until(
         cx,
         "native Settings before Quit",
@@ -1777,7 +1781,7 @@ async fn layout_and_factory_runtime_recovery(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     })
     .unwrap();
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-3");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-3");
     assert_eq!(
         update_workspace(
             cx,
@@ -1787,7 +1791,7 @@ async fn layout_and_factory_runtime_recovery(cx: &mut TestAppContext) {
         ),
         Region::Output
     );
-    cx.simulate_keystrokes(fixture.window.into(), "cmd-j cmd-1");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-j cmd-1");
     assert_eq!(
         update_workspace(
             cx,

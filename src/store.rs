@@ -19,7 +19,9 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+/// Version 2 lacks `threads.effort`; opening it adds the column in one transaction.
+const UPGRADABLE_VERSION: i64 = 2;
 const SCHEMA: &str = "
 CREATE TABLE settings(key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
 CREATE TABLE projects(
@@ -32,7 +34,7 @@ CREATE TABLE threads(
     draft TEXT NOT NULL DEFAULT '', attachments_json TEXT NOT NULL DEFAULT '[]',
     submission_json TEXT, archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'conversation', factory_config_json TEXT
+    kind TEXT NOT NULL DEFAULT 'conversation', factory_config_json TEXT, effort TEXT
 );
 CREATE TABLE factory_launches(
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
@@ -234,12 +236,23 @@ fn open_database(path: &Path) -> Result<Connection> {
             // Never merge a partial/unversioned schema or use IF NOT EXISTS to mask one.
             ensure_empty(&transaction)?;
             transaction.execute_batch(SCHEMA)?;
-            validate_schema(&transaction)?;
+            validate_schema(&transaction, SCHEMA_VERSION)?;
             read_snapshot(&transaction)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction
                 .commit()
                 .context("Commit initial workspace schema")?;
+        } else if version == UPGRADABLE_VERSION {
+            // The upgrade is verified in full before it commits; a failure rolls back every byte.
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch("ALTER TABLE threads ADD COLUMN effort TEXT")?;
+            validate_schema(&transaction, SCHEMA_VERSION)?;
+            read_snapshot(&transaction)?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            transaction.commit().with_context(|| {
+                format!("Commit workspace schema upgrade v{version} to v{SCHEMA_VERSION}")
+            })?;
         }
         Ok(())
     })();
@@ -265,7 +278,7 @@ fn inspect_existing(path: &Path) -> Result<i64> {
     connection.busy_timeout(Duration::from_millis(500))?;
     let transaction = connection.transaction()?;
     let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 0 && version != SCHEMA_VERSION {
+    if version != 0 && version != SCHEMA_VERSION && version != UPGRADABLE_VERSION {
         return Err(StoreError::UnsupportedSchema {
             found: version,
             supported: SCHEMA_VERSION,
@@ -279,9 +292,11 @@ fn inspect_existing(path: &Path) -> Result<i64> {
     if version == 0 {
         ensure_empty(&transaction)?;
     } else {
-        validate_schema(&transaction)?;
+        validate_schema(&transaction, version)?;
         validate_foreign_keys(&transaction)?;
-        read_snapshot(&transaction).context("Decode existing workspace records")?;
+        if version == SCHEMA_VERSION {
+            read_snapshot(&transaction).context("Decode existing workspace records")?;
+        }
     }
     transaction.commit()?;
     Ok(version)
@@ -301,7 +316,7 @@ fn ensure_empty(connection: &Connection) -> Result<()> {
 
 // Validate the current shape and constraints on which updates rely. Equivalent SQL
 // whitespace and index names do not matter; incompatible schemas are never upgraded.
-fn validate_schema(connection: &Connection) -> Result<()> {
+fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
     type Column<'a> = (&'a str, &'a str, bool, Option<&'a str>, bool);
     let tables: &[(&str, &[Column<'_>])] = &[
         (
@@ -338,6 +353,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
                 ("updated_at", "TEXT", true, None, false),
                 ("kind", "TEXT", true, Some("'conversation'"), false),
                 ("factory_config_json", "TEXT", false, None, false),
+                ("effort", "TEXT", false, None, false),
             ],
         ),
         (
@@ -369,9 +385,15 @@ fn validate_schema(connection: &Connection) -> Result<()> {
             kind != "table" || !tables.iter().any(|(table, _)| *table == name.as_str())
         })
     {
-        bail!("Database objects do not match workspace schema v{SCHEMA_VERSION}");
+        bail!("Database objects do not match workspace schema v{version}");
     }
     for (table, expected) in tables {
+        // Version 2 predates the trailing `effort` column.
+        let expected: &[_] = if version == UPGRADABLE_VERSION && *table == "threads" {
+            &expected[..expected.len() - 1]
+        } else {
+            expected
+        };
         let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = statement
             .query_map([], |row| {
@@ -385,7 +407,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if columns.len() != expected.len()
-            || columns.iter().zip(*expected).any(|(actual, expected)| {
+            || columns.iter().zip(expected).any(|(actual, expected)| {
                 actual.0 != expected.0
                     || !actual.1.eq_ignore_ascii_case(expected.1)
                     || actual.2 != expected.2
@@ -393,7 +415,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
                     || actual.4 != expected.4
             })
         {
-            bail!("Table {table} does not match workspace schema v{SCHEMA_VERSION}");
+            bail!("Table {table} does not match workspace schema v{version}");
         }
         let key = if *table == "settings" { "key" } else { "id" };
         require_unique(connection, table, key)?;
@@ -708,16 +730,16 @@ fn save_thread(connection: &mut Connection, thread: Thread) -> Result<()> {
     let submission = thread.submission.as_ref().map(encode).transpose()?;
     let factory = thread.factory.as_ref().map(encode).transpose()?;
     transaction.execute("INSERT INTO threads(id, project_id, title, harness, session_ref, model_json, draft,
-        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json, effort)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
         ON CONFLICT(id) DO UPDATE SET title = excluded.title, harness = excluded.harness,
         session_ref = excluded.session_ref, model_json = excluded.model_json, draft = excluded.draft,
         attachments_json = excluded.attachments_json, submission_json = excluded.submission_json,
         archived = excluded.archived, updated_at = excluded.updated_at,
-        factory_config_json = excluded.factory_config_json",
+        factory_config_json = excluded.factory_config_json, effort = excluded.effort",
         params![id, thread.project_id.to_string(), thread.title, thread.harness, thread.session_ref,
             model, thread.draft, attachments, submission, thread.archived, thread.created_at,
-            thread.updated_at, kind_text(&thread.kind), factory])?;
+            thread.updated_at, kind_text(&thread.kind), factory, thread.effort])?;
     transaction.commit().context("Persist thread and draft")
 }
 
@@ -947,14 +969,14 @@ fn validate_thread_shape(thread: &Thread) -> Result<()> {
 fn read_snapshot(connection: &Connection) -> Result<WorkspaceSnapshot> {
     let projects = read_projects(connection)?;
     let threads = connection.prepare("SELECT id, project_id, title, harness, session_ref, model_json, draft,
-        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json
+        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json, effort
         FROM threads ORDER BY created_at, id")?
         .query_map([], |row| Ok(Thread {
             id: uuid(row, 0)?, project_id: uuid(row, 1)?, title: row.get(2)?, harness: row.get(3)?,
             session_ref: row.get(4)?, model: decode_optional(row, 5)?, draft: row.get(6)?,
             attachments: decode(row, 7)?, submission: decode_optional(row, 8)?, archived: archived(row, 9)?,
             created_at: row.get(10)?, updated_at: row.get(11)?,
-            kind: thread_kind(row, 12)?, factory: decode_optional(row, 13)?,
+            kind: thread_kind(row, 12)?, factory: decode_optional(row, 13)?, effort: row.get(14)?,
         }))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let launches = connection
         .prepare(

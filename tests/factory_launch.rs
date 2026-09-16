@@ -137,6 +137,7 @@ esac
                 harness: String::new(),
                 session_ref: None,
                 model: None,
+                effort: None,
                 draft: String::new(),
                 attachments: Vec::new(),
                 submission: None,

@@ -54,6 +54,9 @@ pub fn run() {
             // Native window geometry is expressed in physical layout pixels.
             window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
             window_min_size: Some(size(px(900.), px(600.))),
+            // Ask for client-side decorations so compositors do not stack their own title bar
+            // above ours; `Root` draws the Linux frame, shadow and resize edges.
+            window_decorations: Some(WindowDecorations::Client),
             ..TitleBar::window_options()
         };
         cx.spawn(async move |cx| {

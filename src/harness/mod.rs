@@ -25,6 +25,8 @@ pub struct ConversationConfig {
     pub session_dir: PathBuf,
     pub session_ref: Option<String>,
     pub model: Option<ModelKey>,
+    /// Claude Code effort level (`--effort`); `None` means the harness default.
+    pub effort: Option<String>,
     /// Only an unsent draft may replace an explicitly file-less provider session.
     pub allow_empty_session: bool,
 }
@@ -79,6 +81,28 @@ pub struct ModelChoice {
     pub key: ModelKey,
     pub name: String,
     pub input: Vec<String>,
+    /// Effort levels the harness accepts for this model; empty when effort is not configurable.
+    pub efforts: Vec<String>,
+}
+/// Tokens in the model's context window, as last reported by the harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub used_tokens: u64,
+    pub max_tokens: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitWindow {
+    FiveHour,
+    SevenDay,
+}
+/// Plan rate-limit utilisation for one window; only reported by harnesses whose
+/// login has plan limits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsageLimit {
+    pub window: LimitWindow,
+    /// Percentage of the window used, 0–100.
+    pub percent_used: f32,
+    pub resets_at: Option<SystemTime>,
 }
 #[derive(Clone, Debug)]
 pub enum ContentBlock {
@@ -177,6 +201,9 @@ pub enum ConversationEvent {
         key: String,
         lines: Vec<String>,
     },
+    ContextUsageUpdated(ContextUsage),
+    /// The complete set of known limit windows; empty when the login has no plan limits.
+    LimitsUpdated(Vec<UsageLimit>),
     Notice {
         level: String,
         text: String,

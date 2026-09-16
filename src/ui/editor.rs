@@ -286,7 +286,7 @@ impl Focusable for PromptEditor {
 }
 
 impl Render for PromptEditor {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let writable =
             !self.switching
@@ -314,13 +314,8 @@ impl Render for PromptEditor {
             .size_full()
             .min_w_0()
             .min_h_0()
-            .rounded(cx.theme().radius)
-            .border_1()
-            .border_color(if self.focus_handle(cx).is_focused(window) {
-                cx.theme().ring
-            } else {
-                cx.theme().input
-            })
+            // No box of its own: the composer divider frames the editor and the
+            // Neovim cursor, painted only while focused, is the focus cue.
             .bg(cx.theme().background)
             .overflow_hidden()
             .when_some(self.view.clone(), |surface, view| {

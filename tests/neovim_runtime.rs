@@ -159,10 +159,14 @@ fn queued_typing_burst_reaches_grid_without_snapshot_or_redraw() {
         loop {
             let caught_up = runtime.grid.lock().as_ref().is_some_and(|grid| {
                 grid.rows.len() >= expected_lines.len()
-                    && grid.rows.iter().zip(&expected_lines).all(|(row, expected)| {
-                        let text: String = row.iter().map(|cell| cell.text.as_str()).collect();
-                        text.trim_end() == *expected
-                    })
+                    && grid
+                        .rows
+                        .iter()
+                        .zip(&expected_lines)
+                        .all(|(row, expected)| {
+                            let text: String = row.iter().map(|cell| cell.text.as_str()).collect();
+                            text.trim_end() == *expected
+                        })
             });
             if caught_up {
                 break;

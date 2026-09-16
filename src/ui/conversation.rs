@@ -6,7 +6,10 @@ use super::{
 };
 use crate::{
     app::{AppState, ConversationSession},
-    harness::{ContentBlock, Message, UserAnswer, UserRequest, UserRequestKind},
+    harness::{
+        ContentBlock, ContextUsage, LimitWindow, Message, UsageLimit, UserAnswer, UserRequest,
+        UserRequestKind,
+    },
     model::{ImageAttachment, ModelKey, ThreadId},
 };
 use gpui_kit::{
@@ -23,18 +26,23 @@ use gpui_kit::{
         h_flex,
         label::Label,
         menu::{DropdownMenu, PopupMenuItem},
+        progress::ProgressCircle,
         searchable_list::SearchableListItem,
         select::{Select, SelectEvent, SelectState},
         spinner::Spinner,
         tag::Tag,
         text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, markdown, markdown_ast},
+        tooltip::Tooltip,
         v_flex,
     },
     prelude::FluentBuilder,
     *,
 };
 use serde_json::Value;
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 pub(super) struct TranscriptDisclosure;
 impl EventEmitter<TranscriptDisclosure> for Workspace {}
@@ -221,6 +229,60 @@ pub(super) struct ModelPicker {
     _subscription: Subscription,
 }
 
+/// `None` is the harness default effort.
+#[derive(Clone, PartialEq)]
+struct EffortOption {
+    value: Option<String>,
+    label: SharedString,
+}
+
+impl SearchableListItem for EffortOption {
+    type Value = Option<String>;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Option<String> {
+        &self.value
+    }
+}
+
+pub(super) struct EffortPicker {
+    thread_id: ThreadId,
+    options: Vec<EffortOption>,
+    selected: Option<String>,
+    select: Entity<SelectState<Vec<EffortOption>>>,
+    _subscription: Subscription,
+}
+
+/// Effort levels come from the chosen model, else the harness default entry, else the first
+/// model that lists any; an empty list hides the picker.
+fn effort_levels(state: &AppState, thread: &crate::model::Thread) -> Vec<String> {
+    let Some(session) = state.conversations.get(&thread.id) else {
+        return Vec::new();
+    };
+    let selected = session.model.as_ref().or(thread.model.as_ref());
+    session
+        .models
+        .iter()
+        .find(|model| Some(&model.key) == selected)
+        .or_else(|| {
+            session
+                .models
+                .iter()
+                .find(|model| model.key.id == "default")
+        })
+        .or_else(|| {
+            session
+                .models
+                .iter()
+                .find(|model| !model.efforts.is_empty())
+        })
+        .map(|model| model.efforts.clone())
+        .unwrap_or_default()
+}
+
 impl Workspace {
     pub(super) fn sync_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
@@ -305,6 +367,72 @@ impl Workspace {
         });
     }
 
+    pub(super) fn sync_effort_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(thread) = state.conversation_thread() else {
+            self.effort_picker = None;
+            return;
+        };
+        let thread_id = thread.id;
+        let levels = effort_levels(state, thread);
+        if levels.is_empty() {
+            self.effort_picker = None;
+            return;
+        }
+        let options: Vec<_> = std::iter::once(EffortOption {
+            value: None,
+            label: "Default effort".into(),
+        })
+        .chain(levels.into_iter().map(|level| EffortOption {
+            label: level.clone().into(),
+            value: Some(level),
+        }))
+        .collect();
+        let selected = thread.effort.clone();
+        if let Some(picker) = self
+            .effort_picker
+            .as_mut()
+            .filter(|picker| picker.thread_id == thread_id)
+        {
+            if picker.options != options || picker.selected != selected {
+                picker.select.update(cx, |select, cx| {
+                    if picker.options != options {
+                        select.set_items(options.clone(), window, cx);
+                    }
+                    select.set_selected_value(&selected, window, cx);
+                });
+                picker.options = options;
+                picker.selected = selected;
+            }
+            return;
+        }
+        let select = cx.new(|cx| {
+            let mut select = SelectState::new(options.clone(), None, window, cx);
+            select.set_selected_value(&selected, window, cx);
+            select
+        });
+        let subscription = cx.subscribe_in(
+            &select,
+            window,
+            move |workspace, _, event: &SelectEvent<Vec<EffortOption>>, _, cx| {
+                let SelectEvent::Confirm(Some(effort)) = event else {
+                    return;
+                };
+                workspace.state.update(cx, |state, cx| {
+                    state.select_effort(thread_id, effort.clone());
+                    cx.notify();
+                });
+            },
+        );
+        self.effort_picker = Some(EffortPicker {
+            thread_id,
+            options,
+            selected,
+            select,
+            _subscription: subscription,
+        });
+    }
+
     pub(super) fn toggle_thread_details(
         &mut self,
         id: ThreadId,
@@ -320,6 +448,121 @@ impl Workspace {
 // A full-width row preserves the transcript's edge scrollbar; only its content is centered.
 fn content_column() -> Div {
     div().w_full().max_w(rems(60.)).px_3()
+}
+
+/// Utilisation at or above this share of a window or context reads as a warning.
+const USAGE_WARNING_PERCENT: f32 = 80.;
+
+/// Context and plan-limit meters for the composer toolbar; absent data renders nothing.
+fn usage_meters(
+    context: Option<ContextUsage>,
+    limits: &[UsageLimit],
+    now: SystemTime,
+    cx: &App,
+) -> Vec<AnyElement> {
+    let tone = |percent: f32| {
+        if percent >= USAGE_WARNING_PERCENT {
+            cx.theme().warning
+        } else {
+            cx.theme().muted_foreground
+        }
+    };
+    let mut meters = Vec::new();
+    if let Some(usage) = context {
+        let percent = context_percent(usage);
+        let tooltip = format!(
+            "Context: {} of {} tokens",
+            compact_tokens(usage.used_tokens),
+            compact_tokens(usage.max_tokens)
+        );
+        meters.push(
+            h_flex()
+                .id("context-usage")
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .text_xs()
+                .text_color(tone(percent))
+                .child(
+                    ProgressCircle::new("context-usage-ring")
+                        .xsmall()
+                        .color(tone(percent))
+                        .value(percent)
+                        .accessibility_label(tooltip.clone()),
+                )
+                .child(format!("{percent:.0}%"))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .into_any_element(),
+        );
+    }
+    for limit in limits {
+        let tooltip = limit_description(limit, now);
+        meters.push(
+            div()
+                .id(window_label(limit.window))
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(tone(limit.percent_used))
+                .child(format!(
+                    "{} {:.0}%",
+                    window_label(limit.window),
+                    limit.percent_used
+                ))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .into_any_element(),
+        );
+    }
+    meters
+}
+
+fn context_percent(usage: ContextUsage) -> f32 {
+    (usage.used_tokens as f64 * 100. / usage.max_tokens.max(1) as f64).clamp(0., 100.) as f32
+}
+
+fn window_label(window: LimitWindow) -> &'static str {
+    match window {
+        LimitWindow::FiveHour => "5h",
+        LimitWindow::SevenDay => "7d",
+    }
+}
+
+fn limit_description(limit: &UsageLimit, now: SystemTime) -> String {
+    let window = match limit.window {
+        LimitWindow::FiveHour => "5-hour limit",
+        LimitWindow::SevenDay => "7-day limit",
+    };
+    let reset = match limit.resets_at.map(|at| at.duration_since(now)) {
+        Some(Ok(remaining)) => format!(", resets in {}", compact_duration(remaining)),
+        Some(Err(_)) => ", reset due".to_owned(),
+        None => String::new(),
+    };
+    format!("{window}: {:.0}% used{reset}", limit.percent_used)
+}
+
+/// `84000` → `84k`, `1_000_000` → `1M`, keeping one decimal below ten.
+fn compact_tokens(tokens: u64) -> String {
+    let (value, unit) = match tokens {
+        0..1_000 => return tokens.to_string(),
+        1_000..1_000_000 => (tokens as f64 / 1_000., "k"),
+        _ => (tokens as f64 / 1_000_000., "M"),
+    };
+    let text = if value < 10. {
+        format!("{value:.1}")
+    } else {
+        format!("{value:.0}")
+    };
+    format!("{}{unit}", text.strip_suffix(".0").unwrap_or(&text))
+}
+
+/// Largest two units: `3d 4h`, `2h 14m`, `5m`.
+fn compact_duration(duration: Duration) -> String {
+    let minutes = duration.as_secs() / 60;
+    let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);
+    match (days, hours) {
+        (0, 0) => format!("{minutes}m"),
+        (0, _) => format!("{hours}h {minutes}m"),
+        _ => format!("{days}d {hours}h"),
+    }
 }
 
 fn inset(content: impl IntoElement) -> AnyElement {
@@ -1848,20 +2091,28 @@ pub(super) fn render(
     transcript: &Entity<TranscriptView>,
     cx: &App,
 ) -> AnyElement {
-    h_flex()
-        .size_full()
-        .min_w_0()
-        .min_h_0()
-        .items_stretch()
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .min_h_0()
-                .child(render_content(state, id, owner, scroll, transcript, cx)),
-        )
-        .child(diff_sidebar(state, id, owner, cx))
-        .into_any_element()
+    render_content(state, id, owner, scroll, transcript, cx)
+}
+
+/// The Conversation frame: history and the changes sidebar share a row, the
+/// composer spans the full pane width beneath both.
+fn frame(
+    root: Stateful<Div>,
+    history: Div,
+    sidebar: AnyElement,
+    composer: Option<AnyElement>,
+) -> AnyElement {
+    root.child(
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .items_stretch()
+            .child(history)
+            .child(sidebar),
+    )
+    .when_some(composer, |root, composer| root.child(composer))
+    .into_any_element()
 }
 
 fn diff_sidebar(
@@ -2004,13 +2255,13 @@ fn render_content(
     cx: &App,
 ) -> AnyElement {
     let drop_owner = owner.clone();
-    let mut root = v_flex()
+    let sidebar = diff_sidebar(state, id, owner, cx);
+    let root = v_flex()
         .id(SharedString::from(format!("conversation-view-{id}")))
         .size_full()
         .min_w_0()
         .min_h_0()
         .text_color(cx.theme().foreground)
-        .gap_2()
         .on_drop(move |paths: &ExternalPaths, window, cx| {
             let _ = drop_owner.update(cx, |workspace, cx| {
                 if workspace.editor_override.is_none()
@@ -2020,10 +2271,14 @@ fn render_content(
                 }
             });
         });
+    let mut history = v_flex().flex_1().min_w_0().min_h_0().gap_2().pb_2();
     let Some(thread) = state.snapshot.threads.iter().find(|thread| thread.id == id) else {
-        return root
-            .child(div().p_3().child("This thread is no longer available."))
-            .into_any_element();
+        return frame(
+            root,
+            history.child(div().p_3().child("This thread is no longer available.")),
+            sidebar,
+            None,
+        );
     };
     let Some(project) = state
         .snapshot
@@ -2031,17 +2286,20 @@ fn render_content(
         .iter()
         .find(|project| project.id == thread.project_id)
     else {
-        return root
-            .child(
+        return frame(
+            root,
+            history.child(
                 div()
                     .p_3()
                     .child("This thread's project is no longer available."),
-            )
-            .into_any_element();
+            ),
+            sidebar,
+            None,
+        );
     };
     let active = state.active_threads.contains(&id);
     if let Some(Err(error)) = state.repositories.get(&project.id) {
-        root = root.child(
+        history = history.child(
             Alert::error(
                 "conversation-root-error",
                 format!("Root unavailable: {error}"),
@@ -2052,12 +2310,12 @@ fn render_content(
     let mut statuses: Vec<String> = Vec::new();
     if let Some(session) = state.conversations.get(&id) {
         if let Some(error) = &session.error {
-            root = root.child(inset(
+            history = history.child(inset(
                 Alert::error("conversation-session-error", error.clone()).small(),
             ));
         }
         statuses = session.statuses.values().cloned().collect();
-        root = root.child(
+        history = history.child(
             div().relative().flex_1().min_h(rems(4.)).min_w_0().child(
                 transcript
                     .clone()
@@ -2065,13 +2323,13 @@ fn render_content(
             ),
         );
         for request in session.requests.values() {
-            root = root.child(inset(request_card(id, request, owner, cx)));
+            history = history.child(inset(request_card(id, request, owner, cx)));
         }
         for (index, (key, lines)) in session.widgets.iter().enumerate() {
             if key.starts_with("Proposed editor replacement") {
                 let owner = owner.clone();
                 let text = lines.join("\n");
-                root = root.child(inset(
+                history = history.child(inset(
                     Button::new(("apply-editor-proposal", index))
                         .small()
                         .ghost()
@@ -2094,7 +2352,7 @@ fn render_content(
             // Widgets are OMP's live panels (plans, progress); open unless folded away.
             let folded_key = format!("widget-folded:{id}:{key}");
             let folded = is_expanded(owner, &folded_key, cx);
-            root = root.child(inset(
+            history = history.child(inset(
                 v_flex()
                     .w_full()
                     .min_w_0()
@@ -2121,10 +2379,10 @@ fn render_content(
             ));
         }
         if let Some(dock) = sticky_dock(id, session, owner, cx) {
-            root = root.child(dock);
+            history = history.child(dock);
         }
     } else {
-        root = root.child(div().flex_1().p_4().child(if thread.archived {
+        history = history.child(div().flex_1().p_4().child(if thread.archived {
             "Archived conversation has no provider history.".into()
         } else {
             format!(
@@ -2159,7 +2417,7 @@ fn render_content(
             .and_then(serde_json::Value::as_str)
             .map(|error| format!(" {error}."))
             .unwrap_or_default();
-        root = root.child(inset(
+        history = history.child(inset(
             v_flex()
                 .gap_1()
                 .child(
@@ -2203,14 +2461,17 @@ fn render_content(
         ));
     }
     if thread.archived || project.archived {
-        return root
-            .child(inset(
+        return frame(
+            root,
+            history.child(inset(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child("Archived history · read-only"),
-            ))
-            .into_any_element();
+            )),
+            sidebar,
+            None,
+        );
     }
     // One region under a single divider: attachments, the editor and its
     // toolbar stack without a box of their own.
@@ -2286,27 +2547,31 @@ fn render_content(
             .text_color(cx.theme().muted_foreground)
             .whitespace_normal()
             .child(if thread.draft.trim().is_empty() {
-                "No draft · press i to write here".to_owned()
+                format!(
+                    "Message {} — press i to write",
+                    if thread.harness == "claude-code" {
+                        "Claude Code"
+                    } else {
+                        "OMP"
+                    }
+                )
             } else {
                 format!("{}\n\nPress i to edit", thread.draft)
             })
             .into_any_element(),
     });
-    let mut controls = h_flex()
-        .flex_shrink_0()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .py_1();
+    // Zed-style toolbar: context actions left, meters, model settings and send right.
+    let mut leading = h_flex().flex_1().min_w_0().items_center().gap_1();
+    let mut trailing = h_flex().flex_shrink_0().items_center().gap_1();
     let attach = owner.clone();
     let menu_owner = owner.clone();
     let no_images = thread.attachments.is_empty();
-    controls = controls
+    leading = leading
         .child(
             Button::new("attach-images")
                 .small()
                 .ghost()
-                .icon(Lucide::Paperclip)
+                .icon(Lucide::Plus)
                 .tooltip("Attach images…")
                 .disabled(state.storage_error.is_some())
                 .on_click(move |_, window, cx| {
@@ -2347,19 +2612,26 @@ fn render_content(
                     )
                 }),
         );
-    // The harness status line sits where Zed shows its mode text.
-    controls = controls.child(
+    // The harness status line trails the context actions, muted and truncated.
+    leading = leading.child(
         div()
             .flex_1()
             .min_w_0()
             .truncate()
             .text_xs()
-            .text_align(TextAlign::Right)
             .text_color(cx.theme().muted_foreground)
             .child(statuses.join(" · ")),
     );
+    if let Some(session) = state.conversations.get(&id) {
+        trailing = trailing.children(usage_meters(
+            session.context_usage,
+            &session.limits,
+            SystemTime::now(),
+            cx,
+        ));
+    }
     if active {
-        controls = controls.child(Spinner::new().xsmall());
+        trailing = trailing.child(Spinner::new().xsmall());
     }
     if let Some(workspace) = owner.upgrade() {
         if let Some(picker) = workspace
@@ -2369,7 +2641,7 @@ fn render_content(
             .filter(|picker| picker.thread_id == id)
         {
             if !picker.options.is_empty() {
-                controls = controls.child(
+                trailing = trailing.child(
                     div()
                         .min_w_0()
                         .max_w(rems(20.))
@@ -2377,20 +2649,42 @@ fn render_content(
                         .child(
                             Select::new(&picker.select)
                                 .small()
+                                .appearance(false)
                                 .disabled(active)
                                 .placeholder("Select model"),
                         ),
                 );
             }
         }
+        if let Some(picker) = workspace
+            .read(cx)
+            .effort_picker
+            .as_ref()
+            .filter(|picker| picker.thread_id == id)
+        {
+            trailing = trailing.child(
+                div()
+                    .min_w_0()
+                    .max_w(rems(10.))
+                    .key_context("NativeInput")
+                    .child(
+                        Select::new(&picker.select)
+                            .small()
+                            .appearance(false)
+                            .disabled(active)
+                            .placeholder("Effort"),
+                    ),
+            );
+        }
     }
+    // Claude Code reports its model only after the first prompt, so an empty list is not a failure.
     let unavailable = state
         .conversations
         .get(&id)
-        .is_none_or(|session| session.models.is_empty() || session.error.is_some());
+        .is_none_or(|session| session.error.is_some());
     if unavailable {
         let retry = owner.clone();
-        controls = controls.child(
+        trailing = trailing.child(
             Button::new("retry-model-discovery")
                 .small()
                 .ghost()
@@ -2408,7 +2702,7 @@ fn render_content(
     }
     if active {
         let stop = owner.clone();
-        controls = controls.child(
+        trailing = trailing.child(
             Button::new("interrupt-prompt")
                 .small()
                 .danger()
@@ -2430,19 +2724,26 @@ fn render_content(
         let reason = state.submit_reason(id).or_else(|| {
             (!hosts_editor).then(|| "Focus this conversation to edit and send".to_owned())
         });
-        controls = controls.child(
+        trailing = trailing.child(
             Button::new("send-prompt")
                 .small()
                 .primary()
                 .icon(Lucide::ArrowUp)
-                .label("Send")
                 .disabled(reason.is_some())
-                .when_some(reason, |button, reason| button.tooltip(reason))
+                .tooltip(reason.unwrap_or_else(|| "Send".to_owned()))
                 .on_click(move |_, window, cx| {
                     let _ = send.update(cx, |workspace, cx| workspace.submit_prompt(window, cx));
                 }),
         );
     }
+    let controls = h_flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .child(leading)
+        .child(trailing);
     // A definite bounded height propagates through the inset wrapper so the editor shrinks,
     // rather than overflowing the actions or introducing a second transcript scroller.
     let preferred_height = 11.
@@ -2451,32 +2752,42 @@ fn render_content(
         } else {
             9.
         };
-    root.child(
-        h_flex()
-            .w_full()
-            .justify_center()
-            .h(rems(preferred_height))
-            .max_h(relative(0.5))
-            .min_h_0()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .pt_2()
-            .pb_2()
-            .child(
-                content_column()
-                    .h_full()
-                    .min_h_0()
-                    .child(composer.h_full().child(controls)),
-            ),
+    frame(
+        root,
+        history,
+        sidebar,
+        Some(
+            h_flex()
+                .id("composer-row")
+                .debug_selector(|| "composer-row".into())
+                .w_full()
+                .flex_shrink_0()
+                .justify_center()
+                .h(rems(preferred_height))
+                .max_h(relative(0.5))
+                .min_h_0()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .pt_2()
+                .pb_2()
+                .child(
+                    content_column()
+                        .h_full()
+                        .min_h_0()
+                        .child(composer.h_full().child(controls)),
+                )
+                .into_any_element(),
+        ),
     )
-    .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentBlock, Lucide, Message, SUMMARY_LIMIT, ToolSummary, Value, code_fence,
-        harness_note_hidden, humanise_key, result_language, tool_summary,
+        ContentBlock, ContextUsage, Duration, LimitWindow, Lucide, Message, SUMMARY_LIMIT,
+        SystemTime, ToolSummary, UsageLimit, Value, code_fence, compact_duration, compact_tokens,
+        context_percent, harness_note_hidden, humanise_key, limit_description, result_language,
+        tool_summary,
     };
     use serde_json::json;
 
@@ -2490,6 +2801,78 @@ mod tests {
             error: false,
             exit_code: None,
         }
+    }
+
+    #[test]
+    fn usage_figures_read_compactly() {
+        assert_eq!(compact_tokens(950), "950");
+        assert_eq!(compact_tokens(1_000), "1k");
+        assert_eq!(compact_tokens(8_450), "8.4k");
+        assert_eq!(compact_tokens(84_000), "84k");
+        assert_eq!(compact_tokens(1_000_000), "1M");
+        assert_eq!(compact_duration(Duration::from_secs(59)), "0m");
+        assert_eq!(
+            compact_duration(Duration::from_secs(2 * 3600 + 14 * 60)),
+            "2h 14m"
+        );
+        assert_eq!(
+            compact_duration(Duration::from_secs(3 * 86_400 + 4 * 3600)),
+            "3d 4h"
+        );
+        let context = |used_tokens| ContextUsage {
+            used_tokens,
+            max_tokens: 200_000,
+        };
+        assert_eq!(context_percent(context(84_000)), 42.);
+        assert_eq!(context_percent(context(250_000)), 100.);
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let limit = |resets_at| UsageLimit {
+            window: LimitWindow::FiveHour,
+            percent_used: 23.4,
+            resets_at,
+        };
+        assert_eq!(
+            limit_description(&limit(Some(now + Duration::from_secs(90 * 60))), now),
+            "5-hour limit: 23% used, resets in 1h 30m"
+        );
+        assert_eq!(
+            limit_description(&limit(Some(now - Duration::from_secs(1))), now),
+            "5-hour limit: 23% used, reset due"
+        );
+        assert_eq!(
+            limit_description(&limit(None), now),
+            "5-hour limit: 23% used"
+        );
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn usage_meters_render_only_reported_figures(cx: &mut gpui_kit::TestAppContext) {
+        use super::usage_meters;
+        cx.update(gpui_kit::init);
+        let now = SystemTime::UNIX_EPOCH;
+        let limits = [
+            UsageLimit {
+                window: LimitWindow::FiveHour,
+                percent_used: 23.,
+                resets_at: None,
+            },
+            UsageLimit {
+                window: LimitWindow::SevenDay,
+                percent_used: 91.,
+                resets_at: None,
+            },
+        ];
+        cx.update(|cx| {
+            assert!(usage_meters(None, &[], now, cx).is_empty());
+            assert_eq!(usage_meters(None, &limits, now, cx).len(), 2);
+            let context = ContextUsage {
+                used_tokens: 84_000,
+                max_tokens: 200_000,
+            };
+            assert_eq!(usage_meters(Some(context), &limits, now, cx).len(), 3);
+        });
     }
 
     #[test]

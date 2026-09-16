@@ -60,6 +60,7 @@ impl AppState {
                         session_dir,
                         session_ref: thread.session_ref,
                         model: thread.model,
+                        effort: thread.effort,
                     })
                 })
                 .await?;
@@ -169,7 +170,10 @@ impl AppState {
         if thread.submission.is_some() {
             return Some("Review the previous submitted draft before starting another turn".into());
         }
+        // An empty model list means the harness has not reported models yet; its Submit then
+        // owns image validation.
         if !thread.attachments.is_empty()
+            && !session.models.is_empty()
             && !session.models.iter().any(|m| {
                 Some(&m.key) == session.model.as_ref()
                     && m.input.iter().any(|input| input == "image")
@@ -220,6 +224,29 @@ impl AppState {
             return;
         }
         self.send_command(id, ConversationCommand::SelectModel(model));
+    }
+    /// Effort is a launch flag for the harness, so a change restarts its process; the
+    /// conversation resumes from the provider session.
+    pub fn select_effort(&mut self, id: ThreadId, effort: Option<String>) {
+        if !self.is_conversation(id) {
+            return;
+        }
+        if self.active_threads.contains(&id) {
+            self.notice(
+                NoticeLevel::Warning,
+                "Effort changes are disabled during a turn",
+            );
+            return;
+        }
+        let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        if thread.effort == effort {
+            return;
+        }
+        thread.effort = effort;
+        self.save_thread(thread);
+        self.retry_conversation(id);
     }
     pub fn respond(&mut self, id: ThreadId, request_id: String, answer: UserAnswer) {
         self.send_command(id, ConversationCommand::Respond { request_id, answer });
@@ -371,6 +398,8 @@ impl AppState {
             | ConversationEvent::EditorTextRequested(_)
             | ConversationEvent::StatusUpdated { .. }
             | ConversationEvent::WidgetUpdated { .. }
+            | ConversationEvent::ContextUsageUpdated(_)
+            | ConversationEvent::LimitsUpdated(_)
             | ConversationEvent::Notice { .. }
             | ConversationEvent::LinkOffered { .. }
             | ConversationEvent::Diagnostic { .. }
@@ -632,6 +661,12 @@ impl AppState {
                 } else {
                     session.widgets.insert(key, lines);
                 }
+            }
+            ConversationEvent::ContextUsageUpdated(usage) => {
+                session.context_usage = Some(usage);
+            }
+            ConversationEvent::LimitsUpdated(limits) => {
+                session.limits = limits;
             }
             ConversationEvent::Notice { level, text } => {
                 let level = match level.as_str() {

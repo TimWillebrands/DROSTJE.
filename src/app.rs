@@ -4,8 +4,9 @@ mod persistence;
 mod project_diff;
 mod shutdown;
 use crate::harness::{
-    self, ContentBlock, ConversationCommand, ConversationEvent, ConversationHandle,
-    ConversationState, Message, ModelChoice, ToolActivity, TurnOutcome, UserAnswer, UserRequest,
+    self, ContentBlock, ContextUsage, ConversationCommand, ConversationEvent, ConversationHandle,
+    ConversationState, Message, ModelChoice, ToolActivity, TurnOutcome, UsageLimit, UserAnswer,
+    UserRequest,
 };
 use crate::{model::*, platform, store::Store};
 use anyhow::{Context as _, Result};
@@ -46,6 +47,8 @@ pub struct ConversationSession {
     pub requests: BTreeMap<String, UserRequest>,
     pub statuses: BTreeMap<String, String>,
     pub widgets: BTreeMap<String, Vec<String>>,
+    pub context_usage: Option<ContextUsage>,
+    pub limits: Vec<UsageLimit>,
     pub links: Vec<(String, Option<String>)>,
     pub diagnostics: VecDeque<(String, Value)>,
     pub error: Option<String>,
@@ -80,6 +83,8 @@ impl ConversationSession {
             requests: BTreeMap::new(),
             statuses: BTreeMap::new(),
             widgets: BTreeMap::new(),
+            context_usage: None,
+            limits: Vec::new(),
             links: Vec::new(),
             diagnostics: VecDeque::new(),
             error: None,
@@ -944,6 +949,27 @@ impl AppState {
         let Some(thread) = self.thread() else {
             return Some("Select a thread first.".into());
         };
+        self.archive_thread_reason_for(thread.id)
+    }
+    /// Why `id` cannot be archived right now, independent of the current selection.
+    pub fn archive_thread_reason_for(&self, id: ThreadId) -> Option<String> {
+        if self.shutting_down {
+            return Some("Application is shutting down".into());
+        }
+        if let Some(error) = &self.storage_error {
+            return Some(format!("Storage is read-only: {error}"));
+        }
+        let Some(thread) = self.snapshot.threads.iter().find(|t| t.id == id) else {
+            return Some("This thread is no longer available.".into());
+        };
+        if self
+            .snapshot
+            .projects
+            .iter()
+            .any(|p| p.id == thread.project_id && p.archived)
+        {
+            return Some("This project is archived. History is read-only.".into());
+        }
         if thread.archived {
             return Some("This thread is already archived.".into());
         }
@@ -1104,6 +1130,7 @@ impl AppState {
             harness,
             session_ref: None,
             model,
+            effort: None,
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,

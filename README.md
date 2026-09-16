@@ -54,6 +54,8 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 
 ### Toetsenbord
 
+`Cmd` is de Command-toets op macOS en Control op Linux. Uitzonderingen op Linux: `Cmd-W` is `Ctrl-Shift-W` (een losse Ctrl-W begint de paneelreeks) en `Cmd-V` is `Ctrl-Shift-V` (Ctrl-V is van Vim).
+
 |Toets|Actie|
 |---|---|
 |`Cmd-Shift-P`|Command palette: opdrachten, projecten en beide threadsoorten|
@@ -61,7 +63,7 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |`Cmd-1` / `Cmd-2` / `Cmd-3`|Focus Projects / Thread / Output; opent zo nodig het dock|
 |`Cmd-B` / `Cmd-J`|Projects / Output tonen of verbergen|
 |`Ctrl-Tab` / `Ctrl-Shift-Tab`|Volgende / vorige open threadtab|
-|`Cmd-W`|Huidige threadtab sluiten|
+|`Cmd-W` (Linux: `Ctrl-Shift-W`)|Huidige threadtab sluiten|
 |`Ctrl-W`, daarna `h/j/k/l`|Naar een zichtbaar aangrenzend paneel, ook vanuit de prompt-editor; tweede toets mag ook met Control|
 |`j/k`, pijlen, `gg/G`, `h/l`, Return|Navigeren, springen, invouwen/uitvouwen en openen in Projects|
 |`i` in een Conversation|Focus naar de prompteditor|
@@ -72,7 +74,7 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |`Cmd-,`|Settings|
 |Escape|Bovenste menu of venster sluiten; in de palette eerst de zoektekst wissen|
 
-In insert-modus voegt Return een nieuwe regel toe; alleen `Cmd-Enter` verstuurt. Escape schakelt binnen de editor de Neovim-modus terug; `Cmd-Escape` verlaat de editor. Moties, operators, visual-selectie, registers, zoeken en undo/redo worden door Neovim uitgevoerd. `Cmd-C/X/V` gebruikt het systeemklembord; bevat het klembord een afbeelding, dan wordt die als bijlage bij de draft gezet in plaats van geplakt als tekst. Directionele paneeltoetsen nemen geen editorinvoer over.
+In insert-modus voegt Return een nieuwe regel toe; alleen `Cmd-Enter` verstuurt. Escape schakelt binnen de editor de Neovim-modus terug; `Cmd-Escape` verlaat de editor. Moties, operators, visual-selectie, registers, zoeken en undo/redo worden door Neovim uitgevoerd. `Cmd-C/X/V` (Linux: `Ctrl-Shift-C/X/V`) gebruikt het systeemklembord; bevat het klembord een afbeelding, dan wordt die als bijlage bij de draft gezet in plaats van geplakt als tekst. Directionele paneeltoetsen nemen geen editorinvoer over.
 
 Versturen neemt een gecontroleerde snapshot nadat Neovim de eerdere invoer verwerkt heeft. Tijdens actieve tekstcompositie of een onvoltooide Neovim-opdracht wordt niet verstuurd of naar een andere draft gewisseld. Onvoltooide IME-tekst blijft aparte recoverytekst; die wordt nooit automatisch verstuurd of in een projectbestand geschreven.
 

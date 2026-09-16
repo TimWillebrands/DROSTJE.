@@ -14,8 +14,14 @@ use std::{
 
 const FRAME: usize = 1_048_576;
 const OUTPUT_FRAME: usize = 67_108_864;
+/// Claude Code (2.1.x, `--input-format stream-json`) emits its `system/init` frame only after
+/// the first `user` frame, so this deadline is armed by the first prompt, not by the spawn.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSCRIPT: &str = "conversation.jsonl";
+const INITIALIZE_REQUEST: &str = "drostje-initialize";
+const CONTEXT_USAGE_REQUEST: &str = "drostje-context-usage";
+/// `get_usage` is marked experimental by Claude Code; an unexpected answer is kept as a diagnostic.
+const USAGE_REQUEST: &str = "drostje-usage";
 
 pub(super) fn submission_size_for_lengths(
     id: Uuid,
@@ -126,6 +132,8 @@ struct Session {
     id: Uuid,
     reference: String,
     transcript_path: PathBuf,
+    /// Claude Code stores a session at its first user frame, so a saved reference alone does not
+    /// prove one exists; a line in our transcript does. Resuming an unstored ID is a fatal error.
     resume: bool,
 }
 
@@ -140,6 +148,7 @@ fn session(config: &mut ConversationConfig) -> Result<Session> {
     fs::create_dir_all(&config.session_dir)?;
     config.session_dir = fs::canonicalize(&config.session_dir)?;
 
+    let transcript_path = config.session_dir.join(TRANSCRIPT);
     let (id, resume) = if let Some(reference) = &config.session_ref {
         let saved: Value = serde_json::from_str(reference).context(
             "Invalid saved Claude Code session reference; create a new conversation explicitly",
@@ -153,7 +162,7 @@ fn session(config: &mut ConversationConfig) -> Result<Session> {
             .as_str()
             .and_then(|id| Uuid::parse_str(id).ok())
             .context("Saved Claude Code session ID is missing or invalid")?;
-        (id, true)
+        (id, !read_transcript(&transcript_path)?.is_empty())
     } else {
         (Uuid::new_v4(), false)
     };
@@ -165,7 +174,7 @@ fn session(config: &mut ConversationConfig) -> Result<Session> {
     Ok(Session {
         id,
         reference,
-        transcript_path: config.session_dir.join(TRANSCRIPT),
+        transcript_path,
         resume,
     })
 }
@@ -195,6 +204,9 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session)> {
     }
     if let Some(model) = &config.model {
         command.arg("--model").arg(&model.id);
+    }
+    if let Some(effort) = &config.effort {
+        command.arg("--effort").arg(effort);
     }
     // SAFETY: pre_exec runs after fork and before exec; setsid has no Rust-managed inputs.
     unsafe {
@@ -276,7 +288,7 @@ struct Actor {
     output: async_channel::Sender<ConversationEvent>,
     events: VecDeque<ConversationEvent>,
     state: ConversationState,
-    ready_deadline: Instant,
+    init_deadline: Option<Instant>,
     initialized: bool,
     closing: bool,
     line: Vec<u8>,
@@ -291,6 +303,12 @@ struct Actor {
     turn: Turn,
     permissions: HashMap<String, Permission>,
     tools: HashMap<String, ToolActivity>,
+    /// `set_model` control requests awaiting the CLI's answer.
+    model_requests: HashMap<String, ModelKey>,
+    /// The `initialize` answer carried the model catalog, so `init` need not report one.
+    models_reported: bool,
+    /// Usage control requests awaiting an answer, so refresh triggers never pile up.
+    usage_requests: Vec<&'static str>,
 }
 
 impl Actor {
@@ -316,7 +334,7 @@ impl Actor {
             output,
             events: VecDeque::from([ConversationEvent::StateChanged(ConversationState::Starting)]),
             state: ConversationState::Starting,
-            ready_deadline: Instant::now() + READY_TIMEOUT,
+            init_deadline: None,
             initialized: false,
             closing: false,
             line: Vec::new(),
@@ -331,6 +349,9 @@ impl Actor {
             turn: Turn::default(),
             permissions: HashMap::new(),
             tools: HashMap::new(),
+            model_requests: HashMap::new(),
+            models_reported: false,
+            usage_requests: Vec::new(),
         })
     }
 
@@ -354,6 +375,27 @@ impl Actor {
             "Claude Code input pipe is not accepting commands"
         );
         self.writes.push_back(PendingWrite { bytes, accepted });
+        Ok(())
+    }
+
+    /// Asks for context and plan usage unless the same question is still unanswered.
+    fn refresh_usage(&mut self, requests: &[&'static str]) -> Result<()> {
+        for &request_id in requests {
+            if self.usage_requests.contains(&request_id) {
+                continue;
+            }
+            let subtype = if request_id == CONTEXT_USAGE_REQUEST {
+                "get_context_usage"
+            } else {
+                "get_usage"
+            };
+            self.queue(
+                json!({"type":"control_request","request_id":request_id,
+                    "request":{"subtype":subtype}}),
+                None,
+            )?;
+            self.usage_requests.push(request_id);
+        }
         Ok(())
     }
 
@@ -396,6 +438,30 @@ impl Actor {
     }
 
     fn run(&mut self) -> Result<()> {
+        // The process accepts prompts as soon as its stdin is open; `init` follows the first one.
+        let models = self
+            .config
+            .model
+            .iter()
+            .map(|key| ModelChoice {
+                key: key.clone(),
+                name: key.id.clone(),
+                input: vec!["text".into(), "image".into()],
+                efforts: Vec::new(),
+            })
+            .collect();
+        self.emit(ConversationEvent::Ready {
+            session_ref: self.session.reference.clone(),
+            models,
+        });
+        self.emit_history()?;
+        self.state(ConversationState::Ready);
+        // The `initialize` answer carries the model catalog before any prompt is sent.
+        self.queue(
+            json!({"type":"control_request","request_id":INITIALIZE_REQUEST,
+                "request":{"subtype":"initialize"}}),
+            None,
+        )?;
         loop {
             while let Some(event) = self.events.pop_front() {
                 match self.output.try_send(event) {
@@ -433,8 +499,11 @@ impl Actor {
                 return Ok(());
             }
             ensure!(
-                self.initialized || Instant::now() < self.ready_deadline,
-                "Claude Code did not initialize within 30 seconds"
+                self.initialized
+                    || self
+                        .init_deadline
+                        .is_none_or(|deadline| Instant::now() < deadline),
+                "Claude Code did not initialize within 30 seconds of the first prompt"
             );
             for _ in 0..16 {
                 if self.events.len() >= 256 || !self.read_stdout()? {
@@ -531,13 +600,14 @@ impl Actor {
                         request_id: None,
                         message: "Model selection requires an idle Claude Code conversation".into(),
                     });
-                } else if self.config.model.as_ref() == Some(&model) {
-                    self.emit(ConversationEvent::ModelSelected(model));
                 } else {
-                    self.emit(ConversationEvent::Failed {
-                        request_id: None,
-                        message: "Start a new Claude Code conversation to change its model".into(),
-                    });
+                    let request_id = Uuid::new_v4().to_string();
+                    self.queue(
+                        json!({"type":"control_request","request_id":request_id,
+                            "request":{"subtype":"set_model","model":model.id}}),
+                        None,
+                    )?;
+                    self.model_requests.insert(request_id, model);
                 }
             }
             ConversationCommand::Interrupt => {
@@ -589,7 +659,6 @@ impl Actor {
                 images,
             } => {
                 let attempt = (|| -> Result<()> {
-                    ensure!(self.initialized, "Claude Code has not initialized");
                     ensure!(
                         self.turn.id.is_none(),
                         "A conversation already has an active turn"
@@ -627,6 +696,9 @@ impl Actor {
                         "images":images,
                     });
                     self.queue(frame, Some((request_id, history)))?;
+                    if !self.initialized && self.init_deadline.is_none() {
+                        self.init_deadline = Some(Instant::now() + READY_TIMEOUT);
+                    }
                     self.turn = Turn {
                         id: Some(request_id),
                         accepted: false,
@@ -672,25 +744,26 @@ impl Actor {
                     "Claude Code initialized a different session"
                 );
                 self.initialized = true;
-                let model = frame["model"]
-                    .as_str()
-                    .filter(|model| !model.is_empty())
-                    .map(|id| ModelChoice {
-                        key: ModelKey {
-                            provider: "anthropic".into(),
-                            id: id.into(),
-                        },
-                        name: id.into(),
-                        input: vec!["text".into(), "image".into()],
-                    })
-                    .into_iter()
-                    .collect();
-                self.emit(ConversationEvent::Ready {
-                    session_ref: self.session.reference.clone(),
-                    models: model,
-                });
-                self.emit_history()?;
-                self.state(ConversationState::Ready);
+                if !self.models_reported {
+                    let models = frame["model"]
+                        .as_str()
+                        .filter(|model| !model.is_empty())
+                        .map(|id| ModelChoice {
+                            key: ModelKey {
+                                provider: "anthropic".into(),
+                                id: id.into(),
+                            },
+                            name: id.into(),
+                            input: vec!["text".into(), "image".into()],
+                            efforts: Vec::new(),
+                        })
+                        .into_iter()
+                        .collect();
+                    self.emit(ConversationEvent::Ready {
+                        session_ref: self.session.reference.clone(),
+                        models,
+                    });
+                }
             }
             "assistant" => {
                 self.append_history(&frame)?;
@@ -778,13 +851,13 @@ impl Actor {
                         .as_str()
                         .is_some_and(|kind| kind != "success");
                 if error {
-                    let text = frame["result"]
-                        .as_str()
-                        .or_else(|| frame["error"].as_str())
-                        .unwrap_or("Claude Code turn failed");
                     self.emit(ConversationEvent::Notice {
                         level: "error".into(),
-                        text: text.into(),
+                        text: result_error_text(&frame),
+                    });
+                    self.emit(ConversationEvent::Diagnostic {
+                        label: "Claude Code result".into(),
+                        raw: frame.clone(),
                     });
                 }
                 let outcome = if self.turn.interrupting {
@@ -796,12 +869,74 @@ impl Actor {
                 };
                 self.settle(outcome);
                 self.state(ConversationState::Ready);
+                self.refresh_usage(&[CONTEXT_USAGE_REQUEST, USAGE_REQUEST])?;
             }
-            "control_response" | "keep_alive" | "rate_limit_event" => {}
+            "control_response" => self.control_response(&frame)?,
+            "rate_limit_event" => self.refresh_usage(&[USAGE_REQUEST])?,
+            "keep_alive" => {}
             _ => self.emit(ConversationEvent::Diagnostic {
                 label: "Claude Code event".into(),
                 raw: frame,
             }),
+        }
+        Ok(())
+    }
+
+    fn control_response(&mut self, frame: &Value) -> Result<()> {
+        let response = &frame["response"];
+        let request_id = response["request_id"].as_str().unwrap_or("");
+        if let Some(index) = self.usage_requests.iter().position(|id| *id == request_id) {
+            let request_id = self.usage_requests.remove(index);
+            let parsed = (response["subtype"] == "success")
+                .then(|| &response["response"])
+                .and_then(|answer| {
+                    if request_id == CONTEXT_USAGE_REQUEST {
+                        parse_context_usage(answer).map(ConversationEvent::ContextUsageUpdated)
+                    } else {
+                        parse_limits(answer).map(ConversationEvent::LimitsUpdated)
+                    }
+                });
+            self.emit(parsed.unwrap_or_else(|| ConversationEvent::Diagnostic {
+                label: "Claude Code usage".into(),
+                raw: frame.clone(),
+            }));
+            return Ok(());
+        }
+        let error = (response["subtype"] != "success").then(|| {
+            response["error"]
+                .as_str()
+                .unwrap_or("Claude Code rejected the request")
+                .to_owned()
+        });
+        if request_id == INITIALIZE_REQUEST {
+            match error {
+                Some(error) => self.emit(ConversationEvent::Notice {
+                    level: "error".into(),
+                    text: format!("Claude Code model discovery failed: {error}"),
+                }),
+                None => {
+                    let models = parse_models(&response["response"]["models"]);
+                    if !models.is_empty() {
+                        self.models_reported = true;
+                        self.emit(ConversationEvent::Ready {
+                            session_ref: self.session.reference.clone(),
+                            models,
+                        });
+                    }
+                    self.refresh_usage(&[CONTEXT_USAGE_REQUEST, USAGE_REQUEST])?;
+                }
+            }
+        } else if let Some(model) = self.model_requests.remove(request_id) {
+            match error {
+                Some(error) => self.emit(ConversationEvent::Failed {
+                    request_id: None,
+                    message: format!("Claude Code did not switch to {}: {error}", model.id),
+                }),
+                None => {
+                    self.emit(ConversationEvent::ModelSelected(model));
+                    self.refresh_usage(&[CONTEXT_USAGE_REQUEST])?;
+                }
+            }
         }
         Ok(())
     }
@@ -824,6 +959,148 @@ impl Actor {
             request_id: None,
             message,
         });
+    }
+}
+
+/// The `initialize` control response lists models as `{value, displayName, supportedEffortLevels?}`;
+/// `value` is what `--model` and `set_model` accept.
+fn parse_models(models: &Value) -> Vec<ModelChoice> {
+    models
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["value"].as_str().filter(|id| !id.is_empty())?;
+            let name = model["displayName"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(id);
+            let efforts = model["supportedEffortLevels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            Some(ModelChoice {
+                key: ModelKey {
+                    provider: "anthropic".into(),
+                    id: id.into(),
+                },
+                name: name.into(),
+                input: vec!["text".into(), "image".into()],
+                efforts,
+            })
+        })
+        .collect()
+}
+
+/// Error results carry their reason in `result`, `error` or (for execution errors) `errors`.
+/// `get_context_usage` answer: `totalTokens` of `maxTokens`.
+fn parse_context_usage(answer: &Value) -> Option<ContextUsage> {
+    let used_tokens = answer["totalTokens"].as_u64()?;
+    let max_tokens = answer["maxTokens"].as_u64().filter(|max| *max > 0)?;
+    Some(ContextUsage {
+        used_tokens,
+        max_tokens,
+    })
+}
+
+/// `get_usage` answer. `rate_limits_available: false` (API key, Bedrock, Vertex) means no windows;
+/// a window without a numeric utilisation is left out rather than shown as zero.
+fn parse_limits(answer: &Value) -> Option<Vec<UsageLimit>> {
+    if answer["rate_limits_available"] == false {
+        return Some(Vec::new());
+    }
+    let limits = answer["rate_limits"].as_object()?;
+    Some(
+        [
+            ("five_hour", LimitWindow::FiveHour),
+            ("seven_day", LimitWindow::SevenDay),
+        ]
+        .into_iter()
+        .filter_map(|(key, window)| {
+            let limit = limits.get(key)?;
+            Some(UsageLimit {
+                window,
+                percent_used: limit["utilization"].as_f64()?.clamp(0., 100.) as f32,
+                resets_at: limit["resets_at"].as_str().and_then(parse_timestamp),
+            })
+        })
+        .collect(),
+    )
+}
+
+/// RFC 3339 timestamp (`2026-09-16T18:00:00.5+02:00`) to `SystemTime`; `None` for anything else.
+fn parse_timestamp(text: &str) -> Option<SystemTime> {
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = text.get(range)?;
+        digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+            .then(|| digits.parse().ok())?
+    };
+    let bytes = text.as_bytes();
+    if bytes.len() < 20 || bytes[4] != b'-' || bytes[7] != b'-' || !matches!(bytes[10], b'T' | b' ')
+    {
+        return None;
+    }
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let mut rest = &text[19..];
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+        rest = &fraction[digits..];
+    }
+    let offset = match rest.as_bytes() {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let hours: i64 = rest[1..3].parse().ok()?;
+            let minutes: i64 = rest[4..6].parse().ok()?;
+            let offset = hours * 3600 + minutes * 60;
+            if *sign == b'-' { -offset } else { offset }
+        }
+        _ => return None,
+    };
+    // Days from civil date (Howard Hinnant's algorithm).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let seconds = days * 86_400 + hour * 3600 + minute * 60 + second - offset;
+    u64::try_from(seconds)
+        .ok()
+        .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
+fn result_error_text(frame: &Value) -> String {
+    if let Some(text) = frame["result"].as_str().or_else(|| frame["error"].as_str()) {
+        return text.to_owned();
+    }
+    let errors = frame["errors"]
+        .as_array()
+        .map(|errors| {
+            errors
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    if errors.is_empty() {
+        "Claude Code turn failed".to_owned()
+    } else {
+        errors
     }
 }
 
@@ -1024,6 +1301,137 @@ mod tests {
     }
 
     #[test]
+    fn initialize_catalog_maps_values_names_and_effort_levels() {
+        let models = parse_models(&json!([
+            {"value":"default","resolvedModel":"claude-opus-5[1m]","displayName":"Default (recommended)",
+             "supportsEffort":true,"supportedEffortLevels":["low","medium","high","xhigh","max"]},
+            {"value":"haiku","resolvedModel":"claude-haiku-4-5-20251001","displayName":"Haiku"},
+            {"displayName":"No value"},
+        ]));
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].key.provider, "anthropic");
+        assert_eq!(models[0].key.id, "default");
+        assert_eq!(models[0].name, "Default (recommended)");
+        assert_eq!(models[0].efforts.len(), 5);
+        assert_eq!(models[1].key.id, "haiku");
+        assert!(models[1].efforts.is_empty());
+    }
+
+    #[test]
+    fn usage_answers_map_context_and_plan_windows() {
+        assert_eq!(
+            parse_context_usage(&json!({"totalTokens":84_000,"maxTokens":200_000,"percentage":42})),
+            Some(ContextUsage {
+                used_tokens: 84_000,
+                max_tokens: 200_000
+            })
+        );
+        assert_eq!(
+            parse_context_usage(&json!({"totalTokens":1,"maxTokens":0})),
+            None
+        );
+        assert_eq!(parse_context_usage(&json!({})), None);
+
+        let limits = parse_limits(&json!({
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": {"utilization": 23.5, "resets_at": "2026-09-16T18:00:00.250+02:00"},
+                "seven_day": {"utilization": null, "resets_at": null},
+                "seven_day_opus": {"utilization": 90, "resets_at": null}
+            }
+        }))
+        .expect("limits");
+        assert_eq!(
+            limits,
+            [UsageLimit {
+                window: LimitWindow::FiveHour,
+                percent_used: 23.5,
+                resets_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_789_574_400)),
+            }]
+        );
+        assert_eq!(
+            parse_limits(&json!({"rate_limits_available": false, "rate_limits": null})),
+            Some(Vec::new())
+        );
+        assert_eq!(parse_limits(&json!({"rate_limits_available": true})), None);
+    }
+
+    #[test]
+    fn timestamps_accept_rfc3339_only() {
+        assert_eq!(
+            parse_timestamp("1970-01-02T00:00:00Z"),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(86_400))
+        );
+        assert_eq!(
+            parse_timestamp("2000-03-01T00:00:00-01:00"),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(951_868_800 + 3_600))
+        );
+        assert_eq!(parse_timestamp("2026-09-16"), None);
+        assert_eq!(parse_timestamp("2026-13-16T18:00:00Z"), None);
+        assert_eq!(parse_timestamp("2026-09-16T18:00:00"), None);
+    }
+
+    #[test]
+    fn error_result_reports_execution_errors() {
+        let frame = json!({"type":"result","subtype":"error_during_execution","is_error":true,
+            "errors":["No conversation found with session ID: x","second"]});
+        assert_eq!(
+            result_error_text(&frame),
+            "No conversation found with session ID: x; second"
+        );
+        assert_eq!(
+            result_error_text(&json!({"type":"result","is_error":true})),
+            "Claude Code turn failed"
+        );
+        assert_eq!(
+            result_error_text(&json!({"type":"result","is_error":true,"result":"Denied"})),
+            "Denied"
+        );
+    }
+
+    #[test]
+    fn saved_session_resumes_only_with_a_local_transcript() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("drostje-claude-{}", Uuid::new_v4()));
+        let cwd = root.join("repo");
+        let session_dir = root.join("session");
+        fs::create_dir_all(&cwd)?;
+        fs::create_dir_all(&session_dir)?;
+        let id = Uuid::new_v4();
+        let reference = serde_json::to_string(&json!({
+            "id":id,
+            "cwd":fs::canonicalize(&cwd)?,
+            "session_dir":fs::canonicalize(&session_dir)?,
+        }))?;
+        let config = || ConversationConfig {
+            harness: "claude-code".into(),
+            executable: root.join("claude"),
+            cwd: cwd.clone(),
+            session_dir: session_dir.clone(),
+            session_ref: Some(reference.clone()),
+            model: None,
+            effort: None,
+            allow_empty_session: true,
+        };
+
+        let fresh = session(&mut config())?;
+        assert_eq!(fresh.id, id);
+        assert!(!fresh.resume, "an unstored session must not be resumed");
+
+        fs::write(
+            session_dir.join(TRANSCRIPT),
+            format!(
+                "{}\n",
+                json!({"type":"drostje_user","id":Uuid::nil(),"text":"Hi","images":[]})
+            ),
+        )?;
+        let stored = session(&mut config())?;
+        assert_eq!(stored.id, id);
+        assert!(stored.resume);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn fake_cli_exercises_session_prompt_permission_and_completion() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1036,16 +1444,33 @@ mod tests {
             &executable,
             r#"#!/bin/sh
 session=
+printf '%s\n' "$@" > "$(dirname "$0")/args.txt"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --session-id|--resume) session="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
-printf '{"type":"system","subtype":"init","session_id":"%s","model":"claude-test"}\n' "$session"
 while IFS= read -r line; do
   case "$line" in
+    *'"subtype":"initialize"'*)
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"drostje-initialize","response":{"models":[{"value":"default","displayName":"Default (recommended)","supportedEffortLevels":["low","high"]},{"value":"haiku","displayName":"Haiku"}]}}}'
+      ;;
+    *'"subtype":"get_context_usage"'*)
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"drostje-context-usage","response":{"totalTokens":84000,"maxTokens":200000,"percentage":42}}}'
+      ;;
+    *'"subtype":"get_usage"'*)
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"drostje-usage","response":{"rate_limits_available":true,"rate_limits":{"five_hour":{"utilization":23,"resets_at":null},"seven_day":{"utilization":61,"resets_at":"2026-09-20T00:00:00Z"}}}}}'
+      ;;
+    *'"subtype":"set_model"'*)
+      id=$(printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+      case "$line" in
+        *'"model":"haiku"'*) printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s"}}\n' "$id" ;;
+        *) printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Model not found"}}\n' "$id" ;;
+      esac
+      ;;
     *'"type":"user"'*)
+      printf '{"type":"system","subtype":"init","session_id":"%s","model":"claude-test"}\n' "$session"
       printf '%s\n' '{"type":"control_request","request_id":"permission-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo check"}}}'
       ;;
     *'"type":"control_response"'*)
@@ -1060,11 +1485,12 @@ done
 
         let handle = smol::block_on(open(ConversationConfig {
             harness: "claude-code".into(),
-            executable,
+            executable: executable.clone(),
             cwd,
             session_dir: session_dir.clone(),
             session_ref: None,
             model: None,
+            effort: Some("low".into()),
             allow_empty_session: true,
         }))?;
         let receive = || {
@@ -1078,9 +1504,69 @@ done
             .context("Timed out waiting for fake Claude Code event")
         };
 
-        let mut ready = false;
-        while !ready {
-            ready = matches!(receive()?, ConversationEvent::Ready { .. });
+        let mut catalog = Vec::new();
+        let mut context = None;
+        let mut limits = None;
+        while catalog.len() != 2 || context.is_none() || limits.is_none() {
+            match receive()? {
+                ConversationEvent::Ready { models, .. } => catalog = models,
+                ConversationEvent::ContextUsageUpdated(usage) => context = Some(usage),
+                ConversationEvent::LimitsUpdated(windows) => limits = Some(windows),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            context,
+            Some(ContextUsage {
+                used_tokens: 84_000,
+                max_tokens: 200_000
+            })
+        );
+        let limits = limits.unwrap_or_default();
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| (limit.window, limit.percent_used))
+                .collect::<Vec<_>>(),
+            [(LimitWindow::FiveHour, 23.), (LimitWindow::SevenDay, 61.)]
+        );
+        assert!(limits[1].resets_at.is_some());
+        assert_eq!(catalog[0].name, "Default (recommended)");
+        assert_eq!(catalog[0].efforts, ["low", "high"]);
+        assert_eq!(catalog[1].key.id, "haiku");
+        assert!(catalog[1].efforts.is_empty());
+        let args = fs::read_to_string(root.join("args.txt"))?;
+        assert!(args.contains("--effort\nlow\n"), "argv: {args}");
+
+        let haiku = catalog[1].key.clone();
+        handle
+            .commands
+            .send_blocking(ConversationCommand::SelectModel(haiku.clone()))?;
+        loop {
+            match receive()? {
+                ConversationEvent::ModelSelected(model) => {
+                    assert_eq!(model, haiku);
+                    break;
+                }
+                ConversationEvent::Failed { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        handle
+            .commands
+            .send_blocking(ConversationCommand::SelectModel(ModelKey {
+                provider: "anthropic".into(),
+                id: "bogus".into(),
+            }))?;
+        loop {
+            match receive()? {
+                ConversationEvent::Failed { message, .. } => {
+                    assert!(message.contains("Model not found"), "{message}");
+                    break;
+                }
+                ConversationEvent::ModelSelected(model) => panic!("selected {model:?}"),
+                _ => {}
+            }
         }
         let request_id = Uuid::new_v4();
         handle.commands.send_blocking(ConversationCommand::Submit {

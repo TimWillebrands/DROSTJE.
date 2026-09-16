@@ -1363,6 +1363,7 @@ impl Actor {
                             Ok(ModelChoice {
                                 key: model_key(value)?,
                                 name: string(value, "name"),
+                                efforts: Vec::new(),
                                 input: value["input"]
                                     .as_array()
                                     .map(|a| {

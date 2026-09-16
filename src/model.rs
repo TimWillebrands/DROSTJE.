@@ -125,6 +125,9 @@ pub struct Thread {
     pub harness: String,
     pub session_ref: Option<String>,
     pub model: Option<ModelKey>,
+    /// Harness effort level; `None` means the harness default.
+    #[serde(default)]
+    pub effort: Option<String>,
     pub draft: String,
     pub attachments: Vec<ImageAttachment>,
     pub submission: Option<Value>,

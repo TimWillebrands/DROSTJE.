@@ -3,6 +3,7 @@ use super::{
     conversation, factory,
     settings::{DialogKind, SurfaceContent},
     sidebar::{self, Row},
+    title_bar::{WorkspaceDockSkin, WorkspaceTitle},
 };
 use crate::{
     app::{AppState, NoticeLevel, PresentationChange},
@@ -10,17 +11,17 @@ use crate::{
 };
 use gpui_kit::{
     component::{
-        ActiveTheme, Root, Sizable, TitleBar, WindowExt,
-        button::{Button, ButtonVariants},
+        ActiveTheme, Root, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
+        button::Button,
         dock::{
             BasePanel, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSizing,
             DockSkin, InsertTarget, Panel, PanelEvent, PanelId, PanelInfo, PanelState, TabGroup,
             panel_handle, register_panel,
         },
         h_flex,
-        menu::{DropdownMenu, PopupMenu, PopupMenuItem},
+        input::{InputEvent, InputState},
+        menu::{PopupMenu, PopupMenuItem},
         notification::Notification,
-        tag::Tag,
         v_flex,
     },
     prelude::FluentBuilder,
@@ -64,7 +65,7 @@ impl PanelKind {
         }
     }
     /// Persisted layout name; never change it.
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Projects => "Projects",
             Self::Welcome => "Welcome",
@@ -104,73 +105,11 @@ type ThreadPanels = Rc<RefCell<BTreeMap<ThreadId, Entity<WorkspacePanel>>>>;
 const LAYOUT_VERSION: usize = 3;
 const OUTDATED_LAYOUT: &str = "Layout was saved by another version";
 
-/// Save acknowledgements repaint only their status, never the workspace shell.
-struct SaveStatus {
-    state: Entity<AppState>,
-    presentation: (bool, bool),
-    _subscriptions: Vec<Subscription>,
-}
-
-impl SaveStatus {
-    fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let presentation = Self::presentation(state.read(cx));
-        let subscriptions = vec![
-            cx.observe(&state, |this, _, cx| this.refresh(cx)),
-            cx.subscribe(&state, |this, _, _: &PresentationChange, cx| {
-                this.refresh(cx)
-            }),
-            cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()),
-        ];
-        Self {
-            state,
-            presentation,
-            _subscriptions: subscriptions,
-        }
-    }
-
-    fn presentation(state: &AppState) -> (bool, bool) {
-        (
-            state.pending_writes > 0,
-            state.storage_error.is_some() || state.shutdown_error.is_some(),
-        )
-    }
-
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        let next = Self::presentation(self.state.read(cx));
-        if next != self.presentation {
-            self.presentation = next;
-            cx.notify();
-        }
-    }
-}
-
-impl Render for SaveStatus {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .gap_2()
-            .when(self.presentation.0, |view| {
-                view.child(
-                    div()
-                        .id("save-indicator")
-                        .test_support()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Saving changes…"),
-                )
-            })
-            .when(self.presentation.1, |view| {
-                view.child(Tag::danger().child("Unsaved changes"))
-            })
-    }
-}
-
 pub struct Workspace {
     pub state: Entity<AppState>,
     pub(super) dock: Entity<DockArea>,
-    _skin: Rc<DockSkin>,
     projects: Entity<WorkspacePanel>,
     output: Entity<WorkspacePanel>,
-    save_status: Entity<SaveStatus>,
     /// Shared with the panel registry so a restored layout rebuilds into the same map.
     threads: ThreadPanels,
     welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>>,
@@ -178,6 +117,8 @@ pub struct Workspace {
     rebuilding: bool,
     focus: FocusHandle,
     pub cursor: Option<Row>,
+    /// Filter text for the Projects list; empty shows every visible row.
+    thread_search: Entity<InputState>,
     pub palette: Option<Entity<Palette>>,
     pub dialog: Option<Entity<SurfaceContent>>,
     pub(super) editor: Option<Entity<super::editor::PromptEditor>>,
@@ -189,6 +130,7 @@ pub struct Workspace {
     pub tool_detail: Option<(crate::model::ThreadId, String)>,
     pub factory_form: Option<Entity<super::factory_form::FactoryThreadForm>>,
     pub(super) model_picker: Option<conversation::ModelPicker>,
+    pub(super) effort_picker: Option<conversation::EffortPicker>,
     pub(super) detail_surface: Option<super::overlays::SurfaceKey>,
     pub(super) quit_requested: bool,
     layout_save: Option<Task<()>>,
@@ -240,17 +182,19 @@ impl Workspace {
                 },
             );
         }
-        let (dock, skin) =
-            DockSkin::dock_area("drostje-workspace", Some(LAYOUT_VERSION), window, cx);
+        let title = cx.new(|cx| WorkspaceTitle::new(state.clone(), owner.clone(), cx));
+        let dock = cx.new(|cx| {
+            let inner = DockSkin::new(cx);
+            DockArea::new("drostje-workspace", Some(LAYOUT_VERSION), window, cx)
+                .with_renderer(Rc::new(WorkspaceDockSkin { inner, title }))
+        });
         let saved = state.read(cx).snapshot.settings.get("layout").cloned();
-        let save_status = cx.new(|cx| SaveStatus::new(state.clone(), cx));
+        let thread_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads…"));
         let mut workspace = Self {
             state,
             dock,
-            _skin: skin,
             projects,
             output,
-            save_status,
             threads,
             welcome,
             rebuilding: false,
@@ -265,7 +209,9 @@ impl Workspace {
             factory_form: None,
             quit_requested: false,
             cursor: None,
+            thread_search,
             model_picker: None,
+            effort_picker: None,
             presented_thread: None,
             detail_surface: None,
             palette: None,
@@ -313,6 +259,25 @@ impl Workspace {
                 dock.set_dock_collapsible(placement, true, window, cx);
             }
         });
+        workspace._subscriptions.push(cx.subscribe_in(
+            &workspace.thread_search,
+            window,
+            |workspace, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    let query = workspace.thread_search.read(cx).value();
+                    let rows = sidebar::rows(workspace.state.read(cx), &query);
+                    if !workspace
+                        .cursor
+                        .is_some_and(|cursor| rows.contains(&cursor))
+                    {
+                        workspace.cursor = first_thread_row(&rows);
+                    }
+                    workspace.projects.update(cx, |_, cx| cx.notify());
+                }
+                InputEvent::PressEnter { .. } => workspace.leave_thread_search(false, window, cx),
+                InputEvent::Focus | InputEvent::Blur => {}
+            },
+        ));
         workspace._subscriptions.push(cx.observe_in(
             &workspace.state,
             window,
@@ -324,6 +289,7 @@ impl Workspace {
                 workspace.sync_session(window, cx);
                 workspace.sync_factory_form(window, cx);
                 workspace.sync_model_picker(window, cx);
+                workspace.sync_effort_picker(window, cx);
                 workspace.sync_detail_surface(window, cx);
                 workspace.show_notices(window, cx);
                 workspace.sync_selection_panels(cx);
@@ -340,6 +306,7 @@ impl Workspace {
                         workspace.sync_session(window, cx);
                         workspace.sync_factory_form(window, cx);
                         workspace.sync_model_picker(window, cx);
+                        workspace.sync_effort_picker(window, cx);
                         workspace.sync_selection_panels(cx);
                         workspace.sync_diff_interest(cx);
                     }
@@ -347,6 +314,7 @@ impl Workspace {
                         if workspace.state.read(cx).selected_thread == Some(id) =>
                     {
                         workspace.sync_model_picker(window, cx);
+                        workspace.sync_effort_picker(window, cx);
                         workspace.sync_detail_surface(window, cx);
                         workspace.show_notices(window, cx);
                     }
@@ -395,6 +363,7 @@ impl Workspace {
         workspace.normalize_layout(None, window, cx);
         workspace.sync_factory_form(window, cx);
         workspace.sync_model_picker(window, cx);
+        workspace.sync_effort_picker(window, cx);
         workspace.sync_selection_panels(cx);
         workspace.sync_diff_interest(cx);
         cx.defer_in(window, |workspace, window, cx| {
@@ -733,9 +702,8 @@ impl Workspace {
         let rem = window.rem_size();
         let mut area = dock.bounds();
         if area.size.width <= px(0.) || area.size.height <= px(0.) {
+            // First layout has no dock measurement; the dock fills the window.
             area = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
-            // First layout has no dock measurement: allow for the native title bar.
-            area.size.height = (area.size.height - rem * 2.).max(px(0.));
         }
         let edges = [
             (DockPlacement::Left, layout.left_dock.as_ref()),
@@ -751,7 +719,11 @@ impl Workspace {
                 open[i] = edge.open();
             }
         }
-        let available = [area.size.width - rem * 28., area.size.height - rem * 16.];
+        // The title bar heads the centre column, above the bottom dock.
+        let available = [
+            area.size.width - rem * 28.,
+            area.size.height - TITLE_BAR_HEIGHT - rem * 16.,
+        ];
         let fits = |open: &[bool; 3], sizes: &[Pixels; 3]| {
             (if open[0] { sizes[0] } else { px(0.) }) + (if open[1] { sizes[1] } else { px(0.) })
                 <= available[0]
@@ -1158,6 +1130,14 @@ impl Workspace {
                 });
                 None
             }
+            Command::SearchThreads => {
+                self.focus_region(Region::Projects, window, cx);
+                if self.focused_region(window, cx) == Region::Projects {
+                    self.thread_search
+                        .update(cx, |input, cx| input.focus(window, cx));
+                }
+                None
+            }
             Command::ResetLayout => {
                 self.reset_layout(window, cx);
                 None
@@ -1344,7 +1324,8 @@ impl Workspace {
             panel.update(cx, |_, cx| cx.notify());
             return;
         }
-        let rows = sidebar::rows(self.state.read(cx));
+        let query = self.thread_search.read(cx).value();
+        let rows = sidebar::rows(self.state.read(cx), &query);
         if rows.is_empty() {
             return;
         }
@@ -1359,6 +1340,30 @@ impl Workspace {
         };
         self.cursor = rows.get(next).copied();
         self.projects.read(cx).scroll.scroll_to_item(next);
+        self.projects.update(cx, |_, cx| cx.notify());
+    }
+    /// Return focus from the thread filter to the Projects list, optionally clearing
+    /// the filter, with the cursor on the first matching thread.
+    pub fn leave_thread_search(
+        &mut self,
+        clear: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if clear {
+            self.thread_search
+                .update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        let query = self.thread_search.read(cx).value();
+        let rows = sidebar::rows(self.state.read(cx), &query);
+        if !clear || !self.cursor.is_some_and(|cursor| rows.contains(&cursor)) {
+            self.cursor = first_thread_row(&rows);
+        }
+        if let Some(index) = rows.iter().position(|row| Some(*row) == self.cursor) {
+            self.projects.read(cx).scroll.scroll_to_item(index);
+        }
+        let focus = self.projects.read(cx).focus.clone();
+        focus.focus(window, cx);
         self.projects.update(cx, |_, cx| cx.notify());
     }
     fn fold(&mut self, collapsed: bool, cx: &mut Context<Self>) {
@@ -1468,21 +1473,8 @@ impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let owner = cx.entity().downgrade();
         let state = self.state.read(cx);
-        let project_name = state
-            .project()
-            .map(|project| project.name.clone())
-            .unwrap_or_else(|| "DROSTJE.".into());
-        let palette_owner = owner.clone();
-        let recovery_owner = owner.clone();
-        let dismiss_recovery = owner.clone();
         let dock_measurement = self.dock_measurement.clone();
         let geometry_owner = owner.clone();
-        let close_owner = owner.clone();
-        let has_saved_recovery = state
-            .snapshot
-            .settings
-            .get("recovered_composition")
-            .is_some_and(|value| !value.is_null());
         let mut root =
             v_flex()
                 .id("workspace")
@@ -1527,6 +1519,9 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &ShowArchived, w, cx| {
                     this.execute(Command::ShowArchived, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SearchThreads, w, cx| {
+                    this.execute(Command::SearchThreads, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &NewFactoryThread, w, cx| {
                     this.execute(Command::NewFactoryThread, w, cx)
@@ -1627,105 +1622,6 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &ToggleOutput, w, cx| {
                     this.execute(Command::ToggleOutput, w, cx)
                 }))
-                .child(
-                    TitleBar::new()
-                        .on_close_window(move |_, window, cx| {
-                            let _ = close_owner
-                                .update(cx, |workspace, cx| workspace.quit_review(window, cx));
-                        })
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_sm()
-                                .text_ellipsis()
-                                .child(project_name),
-                        )
-                        .child(self.save_status.clone())
-                        .child(
-                            Button::new("workspace-palette")
-                                .small()
-                                .ghost()
-                                .cursor_default()
-                                .icon(gpui_kit::component::IconName::Search)
-                                .label("Search")
-                                .tooltip("Search commands, projects and threads")
-                                .on_click(move |_, w, cx| {
-                                    let _ = palette_owner
-                                        .update(cx, |this, cx| this.open_palette(w, cx));
-                                }),
-                        )
-                        .child(
-                            Button::new("workspace-menu")
-                                .small()
-                                .ghost()
-                                .cursor_default()
-                                .icon(gpui_kit::component::IconName::Ellipsis)
-                                .tooltip("Workspace menu")
-                                .dropdown_menu(|menu, _, _| {
-                                    menu.menu("Add project…", Box::new(AddProject))
-                                        .menu("New conversation", Box::new(NewConversation))
-                                        .menu("New Factory thread", Box::new(NewFactoryThread))
-                                        .separator()
-                                        .menu("Toggle projects", Box::new(ToggleProjects))
-                                        .menu("Toggle output", Box::new(ToggleOutput))
-                                        .menu("Show archived", Box::new(ShowArchived))
-                                        .separator()
-                                        .menu("Settings…", Box::new(Settings))
-                                        .menu("Reset layout", Box::new(ResetLayout))
-                                }),
-                        ),
-                )
-                .when_some(state.storage_error.clone(), |view, error| {
-                    view.child(div().px_3().py_2().text_color(cx.theme().danger).child(format!(
-                        "Storage failure — new work is disabled. In-memory drafts retained. {error}"
-                    )))
-                })
-                .when(
-                    has_saved_recovery
-                        || state.storage_error.is_some()
-                        || state.shutdown_error.is_some(),
-                    |view| {
-                        view.child(
-                            h_flex()
-                                .px_3()
-                                .py_1()
-                                .gap_2()
-                                .child("Draft recovery remains separate from submitted text.")
-                                .child(
-                                    Button::new("copy-draft-recovery")
-                                        .small()
-                                        .ghost()
-                                        .label("Copy Draft Recovery")
-                                        .on_click(move |_, _, cx| {
-                                            let _ = recovery_owner.update(cx, |workspace, cx| {
-                                                workspace.copy_draft_recovery(cx)
-                                            });
-                                        }),
-                                )
-                                .when(has_saved_recovery, |view| {
-                                    view.child(
-                                        Button::new("dismiss-saved-recovery")
-                                            .small()
-                                            .ghost()
-                                            .label("Dismiss Saved Preedit")
-                                            .on_click(move |_, _, cx| {
-                                                let _ =
-                                                    dismiss_recovery.update(cx, |workspace, cx| {
-                                                        workspace.state.update(cx, |state, cx| {
-                                                            state.set_setting(
-                                                                "recovered_composition",
-                                                                serde_json::Value::Null,
-                                                            );
-                                                            cx.notify();
-                                                        })
-                                                    });
-                                            }),
-                                    )
-                                }),
-                        )
-                    },
-                )
                 .child(
                     div()
                         .relative()
@@ -2042,9 +1938,14 @@ impl Render for WorkspacePanel {
             let state = self.state.read(cx);
             let scroll = &self.scroll;
             match self.kind {
-                PanelKind::Projects => {
-                    sidebar::render(state, &self.workspace, workspace.cursor, scroll, cx)
-                }
+                PanelKind::Projects => sidebar::render(
+                    state,
+                    &self.workspace,
+                    workspace.cursor,
+                    &workspace.thread_search,
+                    scroll,
+                    cx,
+                ),
                 PanelKind::Welcome => conversation::welcome(state, &self.workspace, cx),
                 PanelKind::Output => factory::output(state, &self.workspace, scroll, cx),
                 PanelKind::Thread(id) => {
@@ -2269,4 +2170,12 @@ impl Render for Recovery {
                 .child(h_flex().gap_2().child(Button::new("copy-recovery-error").label("Copy error").on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()))))
                     .child(Button::new("quit-recovery").label("Quit DROSTJE.").on_click(|_, _, cx| cx.quit()))))
     }
+}
+
+/// Where the keyboard cursor lands after filtering: the first thread, else the first row.
+fn first_thread_row(rows: &[Row]) -> Option<Row> {
+    rows.iter()
+        .copied()
+        .find(|row| matches!(row, Row::Thread(_)))
+        .or_else(|| rows.first().copied())
 }

@@ -610,29 +610,28 @@ impl NvimView {
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
-        if key.modifiers.platform {
-            // Workspace shortcuts (especially Cmd-Return and Cmd-Escape) bubble.
-            if key.modifiers.control || key.modifiers.alt || key.modifiers.shift {
-                return;
-            }
-            match key.key.as_str() {
-                "c" | "x" if self.enabled() && !self.has_composition() => {
-                    self.send(
-                        NvimCommand::Copy {
-                            cut: key.key == "x",
-                        },
-                        cx,
-                    );
-                }
-                "v" if self.enabled() && !self.has_composition() => {
-                    if let Some(item) = cx.read_from_clipboard() {
-                        self.paste_item(item, window, cx);
+        if let Some(chord) = clipboard_chord(key) {
+            if self.enabled() && !self.has_composition() {
+                match chord {
+                    ClipboardChord::Copy => {
+                        self.send(NvimCommand::Copy { cut: false }, cx);
+                    }
+                    ClipboardChord::Cut => {
+                        self.send(NvimCommand::Copy { cut: true }, cx);
+                    }
+                    ClipboardChord::Paste => {
+                        if let Some(item) = cx.read_from_clipboard() {
+                            self.paste_item(item, window, cx);
+                        }
                     }
                 }
-                _ => return,
             }
             window.prevent_default();
             cx.stop_propagation();
+            return;
+        }
+        if key.modifiers.platform {
+            // Workspace shortcuts (especially Cmd-Return and Cmd-Escape) bubble.
             return;
         }
         if !self.writable {
@@ -1692,6 +1691,34 @@ fn buffer_offset(text: &str, cursor: (usize, usize)) -> usize {
     start + byte_floor(&text[start..start + length], cursor.1)
 }
 
+/// The native clipboard chords the composer takes before Neovim sees the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardChord {
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// macOS uses the Cmd key, where Ctrl-C/X/V stay Vim keys. Elsewhere Ctrl is
+/// Vim's, so the terminal convention Ctrl-Shift-C/X/V is the native chord.
+fn clipboard_chord(key: &Keystroke) -> Option<ClipboardChord> {
+    let modifiers = key.modifiers;
+    let native = if cfg!(target_os = "macos") {
+        modifiers.platform && !modifiers.control && !modifiers.alt && !modifiers.shift
+    } else {
+        modifiers.control && modifiers.shift && !modifiers.platform && !modifiers.alt
+    };
+    if !native || modifiers.function {
+        return None;
+    }
+    match key.key.as_str() {
+        "c" => Some(ClipboardChord::Copy),
+        "x" => Some(ClipboardChord::Cut),
+        "v" => Some(ClipboardChord::Paste),
+        _ => None,
+    }
+}
+
 fn key_notation(key: &Keystroke) -> Option<String> {
     let name = match key.key.as_str() {
         "escape" => "Esc",
@@ -2215,6 +2242,31 @@ mod row_cache_tests {
             cache.prepare(changed, &grid.rows, shape);
             assert_eq!(calls.get(), before + 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_chord_tests {
+    #[test]
+    fn native_clipboard_chord_uses_the_platform_paste_key_and_leaves_vim_keys_alone() {
+        use super::{ClipboardChord, clipboard_chord};
+        use gpui_kit::Keystroke;
+        let chord = |source: &str| clipboard_chord(&Keystroke::parse(source).unwrap());
+        let (native, vim) = if cfg!(target_os = "macos") {
+            ("cmd", "ctrl-shift")
+        } else {
+            ("ctrl-shift", "cmd")
+        };
+        assert_eq!(chord(&format!("{native}-v")), Some(ClipboardChord::Paste));
+        assert_eq!(chord(&format!("{native}-c")), Some(ClipboardChord::Copy));
+        assert_eq!(chord(&format!("{native}-x")), Some(ClipboardChord::Cut));
+        assert_eq!(chord(&format!("{native}-alt-v")), None);
+        assert_eq!(chord(&format!("{native}-enter")), None);
+        assert_eq!(chord(&format!("{vim}-v")), None);
+        // Vim's own Ctrl-V (blockwise visual, literal insert) and Ctrl-C stay Neovim's.
+        assert_eq!(chord("ctrl-v"), None);
+        assert_eq!(chord("ctrl-c"), None);
+        assert_eq!(chord("v"), None);
     }
 }
 

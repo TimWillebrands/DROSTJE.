@@ -28,6 +28,7 @@ gpui_kit::actions!(
         NextThread,
         PreviousThread,
         ShowArchived,
+        SearchThreads,
         RefreshFactoryRuns,
         Settings,
         ResetLayout,
@@ -81,6 +82,7 @@ pub enum Command {
     NextThread,
     PreviousThread,
     ShowArchived,
+    SearchThreads,
     RefreshFactoryRuns,
     Settings,
     ResetLayout,
@@ -99,7 +101,7 @@ pub enum Command {
     PasteImage,
 }
 impl Command {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::AddProject,
         Self::NewConversation,
         Self::NewOmpConversation,
@@ -113,6 +115,7 @@ impl Command {
         Self::NextThread,
         Self::PreviousThread,
         Self::ShowArchived,
+        Self::SearchThreads,
         Self::RefreshFactoryRuns,
         Self::Settings,
         Self::ResetLayout,
@@ -146,6 +149,7 @@ impl Command {
             Self::NextThread => "Next thread",
             Self::PreviousThread => "Previous thread",
             Self::ShowArchived => "Show archived threads",
+            Self::SearchThreads => "Search threads…",
             Self::RefreshFactoryRuns => "Refresh Factory runs",
             Self::Settings => "Settings…",
             Self::ResetLayout => "Reset layout",
@@ -180,6 +184,7 @@ impl Command {
             Self::NextThread => Box::new(NextThread),
             Self::PreviousThread => Box::new(PreviousThread),
             Self::ShowArchived => Box::new(ShowArchived),
+            Self::SearchThreads => Box::new(SearchThreads),
             Self::RefreshFactoryRuns => Box::new(RefreshFactoryRuns),
             Self::Settings => Box::new(Settings),
             Self::ResetLayout => Box::new(ResetLayout),
@@ -262,6 +267,26 @@ impl Command {
     }
 }
 
+// Workspace chords use GPUI's `secondary-` modifier: Cmd on macOS, Ctrl elsewhere.
+// Two chords cannot follow that rule on Linux, where Ctrl also belongs to Vim and
+// to the Ctrl-W pane chord; they keep the terminal convention Ctrl-Shift instead.
+
+/// The native paste chord: Cmd-V on macOS; Ctrl-Shift-V elsewhere, where
+/// Ctrl-V is Vim's blockwise visual and literal-insert key.
+pub const PASTE_IMAGE_KEY: &str = if cfg!(target_os = "macos") {
+    "cmd-v"
+} else {
+    "ctrl-shift-v"
+};
+
+/// Close the active thread tab: Cmd-W on macOS; Ctrl-Shift-W elsewhere, because
+/// a lone Ctrl-W is the pending prefix of the Ctrl-W h/j/k/l pane chord.
+pub const CLOSE_THREAD_KEY: &str = if cfg!(target_os = "macos") {
+    "cmd-w"
+} else {
+    "ctrl-shift-w"
+};
+
 pub fn bind_keys(cx: &mut App) {
     let workspace = Some("Workspace && !Command && !PopupMenu && !Sheet && !Dialog");
     let command = Some("DrostjePalette");
@@ -281,31 +306,31 @@ pub fn bind_keys(cx: &mut App) {
         "(Thread || PromptEditor || FactoryThreadForm) && !Command && !PopupMenu && !Sheet && !Dialog",
     );
     cx.bind_keys(vec![
-        KeyBinding::new("cmd-shift-p", OpenPalette, workspace),
+        KeyBinding::new("secondary-shift-p", OpenPalette, workspace),
         KeyBinding::new("ctrl-tab", NextThread, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, workspace),
-        KeyBinding::new("cmd-w", CloseThread, workspace),
-        KeyBinding::new("cmd-1", FocusProjects, workspace),
-        KeyBinding::new("cmd-2", FocusThread, workspace),
-        KeyBinding::new("cmd-3", FocusOutput, workspace),
-        KeyBinding::new("cmd-b", ToggleProjects, workspace),
-        KeyBinding::new("cmd-j", ToggleOutput, workspace),
-        KeyBinding::new("cmd-n", NewConversation, workspace),
-        KeyBinding::new("cmd-shift-n", NewFactoryThread, workspace),
-        KeyBinding::new("cmd-,", Settings, workspace),
-        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, workspace),
+        KeyBinding::new("secondary-1", FocusProjects, workspace),
+        KeyBinding::new("secondary-2", FocusThread, workspace),
+        KeyBinding::new("secondary-3", FocusOutput, workspace),
+        KeyBinding::new("secondary-b", ToggleProjects, workspace),
+        KeyBinding::new("secondary-j", ToggleOutput, workspace),
+        KeyBinding::new("secondary-n", NewConversation, workspace),
+        KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
+        KeyBinding::new("secondary-,", Settings, workspace),
+        KeyBinding::new("secondary-q", Quit, None),
         // The native Command rows resolve hints against the palette's own action host.
-        KeyBinding::new("cmd-1", FocusProjects, command),
-        KeyBinding::new("cmd-2", FocusThread, command),
-        KeyBinding::new("cmd-3", FocusOutput, command),
-        KeyBinding::new("cmd-b", ToggleProjects, command),
-        KeyBinding::new("cmd-j", ToggleOutput, command),
-        KeyBinding::new("cmd-n", NewConversation, command),
-        KeyBinding::new("cmd-shift-n", NewFactoryThread, command),
-        KeyBinding::new("cmd-,", Settings, command),
+        KeyBinding::new("secondary-1", FocusProjects, command),
+        KeyBinding::new("secondary-2", FocusThread, command),
+        KeyBinding::new("secondary-3", FocusOutput, command),
+        KeyBinding::new("secondary-b", ToggleProjects, command),
+        KeyBinding::new("secondary-j", ToggleOutput, command),
+        KeyBinding::new("secondary-n", NewConversation, command),
+        KeyBinding::new("secondary-shift-n", NewFactoryThread, command),
+        KeyBinding::new("secondary-,", Settings, command),
         KeyBinding::new("ctrl-tab", NextThread, command),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, command),
-        KeyBinding::new("cmd-w", CloseThread, command),
+        KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, command),
         KeyBinding::new("ctrl-w h", FocusLeft, navigation),
         KeyBinding::new("ctrl-w j", FocusDown, navigation),
         KeyBinding::new("ctrl-w k", FocusUp, navigation),
@@ -332,6 +357,19 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("left", CollapseProject, projects),
         KeyBinding::new("l", ExpandProject, projects),
         KeyBinding::new("right", ExpandProject, projects),
+        KeyBinding::new("/", SearchThreads, projects),
+        // The thread filter is a native input: Escape clears it and Down moves into the
+        // rows, both only after the input itself declined the key.
+        KeyBinding::new(
+            "escape",
+            Dismiss,
+            Some("ProjectSearch && !Command && !PopupMenu && !Sheet && !Dialog"),
+        ),
+        KeyBinding::new(
+            "down",
+            SelectNext,
+            Some("ProjectSearch && !Command && !PopupMenu && !Sheet && !Dialog"),
+        ),
         KeyBinding::new("enter", OpenSelection, list),
         KeyBinding::new("j", SelectNext, thread),
         KeyBinding::new("down", SelectNext, thread),
@@ -340,36 +378,37 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("g g", SelectFirst, thread),
         KeyBinding::new("shift-g", SelectLast, thread),
         KeyBinding::new("i", FocusComposer, thread),
-        // Inside the composer Neovim owns Cmd-V and hands image clipboards to the same Action.
-        KeyBinding::new("cmd-v", PasteImage, thread),
+        // Inside the composer the Neovim view owns the same chord and hands image
+        // clipboards to this Action.
+        KeyBinding::new(PASTE_IMAGE_KEY, PasteImage, thread),
         KeyBinding::new(
-            "cmd-escape",
+            "secondary-escape",
             LeaveEditor,
             Some("PromptEditor && !Dialog && !Sheet"),
         ),
-        KeyBinding::new("cmd-enter", Submit, submit),
+        KeyBinding::new("secondary-enter", Submit, submit),
         KeyBinding::new(
-            "cmd-enter",
+            "secondary-enter",
             Submit,
             Some("Input && PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "cmd-.",
+            "secondary-.",
             Interrupt,
             Some("Input && PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "cmd-.",
+            "secondary-.",
             Interrupt,
             Some("(Thread || PromptEditor) && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "cmd-enter",
+            "secondary-enter",
             Confirm,
             Some("DrostjeForm && !Command && !PopupMenu"),
         ),
         KeyBinding::new(
-            "cmd-enter",
+            "secondary-enter",
             Confirm,
             Some("Input && PromptEditor && DrostjeForm && !Command && !PopupMenu"),
         ),
@@ -672,6 +711,9 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &ShowArchived, w, cx| {
                 this.run(PaletteTarget::Command(Command::ShowArchived), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SearchThreads, w, cx| {
+                this.run(PaletteTarget::Command(Command::SearchThreads), w, cx)
             }))
             .on_action(cx.listener(|this, _: &RefreshFactoryRuns, w, cx| {
                 this.run(PaletteTarget::Command(Command::RefreshFactoryRuns), w, cx)
