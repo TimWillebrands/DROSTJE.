@@ -1370,7 +1370,7 @@ impl Workspace {
                 && dock.bounds().contains(&bounds.center()))
             .then_some(bounds)
         };
-        let Some(origin) = visible_bounds(&current).map(|bounds| bounds.center()) else {
+        let Some(origin) = visible_bounds(&current) else {
             return;
         };
         let next = self
@@ -1378,19 +1378,31 @@ impl Workspace {
             .into_iter()
             .filter(|panel| *panel != current)
             .filter_map(|panel| {
-                let center = visible_bounds(&panel)?.center();
-                let dx = f32::from(center.x - origin.x);
-                let dy = f32::from(center.y - origin.y);
-                let (forward, cross) = match direction {
-                    PaneDirection::Left => (-dx, dy),
-                    PaneDirection::Right => (dx, dy),
-                    PaneDirection::Up => (-dy, dx),
-                    PaneDirection::Down => (dy, dx),
+                let bounds = visible_bounds(&panel)?;
+                let overlap = origin.intersect(&bounds).size;
+                let delta = bounds.center() - origin.center();
+                let (gap, overlap, cross) = match direction {
+                    PaneDirection::Left => {
+                        (origin.left() - bounds.right(), overlap.height, delta.y)
+                    }
+                    PaneDirection::Right => {
+                        (bounds.left() - origin.right(), overlap.height, delta.y)
+                    }
+                    PaneDirection::Up => (origin.top() - bounds.bottom(), overlap.width, delta.x),
+                    PaneDirection::Down => (bounds.top() - origin.bottom(), overlap.width, delta.x),
                 };
-                (forward > 1.).then_some((panel, forward + cross.abs() * 2.))
+                // Neighbours must lie beyond this edge, not merely have a centre
+                // somewhere in that direction. Allow one pixel of layout rounding.
+                (gap >= px(-1.) && overlap > px(1.)).then_some((
+                    panel,
+                    f32::from(gap).max(0.),
+                    f32::from(cross).abs(),
+                ))
             })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(panel, _)| panel);
+            // Edge distance takes precedence: never skip an intervening pane
+            // because a farther pane's centre happens to line up better.
+            .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)))
+            .map(|(panel, _, _)| panel);
         if let Some(next) = next {
             self.focus_panel(next, window, cx);
         }
@@ -2677,7 +2689,7 @@ impl Render for WorkspacePanel {
                         .absolute()
                         .inset_0()
                         .border_1()
-                        .border_color(cx.theme().ring),
+                        .border_color(cx.theme().input),
                 )
             })
             .child(

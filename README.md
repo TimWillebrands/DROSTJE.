@@ -94,7 +94,7 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |`Ctrl-Tab` / `Ctrl-Shift-Tab`|Volgende / vorige open threadtab|
 |`Cmd-Alt-]` / `Cmd-Alt-[`|Volgende / vorige Space, buiten invoervelden en overlays|
 |`Cmd-W` (Linux: `Ctrl-Shift-W`)|Huidige threadtab sluiten|
-|`Ctrl-W`, daarna `h/j/k/l`|Naar een zichtbaar aangrenzend paneel, ook vanuit de prompt-editor; tweede toets mag ook met Control|
+|`Ctrl-W`, daarna `h/j/k/l`|Naar het dichtstbijzijnde zichtbare paneel in die richting, ook vanuit de prompt-editor; zonder buur blijft focus staan, zonder omslaan of diagonale sprongen|
 |`j/k`, pijlen, `gg/G`, `h/l`, Return|Navigeren, springen, invouwen/uitvouwen en openen in Projects|
 |`i` in een Conversation|Focus naar de prompteditor|
 |`Cmd-V` in een Conversation|Afbeelding van het klembord als bijlage toevoegen (PNG, JPEG, WebP, TIFF); tekst plakt in de editor|
@@ -104,7 +104,7 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |`Cmd-,`|Settings|
 |Escape|Bovenste menu of venster sluiten; in de palette eerst de zoektekst wissen|
 
-Het paneel met toetsenbordfocus krijgt een rand. In Projects heeft de rij waarop `j/k` en Return werken een duidelijke omlijning; de achtergrondmarkering van de geopende thread blijft daarvan gescheiden. Bij zoeken verhuist de focusmarkering naar het zoekveld. De prompteditor toont **Draft · Editing** zolang je daar typt en **Draft · Not focused** zodra je naar een ander onderdeel gaat. De concepttekst, cursorpositie en Neovim-modus blijven behouden.
+Focus gebruikt subtiele, neutrale tintverschillen in plaats van blauwe omlijningen. In Projects heeft de rij waarop `j/k` en Return werken een gedempte achtergrond en een smalle neutrale markering links; de geopende thread blijft apart herkenbaar. De prompteditor krijgt bij focus een subtiel gekleurde kop met **Draft · Editing** en toont **Draft · Not focused** zodra je naar een ander onderdeel gaat. De concepttekst, cursorpositie en Neovim-modus blijven behouden. Projects bereik je met een paneelbeweging vanuit de aangrenzende thread, niet door vanuit een verder gelegen thread over tussenliggende panelen heen te springen.
 
 In insert-modus voegt Return een nieuwe regel toe; alleen `Cmd-Enter` verstuurt. Escape schakelt binnen de editor de Neovim-modus terug; `Cmd-Escape` verlaat de editor. Moties, operators, visual-selectie, registers, zoeken en undo/redo worden door Neovim uitgevoerd. `Cmd-C/X/V` (Linux: `Ctrl-Shift-C/X/V`) gebruikt het systeemklembord; bevat het klembord een afbeelding, dan wordt die als bijlage bij de draft gezet in plaats van geplakt als tekst. Directionele paneeltoetsen nemen geen editorinvoer over.
 
