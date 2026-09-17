@@ -146,6 +146,9 @@ pub struct Workspace {
     reopening: Option<Region>,
     dock_measurement: Rc<Cell<Option<Bounds<Pixels>>>>,
     presented_thread: Option<ThreadId>,
+    /// A selected thread whose tab has not been displayed yet, because its
+    /// panel is added by the next `sync_thread_panels`.
+    unrevealed_thread: Option<ThreadId>,
     pub(super) _subscriptions: Vec<Subscription>,
 }
 impl Workspace {
@@ -224,6 +227,7 @@ impl Workspace {
             effort_picker: None,
             permission_mode_picker: None,
             presented_thread: None,
+            unrevealed_thread: None,
             detail_surface: None,
             palette: None,
             dialog: None,
@@ -303,7 +307,7 @@ impl Workspace {
                 workspace.sync_permission_mode_picker(window, cx);
                 workspace.sync_detail_surface(window, cx);
                 workspace.show_notices(window, cx);
-                workspace.sync_selection_panels(cx);
+                workspace.sync_selection_panels(window, cx);
                 workspace.sync_diff_interest(cx);
                 cx.notify();
             },
@@ -320,7 +324,7 @@ impl Workspace {
                         workspace.sync_model_picker(window, cx);
                         workspace.sync_effort_picker(window, cx);
                         workspace.sync_permission_mode_picker(window, cx);
-                        workspace.sync_selection_panels(cx);
+                        workspace.sync_selection_panels(window, cx);
                         workspace.sync_diff_interest(cx);
                     }
                     PresentationChange::Thread(id)
@@ -381,7 +385,7 @@ impl Workspace {
         workspace.sync_model_picker(window, cx);
         workspace.sync_effort_picker(window, cx);
         workspace.sync_permission_mode_picker(window, cx);
-        workspace.sync_selection_panels(cx);
+        workspace.sync_selection_panels(window, cx);
         workspace.sync_diff_interest(cx);
         cx.defer_in(window, |workspace, window, cx| {
             workspace.show_notices(window, cx)
@@ -542,6 +546,7 @@ impl Workspace {
         self.welcome.borrow_mut().take();
         self.cursor = None;
         self.presented_thread = None;
+        self.unrevealed_thread = None;
         self.reopening = None;
         self.thread_search
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -572,7 +577,7 @@ impl Workspace {
         }
         self.sync_session(window, cx);
         self.sync_factory_form(window, cx);
-        self.sync_selection_panels(cx);
+        self.sync_selection_panels(window, cx);
         self.projects.update(cx, |_, cx| cx.notify());
         cx.defer_in(window, move |workspace, window, cx| {
             if workspace.presented_space == active {
@@ -779,7 +784,7 @@ impl Workspace {
         }
         cx.notify();
     }
-    fn sync_selection_panels(&mut self, cx: &mut Context<Self>) {
+    fn sync_selection_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.state.read(cx).selected_thread;
         if selected != self.presented_thread {
             for id in self.presented_thread.into_iter().chain(selected) {
@@ -788,8 +793,64 @@ impl Workspace {
                 }
             }
             self.presented_thread = selected;
+            self.unrevealed_thread = selected;
             self.projects.update(cx, |_, cx| cx.notify());
         }
+        if let Some(id) = self.unrevealed_thread
+            && self.reveal_thread_tab(id, window, cx)
+        {
+            self.unrevealed_thread = None;
+        }
+    }
+    /// Display a thread's tab in its group without moving focus, so a thread
+    /// selected from Projects, the palette or a close is the one on screen; the
+    /// tab bar scrolls a newly displayed tab into view. False while the thread
+    /// has no panel in a group yet.
+    fn reveal_thread_tab(
+        &mut self,
+        id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.rebuilding || self.preparing_space_change || self.state.read(cx).shutting_down {
+            return false;
+        }
+        let Some(panel) = self.threads.borrow().get(&id).cloned() else {
+            return false;
+        };
+        let Some(group) = panel
+            .read(cx)
+            .group
+            .clone()
+            .and_then(|group| group.upgrade())
+        else {
+            return false;
+        };
+        let panel_id = PanelId::from(panel.entity_id());
+        let Some(index) = group
+            .read(cx)
+            .panels()
+            .iter()
+            .position(|candidate| candidate.panel_id(cx) == panel_id)
+        else {
+            return false;
+        };
+        if index != group.read(cx).active_ix() {
+            // `select_tab` focuses the displayed panel. Focus elsewhere (Projects,
+            // another pane) stays there; focus in the tab being hidden follows the tab.
+            let previous = window.focused(cx).filter(|_| {
+                !group
+                    .read(cx)
+                    .panels()
+                    .iter()
+                    .any(|candidate| candidate.focus_handle(cx).contains_focused(window, cx))
+            });
+            group.update(cx, |group, cx| group.select_tab(index, window, cx));
+            if let Some(previous) = previous {
+                previous.focus(window, cx);
+            }
+        }
+        true
     }
 
     fn sync_diff_interest(&mut self, cx: &mut Context<Self>) {
@@ -1176,6 +1237,36 @@ impl Workspace {
         }
         cx.notify();
     }
+    /// Anchor Projects keyboard navigation to the current selection before focus moves in.
+    /// Without a cursor the pane receives focus but draws no focus indication, so the
+    /// first `j`/`k` starts from an unrelated row.
+    fn prepare_projects_cursor(&mut self, cx: &mut Context<Self>) {
+        let query = self.thread_search.read(cx).value();
+        let (rows, selected) = {
+            let state = self.state.read(cx);
+            let rows = sidebar::rows(state, &query);
+            let selected = state
+                .selected_thread
+                .map(Row::Thread)
+                .filter(|row| rows.contains(row))
+                .or_else(|| {
+                    state
+                        .selected_project
+                        .map(Row::Project)
+                        .filter(|row| rows.contains(row))
+                });
+            (rows, selected)
+        };
+        let target = selected
+            .or_else(|| self.cursor.filter(|row| rows.contains(row)))
+            .or_else(|| first_thread_row(&rows));
+        self.cursor = target;
+        if let Some(index) = rows.iter().position(|row| Some(*row) == target) {
+            self.projects.read(cx).scroll.scroll_to_item(index);
+        }
+        self.projects.update(cx, |_, cx| cx.notify());
+    }
+
     pub fn focus_region(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
         // A thread selected in this same update has no panel until the sync runs.
         if region == Region::Thread {
@@ -1200,6 +1291,9 @@ impl Workspace {
             return;
         }
         let kind = panel.read(cx).kind;
+        if kind == PanelKind::Projects {
+            self.prepare_projects_cursor(cx);
+        }
         let layout = self.dock.read(cx).dump(cx);
         let mut opened = false;
         for (placement, dock) in [
@@ -1677,6 +1771,14 @@ impl Workspace {
             }
             cx.emit(PresentationChange::Selection);
         });
+        if let Row::Thread(id) = row
+            && open
+        {
+            // Reopening the selected thread shows its tab even when another tab
+            // in its group is displayed.
+            self.unrevealed_thread = Some(id);
+            self.sync_selection_panels(window, cx);
+        }
         self.focus_region(Region::Projects, window, cx);
     }
     fn navigate(

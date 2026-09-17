@@ -6,6 +6,7 @@ use crate::{
     store::Store,
     ui::{
         commands,
+        sidebar::Row,
         workspace::{Region, Workspace},
     },
 };
@@ -1372,6 +1373,104 @@ async fn conversation_harness_commands_are_visible_and_actionable(cx: &mut TestA
 }
 
 #[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; split-pane navigation into Projects"]
+async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let mut threads = Vec::new();
+    for _ in 0..3 {
+        threads.push(new_conversation(cx, &fixture).await);
+    }
+
+    let mut layout = update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, _, cx| serde_json::to_value(workspace.dock.read(cx).dump(cx)).unwrap(),
+    );
+    layout["center"] = json!({
+        "panel_name": "StackPanel",
+        "children": threads.iter().map(|thread| json!({
+            "panel_name": "TabPanel",
+            "children": [{
+                "panel_name": "Thread",
+                "children": [],
+                "info": { "panel": { "thread": thread } }
+            }],
+            "info": { "tabs": { "active_index": 0 } }
+        })).collect::<Vec<_>>(),
+        "info": {
+            "stack": {
+                "sizes": [400.0, 400.0, 400.0],
+                "axis": 0
+            }
+        }
+    });
+    let layout = serde_json::from_value(layout).unwrap();
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        move |workspace, window, cx| {
+            workspace
+                .dock
+                .update(cx, |dock, cx| dock.load(layout, window, cx))
+                .unwrap();
+            workspace.focus_region(Region::Thread, window, cx);
+        },
+    );
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).selected_thread),
+        threads.last().copied()
+    );
+    for expected in [Region::Thread, Region::Thread, Region::Projects] {
+        cx.simulate_keystrokes(fixture.window.into(), "ctrl-w h");
+        assert_eq!(
+            update_workspace(
+                cx,
+                fixture.window,
+                &fixture.workspace,
+                |workspace, window, cx| workspace.focused_region(window, cx)
+            ),
+            expected
+        );
+    }
+
+    assert_eq!(
+        cx.read(|cx| fixture.workspace.read(cx).cursor),
+        threads.last().copied().map(Row::Thread),
+        "entering Projects anchors the visible keyboard cursor on the selected thread"
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "k");
+    assert_eq!(
+        cx.read(|cx| fixture.workspace.read(cx).cursor),
+        Some(Row::Thread(threads[1]))
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "enter");
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).selected_thread),
+        Some(threads[1])
+    );
+    assert_eq!(
+        update_workspace(
+            cx,
+            fixture.window,
+            &fixture.workspace,
+            |workspace, window, cx| workspace.focused_region(window, cx)
+        ),
+        Region::Thread
+    );
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native Command/focus/theme integration"]
 async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
@@ -2334,5 +2433,87 @@ async fn spaces_restore_active_context_and_inactive_tabs(cx: &mut TestAppContext
     }));
     cx.dispatch_action(fixture.window.into(), commands::CancelEditorCommand);
     cx.run_until_parked();
+    quit(cx, &fixture).await;
+}
+
+/// The thread each tab group displays, read from the dock's own layout dump.
+fn displayed_threads(layout: &serde_json::Value) -> Vec<String> {
+    let mut displayed = Vec::new();
+    let mut stack = vec![layout];
+    while let Some(node) = stack.pop() {
+        match node {
+            serde_json::Value::Object(map) => {
+                if map.get("panel_name").and_then(|name| name.as_str()) == Some("TabPanel") {
+                    let active = map["info"]["tabs"]["active_index"].as_u64().unwrap_or(0);
+                    if let Some(thread) =
+                        map["children"][active as usize]["info"]["panel"]["thread"].as_str()
+                    {
+                        displayed.push(thread.to_owned());
+                    }
+                }
+                stack.extend(map.values());
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            _ => {}
+        }
+    }
+    displayed
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; opening a background tab from Projects"]
+async fn projects_selection_displays_the_threads_tab(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let mut threads = Vec::new();
+    for _ in 0..3 {
+        threads.push(new_conversation(cx, &fixture).await);
+    }
+    let displayed = |cx: &mut TestAppContext| {
+        let layout = update_workspace(
+            cx,
+            fixture.window,
+            &fixture.workspace,
+            |workspace, _, cx| serde_json::to_value(workspace.dock.read(cx).dump(cx)).unwrap(),
+        );
+        displayed_threads(&layout["center"])
+    };
+    assert_eq!(displayed(cx), vec![threads[2].to_string()]);
+
+    // The first tab sits behind the other two; a click on its Projects row shows it.
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.select_row(Row::Thread(threads[0]), true, window, cx),
+    );
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).selected_thread),
+        Some(threads[0])
+    );
+    assert_eq!(displayed(cx), vec![threads[0].to_string()]);
+    assert_eq!(
+        update_workspace(
+            cx,
+            fixture.window,
+            &fixture.workspace,
+            |workspace, window, cx| workspace.focused_region(window, cx)
+        ),
+        Region::Projects,
+        "selecting from Projects keeps keyboard focus in the list"
+    );
+
+    // A selection made by other means is shown too, from Projects again.
+    cx.simulate_keystrokes(fixture.window.into(), "ctrl-tab");
+    cx.run_until_parked();
+    assert_eq!(displayed(cx), vec![threads[1].to_string()]);
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.select_row(Row::Thread(threads[2]), true, window, cx),
+    );
+    cx.run_until_parked();
+    assert_eq!(displayed(cx), vec![threads[2].to_string()]);
     quit(cx, &fixture).await;
 }
