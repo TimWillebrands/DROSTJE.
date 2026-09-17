@@ -334,7 +334,7 @@ impl Render for PromptEditor {
             .overflow_hidden()
             .border_1()
             .border_color(if focused {
-                cx.theme().ring
+                cx.theme().input
             } else {
                 cx.theme().transparent
             })
@@ -345,6 +345,11 @@ impl Render for PromptEditor {
                     "Draft · Not focused"
                 })
                 .text_xs()
+                .bg(if focused {
+                    cx.theme().muted
+                } else {
+                    cx.theme().transparent
+                })
                 .text_color(if focused {
                     cx.theme().foreground
                 } else {

@@ -350,13 +350,15 @@ pub fn render(
                                 .text_color(theme.muted_foreground)
                                 .cursor_default()
                                 .selected(selected)
-                                .border_2()
+                                .border_l_2()
                                 .border_color(if keyboard_cursor {
-                                    theme.ring
+                                    theme.muted_foreground
                                 } else {
                                     theme.transparent
                                 })
-                                .when(keyboard_cursor, |item| item.bg(theme.sidebar_accent))
+                                .when(keyboard_cursor, |item| {
+                                    item.bg(theme.list_active).text_color(theme.foreground)
+                                })
                                 .tooltip(move |window, cx| {
                                     Tooltip::new(tooltip.clone()).build(window, cx)
                                 })
@@ -556,9 +558,13 @@ pub fn render(
                         .text_color(theme.sidebar_foreground)
                         .cursor_default()
                         .selected(state.selected_thread == Some(id))
-                        .border_2()
-                        .border_color(if keyboard_cursor { theme.ring } else { theme.transparent })
-                        .when(keyboard_cursor, |item| item.bg(theme.sidebar_accent))
+                        .border_l_2()
+                        .border_color(if keyboard_cursor {
+                            theme.muted_foreground
+                        } else {
+                            theme.transparent
+                        })
+                        .when(keyboard_cursor, |item| item.bg(theme.list_active))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                         .child(
                             v_flex()

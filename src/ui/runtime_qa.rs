@@ -1404,11 +1404,9 @@ fn has_focus_outline(window: &Window, cx: &App, id: impl Into<gpui_kit::ElementI
     let bounds = window.find(id).bounds().scale(window.scale_factor());
     window.painted_quads().iter().any(|quad| {
         quad.bounds == bounds
-            && quad.border_color == Theme::global(cx).ring
-            && quad.border_widths.top > px(0.).scale(window.scale_factor())
-            && quad.border_widths.bottom > px(0.).scale(window.scale_factor())
+            && quad.border_color.a > 0.
+            && quad.border_color != Theme::global(cx).ring
             && quad.border_widths.left > px(0.).scale(window.scale_factor())
-            && quad.border_widths.right > px(0.).scale(window.scale_factor())
     })
 }
 
@@ -1446,6 +1444,17 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
                 window.render_frame(cx);
                 assert!(has_focus_outline(window, cx, "prompt-editor"));
                 assert!(!has_focus_outline(window, cx, second_row.clone()));
+            })
+            .unwrap();
+            cx.simulate_keystrokes(fixture.window.into(), "ctrl-w l ctrl-w ctrl-l");
+            cx.run_until_parked();
+            cx.update_window(fixture.window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(
+                    window.find("prompt-editor").focused(),
+                    Some(true),
+                    "moving right at the edge must leave Neovim focused"
+                );
             })
             .unwrap();
 
@@ -1576,6 +1585,21 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         cx.read(|cx| fixture.state.read(cx).selected_thread),
         threads.last().copied()
     );
+    // At the right edge, neither moving right nor moving vertically may pick
+    // Projects just because its full-height pane has a different centre.
+    for keys in ["ctrl-w l", "ctrl-w ctrl-l", "ctrl-w k", "ctrl-w j"] {
+        cx.simulate_keystrokes(fixture.window.into(), keys);
+        assert_eq!(
+            update_workspace(
+                cx,
+                fixture.window,
+                &fixture.workspace,
+                |workspace, window, cx| { workspace.focused_thread(window, cx) }
+            ),
+            threads.last().copied(),
+            "{keys} must stay at the edge, not jump to Projects"
+        );
+    }
     for expected in [Region::Thread, Region::Thread, Region::Projects] {
         cx.simulate_keystrokes(fixture.window.into(), "ctrl-w h");
         assert_eq!(
@@ -1613,6 +1637,79 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         ),
         Region::Thread
     );
+    for (keys, expected) in [
+        ("ctrl-w l", Some(threads[2])),
+        ("ctrl-w l", Some(threads[2])),
+        ("ctrl-w h", Some(threads[1])),
+        ("ctrl-w h", Some(threads[0])),
+        ("ctrl-w h", None),
+        ("ctrl-w l", Some(threads[0])),
+    ] {
+        cx.simulate_keystrokes(fixture.window.into(), keys);
+        assert_eq!(
+            update_workspace(
+                cx,
+                fixture.window,
+                &fixture.workspace,
+                |workspace, window, cx| { workspace.focused_thread(window, cx) }
+            ),
+            expected,
+            "{keys} must visit the adjacent pane without skipping or wrapping"
+        );
+    }
+
+    // Stacked threads sit beside the full-height Projects pane. Its centre
+    // must not make it a vertical neighbour of any of those threads.
+    let mut layout = update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, _, cx| serde_json::to_value(workspace.dock.read(cx).dump(cx)).unwrap(),
+    );
+    layout["center"]["info"]["stack"]["axis"] = json!(1);
+    layout["center"]["info"]["stack"]["sizes"] = json!([220., 300., 220.]);
+    let layout = serde_json::from_value(layout).unwrap();
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace
+                .dock
+                .update(cx, |dock, cx| dock.load(layout, window, cx))
+                .unwrap();
+            workspace.focus_region(Region::Thread, window, cx);
+        },
+    );
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    for (keys, expected) in [
+        ("ctrl-w k", Some(threads[0])),
+        ("ctrl-w l", Some(threads[0])),
+        ("ctrl-w j", Some(threads[1])),
+        ("ctrl-w j", Some(threads[2])),
+        ("ctrl-w j", Some(threads[2])),
+        ("ctrl-w l", Some(threads[2])),
+        ("ctrl-w h", None),
+    ] {
+        cx.simulate_keystrokes(fixture.window.into(), keys);
+        assert_eq!(
+            update_workspace(
+                cx,
+                fixture.window,
+                &fixture.workspace,
+                |workspace, window, cx| { workspace.focused_thread(window, cx) }
+            ),
+            expected,
+            "{keys} must respect stacked pane edges"
+        );
+    }
     quit(cx, &fixture).await;
 }
 
