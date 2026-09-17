@@ -33,6 +33,22 @@ cargo run
 
 Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor testen)? Zet `DROSTJE_DATA_DIR`.
 
+### Installeren
+
+Bouw en installeer een lokale macOS-app in `/Applications`:
+
+```sh
+./install.sh
+```
+
+De installer maakt een ongesigneerde `Drostje.app`-bundle met een release-build en vraagt alleen bij een niet-schrijfbare `/Applications`-map om beheerdersrechten. Gebruik `INSTALL_DIR` voor een andere locatie:
+
+```sh
+INSTALL_DIR="$HOME/Applications" ./install.sh
+```
+
+De installer installeert geen Neovim, OMP, Claude Code, Factory, Docker of andere vereisten. Ontbrekende vereisten configureer je in Settings.
+
 De standaardmap is `~/Library/Application Support/Drostje`. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
 
 Kies in Settings zo nodig expliciete executable-paden, de Conversation-harness per project en de gedeelde Factory-data-root. OMP en Claude Code draaien met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
