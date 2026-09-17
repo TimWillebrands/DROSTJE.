@@ -144,8 +144,12 @@ impl PromptEditor {
                             cx.notify();
                         }));
                         let focus = view.focus_handle(cx);
+                        this._subscriptions.push(cx.on_focus(&focus, window, |_, _, cx| {
+                            cx.notify();
+                        }));
                         this._subscriptions.push(cx.on_blur(&focus, window, |this, _, cx| {
                             this.commit_on_focus_loss(cx);
+                            cx.notify();
                         }));
                         this._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
                             // An inactive window can retain the editor's focus handle.
@@ -153,6 +157,7 @@ impl PromptEditor {
                             if this.window_inactive {
                                 this.commit_on_focus_loss(cx);
                             }
+                            cx.notify();
                         }));
                         if this.focus.is_focused(window) {
                             view.update(cx, |view, cx| view.focus(window, cx));
@@ -290,7 +295,8 @@ impl Focusable for PromptEditor {
 }
 
 impl Render for PromptEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = window.is_window_active() && self.focus_handle(cx).is_focused(window);
         let state = self.state.read(cx);
         let writable =
             !self.switching
@@ -313,17 +319,47 @@ impl Render for PromptEditor {
         }
         div()
             .id("prompt-editor")
+            .test_support()
             .key_context("NativeInput PromptEditor")
             .track_focus(&self.focus)
             .size_full()
+            .relative()
+            .flex()
+            .flex_col()
             .min_w_0()
             .min_h_0()
-            // No box of its own: the composer divider frames the editor and the
-            // Neovim cursor, painted only while focused, is the focus cue.
+            // Keep a steady focus cue even while Neovim's caret is blinking off.
+            // Blurring never changes the buffer, Vim mode, or composition.
             .bg(cx.theme().background)
             .overflow_hidden()
+            .border_1()
+            .border_color(if focused {
+                cx.theme().ring
+            } else {
+                cx.theme().transparent
+            })
+            .child(
+                Label::new(if focused {
+                    "Draft · Editing"
+                } else {
+                    "Draft · Not focused"
+                })
+                .text_xs()
+                .text_color(if focused {
+                    cx.theme().foreground
+                } else {
+                    cx.theme().muted_foreground
+                })
+                .px_2()
+                .py_0p5(),
+            )
             .when_some(self.view.clone(), |surface, view| {
-                surface.child(view.cached(StyleRefinement::default().size_full()))
+                surface.child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(view.cached(StyleRefinement::default().size_full())),
+                )
             })
             .when(self.view.is_none(), |surface| {
                 if let Some(error) = error {

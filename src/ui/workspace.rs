@@ -392,6 +392,7 @@ impl Workspace {
         cx.defer_in(window, |workspace, window, cx| {
             workspace.show_notices(window, cx)
         });
+        workspace.prepare_projects_cursor(cx);
         let projects_focus = workspace.projects.read(cx).focus.clone();
         projects_focus.focus(window, cx);
         workspace.start_editor(window, cx);
@@ -2302,6 +2303,13 @@ impl WorkspacePanel {
         let mut subscriptions = vec![
             cx.observe(&state, |_, _, cx| cx.notify()),
             cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()),
+            cx.on_focus_in(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_focus_out(&focus, window, |_, _, _, cx| cx.notify()),
+            // Moving between the Projects list and its native search input stays
+            // inside the pane, but must still move the row's keyboard focus cue.
+            cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+            cx.observe_window_activation(window, |_, _, cx| cx.notify()),
             cx.subscribe(&state, |panel, _, event: &PresentationChange, cx| {
                 let affected = match (*event, panel.kind) {
                     (
@@ -2554,7 +2562,9 @@ impl Focusable for WorkspacePanel {
 }
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
 impl Render for WorkspacePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let pane_focused = window.is_window_active() && self.focus.contains_focused(window, cx);
+        let list_focused = window.is_window_active() && self.focus.is_focused(window);
         let content = self.workspace.upgrade().map(|owner| {
             let workspace = owner.read(cx);
             let state = self.state.read(cx);
@@ -2563,7 +2573,7 @@ impl Render for WorkspacePanel {
                 PanelKind::Projects => sidebar::render(
                     state,
                     &self.workspace,
-                    workspace.cursor,
+                    workspace.cursor.filter(|_| list_focused),
                     workspace.hovered_sidebar_row,
                     &workspace.thread_search,
                     scroll,
@@ -2659,6 +2669,17 @@ impl Render for WorkspacePanel {
                 }
             })
             .children(content)
+            .when(pane_focused, |pane| {
+                pane.child(
+                    div()
+                        .id("pane-focus")
+                        .test_support()
+                        .absolute()
+                        .inset_0()
+                        .border_1()
+                        .border_color(cx.theme().ring),
+                )
+            })
             .child(
                 canvas(
                     move |measured, _, _| bounds.set(Some(measured)),

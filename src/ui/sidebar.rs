@@ -350,12 +350,13 @@ pub fn render(
                                 .text_color(theme.muted_foreground)
                                 .cursor_default()
                                 .selected(selected)
-                                .border_l_2()
+                                .border_2()
                                 .border_color(if keyboard_cursor {
                                     theme.ring
                                 } else {
                                     theme.transparent
                                 })
+                                .when(keyboard_cursor, |item| item.bg(theme.sidebar_accent))
                                 .tooltip(move |window, cx| {
                                     Tooltip::new(tooltip.clone()).build(window, cx)
                                 })
@@ -555,12 +556,9 @@ pub fn render(
                         .text_color(theme.sidebar_foreground)
                         .cursor_default()
                         .selected(state.selected_thread == Some(id))
-                        .border_l_2()
-                        .border_color(if keyboard_cursor {
-                            theme.ring
-                        } else {
-                            theme.transparent
-                        })
+                        .border_2()
+                        .border_color(if keyboard_cursor { theme.ring } else { theme.transparent })
+                        .when(keyboard_cursor, |item| item.bg(theme.sidebar_accent))
                         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
                         .child(
                             v_flex()
@@ -802,7 +800,7 @@ pub fn render(
                             });
                         })
                         .child(
-                            Input::new(search).appearance(false).cleanable(true).prefix(
+                            Input::new(search).small().cleanable(true).prefix(
                                 Icon::new(IconName::Search)
                                     .small()
                                     .text_color(theme.muted_foreground),

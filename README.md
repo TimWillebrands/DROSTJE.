@@ -104,6 +104,8 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |`Cmd-,`|Settings|
 |Escape|Bovenste menu of venster sluiten; in de palette eerst de zoektekst wissen|
 
+Het paneel met toetsenbordfocus krijgt een rand. In Projects heeft de rij waarop `j/k` en Return werken een duidelijke omlijning; de achtergrondmarkering van de geopende thread blijft daarvan gescheiden. Bij zoeken verhuist de focusmarkering naar het zoekveld. De prompteditor toont **Draft · Editing** zolang je daar typt en **Draft · Not focused** zodra je naar een ander onderdeel gaat. De concepttekst, cursorpositie en Neovim-modus blijven behouden.
+
 In insert-modus voegt Return een nieuwe regel toe; alleen `Cmd-Enter` verstuurt. Escape schakelt binnen de editor de Neovim-modus terug; `Cmd-Escape` verlaat de editor. Moties, operators, visual-selectie, registers, zoeken en undo/redo worden door Neovim uitgevoerd. `Cmd-C/X/V` (Linux: `Ctrl-Shift-C/X/V`) gebruikt het systeemklembord; bevat het klembord een afbeelding, dan wordt die als bijlage bij de draft gezet in plaats van geplakt als tekst. Directionele paneeltoetsen nemen geen editorinvoer over.
 
 Versturen neemt een gecontroleerde snapshot nadat Neovim de eerdere invoer verwerkt heeft. Tijdens actieve tekstcompositie of een onvoltooide Neovim-opdracht wordt niet verstuurd of naar een andere draft gewisseld. Onvoltooide IME-tekst blijft aparte recoverytekst; die wordt nooit automatisch verstuurd of in een projectbestand geschreven.
@@ -142,6 +144,7 @@ export DROSTJE_RUNTIME_FIXTURE="$FX"
 cargo test --features runtime-qa --lib workspace_actions_with_real_backends -- --ignored --nocapture
 cargo test --features runtime-qa --lib editor_startup_failure_and_restart_preserve_draft -- --ignored --nocapture
 cargo test --features runtime-qa --lib thread_workspace_keyboard_and_themes -- --ignored --nocapture
+cargo test --features runtime-qa --lib keyboard_focus_moves_visibly_between_draft_and_projects -- --ignored --nocapture
 cargo test --features runtime-qa --lib empty_workspace_actions_stay_compact -- --ignored --nocapture
 cargo test --features runtime-qa --lib conversation_diff_sidebar_tracks_working_tree -- --ignored --nocapture
 cargo test --features runtime-qa --lib orderly_quit_flushes_before_platform_deadline -- --ignored --nocapture

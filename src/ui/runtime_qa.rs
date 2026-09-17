@@ -1400,6 +1400,124 @@ async fn conversation_harness_commands_are_visible_and_actionable(cx: &mut TestA
     quit(cx, &fixture).await;
 }
 
+fn has_focus_outline(window: &Window, cx: &App, id: impl Into<gpui_kit::ElementId>) -> bool {
+    let bounds = window.find(id).bounds().scale(window.scale_factor());
+    window.painted_quads().iter().any(|quad| {
+        quad.bounds == bounds
+            && quad.border_color == Theme::global(cx).ring
+            && quad.border_widths.top > px(0.).scale(window.scale_factor())
+            && quad.border_widths.bottom > px(0.).scale(window.scale_factor())
+            && quad.border_widths.left > px(0.).scale(window.scale_factor())
+            && quad.border_widths.right > px(0.).scale(window.scale_factor())
+    })
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; real Neovim and focus presentation"]
+async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let first = new_conversation(cx, &fixture).await;
+    let second = new_conversation(cx, &fixture).await;
+    cx.update_window(fixture.window.into(), |_, window, _| {
+        window.activate_window()
+    })
+    .unwrap();
+    let first_row = gpui_kit::SharedString::from(format!("thread-{first}"));
+    let second_row = gpui_kit::SharedString::from(format!("thread-{second}"));
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-2 i a b c");
+    until(
+        cx,
+        "draft before pane navigation",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == "abc",
+    )
+    .await;
+
+    for mode in ["light", "dark"] {
+        fixture.state.update(cx, |state, cx| {
+            state.set_setting("theme_mode", json!(mode));
+            cx.notify();
+        });
+        for (width, height) in [(1440., 900.), (900., 600.)] {
+            cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
+            cx.simulate_keystrokes(fixture.window.into(), "secondary-2 i");
+            cx.run_until_parked();
+            cx.update_window(fixture.window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(has_focus_outline(window, cx, "prompt-editor"));
+                assert!(!has_focus_outline(window, cx, second_row.clone()));
+            })
+            .unwrap();
+
+            cx.simulate_keystrokes(
+                fixture.window.into(),
+                if width == 900. {
+                    "ctrl-w h"
+                } else {
+                    "secondary-escape ctrl-w h"
+                },
+            );
+            cx.run_until_parked();
+            cx.update_window(fixture.window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(window.find("Projects").focused(), Some(true));
+                assert!(!has_focus_outline(window, cx, "prompt-editor"));
+                assert!(has_focus_outline(window, cx, second_row.clone()));
+            })
+            .unwrap();
+            cx.simulate_keystrokes(fixture.window.into(), "k");
+            cx.run_until_parked();
+            assert_eq!(
+                cx.read(|cx| fixture.state.read(cx).selected_thread),
+                Some(second)
+            );
+            cx.update_window(fixture.window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(has_focus_outline(window, cx, first_row.clone()));
+                assert!(!has_focus_outline(window, cx, second_row.clone()));
+            })
+            .unwrap();
+
+            // Native search owns its own focus cue, not the remembered list cursor.
+            cx.simulate_keystrokes(fixture.window.into(), "/");
+            cx.run_until_parked();
+            cx.update_window(fixture.window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert!(!has_focus_outline(window, cx, first_row.clone()));
+                assert!(!has_focus_outline(window, cx, "prompt-editor"));
+            })
+            .unwrap();
+            cx.simulate_keystrokes(fixture.window.into(), "escape");
+        }
+    }
+    // Pane navigation must not type into the retained Neovim buffer or reset
+    // insert mode; returning to the editor resumes at the same cursor.
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-2 i d");
+    until(
+        cx,
+        "draft after pane navigation",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == "abcd",
+    )
+    .await;
+    VisualTestContext::from_window(fixture.window.into(), cx).deactivate_window();
+    cx.run_until_parked();
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!has_focus_outline(window, cx, "prompt-editor"));
+        assert!(window.try_find("pane-focus").is_none());
+        window.activate_window();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(has_focus_outline(window, cx, "prompt-editor"));
+    })
+    .unwrap();
+    quit(cx, &fixture).await;
+}
+
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; split-pane navigation into Projects"]
 async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppContext) {
