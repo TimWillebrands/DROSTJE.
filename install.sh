@@ -66,15 +66,28 @@ cat <<EOF > "$APP_BUNDLE/Contents/Info.plist"
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.developer-tools</string>
     <key>NSHighResolutionCapable</key>
-    <string>true</string>
+    <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 </dict>
 </plist>
 EOF
 
-# Copy icon if available
-if [ -f "assets/drostje-app-icon.png" ]; then
+# Build the .icns icon set. Finder, Launchpad and Spotlight only read .icns declared
+# via CFBundleIconFile; a bare PNG in Resources is ignored (the Dock icon comes from
+# the binary itself at runtime, which is why it showed even without this).
+ICON_SRC="assets/drostje-app-icon.png"
+if [ -f "$ICON_SRC" ]; then
     echo "Adding app icon..."
-    cp "assets/drostje-app-icon.png" "$APP_BUNDLE/Contents/Resources/icon.png"
+    ICONSET="$DIST_DIR/AppIcon.iconset"
+    mkdir -p "$ICONSET"
+    for size in 16 32 128 256 512; do
+        sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+        double=$((size * 2))
+        sips -z "$double" "$double" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+    rm -rf "$ICONSET"
 fi
 
 # 5. Install
@@ -87,6 +100,9 @@ if [ ! -w "$INSTALL_DIR" ]; then
 else
     cp -R "$APP_BUNDLE" "$INSTALL_DIR/"
 fi
+
+# Finder caches bundle icons; bump the mtime so it re-reads Info.plist and the .icns.
+touch "$INSTALL_DIR/$BUNDLE_NAME"
 
 # Cleanup build artifacts (optional, user might want to keep them for dev)
 # rm -rf "$DIST_DIR"
