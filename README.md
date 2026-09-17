@@ -21,7 +21,7 @@ Een **drost** (of drossaard, als je het deftig wilt zeggen) was vroeger de rentm
 ## Wat DROSTJE. níet doet
 
 - **Niks verzinnen.** Mislukt een run, dan zie je dat. Is iets onbekend, dan staat er "onbekend".
-- **Niks stiekem installeren of inloggen.** Ontbreekt er iets, dan zegt DROSTJE. dat netjes in Settings.
+- **Niks stiekem installeren of bijwerken.** DROSTJE. doet dat alleen als jij er expliciet om vraagt en logt nooit voor je in. Ontbreekt er iets, dan zie je dat in Settings.
 - **Geen editor voor je hele codebase.** Daar heb je andere dingen voor.
 - **Niet zelf opnieuw proberen.** Een drost doet wat je vraagt, niet meer en niet minder.
 
@@ -110,7 +110,7 @@ GPUI Kit is vastgezet op `0.6.1`. De prompteditor vereist een geïnstalleerde Ne
 
 De OMP-integratie is getest met `18.2.0` (native RPC v2). Claude Code gebruikt de streaming JSON-interface en vraagt toestemming voor tools in DROSTJE. zelf. Authenticatie en modeltoegang moeten voor de gekozen Conversation-harness al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
 
-`Check readiness` toont echte `factory doctor --harness …`-uitvoer. Een Conversation gebruikt per project `omp` (standaard) of `claude-code`; een Factory-thread gebruikt `opencode` (standaard), `codex` of `claude-code`. Een ongeldige of niet-ondersteunde keuze blijft zichtbaar en moet vóór de volgende Conversation of Factory-run worden aangepast. DROSTJE. voert geen upgrades of authenticatie uit.
+`Check readiness` toont echte `factory doctor --harness …`-uitvoer. Een Conversation gebruikt per project `omp` (standaard) of `claude-code`; een Factory-thread gebruikt `opencode` (standaard), `codex` of `claude-code`. Een ongeldige of niet-ondersteunde keuze blijft zichtbaar en moet vóór de volgende Conversation of Factory-run worden aangepast. DROSTJE. installeert of werkt vereisten alleen bij op jouw expliciete verzoek en voert geen authenticatie uit.
 
 ```sh
 cargo check --all-targets

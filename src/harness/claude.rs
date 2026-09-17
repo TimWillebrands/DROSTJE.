@@ -182,6 +182,8 @@ fn session(config: &mut ConversationConfig) -> Result<Session> {
 fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session)> {
     let session = session(config)?;
     let mut command = Command::new(&config.executable);
+    // `--permission-prompts host` only names who answers; without `--permission-prompt-tool
+    // stdio` the CLI never sends `can_use_tool` and auto-denies every prompt.
     command
         .args([
             "--print",
@@ -192,6 +194,8 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session)> {
             "--verbose",
             "--permission-prompts",
             "host",
+            "--permission-prompt-tool",
+            "stdio",
         ])
         .current_dir(&config.cwd)
         .stdin(Stdio::piped())
@@ -207,6 +211,15 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session)> {
     }
     if let Some(effort) = &config.effort {
         command.arg("--effort").arg(effort);
+    }
+    if let Some(mode) = &config.permission_mode {
+        ensure!(
+            super::permission_modes("claude-code")
+                .iter()
+                .any(|(value, _)| value == mode),
+            "Unsupported Claude Code permission mode: {mode}"
+        );
+        command.arg("--permission-mode").arg(mode);
     }
     // SAFETY: pre_exec runs after fork and before exec; setsid has no Rust-managed inputs.
     unsafe {
@@ -276,8 +289,16 @@ struct Turn {
     interrupting: bool,
 }
 
+/// One unanswered `can_use_tool` request.
+#[derive(Debug)]
 struct Permission {
     input: Value,
+    /// Labelled `permission_suggestions` from the CLI; the chosen one goes back verbatim as
+    /// `updatedPermissions` so Claude Code stops asking.
+    choices: Vec<(String, Value)>,
+    /// `AskUserQuestion` travels through the same channel; `Some` names the question whose
+    /// answer goes into `updatedInput`.
+    question: Option<String>,
 }
 
 struct Actor {
@@ -422,6 +443,10 @@ impl Actor {
                         self.write_offset = 0;
                         if let Some((request_id, history)) = completed.accepted {
                             self.append_history(&history)?;
+                            // Claude Code never echoes prompts; show one as soon as it is accepted.
+                            for message in normalize_history(&history, self.sequence)? {
+                                self.emit(ConversationEvent::MessageUpdated(message));
+                            }
                             if self.turn.id == Some(request_id) && !self.turn.accepted {
                                 self.turn.accepted = true;
                                 self.emit(ConversationEvent::SubmissionAccepted { request_id });
@@ -624,24 +649,13 @@ impl Actor {
             }
             ConversationCommand::Respond { request_id, answer } => {
                 if let Some(permission) = self.permissions.remove(&request_id) {
-                    let response = match answer {
-                        UserAnswer::Confirmed(true) => json!({
-                            "behavior":"allow",
-                            "updatedInput":permission.input,
-                        }),
-                        UserAnswer::Confirmed(false) | UserAnswer::Cancelled { .. } => json!({
-                            "behavior":"deny",
-                            "message":"The user denied this tool request.",
-                        }),
-                        UserAnswer::Value(_) => {
-                            self.permissions.insert(request_id, permission);
-                            self.emit(ConversationEvent::Notice {
-                                level: "error".into(),
-                                text: "Claude Code permission requests require Allow or Deny"
-                                    .into(),
-                            });
-                            return Ok(());
-                        }
+                    let Some(response) = permission_response(&permission, &answer) else {
+                        self.permissions.insert(request_id, permission);
+                        self.emit(ConversationEvent::Notice {
+                            level: "error".into(),
+                            text: "Claude Code requests take one of the offered answers".into(),
+                        });
+                        return Ok(());
                     };
                     self.queue(
                         json!({"type":"control_response","response":{
@@ -823,27 +837,28 @@ impl Actor {
                     .filter(|id| !id.is_empty())
                     .context("Claude Code permission request omitted its ID")?
                     .to_owned();
-                let tool_name = frame["request"]["tool_name"]
-                    .as_str()
-                    .unwrap_or("tool")
-                    .to_owned();
-                let input = frame["request"]["input"].clone();
-                self.permissions.insert(
-                    request_id.clone(),
-                    Permission {
-                        input: input.clone(),
-                    },
-                );
-                self.emit(ConversationEvent::UserRequest(UserRequest {
-                    id: request_id,
-                    kind: UserRequestKind::Confirm,
-                    title: format!("Allow {tool_name}?"),
-                    options: Vec::new(),
-                    text: permission_text(&tool_name, &input),
-                    placeholder: None,
-                    deadline: None,
-                }));
-                self.state(ConversationState::WaitingForInput);
+                match permission_request(request_id.clone(), &frame["request"]) {
+                    Ok((request, permission)) => {
+                        self.permissions.insert(request_id, permission);
+                        self.emit(ConversationEvent::UserRequest(request));
+                        self.state(ConversationState::WaitingForInput);
+                    }
+                    Err(reason) => {
+                        // A question shape DROSTJE cannot present is declined with the reason,
+                        // visibly, so Claude Code can ask again in a supported form.
+                        self.emit(ConversationEvent::Notice {
+                            level: "warning".into(),
+                            text: format!("Declined a Claude Code request: {reason}"),
+                        });
+                        self.queue(
+                            json!({"type":"control_response","response":{
+                                "subtype":"success","request_id":request_id,
+                                "response":{"behavior":"deny","message":reason}
+                            }}),
+                            None,
+                        )?;
+                    }
+                }
             }
             "result" => {
                 let error = frame["is_error"].as_bool().unwrap_or(false)
@@ -1129,6 +1144,238 @@ fn permission_text(tool_name: &str, input: &Value) -> String {
         .unwrap_or_else(|| format!("{tool_name}: {input}"))
 }
 
+const ALLOW: &str = "Allow";
+const DENY: &str = "Deny";
+const DENIED: &str = "The user denied this tool request.";
+
+/// Maps a `can_use_tool` request to the choices shown to the user: allow once, one entry per
+/// usable `permission_suggestions` item, deny. `AskUserQuestion` becomes a plain selection.
+/// `Err` carries the reason a request cannot be presented here.
+fn permission_request(
+    request_id: String,
+    request: &Value,
+) -> std::result::Result<(UserRequest, Permission), String> {
+    let tool_name = request["tool_name"].as_str().unwrap_or("tool");
+    let input = request["input"].clone();
+    if tool_name == "AskUserQuestion" {
+        return question_request(request_id, input);
+    }
+    let display_name = request["display_name"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(tool_name);
+    let choices: Vec<(String, Value)> = request["permission_suggestions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|suggestion| Some((describe_suggestion(suggestion)?, suggestion.clone())))
+        .collect();
+    let mut options = vec![UserOption {
+        value: ALLOW.into(),
+        description: Some("This time".into()),
+    }];
+    for (label, suggestion) in &choices {
+        if options.iter().any(|option| option.value == *label) {
+            continue;
+        }
+        options.push(UserOption {
+            value: label.clone(),
+            description: Some(destination_text(suggestion)),
+        });
+    }
+    options.push(UserOption {
+        value: DENY.into(),
+        description: None,
+    });
+    let mut text = permission_text(tool_name, &input);
+    if let Some(description) = request["description"]
+        .as_str()
+        .filter(|description| !description.is_empty())
+    {
+        text = format!("{description}\n{text}");
+    }
+    Ok((
+        UserRequest {
+            id: request_id,
+            kind: UserRequestKind::Select,
+            title: format!("Allow {display_name}?"),
+            options,
+            text,
+            placeholder: None,
+            deadline: None,
+        },
+        Permission {
+            input,
+            choices,
+            question: None,
+        },
+    ))
+}
+
+/// One single-choice question with options is a selection; anything else is declined so the
+/// model asks again in that form rather than DROSTJE guessing an answer.
+fn question_request(
+    request_id: String,
+    input: Value,
+) -> std::result::Result<(UserRequest, Permission), String> {
+    let questions = input["questions"].as_array().cloned().unwrap_or_default();
+    let [question] = questions.as_slice() else {
+        return Err(format!(
+            "DROSTJE answers one question at a time; this request carried {}. \
+             Ask again with one single-choice question per request.",
+            questions.len()
+        ));
+    };
+    if question["multiSelect"].as_bool().unwrap_or(false) {
+        return Err(
+            "DROSTJE answers single-choice questions only. Ask again without multiSelect.".into(),
+        );
+    }
+    let options: Vec<UserOption> = question["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|option| {
+            Some(UserOption {
+                value: option["label"]
+                    .as_str()
+                    .filter(|label| !label.is_empty())?
+                    .to_owned(),
+                description: option["description"].as_str().map(str::to_owned),
+            })
+        })
+        .collect();
+    if options.is_empty() {
+        return Err(
+            "DROSTJE answers questions with labelled options only. Ask again with options.".into(),
+        );
+    }
+    let text = question["question"].as_str().unwrap_or_default().to_owned();
+    let title = question["header"]
+        .as_str()
+        .filter(|header| !header.is_empty())
+        .unwrap_or("Question")
+        .to_owned();
+    Ok((
+        UserRequest {
+            id: request_id,
+            kind: UserRequestKind::Select,
+            title,
+            options,
+            text: text.clone(),
+            placeholder: None,
+            deadline: None,
+        },
+        Permission {
+            input,
+            choices: Vec::new(),
+            question: Some(text),
+        },
+    ))
+}
+
+/// The `control_response` payload for an answer; `None` when it is not one of the offered choices.
+fn permission_response(permission: &Permission, answer: &UserAnswer) -> Option<Value> {
+    let deny = |message: &str| json!({"behavior":"deny","message":message});
+    let allow = |suggestion: Option<&Value>| {
+        let mut response = json!({"behavior":"allow","updatedInput":permission.input});
+        if let Some(suggestion) = suggestion {
+            response["updatedPermissions"] = json!([suggestion]);
+        }
+        response
+    };
+    match (answer, &permission.question) {
+        (UserAnswer::Cancelled { .. }, Some(_)) => Some(deny("The user dismissed the question.")),
+        (UserAnswer::Cancelled { .. } | UserAnswer::Confirmed(false), None) => Some(deny(DENIED)),
+        (UserAnswer::Confirmed(true), None) => Some(allow(None)),
+        (UserAnswer::Confirmed(_), Some(_)) => None,
+        (UserAnswer::Value(value), Some(question)) => {
+            let offered = permission.input["questions"][0]["options"]
+                .as_array()?
+                .iter()
+                .any(|option| option["label"] == *value);
+            offered.then(|| {
+                let mut input = permission.input.clone();
+                input["answers"] = json!({ question.as_str(): value });
+                json!({"behavior":"allow","updatedInput":input})
+            })
+        }
+        (UserAnswer::Value(value), None) if value == ALLOW => Some(allow(None)),
+        (UserAnswer::Value(value), None) if value == DENY => Some(deny(DENIED)),
+        (UserAnswer::Value(value), None) => permission
+            .choices
+            .iter()
+            .find(|(label, _)| label == value)
+            .map(|(_, suggestion)| allow(Some(suggestion))),
+    }
+}
+
+/// Label for one `permission_suggestions` item, or `None` for kinds DROSTJE will not offer
+/// (deny rules, `bypassPermissions`, `dontAsk`, unknown types).
+fn describe_suggestion(suggestion: &Value) -> Option<String> {
+    let scope = match suggestion["destination"].as_str().unwrap_or("session") {
+        "session" => "this session",
+        "userSettings" => "in every project",
+        _ => "in this project",
+    };
+    Some(match suggestion["type"].as_str()? {
+        "addRules" => {
+            if suggestion["behavior"]
+                .as_str()
+                .is_some_and(|behavior| behavior != "allow")
+            {
+                return None;
+            }
+            let rules: Vec<String> = suggestion["rules"]
+                .as_array()?
+                .iter()
+                .filter_map(|rule| {
+                    let tool = rule["toolName"].as_str()?;
+                    Some(match rule["ruleContent"].as_str() {
+                        Some(content) => format!("{tool}({content})"),
+                        None => tool.to_owned(),
+                    })
+                })
+                .collect();
+            if rules.is_empty() {
+                return None;
+            }
+            format!("Allow and don't ask again for {} {scope}", rules.join(", "))
+        }
+        "setMode" => match suggestion["mode"].as_str()? {
+            "acceptEdits" => format!("Allow and accept edits {scope}"),
+            "plan" => format!("Allow and switch to plan mode {scope}"),
+            "bypassPermissions" | "dontAsk" => return None,
+            mode => format!("Allow and switch to {mode} mode {scope}"),
+        },
+        "addDirectories" => {
+            let directories: Vec<&str> = suggestion["directories"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect();
+            if directories.is_empty() {
+                return None;
+            }
+            format!(
+                "Allow and grant access to {} {scope}",
+                directories.join(", ")
+            )
+        }
+        _ => return None,
+    })
+}
+
+fn destination_text(suggestion: &Value) -> String {
+    match suggestion["destination"].as_str().unwrap_or("session") {
+        "session" => "Until this conversation closes".into(),
+        "userSettings" => "Saved to ~/.claude/settings.json".into(),
+        "projectSettings" => "Saved to .claude/settings.json".into(),
+        "localSettings" => "Saved to .claude/settings.local.json".into(),
+        other => format!("Saved to {other}"),
+    }
+}
+
 fn normalize_history(frame: &Value, sequence: usize) -> Result<Vec<Message>> {
     match frame["type"].as_str().unwrap_or("") {
         "drostje_user" => {
@@ -1183,9 +1430,11 @@ fn normalize_assistant(frame: &Value, sequence: usize) -> Result<Message> {
         }
     }
     Ok(Message {
-        id: message["id"]
+        // One `assistant` frame per content block, all sharing the API `message.id`; only the
+        // frame `uuid` is unique, and keying on the shared ID would replace earlier blocks.
+        id: frame["uuid"]
             .as_str()
-            .or_else(|| frame["uuid"].as_str())
+            .filter(|id| !id.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("claude-assistant-{sequence}")),
         role: "assistant".into(),
@@ -1253,7 +1502,7 @@ mod tests {
             ]}
         });
         let message = normalize_assistant(&assistant, 0)?;
-        assert_eq!(message.id, "message-1");
+        assert_eq!(message.id, "event-1");
         assert!(matches!(&message.content[0], ContentBlock::Text(text) if text == "Checking"));
         assert!(
             matches!(&message.content[1], ContentBlock::ToolCall { id, name, .. } if id == "tool-1" && name == "Bash")
@@ -1269,6 +1518,149 @@ mod tests {
         assert_eq!(messages[0].tool_call_id.as_deref(), Some("tool-1"));
         assert!(messages[0].error);
         Ok(())
+    }
+
+    #[test]
+    fn assistant_frames_sharing_a_message_id_stay_separate() -> Result<()> {
+        let frames = [
+            json!({"type":"assistant","uuid":"event-1","message":{"id":"msg_1","content":[
+                {"type":"text","text":"Let me check"}]}}),
+            json!({"type":"assistant","uuid":"event-2","message":{"id":"msg_1","content":[
+                {"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"ls"}}]}}),
+            json!({"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"x"}]}}),
+        ];
+        let ids: Vec<String> = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| normalize_assistant(frame, index).map(|message| message.id))
+            .collect::<Result<_>>()?;
+        assert_eq!(ids, ["event-1", "event-2", "claude-assistant-2"]);
+        let history: Vec<String> = frames
+            .iter()
+            .enumerate()
+            .flat_map(|(index, frame)| normalize_history(frame, index).unwrap_or_default())
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(history, ids, "reloaded history keeps live message IDs");
+        Ok(())
+    }
+
+    #[test]
+    fn permission_requests_offer_suggestions_that_answers_echo_back() {
+        let request = json!({"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash",
+            "input":{"command":"mkdir -p sub","description":"Create sub directory"},
+            "description":"Create sub directory",
+            "permission_suggestions":[
+                {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"mkdir -p sub"}],
+                 "behavior":"allow","destination":"localSettings"},
+                {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"rm -rf"}],
+                 "behavior":"deny","destination":"localSettings"},
+                {"type":"setMode","mode":"bypassPermissions","destination":"session"},
+                {"type":"setMode","mode":"acceptEdits","destination":"session"},
+                {"type":"unknownKind"}
+            ],
+            "tool_use_id":"tool-1"});
+        let (shown, permission) =
+            permission_request("permission-1".into(), &request).expect("presentable");
+        assert_eq!(shown.kind, UserRequestKind::Select);
+        assert_eq!(shown.title, "Allow Bash?");
+        assert_eq!(shown.text, "Create sub directory\nBash: mkdir -p sub");
+        let labels: Vec<&str> = shown.options.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Allow",
+                "Allow and don't ask again for Bash(mkdir -p sub) in this project",
+                "Allow and accept edits this session",
+                "Deny",
+            ]
+        );
+        assert_eq!(
+            shown.options[1].description.as_deref(),
+            Some("Saved to .claude/settings.local.json")
+        );
+
+        let once = permission_response(&permission, &UserAnswer::Value("Allow".into())).unwrap();
+        assert_eq!(once["behavior"], "allow");
+        assert_eq!(once["updatedInput"]["command"], "mkdir -p sub");
+        assert!(once.get("updatedPermissions").is_none());
+        let always =
+            permission_response(&permission, &UserAnswer::Value(labels[1].into())).unwrap();
+        assert_eq!(always["behavior"], "allow");
+        assert_eq!(
+            always["updatedPermissions"],
+            json!([request["permission_suggestions"][0]])
+        );
+        let denied = permission_response(&permission, &UserAnswer::Value("Deny".into())).unwrap();
+        assert_eq!(denied["behavior"], "deny");
+        assert_eq!(
+            permission_response(&permission, &UserAnswer::Cancelled { timed_out: false }).unwrap()
+                ["behavior"],
+            "deny"
+        );
+        assert_eq!(
+            permission_response(&permission, &UserAnswer::Confirmed(true)).unwrap()["behavior"],
+            "allow"
+        );
+        assert!(permission_response(&permission, &UserAnswer::Value("Maybe".into())).is_none());
+    }
+
+    #[test]
+    fn single_choice_questions_become_selections_and_others_are_declined() {
+        let question = |questions: Value| {
+            json!({"subtype":"can_use_tool","tool_name":"AskUserQuestion",
+                "input":{"questions":questions},"tool_use_id":"tool-1"})
+        };
+        let (shown, permission) = permission_request(
+            "q-1".into(),
+            &question(
+                json!([{"question":"Which colour?","header":"Colour","multiSelect":false,
+                "options":[{"label":"Red","description":"Warm"},{"label":"Blue"}]}]),
+            ),
+        )
+        .expect("presentable");
+        assert_eq!(shown.kind, UserRequestKind::Select);
+        assert_eq!(shown.title, "Colour");
+        assert_eq!(shown.text, "Which colour?");
+        assert_eq!(shown.options.len(), 2);
+        assert_eq!(shown.options[0].description.as_deref(), Some("Warm"));
+        let answer = permission_response(&permission, &UserAnswer::Value("Blue".into())).unwrap();
+        assert_eq!(answer["behavior"], "allow");
+        assert_eq!(
+            answer["updatedInput"]["answers"],
+            json!({"Which colour?":"Blue"})
+        );
+        assert_eq!(
+            answer["updatedInput"]["questions"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert!(permission_response(&permission, &UserAnswer::Value("Green".into())).is_none());
+        assert!(permission_response(&permission, &UserAnswer::Confirmed(true)).is_none());
+        assert_eq!(
+            permission_response(&permission, &UserAnswer::Cancelled { timed_out: true }).unwrap()["behavior"],
+            "deny"
+        );
+
+        let two = question(json!([{"question":"A","options":[{"label":"1"}]},
+            {"question":"B","options":[{"label":"2"}]}]));
+        assert!(
+            permission_request("q-2".into(), &two)
+                .unwrap_err()
+                .contains("carried 2")
+        );
+        let multi =
+            question(json!([{"question":"A","multiSelect":true,"options":[{"label":"1"}]}]));
+        assert!(
+            permission_request("q-3".into(), &multi)
+                .unwrap_err()
+                .contains("multiSelect")
+        );
+        let free = question(json!([{"question":"A","options":[]}]));
+        assert!(
+            permission_request("q-4".into(), &free)
+                .unwrap_err()
+                .contains("options")
+        );
     }
 
     #[test]
@@ -1410,6 +1802,7 @@ mod tests {
             session_ref: Some(reference.clone()),
             model: None,
             effort: None,
+            permission_mode: None,
             allow_empty_session: true,
         };
 
@@ -1471,11 +1864,15 @@ while IFS= read -r line; do
       ;;
     *'"type":"user"'*)
       printf '{"type":"system","subtype":"init","session_id":"%s","model":"claude-test"}\n' "$session"
-      printf '%s\n' '{"type":"control_request","request_id":"permission-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo check"}}}'
+      printf '%s\n' '{"type":"control_request","request_id":"permission-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"cargo check"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"cargo check"}],"behavior":"allow","destination":"localSettings"}]}}'
+      ;;
+    *'"updatedPermissions":[{"type":"addRules"'*)
+      printf '%s\n' '{"type":"assistant","uuid":"event-1","message":{"id":"message-1","content":[{"type":"text","text":"Checking"}]}}'
+      printf '%s\n' '{"type":"assistant","uuid":"event-2","message":{"id":"message-1","content":[{"type":"text","text":"Done"}]}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Done"}'
       ;;
     *'"type":"control_response"'*)
-      printf '%s\n' '{"type":"assistant","uuid":"event-1","message":{"id":"message-1","content":[{"type":"text","text":"Done"}]}}'
-      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"Done"}'
+      printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["permission answer lacked updatedPermissions"]}'
       ;;
   esac
 done
@@ -1491,6 +1888,7 @@ done
             session_ref: None,
             model: None,
             effort: Some("low".into()),
+            permission_mode: Some("acceptEdits".into()),
             allow_empty_session: true,
         }))?;
         let receive = || {
@@ -1537,6 +1935,14 @@ done
         assert!(catalog[1].efforts.is_empty());
         let args = fs::read_to_string(root.join("args.txt"))?;
         assert!(args.contains("--effort\nlow\n"), "argv: {args}");
+        assert!(
+            args.contains("--permission-prompt-tool\nstdio\n"),
+            "argv: {args}"
+        );
+        assert!(
+            args.contains("--permission-mode\nacceptEdits\n"),
+            "argv: {args}"
+        );
 
         let haiku = catalog[1].key.clone();
         handle
@@ -1576,37 +1982,46 @@ done
         })?;
 
         let mut accepted = false;
-        let mut permission = false;
-        while !permission {
+        let mut echoed = false;
+        let mut permission = None;
+        while permission.is_none() {
             match receive()? {
                 ConversationEvent::SubmissionAccepted { request_id: seen } => {
                     accepted = seen == request_id;
                 }
+                ConversationEvent::MessageUpdated(message) => {
+                    echoed = message.role == "user"
+                        && message.id == request_id.to_string()
+                        && matches!(
+                            message.content.first(),
+                            Some(ContentBlock::Text(text)) if text == "Check it"
+                        );
+                }
                 ConversationEvent::UserRequest(request) => {
                     assert_eq!(request.id, "permission-1");
-                    assert_eq!(request.kind, UserRequestKind::Confirm);
-                    permission = true;
+                    assert_eq!(request.kind, UserRequestKind::Select);
+                    permission = Some(request);
                 }
                 _ => {}
             }
         }
         assert!(accepted);
+        assert!(echoed, "the accepted prompt is shown before the reply");
+        let permission = permission.unwrap();
+        assert_eq!(permission.options.len(), 3, "{:?}", permission.options);
         handle
             .commands
             .send_blocking(ConversationCommand::Respond {
                 request_id: "permission-1".into(),
-                answer: UserAnswer::Confirmed(true),
+                answer: UserAnswer::Value(permission.options[1].value.clone()),
             })?;
 
-        let mut assistant = false;
+        let mut assistant = Vec::new();
         let mut completed = false;
         while !completed {
             match receive()? {
-                ConversationEvent::MessageUpdated(message) => {
-                    assistant = matches!(
-                        message.content.first(),
-                        Some(ContentBlock::Text(text)) if text == "Done"
-                    );
+                ConversationEvent::MessageUpdated(message) if message.role == "assistant" => {
+                    assistant.push(message.id.clone());
                 }
                 ConversationEvent::TurnSettled {
                     request_id: seen,
@@ -1619,7 +2034,11 @@ done
                 _ => {}
             }
         }
-        assert!(assistant);
+        assert_eq!(
+            assistant,
+            ["event-1", "event-2"],
+            "both blocks of one API message reach the display"
+        );
         handle.commands.send_blocking(ConversationCommand::Close)?;
 
         let history = read_transcript(&session_dir.join(TRANSCRIPT))?;

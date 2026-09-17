@@ -62,6 +62,7 @@ impl AppState {
                         session_ref: thread.session_ref,
                         model: thread.model,
                         effort: thread.effort,
+                        permission_mode: thread.permission_mode,
                     })
                 })
                 .await?;
@@ -249,6 +250,28 @@ impl AppState {
         self.save_thread(thread);
         self.retry_conversation(id);
     }
+    /// Permission mode is a launch flag like effort: a change restarts the harness process.
+    pub fn select_permission_mode(&mut self, id: ThreadId, mode: Option<String>) {
+        if !self.is_conversation(id) {
+            return;
+        }
+        if self.active_threads.contains(&id) {
+            self.notice(
+                NoticeLevel::Warning,
+                "Permission mode changes are disabled during a turn",
+            );
+            return;
+        }
+        let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        if thread.permission_mode == mode {
+            return;
+        }
+        thread.permission_mode = mode;
+        self.save_thread(thread);
+        self.retry_conversation(id);
+    }
     pub fn respond(&mut self, id: ThreadId, request_id: String, answer: UserAnswer) {
         self.send_command(id, ConversationCommand::Respond { request_id, answer });
     }
@@ -408,8 +431,8 @@ impl AppState {
         self.generate_title(id, prompt, true, cx);
     }
 
-    /// Names a Conversation from `prompt` with a local Ollama model. Automatic requests
-    /// (`replace == false`) keep a title set meanwhile and stay silent without Ollama.
+    /// Names a Conversation with the configured local title provider. Automatic mode tries
+    /// llama.cpp before falling back to Ollama.
     fn generate_title(
         &mut self,
         id: ThreadId,
@@ -420,18 +443,26 @@ impl AppState {
         if self.shutting_down || !self.titling.insert(id) {
             return;
         }
+        let provider = match self
+            .snapshot
+            .settings
+            .get(titles::PROVIDER_SETTING)
+            .and_then(Value::as_str)
+        {
+            Some("llama_cpp") => titles::TitleProvider::LlamaCpp,
+            Some("ollama") => titles::TitleProvider::Ollama,
+            _ => titles::DEFAULT_PROVIDER,
+        };
         let model = self
             .snapshot
             .settings
             .get(titles::MODEL_SETTING)
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let host = titles::server_host();
         cx.emit(PresentationChange::Thread(id));
         cx.spawn(async move |this, cx| {
-            let request_host = host.clone();
             let result = smol::unblock(move || {
-                titles::generate_title(&request_host, model.as_deref(), &prompt)
+                titles::generate_title(provider, model.as_deref(), &prompt)
             })
             .await;
             let _ = this.update(cx, |this, cx| {
@@ -440,12 +471,14 @@ impl AppState {
                     Ok(Some(title)) => this.apply_generated_title(id, title, replace, cx),
                     Ok(None) if replace => this.notice(
                         NoticeLevel::Warning,
-                        format!("No title generated: Ollama is not reachable at {host} or has no installed models."),
+                        "No title generated: start llama.cpp or Ollama, then try again.",
                     ),
                     Ok(None) => {}
                     Err(error) => this.notice(
                         NoticeLevel::Warning,
-                        format!("Could not generate a conversation title: {error:#}. Check the title model in Settings."),
+                        format!(
+                            "Could not generate a conversation title: {error:#}. Check title generation in Settings."
+                        ),
                     ),
                 }
                 cx.emit(PresentationChange::Thread(id));

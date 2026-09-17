@@ -1134,6 +1134,7 @@ impl AppState {
             session_ref: None,
             model,
             effort: None,
+            permission_mode: None,
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,

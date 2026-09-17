@@ -54,6 +54,7 @@ fn conversation(project: &Project) -> Thread {
         session_ref: None,
         model: None,
         effort: None,
+        permission_mode: None,
         draft: "Unsent draft\n日本語 é".into(),
         attachments: Vec::new(),
         submission: None,
@@ -233,7 +234,7 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
     });
 }
@@ -306,33 +307,98 @@ fn version_2_database_upgrades_in_place_and_persists_effort() {
         assert_eq!(snapshot.threads[0].id, thread.id);
         assert_eq!(snapshot.threads[0].session_ref.as_deref(), Some("saved"));
         assert_eq!(snapshot.threads[0].effort, None);
+        assert_eq!(snapshot.threads[0].permission_mode, None);
         let mut upgraded = snapshot.threads[0].clone();
         upgraded.effort = Some("low".into());
+        upgraded.permission_mode = Some("plan".into());
         store.save_thread(upgraded).await.unwrap();
         store.flush().await.unwrap();
         drop(store);
 
         let reopened = reopen(&directory.0);
-        assert_eq!(
-            reopened.snapshot().await.unwrap().threads[0]
-                .effort
-                .as_deref(),
-            Some("low")
-        );
+        let threads = reopened.snapshot().await.unwrap().threads;
+        assert_eq!(threads[0].effort.as_deref(), Some("low"));
+        assert_eq!(threads[0].permission_mode.as_deref(), Some("plan"));
         drop(reopened);
         let database = Connection::open(&path).unwrap();
         assert_eq!(
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
+        );
+    });
+}
+
+#[test]
+fn version_3_database_upgrades_in_place_and_persists_permission_mode() {
+    smol::block_on(async {
+        let directory = TempDirectory::new();
+        let path = directory.0.join("drostje.sqlite3");
+        let project = project(directory.0.join("checkout"));
+        let thread = conversation(&project);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_V2).unwrap();
+        connection
+            .execute_batch("ALTER TABLE threads ADD COLUMN effort TEXT")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects(id, name, root, defaults_json) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    project.id.to_string(),
+                    project.name,
+                    project.root.to_string_lossy().into_owned(),
+                    serde_json::to_string(&project.defaults).unwrap(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads(id, project_id, title, harness, draft, created_at, updated_at, effort)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'high')",
+                rusqlite::params![
+                    thread.id.to_string(),
+                    project.id.to_string(),
+                    thread.title,
+                    thread.harness,
+                    thread.draft,
+                    thread.created_at,
+                    thread.updated_at,
+                ],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        drop(connection);
+
+        let store = reopen(&directory.0);
+        let snapshot = store.snapshot().await.unwrap();
+        assert_eq!(snapshot.threads[0].effort.as_deref(), Some("high"));
+        assert_eq!(snapshot.threads[0].permission_mode, None);
+        let mut upgraded = snapshot.threads[0].clone();
+        upgraded.permission_mode = Some("acceptEdits".into());
+        store.save_thread(upgraded).await.unwrap();
+        store.flush().await.unwrap();
+        drop(store);
+
+        let reopened = reopen(&directory.0);
+        let threads = reopened.snapshot().await.unwrap().threads;
+        assert_eq!(threads[0].effort.as_deref(), Some("high"));
+        assert_eq!(threads[0].permission_mode.as_deref(), Some("acceptEdits"));
+        drop(reopened);
+        let database = Connection::open(&path).unwrap();
+        assert_eq!(
+            database
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            4
         );
     });
 }
 
 #[test]
 fn incompatible_schema_is_refused_without_changing_database_bytes() {
-    for version in [1, 4] {
+    for version in [1, 5] {
         let directory = TempDirectory::new();
         let path = directory.0.join("drostje.sqlite3");
         let connection = Connection::open(&path).unwrap();

@@ -17,6 +17,19 @@ pub fn executable_name(harness: &str) -> anyhow::Result<&'static str> {
 
 use uuid::Uuid;
 
+/// Permission modes a harness accepts as a launch flag, as `(value, label)`. Empty when the
+/// harness has none. `bypassPermissions` is never offered: it is `--yolo` under another name.
+pub fn permission_modes(harness: &str) -> &'static [(&'static str, &'static str)] {
+    match harness {
+        "claude-code" => &[
+            ("acceptEdits", "Accept edits"),
+            ("plan", "Plan"),
+            ("dontAsk", "Don't ask"),
+        ],
+        _ => &[],
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ConversationConfig {
     pub harness: String,
@@ -27,6 +40,8 @@ pub struct ConversationConfig {
     pub model: Option<ModelKey>,
     /// Claude Code effort level (`--effort`); `None` means the harness default.
     pub effort: Option<String>,
+    /// Claude Code permission mode (`--permission-mode`); `None` means the harness default.
+    pub permission_mode: Option<String>,
     /// Only an unsent draft may replace an explicitly file-less provider session.
     pub allow_empty_session: bool,
 }

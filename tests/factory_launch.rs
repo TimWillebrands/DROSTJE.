@@ -138,6 +138,7 @@ esac
                 session_ref: None,
                 model: None,
                 effort: None,
+                permission_mode: None,
                 draft: String::new(),
                 attachments: Vec::new(),
                 submission: None,

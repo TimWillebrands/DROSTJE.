@@ -256,6 +256,16 @@ pub(super) struct EffortPicker {
     _subscription: Subscription,
 }
 
+/// Permission modes are launch flags of the thread's harness, listed by `harness::permission_modes`;
+/// `None` is the harness default and an empty list hides the picker.
+pub(super) struct PermissionModePicker {
+    thread_id: ThreadId,
+    options: Vec<EffortOption>,
+    selected: Option<String>,
+    select: Entity<SelectState<Vec<EffortOption>>>,
+    _subscription: Subscription,
+}
+
 /// Effort levels come from the chosen model, else the harness default entry, else the first
 /// model that lists any; an empty list hides the picker.
 fn effort_levels(state: &AppState, thread: &crate::model::Thread) -> Vec<String> {
@@ -425,6 +435,76 @@ impl Workspace {
             },
         );
         self.effort_picker = Some(EffortPicker {
+            thread_id,
+            options,
+            selected,
+            select,
+            _subscription: subscription,
+        });
+    }
+
+    pub(super) fn sync_permission_mode_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.read(cx);
+        let Some(thread) = state.conversation_thread() else {
+            self.permission_mode_picker = None;
+            return;
+        };
+        let thread_id = thread.id;
+        let modes = crate::harness::permission_modes(&thread.harness);
+        if modes.is_empty() {
+            self.permission_mode_picker = None;
+            return;
+        }
+        let options: Vec<_> = std::iter::once(EffortOption {
+            value: None,
+            label: "Default permissions".into(),
+        })
+        .chain(modes.iter().map(|(value, label)| EffortOption {
+            value: Some((*value).to_owned()),
+            label: (*label).into(),
+        }))
+        .collect();
+        let selected = thread.permission_mode.clone();
+        if let Some(picker) = self
+            .permission_mode_picker
+            .as_mut()
+            .filter(|picker| picker.thread_id == thread_id)
+        {
+            if picker.options != options || picker.selected != selected {
+                picker.select.update(cx, |select, cx| {
+                    if picker.options != options {
+                        select.set_items(options.clone(), window, cx);
+                    }
+                    select.set_selected_value(&selected, window, cx);
+                });
+                picker.options = options;
+                picker.selected = selected;
+            }
+            return;
+        }
+        let select = cx.new(|cx| {
+            let mut select = SelectState::new(options.clone(), None, window, cx);
+            select.set_selected_value(&selected, window, cx);
+            select
+        });
+        let subscription = cx.subscribe_in(
+            &select,
+            window,
+            move |workspace, _, event: &SelectEvent<Vec<EffortOption>>, _, cx| {
+                let SelectEvent::Confirm(Some(mode)) = event else {
+                    return;
+                };
+                workspace.state.update(cx, |state, cx| {
+                    state.select_permission_mode(thread_id, mode.clone());
+                    cx.notify();
+                });
+            },
+        );
+        self.permission_mode_picker = Some(PermissionModePicker {
             thread_id,
             options,
             selected,
@@ -2673,6 +2753,26 @@ fn render_content(
                             .appearance(false)
                             .disabled(active)
                             .placeholder("Effort"),
+                    ),
+            );
+        }
+        if let Some(picker) = workspace
+            .read(cx)
+            .permission_mode_picker
+            .as_ref()
+            .filter(|picker| picker.thread_id == id)
+        {
+            trailing = trailing.child(
+                div()
+                    .min_w_0()
+                    .max_w(rems(12.))
+                    .key_context("NativeInput")
+                    .child(
+                        Select::new(&picker.select)
+                            .small()
+                            .appearance(false)
+                            .disabled(active)
+                            .placeholder("Permissions"),
                     ),
             );
         }

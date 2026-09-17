@@ -131,6 +131,7 @@ pub struct Workspace {
     pub factory_form: Option<Entity<super::factory_form::FactoryThreadForm>>,
     pub(super) model_picker: Option<conversation::ModelPicker>,
     pub(super) effort_picker: Option<conversation::EffortPicker>,
+    pub(super) permission_mode_picker: Option<conversation::PermissionModePicker>,
     pub(super) detail_surface: Option<super::overlays::SurfaceKey>,
     pub(super) quit_requested: bool,
     layout_save: Option<Task<()>>,
@@ -212,6 +213,7 @@ impl Workspace {
             thread_search,
             model_picker: None,
             effort_picker: None,
+            permission_mode_picker: None,
             presented_thread: None,
             detail_surface: None,
             palette: None,
@@ -290,6 +292,7 @@ impl Workspace {
                 workspace.sync_factory_form(window, cx);
                 workspace.sync_model_picker(window, cx);
                 workspace.sync_effort_picker(window, cx);
+                workspace.sync_permission_mode_picker(window, cx);
                 workspace.sync_detail_surface(window, cx);
                 workspace.show_notices(window, cx);
                 workspace.sync_selection_panels(cx);
@@ -307,6 +310,7 @@ impl Workspace {
                         workspace.sync_factory_form(window, cx);
                         workspace.sync_model_picker(window, cx);
                         workspace.sync_effort_picker(window, cx);
+                        workspace.sync_permission_mode_picker(window, cx);
                         workspace.sync_selection_panels(cx);
                         workspace.sync_diff_interest(cx);
                     }
@@ -315,6 +319,7 @@ impl Workspace {
                     {
                         workspace.sync_model_picker(window, cx);
                         workspace.sync_effort_picker(window, cx);
+                        workspace.sync_permission_mode_picker(window, cx);
                         workspace.sync_detail_surface(window, cx);
                         workspace.show_notices(window, cx);
                     }
@@ -364,6 +369,7 @@ impl Workspace {
         workspace.sync_factory_form(window, cx);
         workspace.sync_model_picker(window, cx);
         workspace.sync_effort_picker(window, cx);
+        workspace.sync_permission_mode_picker(window, cx);
         workspace.sync_selection_panels(cx);
         workspace.sync_diff_interest(cx);
         cx.defer_in(window, |workspace, window, cx| {

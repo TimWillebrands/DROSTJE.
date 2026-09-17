@@ -19,9 +19,10 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 3;
-/// Version 2 lacks `threads.effort`; opening it adds the column in one transaction.
-const UPGRADABLE_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
+/// Version 2 lacks `threads.effort`, version 3 lacks `threads.permission_mode`; opening
+/// either adds the missing trailing columns in one transaction.
+const UPGRADABLE_VERSIONS: [i64; 2] = [2, 3];
 const SCHEMA: &str = "
 CREATE TABLE settings(key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
 CREATE TABLE projects(
@@ -34,7 +35,8 @@ CREATE TABLE threads(
     draft TEXT NOT NULL DEFAULT '', attachments_json TEXT NOT NULL DEFAULT '[]',
     submission_json TEXT, archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'conversation', factory_config_json TEXT, effort TEXT
+    kind TEXT NOT NULL DEFAULT 'conversation', factory_config_json TEXT, effort TEXT,
+    permission_mode TEXT
 );
 CREATE TABLE factory_launches(
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
@@ -242,11 +244,14 @@ fn open_database(path: &Path) -> Result<Connection> {
             transaction
                 .commit()
                 .context("Commit initial workspace schema")?;
-        } else if version == UPGRADABLE_VERSION {
+        } else if UPGRADABLE_VERSIONS.contains(&version) {
             // The upgrade is verified in full before it commits; a failure rolls back every byte.
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch("ALTER TABLE threads ADD COLUMN effort TEXT")?;
+            if version < 3 {
+                transaction.execute_batch("ALTER TABLE threads ADD COLUMN effort TEXT")?;
+            }
+            transaction.execute_batch("ALTER TABLE threads ADD COLUMN permission_mode TEXT")?;
             validate_schema(&transaction, SCHEMA_VERSION)?;
             read_snapshot(&transaction)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -278,7 +283,7 @@ fn inspect_existing(path: &Path) -> Result<i64> {
     connection.busy_timeout(Duration::from_millis(500))?;
     let transaction = connection.transaction()?;
     let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != 0 && version != SCHEMA_VERSION && version != UPGRADABLE_VERSION {
+    if version != 0 && version != SCHEMA_VERSION && !UPGRADABLE_VERSIONS.contains(&version) {
         return Err(StoreError::UnsupportedSchema {
             found: version,
             supported: SCHEMA_VERSION,
@@ -354,6 +359,7 @@ fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
                 ("kind", "TEXT", true, Some("'conversation'"), false),
                 ("factory_config_json", "TEXT", false, None, false),
                 ("effort", "TEXT", false, None, false),
+                ("permission_mode", "TEXT", false, None, false),
             ],
         ),
         (
@@ -388,12 +394,13 @@ fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
         bail!("Database objects do not match workspace schema v{version}");
     }
     for (table, expected) in tables {
-        // Version 2 predates the trailing `effort` column.
-        let expected: &[_] = if version == UPGRADABLE_VERSION && *table == "threads" {
-            &expected[..expected.len() - 1]
-        } else {
-            expected
+        // Versions 2 and 3 predate the trailing `effort` and `permission_mode` columns.
+        let missing = match (*table, version) {
+            ("threads", 2) => 2,
+            ("threads", 3) => 1,
+            _ => 0,
         };
+        let expected: &[_] = &expected[..expected.len() - missing];
         let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
         let columns = statement
             .query_map([], |row| {
@@ -730,16 +737,18 @@ fn save_thread(connection: &mut Connection, thread: Thread) -> Result<()> {
     let submission = thread.submission.as_ref().map(encode).transpose()?;
     let factory = thread.factory.as_ref().map(encode).transpose()?;
     transaction.execute("INSERT INTO threads(id, project_id, title, harness, session_ref, model_json, draft,
-        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json, effort)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json, effort,
+        permission_mode)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(id) DO UPDATE SET title = excluded.title, harness = excluded.harness,
         session_ref = excluded.session_ref, model_json = excluded.model_json, draft = excluded.draft,
         attachments_json = excluded.attachments_json, submission_json = excluded.submission_json,
         archived = excluded.archived, updated_at = excluded.updated_at,
-        factory_config_json = excluded.factory_config_json, effort = excluded.effort",
+        factory_config_json = excluded.factory_config_json, effort = excluded.effort,
+        permission_mode = excluded.permission_mode",
         params![id, thread.project_id.to_string(), thread.title, thread.harness, thread.session_ref,
             model, thread.draft, attachments, submission, thread.archived, thread.created_at,
-            thread.updated_at, kind_text(&thread.kind), factory, thread.effort])?;
+            thread.updated_at, kind_text(&thread.kind), factory, thread.effort, thread.permission_mode])?;
     transaction.commit().context("Persist thread and draft")
 }
 
@@ -969,14 +978,15 @@ fn validate_thread_shape(thread: &Thread) -> Result<()> {
 fn read_snapshot(connection: &Connection) -> Result<WorkspaceSnapshot> {
     let projects = read_projects(connection)?;
     let threads = connection.prepare("SELECT id, project_id, title, harness, session_ref, model_json, draft,
-        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json, effort
-        FROM threads ORDER BY created_at, id")?
+        attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json, effort,
+        permission_mode FROM threads ORDER BY created_at, id")?
         .query_map([], |row| Ok(Thread {
             id: uuid(row, 0)?, project_id: uuid(row, 1)?, title: row.get(2)?, harness: row.get(3)?,
             session_ref: row.get(4)?, model: decode_optional(row, 5)?, draft: row.get(6)?,
             attachments: decode(row, 7)?, submission: decode_optional(row, 8)?, archived: archived(row, 9)?,
             created_at: row.get(10)?, updated_at: row.get(11)?,
             kind: thread_kind(row, 12)?, factory: decode_optional(row, 13)?, effort: row.get(14)?,
+            permission_mode: row.get(15)?,
         }))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let launches = connection
         .prepare(

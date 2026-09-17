@@ -17,7 +17,22 @@ pub const DEFAULT_CONVERSATION_TITLE: &str = "New conversation";
 /// Settings key holding the Ollama model name; blank or absent means the first installed model.
 pub const MODEL_SETTING: &str = "title_model";
 
-const DEFAULT_HOST: &str = "127.0.0.1:11434";
+/// Settings key holding the selected title generator.
+pub const PROVIDER_SETTING: &str = "title_provider";
+
+/// The default attempts llama.cpp before falling back to Ollama.
+pub const DEFAULT_PROVIDER: TitleProvider = TitleProvider::Automatic;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleProvider {
+    /// Try llama.cpp first, then Ollama when its server is unavailable.
+    Automatic,
+    LlamaCpp,
+    Ollama,
+}
+
+const DEFAULT_OLLAMA_HOST: &str = "127.0.0.1:11434";
+const DEFAULT_LLAMA_CPP_HOST: &str = "127.0.0.1:8080";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Generation includes a cold model load.
@@ -52,15 +67,24 @@ pub fn conversation_prompt<'a>(prompts: impl IntoIterator<Item = &'a str>) -> St
 }
 
 /// Server address from `OLLAMA_HOST` (as the Ollama CLI reads it), else the default port.
-pub fn server_host() -> String {
+pub fn ollama_host() -> String {
     std::env::var("OLLAMA_HOST")
         .ok()
-        .map(|host| normalize_host(&host))
+        .map(|host| normalize_host(&host, 11434))
         .filter(|host| !host.is_empty())
-        .unwrap_or_else(|| DEFAULT_HOST.into())
+        .unwrap_or_else(|| DEFAULT_OLLAMA_HOST.into())
 }
 
-fn normalize_host(raw: &str) -> String {
+/// Server address from `LLAMA_CPP_HOST`, else llama.cpp's default server port.
+pub fn llama_cpp_host() -> String {
+    std::env::var("LLAMA_CPP_HOST")
+        .ok()
+        .map(|host| normalize_host(&host, 8080))
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| DEFAULT_LLAMA_CPP_HOST.into())
+}
+
+fn normalize_host(raw: &str, default_port: u16) -> String {
     let host = raw.trim();
     let host = host
         .strip_prefix("http://")
@@ -74,12 +98,12 @@ fn normalize_host(raw: &str) -> String {
         if host.contains("]:") {
             host.to_string()
         } else {
-            format!("{host}:11434")
+            format!("{host}:{default_port}")
         }
     } else if host.contains(':') {
         host.to_string()
     } else {
-        format!("{host}:11434")
+        format!("{host}:{default_port}")
     };
     // A server bound to every interface is reached through loopback.
     match host.strip_prefix("0.0.0.0:") {
@@ -88,9 +112,35 @@ fn normalize_host(raw: &str) -> String {
     }
 }
 
-/// Generates a title for `prompt`, or `Ok(None)` when Ollama is not reachable or has no model.
-/// `model` is the configured model; `None` picks the first model Ollama lists.
-pub fn generate_title(host: &str, model: Option<&str>, prompt: &str) -> Result<Option<String>> {
+/// Generates a title for `prompt` with the selected local provider.
+pub fn generate_title(
+    provider: TitleProvider,
+    model: Option<&str>,
+    prompt: &str,
+) -> Result<Option<String>> {
+    generate_title_with_hosts(provider, &llama_cpp_host(), &ollama_host(), model, prompt)
+}
+
+/// Automatic mode prefers llama.cpp and falls back to Ollama only when the llama.cpp server is
+/// unavailable.
+fn generate_title_with_hosts(
+    provider: TitleProvider,
+    llama_cpp_host: &str,
+    ollama_host: &str,
+    model: Option<&str>,
+    prompt: &str,
+) -> Result<Option<String>> {
+    match provider {
+        TitleProvider::Automatic => generate_llama_cpp_title(llama_cpp_host, prompt)?.map_or_else(
+            || generate_ollama_title(ollama_host, model, prompt),
+            |title| Ok(Some(title)),
+        ),
+        TitleProvider::LlamaCpp => generate_llama_cpp_title(llama_cpp_host, prompt),
+        TitleProvider::Ollama => generate_ollama_title(ollama_host, model, prompt),
+    }
+}
+
+fn generate_ollama_title(host: &str, model: Option<&str>, prompt: &str) -> Result<Option<String>> {
     let Some(address) = resolve(host) else {
         return Ok(None);
     };
@@ -160,7 +210,10 @@ fn request(
     stream
         .take(RESPONSE_LIMIT as u64 + 1)
         .read_to_end(&mut raw)?;
-    anyhow::ensure!(raw.len() <= RESPONSE_LIMIT, "Ollama response exceeds 1 MiB");
+    anyhow::ensure!(
+        raw.len() <= RESPONSE_LIMIT,
+        "Title server response exceeds 1 MiB"
+    );
     parse_response(&raw)
 }
 
@@ -168,16 +221,17 @@ fn parse_response(raw: &[u8]) -> Result<Value> {
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .context("Ollama sent an incomplete HTTP response")?;
-    let head = std::str::from_utf8(&raw[..split]).context("Ollama sent invalid HTTP headers")?;
+        .context("Title server sent an incomplete HTTP response")?;
+    let head =
+        std::str::from_utf8(&raw[..split]).context("Title server sent invalid HTTP headers")?;
     let status = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .context("Ollama sent no HTTP status")?;
+        .context("Title server sent no HTTP status")?;
     let body: Value =
-        serde_json::from_slice(&raw[split + 4..]).context("Ollama sent a non-JSON body")?;
+        serde_json::from_slice(&raw[split + 4..]).context("Title server sent a non-JSON body")?;
     if !(200..300).contains(&status) {
         let message = body
             .get("error")
@@ -229,6 +283,34 @@ fn clean_title(output: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
+fn generate_llama_cpp_title(host: &str, prompt: &str) -> Result<Option<String>> {
+    let Some(address) = resolve(host) else {
+        return Ok(None);
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) else {
+        return Ok(None);
+    };
+    let body = json!({
+        "prompt": format!("{SYSTEM_PROMPT}\n\nUser requests:\n{}", truncate(prompt.trim(), PROMPT_LIMIT)),
+        "n_predict": 24,
+        "temperature": 0.7,
+        "stream": false,
+    });
+    let response = request(
+        &mut stream,
+        host,
+        "POST",
+        "/completion",
+        Some(&body),
+        GENERATE_TIMEOUT,
+    )
+    .context("llama.cpp could not generate a title")?;
+    Ok(response
+        .get("content")
+        .and_then(Value::as_str)
+        .and_then(clean_title))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,7 +360,7 @@ mod tests {
             ok(json!({"models": [{"name": "lfm2:24b"}, {"name": "llama3:8b"}]})),
             ok(json!({"response": "\"Taming the Borrow Checker.\"\n"})),
         ]);
-        let title = generate_title(&host, None, "Fix my lifetimes").unwrap();
+        let title = generate_ollama_title(&host, None, "Fix my lifetimes").unwrap();
         assert_eq!(title.as_deref(), Some("Taming the Borrow Checker"));
         let requests = server.join().unwrap();
         assert!(requests[0].starts_with("GET /api/tags HTTP/1.0"));
@@ -293,7 +375,7 @@ mod tests {
     #[test]
     fn configured_model_skips_listing() {
         let (host, server) = serve(vec![ok(json!({"response": "Sparks in the Parser"}))]);
-        let title = generate_title(&host, Some("llama3:8b"), "Parse this").unwrap();
+        let title = generate_ollama_title(&host, Some("llama3:8b"), "Parse this").unwrap();
         assert_eq!(title.as_deref(), Some("Sparks in the Parser"));
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
@@ -303,7 +385,7 @@ mod tests {
     #[test]
     fn no_models_means_no_title() {
         let (host, server) = serve(vec![ok(json!({"models": []}))]);
-        assert_eq!(generate_title(&host, None, "Hello").unwrap(), None);
+        assert_eq!(generate_ollama_title(&host, None, "Hello").unwrap(), None);
         server.join().unwrap();
     }
 
@@ -312,7 +394,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let host = listener.local_addr().unwrap().to_string();
         drop(listener);
-        assert_eq!(generate_title(&host, None, "Hello").unwrap(), None);
+        assert_eq!(generate_ollama_title(&host, None, "Hello").unwrap(), None);
     }
 
     #[test]
@@ -321,9 +403,32 @@ mod tests {
             "HTTP/1.0 404 Not Found\r\n\r\n{}",
             json!({"error": "model \"missing\" not found"})
         )]);
-        let error = generate_title(&host, Some("missing"), "Hello").unwrap_err();
+        let error = generate_ollama_title(&host, Some("missing"), "Hello").unwrap_err();
         assert!(format!("{error:#}").contains("model \"missing\" not found"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn automatic_prefers_llama_cpp() {
+        let (llama_cpp_host, llama_cpp) =
+            serve(vec![ok(json!({"content": "Focused Parser Repair"}))]);
+        let unused_ollama = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ollama_host = unused_ollama.local_addr().unwrap().to_string();
+        drop(unused_ollama);
+
+        let title = generate_title_with_hosts(
+            TitleProvider::Automatic,
+            &llama_cpp_host,
+            &ollama_host,
+            None,
+            "Fix parser recovery",
+        )
+        .unwrap();
+
+        assert_eq!(title.as_deref(), Some("Focused Parser Repair"));
+        let requests = llama_cpp.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /completion HTTP/1.0"));
     }
 
     #[test]
@@ -344,7 +449,7 @@ mod tests {
     #[ignore]
     fn local_ollama_names_a_prompt() {
         let title = generate_title(
-            &server_host(),
+            TitleProvider::Ollama,
             None,
             "The sidebar flickers when I resize the window; find out why",
         )
@@ -384,9 +489,12 @@ mod tests {
     }
 
     #[test]
-    fn hosts_follow_ollama_conventions() {
-        assert_eq!(normalize_host("0.0.0.0"), "127.0.0.1:11434");
-        assert_eq!(normalize_host("http://example:8080/"), "example:8080");
-        assert_eq!(normalize_host("[::1]"), "[::1]:11434");
+    fn hosts_follow_server_conventions() {
+        assert_eq!(normalize_host("0.0.0.0", 11434), "127.0.0.1:11434");
+        assert_eq!(
+            normalize_host("http://example:8080/", 11434),
+            "example:8080"
+        );
+        assert_eq!(normalize_host("[::1]", 8080), "[::1]:8080");
     }
 }

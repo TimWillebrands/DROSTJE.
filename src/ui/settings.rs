@@ -250,6 +250,26 @@ impl SurfaceContent {
                                 .unwrap_or_default(),
                         );
                     }
+
+                    let title_provider = state
+                        .snapshot
+                        .settings
+                        .get(crate::titles::PROVIDER_SETTING)
+                        .and_then(|value| value.as_str())
+                        .filter(|value| ["automatic", "llama_cpp", "ollama"].contains(value))
+                        .unwrap_or("automatic");
+                    selects.push(select_field(
+                        crate::titles::PROVIDER_SETTING,
+                        "Title generator",
+                        vec![
+                            Choice::new("automatic", "Automatic (llama.cpp, then Ollama)"),
+                            Choice::new("llama_cpp", "Llama.cpp"),
+                            Choice::new("ollama", "Ollama"),
+                        ],
+                        title_provider,
+                        window,
+                        cx,
+                    ));
                     let mode = state
                         .snapshot
                         .settings
@@ -655,6 +675,10 @@ impl SurfaceContent {
                     crate::titles::MODEL_SETTING,
                     json!(self.value(crate::titles::MODEL_SETTING, cx)),
                 );
+                state.set_setting(
+                    crate::titles::PROVIDER_SETTING,
+                    json!(self.value(crate::titles::PROVIDER_SETTING, cx)),
+                );
                 state.set_setting("theme_mode", json!(mode));
                 state.set_setting("theme_light", json!(light));
                 state.set_setting("theme_dark", json!(dark));
@@ -847,14 +871,21 @@ impl SurfaceContent {
                 ))
                 .keywords(["appearance", "theme", "folder"]),
             );
-        let tools = fields("Tools", &["nvim", "omp", "claude", "factory"])
-            .description("DROSTJE. does not install, authenticate, or upgrade tools.");
-        let titles = fields("Conversation titles", &[crate::titles::MODEL_SETTING]).description(
-            format!(
-                "A local Ollama model names a new conversation from its first prompt. Without Ollama at {}, titles stay unchanged.",
-                crate::titles::server_host()
-            ),
+        let tools = fields("Tools", &["nvim", "omp", "claude", "factory"]).description(
+            "Tool installation and upgrades run only at your explicit request. DROSTJE. does not authenticate for you.",
         );
+        let titles = fields(
+            "Conversation titles",
+            &[
+                crate::titles::PROVIDER_SETTING,
+                crate::titles::MODEL_SETTING,
+            ],
+        )
+        .description(format!(
+            "Automatic generation tries llama.cpp at {} before Ollama at {}. The model field applies only to Ollama.",
+            crate::titles::llama_cpp_host(),
+            crate::titles::ollama_host()
+        ));
         let factory = fields(
             "Factory defaults",
             &[

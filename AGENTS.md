@@ -76,7 +76,7 @@ reveal a shortcut to an action, never the only copy of it; the command palette
 - **One command, one `Action`.** Palette item, menu item, button and key binding dispatch the same Action; label, enabled state and disabled reason come from one place (`src/ui/commands.rs`). Every command is reachable from the palette. Bindings are context-scoped (`Workspace`, `List`, `Thread`, `PromptEditor`, `NativeInput`, `Command`, `Dialog`, `Sheet`); `key_context` and `on_action` sit on the same focused region. Tooltips and menu items show the bound key automatically; never format shortcuts by hand.
 - **Fixed bindings, do not reassign** (`Cmd` is GPUI `secondary-`: Cmd on macOS, Ctrl on Linux; `Cmd-W` and `Cmd-V` are `Ctrl-Shift-W/V` on Linux because a lone Ctrl-W is the pane-chord prefix and Ctrl-V is Vim's): `Cmd-Shift-P` palette; `Cmd-1/2/3` focus Projects / Thread / Output; `Cmd-B/J` toggle Projects / Output; `Cmd-N` new Conversation; `Cmd-Shift-N` new Factory thread; `Ctrl-Tab` / `Ctrl-Shift-Tab` cycle thread tabs; `Cmd-W` closes the active tab; `Cmd-,` settings; `Cmd-Return` submit prompt, start editable Factory configuration, or confirm a form; `Cmd-.` interrupt interactive turn. New bindings must not shadow native input editing or list motions.
 - **Layers and focus.** Escape dismisses the topmost layer and restores previous focus. Overlays trap focus and restore it on dismiss; nested overlays dismiss from the top; never stack overlays. Transient, centred, keyboard-driven pickers instead of OS dialogs.
-- **Feedback.** Smallest surface that fits: tooltip → popover → menu → notification → dialog → alert dialog → sheet. Instant feedback on activation; disable submit while in flight; keep user input; show the result next to the object. Reversible → undo or notification; irreversible → `AlertDialog` naming the object. Missing tools or auth are visible setup issues in Settings with a retry, never silent installs or fallbacks.
+- **Feedback.** Smallest surface that fits: tooltip → popover → menu → notification → dialog → alert dialog → sheet. Instant feedback on activation; disable submit while in flight; keep user input; show the result next to the object. Reversible → undo or notification; irreversible → `AlertDialog` naming the object. Missing tools or auth are visible setup issues in Settings with a retry. Install or upgrade dependencies only in response to an explicit user request; never do so silently or as a fallback.
 - **Copy.** Sentence case, no trailing period on labels, `…` on commands that need more input, verbs for commands, nouns for destinations. Errors say what happened and the next action. No `Are you sure…`, no `successfully`.
 
 ## Rust conventions
@@ -103,7 +103,7 @@ Add a regression test before fixing a deterministic bug. "Compiles" and "screens
 ## Never
 
 - Fabricate progress, completion, PR URLs, model names or defaults. `null` model means the harness default.
-- Install, upgrade, authenticate or configure `omp`, `factory` or Docker on the user's behalf.
+- Install or upgrade dependencies without an explicit user request, or authenticate or configure `omp`, `factory` or Docker on the user's behalf.
 - Pass `--yolo`, `--ignore-capacity`, `--clean`, `--tui` or shell strings to child processes; use separated argv.
 - Touch the user's working repositories from tests. Fixtures come from `mktemp -d` per the plan.
 - Write editor buffers to project files, replay raw keys, auto-submit or auto-resend after a crash or reconnect.

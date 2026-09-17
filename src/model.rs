@@ -128,6 +128,9 @@ pub struct Thread {
     /// Harness effort level; `None` means the harness default.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Harness permission mode (Claude Code `--permission-mode`); `None` means the harness default.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
     pub draft: String,
     pub attachments: Vec<ImageAttachment>,
     pub submission: Option<Value>,
