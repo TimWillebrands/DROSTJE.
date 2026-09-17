@@ -396,22 +396,32 @@ async fn thread_sidebar_hover_actions_are_visible_and_rename(cx: &mut TestAppCon
     let fixture = open_fixture(cx, None).await;
     let id = new_conversation(cx, &fixture).await;
     let row = format!("thread-{id}");
+    let actions = format!("thread-actions-{id}");
     let rename = format!("rename-thread-{id}");
     let archive = format!("archive-thread-{id}");
 
     cx.update_window(fixture.window.into(), |_, window, cx| {
-        window.render_frame(cx);
         assert!(
-            !window.find(rename.clone()).visible(),
-            "rename stays quiet until the row is hovered"
-        );
-        assert!(
-            !window.find(archive.clone()).visible(),
-            "archive stays quiet until the row is hovered"
+            window.try_find(actions.clone()).is_none(),
+            "thread actions stay out of the tree until the row is hovered"
         );
         window.hover(row.clone(), cx);
+        assert!(
+            window.find(actions.clone()).visible(),
+            "hover paints the thread action lane"
+        );
         assert!(window.find(rename.clone()).visible());
         assert!(window.find(archive.clone()).visible());
+    })
+    .unwrap();
+    smol::Timer::after(Duration::from_secs(1)).await;
+    cx.run_until_parked();
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find(actions.clone()).visible(),
+            "thread actions remain painted after the row tooltip opens"
+        );
         window.click(rename.clone(), cx);
     })
     .unwrap();
@@ -443,6 +453,24 @@ async fn thread_sidebar_hover_actions_are_visible_and_rename(cx: &mut TestAppCon
             .is_some_and(|thread| thread.title == "Manually renamed")
     })
     .await;
+
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(row.clone(), cx);
+        assert!(window.find(archive.clone()).visible());
+        window.click(archive.clone(), cx);
+    })
+    .unwrap();
+    assert!(cx.read(|cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| matches!(dialog.read(cx).kind, crate::ui::settings::DialogKind::ArchiveThread(target) if target == id))
+    }));
+    cx.dispatch_action(fixture.window.into(), commands::Dismiss);
+    cx.run_until_parked();
 
     quit(cx, &fixture).await;
 }

@@ -276,6 +276,7 @@ pub fn render(
     state: &AppState,
     owner: &WeakEntity<Workspace>,
     cursor: Option<Row>,
+    hovered_row: Option<Row>,
     search: &Entity<InputState>,
     scroll: &ScrollHandle,
     cx: &App,
@@ -297,6 +298,7 @@ pub fn render(
         let action_owner = owner.clone();
         let menu_owner = owner.clone();
         let keyboard_cursor = cursor == Some(row);
+        let pointer_hovered = hovered_row == Some(row);
         match row {
             Row::Project(id) => {
                 let project = state
@@ -540,14 +542,13 @@ pub fn render(
                         .when(!first_detail, |view| view.child(separator()))
                         .child(div().flex_shrink_0().child(age));
                 }
-                let group: SharedString = format!("thread-row-{id}").into();
+                let hover_owner = owner.clone();
                 let rename_owner = owner.clone();
                 let rename_reason = state.rename_thread_reason_for(id);
                 let archive_owner = owner.clone();
                 let archive_reason = state.archive_thread_reason_for(id);
                 list = list.child(
                     ListItem::new(SharedString::from(format!("thread-{id}")))
-                        .group(group.clone())
                         .px_2()
                         .py_1()
                         .text_sm()
@@ -582,89 +583,134 @@ pub fn render(
                                             }
                                         }))
                                         // Pointer shortcuts only: the context menu and palette
-                                        // carry the same commands.
+                                        // carry the same commands. The lane keeps its width so
+                                        // long titles do not jump when the pointer enters.
                                         .when(!thread.archived, |view| {
                                             view.child(
                                                 h_flex()
+                                                    .w(rems(2.75))
                                                     .flex_shrink_0()
-                                                    .gap_0p5()
-                                                    .invisible()
-                                                    .group_hover(group.clone(), |style| {
-                                                        style.visible()
-                                                    })
-                                                    .child(
-                                                        Button::new(SharedString::from(format!(
-                                                            "rename-thread-{id}"
-                                                        )))
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .cursor_default()
-                                                        .icon(Lucide::Pencil)
-                                                        .disabled(rename_reason.is_some())
-                                                        .map(|button| match rename_reason {
-                                                            Some(reason) => button.tooltip(reason),
-                                                            None => button.tooltip_with_action(
-                                                                Command::RenameThread.label(),
-                                                                &RenameThread,
-                                                                Some("Workspace"),
-                                                            ),
-                                                        })
-                                                        .on_click(move |_, window, cx| {
-                                                            cx.stop_propagation();
-                                                            let _ = rename_owner.update(
-                                                                cx,
-                                                                |workspace, cx| {
-                                                                    workspace.select_row(
-                                                                        row, true, window, cx,
-                                                                    );
-                                                                    workspace.execute(
-                                                                        Command::RenameThread,
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            );
-                                                        }),
-                                                    )
-                                                    .child(
-                                                        Button::new(SharedString::from(format!(
-                                                            "archive-thread-{id}"
-                                                        )))
-                                                        .ghost()
-                                                        .xsmall()
-                                                        .cursor_default()
-                                                        .icon(Lucide::Archive)
-                                                        .disabled(archive_reason.is_some())
-                                                        .map(|button| match archive_reason {
-                                                            Some(reason) => button.tooltip(reason),
-                                                            None => button.tooltip_with_action(
-                                                                Command::ArchiveThread.label(),
-                                                                &ArchiveThread,
-                                                                Some("Workspace"),
-                                                            ),
-                                                        })
-                                                        .on_click(move |_, window, cx| {
-                                                            cx.stop_propagation();
-                                                            let _ = archive_owner.update(
-                                                                cx,
-                                                                |workspace, cx| {
-                                                                    workspace.select_row(
-                                                                        row, true, window, cx,
-                                                                    );
-                                                                    workspace.execute(
-                                                                        Command::ArchiveThread,
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            );
-                                                        }),
-                                                    ),
+                                                    .justify_end()
+                                                    .when(pointer_hovered, |lane| {
+                                                        lane.child(
+                                                            h_flex()
+                                                                .id(SharedString::from(format!(
+                                                                    "thread-actions-{id}"
+                                                                )))
+                                                                .test_support()
+                                                                .gap_0p5()
+                                                                .child(
+                                                                    Button::new(
+                                                                        SharedString::from(format!(
+                                                                            "rename-thread-{id}"
+                                                                        )),
+                                                                    )
+                                                                    .ghost()
+                                                                    .xsmall()
+                                                                    .cursor_default()
+                                                                    .icon(Lucide::Pencil)
+                                                                    .disabled(
+                                                                        rename_reason.is_some(),
+                                                                    )
+                                                                    .map(|button| {
+                                                                        match rename_reason {
+                                                                            Some(reason) => button
+                                                                                .tooltip(reason),
+                                                                            None => button
+                                                                                .tooltip_with_action(
+                                                                                    Command::RenameThread.label(),
+                                                                                    &RenameThread,
+                                                                                    Some("Workspace"),
+                                                                                ),
+                                                                        }
+                                                                    })
+                                                                    .on_click(
+                                                                        move |_, window, cx| {
+                                                                            cx.stop_propagation();
+                                                                            let _ =
+                                                                                rename_owner.update(
+                                                                                    cx,
+                                                                                    |workspace, cx| {
+                                                                                        workspace
+                                                                                            .select_row(
+                                                                                                row,
+                                                                                                true,
+                                                                                                window,
+                                                                                                cx,
+                                                                                            );
+                                                                                        workspace
+                                                                                            .execute(
+                                                                                                Command::RenameThread,
+                                                                                                window,
+                                                                                                cx,
+                                                                                            );
+                                                                                    },
+                                                                                );
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .child(
+                                                                    Button::new(
+                                                                        SharedString::from(format!(
+                                                                            "archive-thread-{id}"
+                                                                        )),
+                                                                    )
+                                                                    .ghost()
+                                                                    .xsmall()
+                                                                    .cursor_default()
+                                                                    .icon(Lucide::Archive)
+                                                                    .disabled(
+                                                                        archive_reason.is_some(),
+                                                                    )
+                                                                    .map(|button| {
+                                                                        match archive_reason {
+                                                                            Some(reason) => button
+                                                                                .tooltip(reason),
+                                                                            None => button
+                                                                                .tooltip_with_action(
+                                                                                    Command::ArchiveThread.label(),
+                                                                                    &ArchiveThread,
+                                                                                    Some("Workspace"),
+                                                                                ),
+                                                                        }
+                                                                    })
+                                                                    .on_click(
+                                                                        move |_, window, cx| {
+                                                                            cx.stop_propagation();
+                                                                            let _ =
+                                                                                archive_owner.update(
+                                                                                    cx,
+                                                                                    |workspace, cx| {
+                                                                                        workspace
+                                                                                            .select_row(
+                                                                                                row,
+                                                                                                true,
+                                                                                                window,
+                                                                                                cx,
+                                                                                            );
+                                                                                        workspace
+                                                                                            .execute(
+                                                                                                Command::ArchiveThread,
+                                                                                                window,
+                                                                                                cx,
+                                                                                            );
+                                                                                    },
+                                                                                );
+                                                                        },
+                                                                    ),
+                                                                ),
+                                                        )
+                                                    }),
                                             )
                                         }),
                                 )
                                 .child(details),
                         )
+                        .on_hover(move |hovered, _, cx| {
+                            let _ = hover_owner.update(cx, |workspace, cx| {
+                                workspace.set_sidebar_row_hovered(row, *hovered, cx)
+                            });
+                        })
                         .on_click(move |_, window, cx| {
                             let _ = action_owner.update(cx, |workspace, cx| {
                                 workspace.select_row(row, true, window, cx)

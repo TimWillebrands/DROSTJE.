@@ -122,6 +122,7 @@ pub struct Workspace {
     rebuilding: bool,
     focus: FocusHandle,
     pub cursor: Option<Row>,
+    hovered_sidebar_row: Option<Row>,
     /// Filter text for the Projects list; empty shows every visible row.
     thread_search: Entity<InputState>,
     pub palette: Option<Entity<Palette>>,
@@ -222,6 +223,7 @@ impl Workspace {
             factory_form: None,
             quit_requested: false,
             cursor: None,
+            hovered_sidebar_row: None,
             thread_search,
             model_picker: None,
             effort_picker: None,
@@ -1748,6 +1750,24 @@ impl Workspace {
             }
         }
     }
+    pub(super) fn set_sidebar_row_hovered(
+        &mut self,
+        row: Row,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let next = if hovered {
+            Some(row)
+        } else if self.hovered_sidebar_row == Some(row) {
+            None
+        } else {
+            return;
+        };
+        if self.hovered_sidebar_row != next {
+            self.hovered_sidebar_row = next;
+            self.projects.update(cx, |_, cx| cx.notify());
+        }
+    }
     pub fn select_row(
         &mut self,
         row: Row,
@@ -2544,6 +2564,7 @@ impl Render for WorkspacePanel {
                     state,
                     &self.workspace,
                     workspace.cursor,
+                    workspace.hovered_sidebar_row,
                     &workspace.thread_search,
                     scroll,
                     cx,
