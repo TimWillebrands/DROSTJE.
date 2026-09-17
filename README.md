@@ -42,7 +42,7 @@ Bouw en installeer een lokale macOS-app in `/Applications`:
 ./install.sh
 ```
 
-De installer maakt een ongesigneerde `Drostje.app`-bundle met een release-build en vraagt alleen bij een niet-schrijfbare `/Applications`-map om beheerdersrechten. Gebruik `INSTALL_DIR` voor een andere locatie:
+De installer maakt een ongesigneerde `DROSTJE.app`-bundle (weergegeven als DROSTJE.) met een release-build en vraagt alleen bij een niet-schrijfbare `/Applications`-map om beheerdersrechten. Gebruik `INSTALL_DIR` voor een andere locatie:
 
 ```sh
 INSTALL_DIR="$HOME/Applications" ./install.sh

@@ -5,10 +5,12 @@
 
 set -e
 
-APP_NAME="Drostje"
+APP_NAME="DROSTJE."
 BINARY_NAME="drostje"
 INSTALL_DIR="${INSTALL_DIR:-/Applications}"
-BUNDLE_NAME="${APP_NAME}.app"
+# The bundle folder is "DROSTJE.app": brand plus extension, so Finder never shows "DROSTJE..app".
+BUNDLE_NAME="DROSTJE.app"
+LEGACY_BUNDLE_NAME="Drostje.app"
 BUILD_DIR="target/release"
 
 echo "--- Installing $APP_NAME ---"
@@ -57,6 +59,8 @@ cat <<EOF > "$APP_BUNDLE/Contents/Info.plist"
     <string>com.drostje.app</string>
     <key>CFBundleName</key>
     <string>$APP_NAME</string>
+    <key>CFBundleDisplayName</key>
+    <string>$APP_NAME</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -93,11 +97,14 @@ fi
 # 5. Install
 echo "Step 3: Installing to $INSTALL_DIR..."
 
-# Check if target directory is writable
+# Replace any previous install (including the pre-rename "Drostje.app") instead of
+# merging into it, so stale files and a duplicate Launchpad entry do not linger.
 if [ ! -w "$INSTALL_DIR" ]; then
     echo "Target directory $INSTALL_DIR is not writable. Requesting sudo..."
+    sudo rm -rf "$INSTALL_DIR/$BUNDLE_NAME" "$INSTALL_DIR/$LEGACY_BUNDLE_NAME"
     sudo cp -R "$APP_BUNDLE" "$INSTALL_DIR/"
 else
+    rm -rf "$INSTALL_DIR/$BUNDLE_NAME" "$INSTALL_DIR/$LEGACY_BUNDLE_NAME"
     cp -R "$APP_BUNDLE" "$INSTALL_DIR/"
 fi
 
