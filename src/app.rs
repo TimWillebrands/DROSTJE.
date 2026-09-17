@@ -3,6 +3,7 @@ mod factory;
 mod persistence;
 mod project_diff;
 mod shutdown;
+mod spaces;
 use crate::harness::{
     self, ContentBlock, ContextUsage, ConversationCommand, ConversationEvent, ConversationHandle,
     ConversationState, Message, ModelChoice, ToolActivity, TurnOutcome, UsageLimit, UserAnswer,
@@ -67,6 +68,13 @@ pub struct ConversationSession {
     /// Indices of harness-injected `custom` messages (job notices and the like).
     notice_indices: Vec<usize>,
     submitted: HashMap<Uuid, DraftSnapshot>,
+    /// Whether the front of the thread's queue may start the next turn on its own. Set by
+    /// an explicit queue or send-now action; cleared by a failure, an interrupt the user
+    /// did not request through the queue, and a harness restart (a new session).
+    pub auto_dispatch: bool,
+    /// The user asked to send a queued message now, so the interrupt that settles the
+    /// current turn must not stall the queue.
+    interrupt_for_queue: bool,
 }
 impl ConversationSession {
     fn new(model: Option<ModelKey>) -> Self {
@@ -98,6 +106,8 @@ impl ConversationSession {
             tool_call_order: Vec::new(),
             notice_indices: Vec::new(),
             submitted: HashMap::new(),
+            auto_dispatch: false,
+            interrupt_for_queue: false,
         }
     }
     fn message(&mut self, message: Message) {
@@ -225,7 +235,9 @@ impl Bootstrap {
         let store = Store::open(data_dir.clone())?;
         let mut snapshot = smol::block_on(store.snapshot())?;
         if !snapshot.settings.contains_key("executables") {
-            let value = json!({ "nvim": "", "omp": "", "claude": "", "factory": "" });
+            let value = json!({
+                "nvim": "", "omp": "", "pi": "", "claude": "", "llama": "", "factory": ""
+            });
             smol::block_on(store.set_setting("executables".into(), value.clone()))?;
             snapshot.settings.insert("executables".into(), value);
         }
@@ -257,7 +269,7 @@ impl Bootstrap {
 }
 
 fn executable_diagnostics(settings: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
-    ["nvim", "omp", "claude", "factory"]
+    ["nvim", "omp", "pi", "claude", "llama", "factory"]
         .into_iter()
         .map(|name| {
             let explicit = settings
@@ -284,6 +296,24 @@ enum Write {
     Flush(async_channel::Sender<Result<(), String>>),
 }
 
+/// A tab of a thread's sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarTab {
+    Changes,
+    Output,
+}
+impl SidebarTab {
+    /// The sidebar `(open, tab)` after asking for `requested`: a hidden sidebar or
+    /// another tab switches to it; the tab already on screen hides the sidebar.
+    pub fn toggle(open: bool, current: Self, requested: Self) -> (bool, Self) {
+        if open && current == requested {
+            (false, current)
+        } else {
+            (true, requested)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeLevel {
     Info,
@@ -303,8 +333,9 @@ pub struct WorkspaceNotice {
 pub enum AppEvent {
     WriteFinished(Result<(), String>),
     RepositoryChecked(ProjectId, Result<platform::RepositoryInfo, String>),
-    ProjectResolved(Result<platform::RepositoryInfo, String>),
+    ProjectResolved(SpaceId, Result<platform::RepositoryInfo, String>),
     Diagnostics(BTreeMap<String, String>),
+    PiInstalled(Result<PathBuf, String>),
     StorageFailed(String),
     InteractiveActivity { thread_id: ThreadId, active: bool },
     FactorySnapshot(Box<crate::factory::FactorySnapshot>),
@@ -318,6 +349,9 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub store: Store,
     pub snapshot: WorkspaceSnapshot,
+    pub spaces: Vec<Space>,
+    pub active_space: SpaceId,
+    space_state: spaces::Spaces,
     pub selected_project: Option<ProjectId>,
     pub selected_thread: Option<ThreadId>,
     pub open_threads: Vec<ThreadId>,
@@ -332,6 +366,7 @@ pub struct AppState {
     pub pending_writes: usize,
     /// Changed in memory; no persistence work is queued until a commit boundary.
     edited_threads: HashSet<ThreadId>,
+    pub installing_pi: bool,
     pub registering: bool,
     pub active_threads: HashSet<ThreadId>,
     pub owned_launches: HashSet<LaunchId>,
@@ -364,87 +399,39 @@ impl AppState {
             diagnostics,
             repositories,
         } = bootstrap;
-        let selected_thread = snapshot
-            .settings
-            .get("selected_thread")
-            .and_then(Value::as_str)
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .filter(|id| snapshot.threads.iter().any(|t| t.id == *id))
-            .or_else(|| {
-                let launch_id = snapshot
-                    .settings
-                    .get("selected_launch")
-                    .and_then(Value::as_str)
-                    .and_then(|id| Uuid::parse_str(id).ok())?;
-                let launch = snapshot
-                    .launches
-                    .iter()
-                    .find(|launch| launch.id == launch_id)?;
-                snapshot
-                    .threads
-                    .iter()
-                    .find(|thread| {
-                        thread.id == launch.factory_thread_id
-                            && thread.kind == ThreadKind::Factory
-                            && thread.project_id == launch.project_id
-                    })
-                    .map(|thread| thread.id)
-            });
-        let mut open_threads: Vec<ThreadId> = snapshot
-            .settings
-            .get("open_threads")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default();
-        let mut seen = HashSet::new();
-        open_threads.retain(|id| {
-            seen.insert(*id) && snapshot.threads.iter().any(|thread| thread.id == *id)
-        });
-        if let Some(id) = selected_thread
-            && !open_threads.contains(&id)
-        {
-            open_threads.push(id);
-        }
-        let selected_project = selected_thread
-            .and_then(|id| {
-                snapshot
-                    .threads
-                    .iter()
-                    .find(|t| t.id == id)
-                    .map(|t| t.project_id)
-            })
-            .or_else(|| {
-                snapshot
-                    .settings
-                    .get("selected_project")
-                    .and_then(Value::as_str)
-                    .and_then(|id| Uuid::parse_str(id).ok())
-                    .filter(|id| snapshot.projects.iter().any(|p| p.id == *id))
-            })
-            .or_else(|| snapshot.projects.iter().find(|p| !p.archived).map(|p| p.id));
+        let (space_state, storage_error) = match spaces::Spaces::load(&snapshot) {
+            Ok(spaces) => (spaces, None),
+            Err(error) => (
+                spaces::Spaces::recovery(&snapshot),
+                Some(format!(
+                    "Spaces are read-only: {error:#}. Restore the saved spaces metadata before making changes."
+                )),
+            ),
+        };
+        let session = space_state.active_session();
+        let selected_project = session.selected_project;
+        let selected_thread = session.selected_thread;
+        let open_threads = session.open_threads;
+        let show_archived = session.show_archived;
         let selected_launch = selected_thread.and_then(|id| {
             snapshot
-                .threads
+                .launches
                 .iter()
-                .find(|thread| thread.id == id && thread.kind == ThreadKind::Factory)
-                .and_then(|thread| {
-                    snapshot
-                        .launches
-                        .iter()
-                        .find(|launch| launch.factory_thread_id == thread.id)
-                        .map(|launch| launch.id)
-                })
+                .find(|launch| launch.factory_thread_id == id)
+                .map(|launch| launch.id)
         });
-        let show_archived = snapshot
-            .settings
-            .get("show_archived")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let (events, receiver) = async_channel::bounded(256);
         let (writes, requests) = async_channel::unbounded();
         let completed = events.clone();
         let failures = store.failures.clone();
         let durable_store = store.clone();
         let mut notices = VecDeque::new();
+        if let Some(error) = &storage_error {
+            notices.push_back(WorkspaceNotice {
+                level: NoticeLevel::Error,
+                text: error.clone(),
+            });
+        }
         let factory = match crate::factory::FactoryManager::open(
             durable_store.clone(),
             data_dir.clone(),
@@ -576,21 +563,25 @@ impl AppState {
             }
         })
         .detach();
-        Self {
+        let mut state = Self {
             data_dir,
             store: durable_store,
             snapshot,
+            spaces: space_state.spaces.clone(),
+            active_space: space_state.active,
+            space_state,
             selected_project,
             selected_thread,
             open_threads,
             selected_launch,
             show_archived,
-            collapsed: HashSet::new(),
+            collapsed: session.collapsed,
             repositories,
             diagnostics,
             notice_sequence: notices.len() as u64,
             notices,
-            storage_error: None,
+            installing_pi: false,
+            storage_error,
             pending_writes: 0,
             edited_threads: HashSet::new(),
             registering: false,
@@ -613,7 +604,9 @@ impl AppState {
             owned_launches: HashSet::new(),
             events,
             writes,
-        }
+        };
+        state.persist_space_session();
+        state
     }
 
     fn receive(&mut self, event: AppEvent, cx: &mut Context<Self>) {
@@ -636,7 +629,7 @@ impl AppState {
             AppEvent::RepositoryChecked(id, info) => {
                 self.repositories.insert(id, info);
             }
-            AppEvent::ProjectResolved(result) => {
+            AppEvent::ProjectResolved(space, result) => {
                 self.registering = false;
                 match result {
                     Ok(info) => {
@@ -647,14 +640,19 @@ impl AppState {
                             .find(|p| p.root == info.root)
                             .map(|p| (p.id, p.archived))
                         {
-                            self.select_project(id);
                             self.repositories.insert(id, Ok(info));
-                            if archived {
-                                self.show_archived = true;
-                                self.set_setting("show_archived", json!(true));
+                            if space == self.active_space && self.project_in_active_space(id) {
+                                self.select_project(id);
+                                if archived {
+                                    self.set_show_archived(true);
+                                }
+                                self.notice(NoticeLevel::Info, "This working tree is already registered; selected the existing project.");
+                            } else {
+                                let name =
+                                    self.project_space_name(id).unwrap_or("Default").to_owned();
+                                self.notice(NoticeLevel::Info, format!("This working tree is already registered in space {name}. Switch to that space to open it."));
                             }
-                            self.notice(NoticeLevel::Info, "This working tree is already registered; selected the existing project.");
-                        } else if self.storage_error.is_none() {
+                        } else if self.space_mutation_reason().is_none() {
                             let project = Project {
                                 id: Uuid::new_v4(),
                                 name: info
@@ -666,15 +664,50 @@ impl AppState {
                                 archived: false,
                                 defaults: ProjectDefaults::default(),
                             };
-                            self.select_project(project.id);
+                            let id = project.id;
                             self.repositories.insert(project.id, Ok(info));
-                            self.save_project(project);
+                            self.save_project_in_space(project, space);
+                            if space == self.active_space {
+                                self.select_project(id);
+                            } else {
+                                let name =
+                                    self.project_space_name(id).unwrap_or("Default").to_owned();
+                                self.notice(NoticeLevel::Info, format!("Project registered in space {name}. Switch to that space to open it."));
+                            }
                         }
                     }
                     Err(error) => self.notice(NoticeLevel::Error, error),
                 }
             }
             AppEvent::Diagnostics(diagnostics) => self.diagnostics = diagnostics,
+            AppEvent::PiInstalled(result) => {
+                self.installing_pi = false;
+                match result {
+                    Ok(path) => {
+                        let mut executables = self
+                            .snapshot
+                            .settings
+                            .get("executables")
+                            .and_then(Value::as_object)
+                            .cloned()
+                            .unwrap_or_default();
+                        executables.insert(
+                            "pi".into(),
+                            Value::String(path.to_string_lossy().into_owned()),
+                        );
+                        self.set_setting("executables", Value::Object(executables));
+                        self.notice(
+                            NoticeLevel::Info,
+                            format!("Pi installed at {}", path.display()),
+                        );
+                    }
+                    Err(error) => self.notice(
+                        NoticeLevel::Error,
+                        format!("Pi installation failed: {error}"),
+                    ),
+                }
+                self.refresh_diagnostics();
+            }
             AppEvent::InteractiveActivity { thread_id, active } => {
                 if active && self.is_conversation(thread_id) {
                     self.active_threads.insert(thread_id);
@@ -780,6 +813,15 @@ impl AppState {
     }
 
     pub fn save_project(&mut self, project: Project) {
+        self.save_project_in_space(project, self.active_space);
+    }
+
+    fn save_project_in_space(&mut self, project: Project, space: SpaceId) {
+        let id = project.id;
+        let is_new = !self.snapshot.projects.iter().any(|old| old.id == id);
+        if is_new && self.space_mutation_reason().is_some() {
+            return;
+        }
         if let Some(old) = self
             .snapshot
             .projects
@@ -791,6 +833,9 @@ impl AppState {
             self.snapshot.projects.push(project.clone());
         }
         self.enqueue(Write::Project(project));
+        if is_new {
+            self.register_project_membership(id, space);
+        }
     }
 
     pub fn save_thread(&mut self, thread: Thread) {
@@ -867,10 +912,12 @@ impl AppState {
 
     pub fn project(&self) -> Option<&Project> {
         self.selected_project
+            .filter(|id| self.project_in_active_space(*id))
             .and_then(|id| self.snapshot.projects.iter().find(|p| p.id == id))
     }
     pub fn thread(&self) -> Option<&Thread> {
         self.selected_thread
+            .filter(|id| self.thread_in_active_space(*id))
             .and_then(|id| self.snapshot.threads.iter().find(|t| t.id == id))
     }
     pub fn conversation_thread(&self) -> Option<&Thread> {
@@ -881,7 +928,9 @@ impl AppState {
         self.thread()
             .filter(|thread| thread.kind == ThreadKind::Factory)
     }
-    pub fn conversation_diff_open(&self, id: ThreadId) -> bool {
+    /// Whether a thread's sidebar (Changes, Output) is shown. The settings key predates
+    /// the Output tab and is kept so existing choices survive.
+    pub fn thread_sidebar_open(&self, id: ThreadId) -> bool {
         let id = id.to_string();
         self.snapshot
             .settings
@@ -892,7 +941,41 @@ impl AppState {
             .unwrap_or(true)
     }
 
-    pub fn set_conversation_diff_open(&mut self, id: ThreadId, open: bool) {
+    /// The sidebar tab a thread shows. Factory threads have no Changes tab.
+    pub fn thread_sidebar_tab(&self, id: ThreadId) -> SidebarTab {
+        if !self.is_conversation(id) {
+            return SidebarTab::Output;
+        }
+        match self
+            .snapshot
+            .settings
+            .get("thread_sidebar_tab")
+            .and_then(Value::as_object)
+            .and_then(|threads| threads.get(&id.to_string()))
+            .and_then(Value::as_str)
+        {
+            Some("output") => SidebarTab::Output,
+            _ => SidebarTab::Changes,
+        }
+    }
+
+    /// Show `tab` in the thread's sidebar, or hide the sidebar when `tab` is already shown.
+    pub fn toggle_thread_sidebar(&mut self, id: ThreadId, tab: SidebarTab) {
+        let (open, tab) = SidebarTab::toggle(
+            self.thread_sidebar_open(id),
+            self.thread_sidebar_tab(id),
+            tab,
+        );
+        self.set_thread_sidebar(id, open, tab);
+    }
+
+    /// Open the thread's sidebar on `tab`.
+    pub fn show_thread_sidebar(&mut self, id: ThreadId, tab: SidebarTab) {
+        self.set_thread_sidebar(id, true, tab);
+    }
+
+    fn set_thread_sidebar(&mut self, id: ThreadId, open: bool, tab: SidebarTab) {
+        let key = id.to_string();
         let mut threads = self
             .snapshot
             .settings
@@ -901,11 +984,29 @@ impl AppState {
             .cloned()
             .unwrap_or_default();
         if open {
-            threads.remove(&id.to_string());
+            threads.remove(&key);
         } else {
-            threads.insert(id.to_string(), Value::Bool(false));
+            threads.insert(key.clone(), Value::Bool(false));
         }
-        self.set_setting("conversation_diff_open", Value::Object(threads));
+        if self.snapshot.settings.get("conversation_diff_open")
+            != Some(&Value::Object(threads.clone()))
+        {
+            self.set_setting("conversation_diff_open", Value::Object(threads));
+        }
+        if self.is_conversation(id) && self.thread_sidebar_tab(id) != tab {
+            let mut tabs = self
+                .snapshot
+                .settings
+                .get("thread_sidebar_tab")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            match tab {
+                SidebarTab::Changes => tabs.remove(&key),
+                SidebarTab::Output => tabs.insert(key, Value::String("output".into())),
+            };
+            self.set_setting("thread_sidebar_tab", Value::Object(tabs));
+        }
     }
     fn is_conversation(&self, id: ThreadId) -> bool {
         self.snapshot
@@ -945,6 +1046,41 @@ impl AppState {
             None
         }
     }
+    pub fn rename_thread_reason(&self) -> Option<String> {
+        let Some(thread) = self.thread() else {
+            return Some("Select a thread first.".into());
+        };
+        self.rename_thread_reason_for(thread.id)
+    }
+    /// Why `id` cannot be renamed right now, independent of the current selection.
+    pub fn rename_thread_reason_for(&self, id: ThreadId) -> Option<String> {
+        if !self.thread_in_active_space(id) {
+            return Some("This thread belongs to another space.".into());
+        }
+        if self.shutting_down {
+            return Some("Application is shutting down".into());
+        }
+        if let Some(error) = &self.storage_error {
+            return Some(format!("Storage is read-only: {error}"));
+        }
+        let Some(thread) = self.snapshot.threads.iter().find(|thread| thread.id == id) else {
+            return Some("This thread is no longer available.".into());
+        };
+        let Some(project) = self
+            .snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == thread.project_id)
+        else {
+            return Some("This thread's project is no longer available.".into());
+        };
+        if project.archived {
+            return Some("This project is archived. History is read-only.".into());
+        }
+        thread
+            .archived
+            .then(|| "Archived threads are read-only.".into())
+    }
     pub fn archive_thread_reason(&self) -> Option<String> {
         if let Some(reason) = self.mutable_project_reason() {
             return Some(reason);
@@ -956,6 +1092,9 @@ impl AppState {
     }
     /// Why `id` cannot be archived right now, independent of the current selection.
     pub fn archive_thread_reason_for(&self, id: ThreadId) -> Option<String> {
+        if !self.thread_in_active_space(id) {
+            return Some("This thread belongs to another space.".into());
+        }
         if self.shutting_down {
             return Some("Application is shutting down".into());
         }
@@ -994,18 +1133,23 @@ impl AppState {
     }
 
     pub fn select_project(&mut self, id: ProjectId) {
+        if !self.project_in_active_space(id) {
+            return;
+        }
         self.selected_project = Some(id);
-        self.set_setting("selected_project", json!(id));
         if self.thread().is_some_and(|t| t.project_id != id) {
             if let Some(previous) = self.selected_thread {
                 self.commit_thread_edits(previous);
             }
             self.selected_thread = None;
-            self.set_setting("selected_thread", Value::Null);
             self.select_launch_output(None);
         }
+        self.persist_space_session();
     }
     pub fn select_thread(&mut self, id: ThreadId) {
+        if !self.thread_in_active_space(id) {
+            return;
+        }
         let Some(thread) = self.snapshot.threads.iter().find(|thread| thread.id == id) else {
             return;
         };
@@ -1027,18 +1171,18 @@ impl AppState {
         self.selected_thread = Some(id);
         if !self.open_threads.contains(&id) {
             self.open_threads.push(id);
-            self.set_setting("open_threads", json!(self.open_threads));
         }
-        self.set_setting("selected_thread", json!(id));
-        self.set_setting("selected_project", json!(self.selected_project));
         self.select_launch_output(launch_id);
+        self.persist_space_session();
     }
     pub fn close_thread(&mut self, id: ThreadId) {
+        if !self.thread_in_active_space(id) {
+            return;
+        }
         self.commit_thread_edits(id);
         let closed_ix = self.open_threads.iter().position(|open| *open == id);
         if let Some(ix) = closed_ix {
             self.open_threads.remove(ix);
-            self.set_setting("open_threads", json!(self.open_threads));
         }
         if self.is_conversation(id) && !self.active_threads.contains(&id) {
             if let Some(session) = self.conversations.remove(&id) {
@@ -1058,10 +1202,10 @@ impl AppState {
                 self.select_thread(next);
             } else {
                 self.selected_thread = None;
-                self.set_setting("selected_thread", Value::Null);
                 self.select_launch_output(None);
             }
         }
+        self.persist_space_session();
     }
     pub fn new_thread(&mut self, kind: ThreadKind) -> Result<()> {
         self.new_thread_with_harness(kind, None)
@@ -1138,6 +1282,7 @@ impl AppState {
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,
+            queued: Vec::new(),
             archived: false,
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -1148,20 +1293,59 @@ impl AppState {
         Ok(())
     }
     pub fn register_project(&mut self, path: PathBuf) {
-        if self.storage_error.is_some() || self.registering {
+        if self.space_mutation_reason().is_some() || self.registering {
             return;
         }
         self.registering = true;
         let sender = self.events.clone();
+        let space = self.active_space;
         smol::spawn(async move {
             let result = smol::unblock(move || {
                 platform::inspect_repository(&path).map_err(|e| format!("{e:#}"))
             })
             .await;
-            let _ = sender.send(AppEvent::ProjectResolved(result)).await;
+            let _ = sender.send(AppEvent::ProjectResolved(space, result)).await;
         })
         .detach();
     }
+    pub fn install_pi(&mut self) {
+        if self.installing_pi {
+            return;
+        }
+        if self.storage_error.is_some() {
+            self.notice(
+                NoticeLevel::Warning,
+                "Storage is not writable; Pi's managed path cannot be saved.",
+            );
+            return;
+        }
+        let explicit = self
+            .snapshot
+            .settings
+            .get("executables")
+            .and_then(|value| value.get("pi"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty());
+        if let Ok(path) = platform::resolve_executable("pi", explicit) {
+            self.notice(
+                NoticeLevel::Info,
+                format!("Pi is already available at {}", path.display()),
+            );
+            return;
+        }
+        self.installing_pi = true;
+        self.diagnostics.insert("pi".into(), "Installing…".into());
+        let sender = self.events.clone();
+        let data_dir = self.data_dir.clone();
+        smol::spawn(async move {
+            let result = harness::install_pi(data_dir)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(AppEvent::PiInstalled(result)).await;
+        })
+        .detach();
+    }
+
     pub fn refresh_diagnostics(&self) {
         let sender = self.events.clone();
         let settings = self.snapshot.settings.clone();
@@ -1200,7 +1384,16 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentBlock, ConversationSession, Message, Value};
+    use super::{ContentBlock, ConversationSession, Message, SidebarTab, Value};
+
+    #[test]
+    fn sidebar_toggle_switches_tabs_before_hiding() {
+        use SidebarTab::{Changes, Output};
+        assert_eq!(SidebarTab::toggle(true, Changes, Output), (true, Output));
+        assert_eq!(SidebarTab::toggle(true, Output, Output), (false, Output));
+        assert_eq!(SidebarTab::toggle(false, Output, Output), (true, Output));
+        assert_eq!(SidebarTab::toggle(false, Output, Changes), (true, Changes));
+    }
 
     fn message(id: &str, role: &str, content: Vec<ContentBlock>) -> Message {
         Message {

@@ -1,5 +1,5 @@
 use super::{
-    commands::{Command, button},
+    commands::{ClearQueuedMessages, Command, button},
     job_notice::{self, JobKind, JobNotice, JobOutput, JobResult, JobStart},
     todo_list::{self, TodoList, TodoStatus},
     workspace::Workspace,
@@ -31,7 +31,7 @@ use gpui_kit::{
         select::{Select, SelectEvent, SelectState},
         spinner::Spinner,
         tag::Tag,
-        text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, markdown, markdown_ast},
+        text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, markdown_ast},
         tooltip::Tooltip,
         v_flex,
     },
@@ -692,8 +692,8 @@ impl MarkdownPlugin for InertResources {
         div().whitespace_normal().child(node.as_text().to_owned())
     }
 }
-pub fn markdown_text(text: String) -> impl IntoElement {
-    markdown(text)
+pub fn markdown_text(id: impl Into<ElementId>, text: String) -> impl IntoElement {
+    TextView::markdown(id, text)
         .plugin(InertResources)
         .selectable(true)
         .on_link_click(|url, event, _, cx| {
@@ -801,51 +801,86 @@ fn mono(cx: &App) -> Div {
         .whitespace_normal()
 }
 
+/// Match OMP's prose-first reasoning display: empty stream sentinels disappear and
+/// fenced implementation detail becomes an ellipsis instead of dominating the timeline.
+fn thinking_for_display(text: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some((marker, width)) = fence {
+            let marker_width = trimmed.chars().take_while(|ch| *ch == marker).count();
+            if marker_width >= width && trimmed.chars().all(|ch| ch == marker) {
+                fence = None;
+            }
+            continue;
+        }
+        if matches!(trimmed, "<!-- -->" | "<!-->") {
+            continue;
+        }
+        let marker = trimmed.chars().next();
+        let marker_width = marker
+            .filter(|marker| matches!(marker, '`' | '~'))
+            .map_or(0, |marker| {
+                trimmed.chars().take_while(|ch| *ch == marker).count()
+            });
+        if marker_width >= 3 {
+            fence = marker.map(|marker| (marker, marker_width));
+            if let Some(last) = lines.iter_mut().rev().find(|line| !line.trim().is_empty()) {
+                let trimmed = last.trim_end();
+                *last = if trimmed.ends_with("...") {
+                    trimmed.to_owned()
+                } else if let Some(prefix) = trimmed.strip_suffix('.') {
+                    format!("{prefix}...")
+                } else {
+                    format!("{trimmed}...")
+                };
+            } else {
+                lines.push("...".into());
+            }
+            continue;
+        }
+        lines.push(line.to_owned());
+    }
+    let display = lines.join("\n").trim().to_owned();
+    if display
+        .chars()
+        .all(|ch| ch.is_whitespace() || matches!(ch, '.' | '…'))
+    {
+        String::new()
+    } else {
+        display
+    }
+}
+
 pub(super) fn block(
     content: &ContentBlock,
     identity: String,
     owner: &WeakEntity<Workspace>,
     cx: &App,
 ) -> AnyElement {
-    let expanded = is_expanded(owner, &identity, cx);
     match content {
-        ContentBlock::Text(text) => guarded_text(identity, text, owner, cx, || {
-            markdown_text(text.clone()).into_any_element()
-        }),
+        ContentBlock::Text(text) => {
+            let markdown_id = format!("{identity}:markdown");
+            guarded_text(identity, text, owner, cx, || {
+                markdown_text(markdown_id, text.clone()).into_any_element()
+            })
+        }
         ContentBlock::Thinking(text) => {
-            let key = identity.clone();
-            v_flex()
-                .gap_1()
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .items_center()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(disclosure(
-                            key.clone(),
-                            expanded,
-                            owner,
-                            if expanded {
-                                "Hide thinking"
-                            } else {
-                                "Show thinking"
-                            },
-                        ))
-                        .child("Thinking"),
-                )
-                .child(
-                    Collapsible::new()
-                        .open(expanded)
-                        .motion_id(SharedString::from(format!("{key}:reveal")))
-                        .content(
-                            div()
-                                .pl_6()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(markdown_text(text.clone())),
-                        ),
-                )
-                .into_any_element()
+            let display = thinking_for_display(text);
+            if display.is_empty() {
+                return div().into_any_element();
+            }
+            let rendered = display.clone();
+            let markdown_id = format!("{identity}:markdown");
+            guarded_content(identity, &display, owner, cx, "thinking", || {
+                div()
+                    .debug_selector(|| "conversation-thinking".into())
+                    .italic()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(markdown_text(markdown_id, rendered))
+                    .into_any_element()
+            })
         }
         ContentBlock::Image(image) => image_thumbnail(image, owner, cx),
         ContentBlock::ImageError(error) => Alert::error(
@@ -887,6 +922,17 @@ fn guarded_text(
     cx: &App,
     render: impl FnOnce() -> AnyElement,
 ) -> AnyElement {
+    guarded_content(identity, text, owner, cx, "result", render)
+}
+
+fn guarded_content(
+    identity: String,
+    text: &str,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+    kind: &str,
+    render: impl FnOnce() -> AnyElement,
+) -> AnyElement {
     if text.len() <= 16_384 {
         return render();
     }
@@ -899,7 +945,7 @@ fn guarded_text(
                 .small()
                 .ghost()
                 .label(format!(
-                    "{} large result ({} bytes)",
+                    "{} large {kind} ({} bytes)",
                     if expanded { "Collapse" } else { "Expand" },
                     text.len()
                 ))
@@ -911,8 +957,8 @@ fn guarded_text(
 /// Plain output (compiler messages, grep hits, file contents) rendered through
 /// the kit's Markdown code block, which brings the code font, background,
 /// highlighting for a known language and copy support.
-fn code_block(text: &str, language: &str) -> impl IntoElement {
-    markdown_text(code_fence(text, language))
+fn code_block(identity: impl Into<ElementId>, text: &str, language: &str) -> impl IntoElement {
+    markdown_text(identity, code_fence(text, language))
 }
 /// Wrap `text` in a fence longer than any backtick run it contains, so the
 /// block always closes where intended.
@@ -1071,6 +1117,44 @@ impl ToolResult<'_> {
         }
     }
 }
+const COLLAPSED_TOOL_RESULT_LINES: usize = 6;
+const COLLAPSED_TOOL_RESULT_COLUMNS: usize = 240;
+
+/// Keep the useful head of a tool result visible like OMP's compact tool rows,
+/// without allowing one unbroken line or a large result to dominate the timeline.
+fn collapsed_tool_result_preview(blocks: &[ContentBlock]) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut truncated = false;
+    'blocks: for block in blocks {
+        let ContentBlock::Text(text) = block else {
+            continue;
+        };
+        for raw_line in text.lines() {
+            if lines.len() == COLLAPSED_TOOL_RESULT_LINES {
+                truncated = true;
+                break 'blocks;
+            }
+            let mut chars = raw_line.chars();
+            lines.push(
+                chars
+                    .by_ref()
+                    .take(COLLAPSED_TOOL_RESULT_COLUMNS)
+                    .collect::<String>(),
+            );
+            if chars.next().is_some() {
+                truncated = true;
+                break 'blocks;
+            }
+        }
+    }
+    if lines.iter().all(|line| line.trim().is_empty()) {
+        return None;
+    }
+    if truncated {
+        lines.push("…".into());
+    }
+    Some(lines.join("\n"))
+}
 
 /// One card for a tool call, live or historical. A failed card opens its result
 /// automatically, otherwise the disclosure does.
@@ -1160,8 +1244,11 @@ fn tool_card(
             },
         ));
     }
+    let card_selector = format!("{key}:card");
     let mut card = v_flex()
-        .id(SharedString::from(format!("{key}:card")))
+        .id(SharedString::from(card_selector))
+        .debug_selector(|| "conversation-tool-card".into())
+        .test_support()
         .w_full()
         .min_w_0()
         .gap_1()
@@ -1169,12 +1256,30 @@ fn tool_card(
         .rounded(cx.theme().radius)
         .bg(cx.theme().muted)
         .child(header)
-        .child(mono(cx).child(summary.body));
+        .when(!summary.body.is_empty(), |card| {
+            card.child(mono(cx).child(summary.body))
+        });
     if has_result {
         card = card.on_click(toggle(owner, key.clone()));
     }
+    if has_result
+        && !expanded
+        && let Some(preview) = collapsed_tool_result_preview(result)
+    {
+        card = card.child(
+            mono(cx)
+                .debug_selector(|| "conversation-tool-result-preview".into())
+                .pt_2()
+                .mt_1()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .text_color(cx.theme().muted_foreground)
+                .child(preview),
+        );
+    }
     if has_result && expanded {
         let mut output = v_flex()
+            .debug_selector(|| "conversation-tool-full-result".into())
             .gap_2()
             .pt_2()
             .mt_1()
@@ -1188,8 +1293,9 @@ fn tool_card(
             let identity = format!("{key}:{index}");
             output = output.child(match (block, language) {
                 (ContentBlock::Text(text), Some(language)) => {
+                    let markdown_id = format!("{identity}:markdown");
                     guarded_text(identity, text, owner, cx, || {
-                        code_block(text, language).into_any_element()
+                        code_block(markdown_id, text, language).into_any_element()
                     })
                 }
                 _ => self::block(block, identity, owner, cx),
@@ -1886,20 +1992,20 @@ fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &Ap
             );
         }
         output = match &job.output {
-            JobOutput::Structured(value) => output.child(structured_view(value, 0, cx)),
+            JobOutput::Structured(value) => {
+                output.child(structured_view(format!("{key}:structured"), value, 0, cx))
+            }
             JobOutput::Text(text) => {
                 let language = if text.trim_start().starts_with(['{', '[']) {
                     "json"
                 } else {
                     "text"
                 };
-                output.child(guarded_text(
-                    format!("{key}:output"),
-                    text,
-                    owner,
-                    cx,
-                    || code_block(text, language).into_any_element(),
-                ))
+                let identity = format!("{key}:output");
+                let markdown_id = format!("{identity}:markdown");
+                output.child(guarded_text(identity, text, owner, cx, || {
+                    code_block(markdown_id, text, language).into_any_element()
+                }))
             }
             JobOutput::Empty => output,
         };
@@ -1910,7 +2016,7 @@ fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &Ap
 /// Generic reading view for a job's JSON report: keys become captions, strings
 /// render as Markdown, string lists as bullets, nested objects indent. Beyond a
 /// few levels the raw JSON is shown so nothing is hidden.
-fn structured_view(value: &Value, depth: usize, cx: &App) -> AnyElement {
+fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> AnyElement {
     const MAX_DEPTH: usize = 3;
     match value {
         Value::Object(fields) if depth < MAX_DEPTH && !fields.is_empty() => {
@@ -1927,7 +2033,12 @@ fn structured_view(value: &Value, depth: usize, cx: &App) -> AnyElement {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(caption),
                         )
-                        .child(structured_view(value, depth + 1, cx)),
+                        .child(structured_view(
+                            format!("{identity}:field:{key}"),
+                            value,
+                            depth + 1,
+                            cx,
+                        )),
                 );
             }
             column.into_any_element()
@@ -1943,7 +2054,7 @@ fn structured_view(value: &Value, depth: usize, cx: &App) -> AnyElement {
                 .map(|item| format!("- {}", item.replace('\n', "\n  ")))
                 .collect::<Vec<_>>()
                 .join("\n");
-            markdown_text(list).into_any_element()
+            markdown_text(identity, list).into_any_element()
         }
         Value::Array(items)
             if depth < MAX_DEPTH
@@ -1951,24 +2062,30 @@ fn structured_view(value: &Value, depth: usize, cx: &App) -> AnyElement {
                 && items.iter().all(|item| item.is_object()) =>
         {
             let mut column = v_flex().gap_2().min_w_0();
-            for item in items {
+            for (index, item) in items.iter().enumerate() {
                 column = column.child(
                     div()
                         .pl_3()
                         .border_l_1()
                         .border_color(cx.theme().border)
-                        .child(structured_view(item, depth + 1, cx)),
+                        .child(structured_view(
+                            format!("{identity}:item:{index}"),
+                            item,
+                            depth + 1,
+                            cx,
+                        )),
                 );
             }
             column.into_any_element()
         }
-        Value::String(text) => markdown_text(text.clone()).into_any_element(),
+        Value::String(text) => markdown_text(identity, text.clone()).into_any_element(),
         Value::Null => div()
             .text_color(cx.theme().muted_foreground)
             .child("None")
             .into_any_element(),
         Value::Bool(_) | Value::Number(_) => mono(cx).child(value.to_string()).into_any_element(),
         Value::Object(_) | Value::Array(_) => code_block(
+            identity,
             &serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
             "json",
         )
@@ -2174,8 +2291,202 @@ pub(super) fn render(
     render_content(state, id, owner, scroll, transcript, cx)
 }
 
-/// The Conversation frame: history and the changes sidebar share a row, the
+/// The Conversation frame: history and the thread sidebar share a row, the
 /// composer spans the full pane width beneath both.
+/// Rem height the queue bar adds to the composer: a header plus up to four rows; longer
+/// queues scroll inside the bar.
+fn queued_messages_height(
+    thread: &crate::model::Thread,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> f32 {
+    if thread.queued.is_empty() {
+        return 0.;
+    }
+    if is_expanded(owner, &format!("queue-collapsed:{}", thread.id), cx) {
+        return QUEUE_HEADER_HEIGHT;
+    }
+    QUEUE_HEADER_HEIGHT + QUEUE_ROW_HEIGHT * thread.queued.len().min(QUEUE_VISIBLE_ROWS) as f32
+}
+const QUEUE_HEADER_HEIGHT: f32 = 2.25;
+const QUEUE_ROW_HEIGHT: f32 = 2.;
+const QUEUE_VISIBLE_ROWS: usize = 4;
+
+/// Zed-style queue above the composer: a collapsible header with the count and Clear all,
+/// then one row per waiting prompt with Remove, Edit and Send now. The front row is the
+/// one the queue sends next. `dispatch_reason` disables Send now while the conversation is
+/// idle but unable to start a turn; during a turn, Send now stops that turn first.
+fn queued_messages(
+    thread: &crate::model::Thread,
+    active: bool,
+    dispatch_reason: Option<String>,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    let id = thread.id;
+    let collapsed_key = format!("queue-collapsed:{id}");
+    let collapsed = is_expanded(owner, &collapsed_key, cx);
+    let count = thread.queued.len();
+    let clear = owner.clone();
+    let header = h_flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .h(rems(QUEUE_HEADER_HEIGHT))
+        .child(disclosure(
+            collapsed_key,
+            !collapsed,
+            owner,
+            if collapsed {
+                "Show queued messages"
+            } else {
+                "Hide queued messages"
+            },
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(match count {
+                    1 => "1 queued message".to_owned(),
+                    count => format!("{count} queued messages"),
+                }),
+        )
+        .child(
+            Button::new("clear-queued")
+                .xsmall()
+                .ghost()
+                .label("Clear all")
+                .tooltip_with_action(
+                    "Remove every queued message…",
+                    &ClearQueuedMessages,
+                    Some("Thread"),
+                )
+                .on_click(move |_, window, cx| {
+                    let _ = clear.update(cx, |workspace, cx| {
+                        workspace.clear_queued_messages(window, cx)
+                    });
+                }),
+        );
+    let mut bar = v_flex()
+        .id(SharedString::from(format!("queued-messages-{id}")))
+        .debug_selector(|| "queued-messages".into())
+        .test_support()
+        .w_full()
+        .min_w_0()
+        .flex_shrink_0()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(header);
+    if collapsed {
+        return bar.into_any_element();
+    }
+    let mut rows = v_flex()
+        .id(SharedString::from(format!("queued-rows-{id}")))
+        .max_h(rems(QUEUE_ROW_HEIGHT * QUEUE_VISIBLE_ROWS as f32))
+        .overflow_y_scroll()
+        .w_full()
+        .min_w_0();
+    for (index, message) in thread.queued.iter().enumerate() {
+        let message_id = message.id;
+        let remove = owner.clone();
+        let edit = owner.clone();
+        let send = owner.clone();
+        let next = index == 0;
+        let send_reason = if active {
+            None
+        } else {
+            dispatch_reason.clone()
+        };
+        let attachments = message.attachments.len();
+        rows = rows.child(
+            h_flex()
+                .id(SharedString::from(format!("queued-{message_id}")))
+                .debug_selector(move || {
+                    if next {
+                        "queued-row-next".into()
+                    } else {
+                        "queued-row".into()
+                    }
+                })
+                .items_center()
+                .gap_2()
+                .px_2()
+                .h(rems(QUEUE_ROW_HEIGHT))
+                .child(Icon::new(Lucide::CircleDot).xsmall().text_color(if next {
+                    cx.theme().primary
+                } else {
+                    cx.theme().muted_foreground
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .child(message.preview()),
+                )
+                .when(attachments > 0, |row| {
+                    row.child(Tag::secondary().xsmall().child(match attachments {
+                        1 => "1 image".to_owned(),
+                        count => format!("{count} images"),
+                    }))
+                })
+                .child(
+                    Button::new(SharedString::from(format!("remove-queued-{message_id}")))
+                        .xsmall()
+                        .ghost()
+                        .icon(Lucide::Trash)
+                        .tooltip("Remove")
+                        .on_click(move |_, _, cx| {
+                            let _ = remove.update(cx, |workspace, cx| {
+                                workspace.state.update(cx, |state, cx| {
+                                    state.remove_queued(id, message_id);
+                                    cx.notify();
+                                })
+                            });
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("edit-queued-{message_id}")))
+                        .xsmall()
+                        .ghost()
+                        .icon(Lucide::Pencil)
+                        .tooltip("Edit in composer")
+                        .on_click(move |_, window, cx| {
+                            let _ = edit.update(cx, |workspace, cx| {
+                                workspace.edit_queued(id, message_id, window, cx)
+                            });
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("send-queued-{message_id}")))
+                        .xsmall()
+                        .outline()
+                        .label("Send now")
+                        .disabled(send_reason.is_some())
+                        .tooltip(send_reason.unwrap_or_else(|| {
+                            if active {
+                                "Stop the running turn and send this next".to_owned()
+                            } else {
+                                "Send this now".to_owned()
+                            }
+                        }))
+                        .on_click(move |_, _, cx| {
+                            let _ = send.update(cx, |workspace, cx| {
+                                workspace.send_queued_now(id, message_id, cx)
+                            });
+                        }),
+                ),
+        );
+    }
+    bar = bar.child(rows);
+    bar.into_any_element()
+}
+
 fn frame(
     root: Stateful<Div>,
     history: Div,
@@ -2195,147 +2506,16 @@ fn frame(
     .into_any_element()
 }
 
-fn diff_sidebar(
-    state: &AppState,
-    id: ThreadId,
-    owner: &WeakEntity<Workspace>,
-    cx: &App,
-) -> AnyElement {
-    let open = state.conversation_diff_open(id);
-    let toggle = button(
-        "toggle-conversation-diffs",
-        Command::ToggleConversationDiffs,
-        owner,
-        state,
-    )
-    .label("")
-    .icon(if open {
-        IconName::ChevronRight
-    } else {
-        IconName::ChevronLeft
-    })
-    .tooltip(if open { "Hide changes" } else { "Show changes" })
-    .debug_selector(|| "toggle-conversation-diffs".into());
-    if !open {
-        return v_flex()
-            .w(rems(2.5))
-            .h_full()
-            .flex_shrink_0()
-            .items_center()
-            .border_l_1()
-            .border_color(cx.theme().border)
-            .pt_2()
-            .child(toggle)
-            .into_any_element();
-    }
-    let diff = state.conversation_diff(id);
-    let loading = diff.is_none_or(|diff| diff.loading);
-    let result = diff.and_then(|diff| diff.result.as_ref());
-    let summary = match result {
-        Some(Ok(diff)) if diff.changed_files > 0 => format!(
-            "{} files · +{} −{}",
-            diff.changed_files, diff.additions, diff.deletions
-        ),
-        Some(Ok(_)) => "Working tree clean".to_owned(),
-        Some(Err(_)) => "Changes unavailable".to_owned(),
-        None if loading => "Loading changes…".to_owned(),
-        None => "Changes not loaded".to_owned(),
-    };
-    let mut body = v_flex()
-        .id("conversation-diff-sidebar")
-        .debug_selector(|| "conversation-diff-sidebar".into())
-        .w(rems(22.))
-        .max_w(relative(0.4))
-        .h_full()
-        .min_w_0()
-        .min_h_0()
-        .flex_shrink_0()
-        .border_l_1()
-        .border_color(cx.theme().border)
-        .bg(cx.theme().sidebar)
-        .child(
-            h_flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap_1()
-                .border_b_1()
-                .border_color(cx.theme().border)
-                .px_2()
-                .py_1()
-                .child(Label::new("Changes").secondary(summary))
-                .child(div().flex_1())
-                .when(loading, |row| row.child(Spinner::new().xsmall()))
-                .child(
-                    button(
-                        "refresh-conversation-diff",
-                        Command::RefreshConversationDiff,
-                        owner,
-                        state,
-                    )
-                    .label("Refresh")
-                    .debug_selector(|| "refresh-conversation-diff".into()),
-                )
-                .child(toggle),
-        );
-    body = body.child(match result {
-        Some(Ok(diff)) if diff.patch.is_empty() => div()
-            .flex_1()
-            .p_3()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child("No uncommitted changes")
-            .into_any_element(),
-        Some(Ok(diff)) => div()
-            .id("conversation-diff-patch")
-            .debug_selector(|| "conversation-diff-patch".into())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_2()
-            .font_family(cx.theme().mono_font_family.clone())
-            .text_size(cx.theme().mono_font_size)
-            .whitespace_normal()
-            .child(diff.patch.clone())
-            .into_any_element(),
-        Some(Err(error)) => v_flex()
-            .flex_1()
-            .gap_2()
-            .p_3()
-            .text_sm()
-            .child(
-                Alert::error(
-                    "conversation-diff-error",
-                    format!("Changes could not be read: {error}"),
-                )
-                .small(),
-            )
-            .child("Retry after restoring access to the working tree.")
-            .into_any_element(),
-        None => div()
-            .flex_1()
-            .p_3()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(if loading {
-                "Reading working tree changes…"
-            } else {
-                "Open or refresh this conversation to read changes."
-            })
-            .into_any_element(),
-    });
-    body.into_any_element()
-}
-
 fn render_content(
     state: &AppState,
     id: ThreadId,
     owner: &WeakEntity<Workspace>,
-    _scroll: &ScrollHandle,
+    output_scroll: &ScrollHandle,
     transcript: &Entity<TranscriptView>,
     cx: &App,
 ) -> AnyElement {
     let drop_owner = owner.clone();
-    let sidebar = diff_sidebar(state, id, owner, cx);
+    let sidebar = super::thread_sidebar::render(state, id, true, owner, output_scroll, cx);
     let root = v_flex()
         .id(SharedString::from(format!("conversation-view-{id}")))
         .size_full()
@@ -2467,11 +2647,7 @@ fn render_content(
         } else {
             format!(
                 "Opening {} session…",
-                if thread.harness == "claude-code" {
-                    "Claude Code"
-                } else {
-                    "OMP"
-                }
+                crate::harness::display_name(&thread.harness)
             )
         }));
     }
@@ -2560,6 +2736,15 @@ fn render_content(
         .debug_selector(|| "composer-content".into())
         .test_support()
         .min_h_0();
+    if !thread.queued.is_empty() {
+        composer = composer.child(queued_messages(
+            thread,
+            active,
+            state.queued_dispatch_reason(id),
+            owner,
+            cx,
+        ));
+    }
     let mut previews = h_flex()
         .id("draft-attachments")
         .overflow_x_scroll()
@@ -2629,11 +2814,7 @@ fn render_content(
             .child(if thread.draft.trim().is_empty() {
                 format!(
                     "Message {} — press i to write",
-                    if thread.harness == "claude-code" {
-                        "Claude Code"
-                    } else {
-                        "OMP"
-                    }
+                    crate::harness::display_name(&thread.harness)
                 )
             } else {
                 format!("{}\n\nPress i to edit", thread.draft)
@@ -2801,6 +2982,23 @@ fn render_content(
         );
     }
     if active {
+        let queue = owner.clone();
+        let queue_reason = state.queue_reason(id).or_else(|| {
+            (!hosts_editor).then(|| "Focus this conversation to edit and queue".to_owned())
+        });
+        trailing = trailing.child(
+            Button::new("queue-prompt")
+                .small()
+                .ghost()
+                .icon(Lucide::ListPlus)
+                .label("Queue")
+                .disabled(queue_reason.is_some())
+                .tooltip(queue_reason.unwrap_or_else(|| "Queue for after this turn".to_owned()))
+                .on_click(move |_, window, cx| {
+                    let _ =
+                        queue.update(cx, |workspace, cx| workspace.queue_prompt(id, window, cx));
+                }),
+        );
         let stop = owner.clone();
         trailing = trailing.child(
             Button::new("interrupt-prompt")
@@ -2846,12 +3044,12 @@ fn render_content(
         .child(trailing);
     // A definite bounded height propagates through the inset wrapper so the editor shrinks,
     // rather than overflowing the actions or introducing a second transcript scroller.
-    let preferred_height = 11.
-        + if thread.attachments.is_empty() {
+    let preferred_height =
+        11. + if thread.attachments.is_empty() {
             0.
         } else {
             9.
-        };
+        } + queued_messages_height(thread, owner, cx);
     frame(
         root,
         history,
@@ -2885,9 +3083,9 @@ fn render_content(
 mod tests {
     use super::{
         ContentBlock, ContextUsage, Duration, LimitWindow, Lucide, Message, SUMMARY_LIMIT,
-        SystemTime, ToolSummary, UsageLimit, Value, code_fence, compact_duration, compact_tokens,
-        context_percent, harness_note_hidden, humanise_key, limit_description, result_language,
-        tool_summary,
+        SystemTime, ToolSummary, UsageLimit, Value, code_fence, collapsed_tool_result_preview,
+        compact_duration, compact_tokens, context_percent, harness_note_hidden, humanise_key,
+        limit_description, result_language, thinking_for_display, tool_summary,
     };
     use serde_json::json;
 
@@ -2973,6 +3171,315 @@ mod tests {
             };
             assert_eq!(usage_meters(Some(context), &limits, now, cx).len(), 3);
         });
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn compact_timeline_states_render_on_the_native_surface(cx: &mut gpui_kit::TestAppContext) {
+        use super::{ToolCall, ToolOutcome, ToolResult, Workspace, block, tool_card, v_flex};
+        use gpui_kit::{
+            AppContext, Context, IntoElement, ParentElement, Render, Styled, VisualTestContext,
+            WeakEntity, Window, component::Root, test::TestWindowExt,
+        };
+
+        struct TimelineHarness;
+        impl Render for TimelineHarness {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let owner = WeakEntity::<Workspace>::new_invalid();
+                let reasoning =
+                    ContentBlock::Thinking("**Planning**\n\nInspect the relevant files".into());
+                let result = [ContentBlock::Text(
+                    "one\ntwo\nthree\nfour\nfive\nsix\nseven".into(),
+                )];
+                let failure = [ContentBlock::Text("permission denied".into())];
+                v_flex()
+                    .gap_2()
+                    .child(block(&reasoning, "reasoning".into(), &owner, cx))
+                    .child(tool_card(
+                        "preview".into(),
+                        ToolCall {
+                            name: "grep",
+                            intent: Some("Finding timeline rendering"),
+                            input: &Value::Null,
+                        },
+                        ToolResult {
+                            outcome: ToolOutcome::Succeeded,
+                            content: &result,
+                            exit_code: Some(0),
+                        },
+                        &owner,
+                        cx,
+                    ))
+                    .child(tool_card(
+                        "failure".into(),
+                        ToolCall {
+                            name: "bash",
+                            intent: Some("Running validation"),
+                            input: &Value::Null,
+                        },
+                        ToolResult {
+                            outcome: ToolOutcome::Failed,
+                            content: &failure,
+                            exit_code: Some(1),
+                        },
+                        &owner,
+                        cx,
+                    ))
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, None, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            let content = cx.new(|_| TimelineHarness);
+            Root::new(content, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        assert!(visual.debug_bounds("conversation-thinking").is_some());
+        assert!(
+            visual
+                .debug_bounds("conversation-tool-result-preview")
+                .is_some()
+        );
+        assert!(
+            visual
+                .debug_bounds("conversation-tool-full-result")
+                .is_some()
+        );
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn queued_messages_render_a_bar_with_the_next_row_first(cx: &mut gpui_kit::TestAppContext) {
+        use super::{Workspace, queued_messages, queued_messages_height, v_flex};
+        use crate::model::{QueuedMessage, Thread, ThreadKind};
+        use gpui_kit::{
+            AppContext, Context, IntoElement, ParentElement, Render, Styled, VisualTestContext,
+            WeakEntity, Window, component::Root, test::TestWindowExt,
+        };
+        use uuid::Uuid;
+
+        fn thread(queued: usize) -> Thread {
+            Thread {
+                id: Uuid::from_u128(7),
+                project_id: Uuid::from_u128(1),
+                kind: ThreadKind::Conversation,
+                factory: None,
+                title: "Queue".into(),
+                harness: "omp".into(),
+                session_ref: None,
+                model: None,
+                effort: None,
+                permission_mode: None,
+                draft: String::new(),
+                attachments: Vec::new(),
+                submission: None,
+                queued: (0..queued)
+                    .map(|index| QueuedMessage {
+                        id: Uuid::from_u128(100 + index as u128),
+                        text: format!("Queued prompt {index}"),
+                        attachments: Vec::new(),
+                    })
+                    .collect(),
+                archived: false,
+                created_at: "2026-09-17T12:00:00Z".into(),
+                updated_at: "2026-09-17T12:00:00Z".into(),
+            }
+        }
+
+        struct QueueHarness;
+        impl Render for QueueHarness {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let owner = WeakEntity::<Workspace>::new_invalid();
+                v_flex().w(gpui_kit::px(480.)).child(queued_messages(
+                    &thread(2),
+                    true,
+                    None,
+                    &owner,
+                    cx,
+                ))
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, None, cx);
+            let owner = WeakEntity::<Workspace>::new_invalid();
+            assert_eq!(queued_messages_height(&thread(0), &owner, cx), 0.);
+            assert!(
+                queued_messages_height(&thread(6), &owner, cx)
+                    > queued_messages_height(&thread(1), &owner, cx)
+            );
+            assert_eq!(
+                queued_messages_height(&thread(6), &owner, cx),
+                queued_messages_height(&thread(4), &owner, cx),
+                "longer queues scroll instead of growing the composer"
+            );
+        });
+        let window = cx.add_window(|window, cx| {
+            let content = cx.new(|_| QueueHarness);
+            Root::new(content, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let bar = visual
+            .debug_bounds("queued-messages")
+            .expect("queue bar should render");
+        let next = visual
+            .debug_bounds("queued-row-next")
+            .expect("the next message renders as the first row");
+        let later = visual
+            .debug_bounds("queued-row")
+            .expect("later messages render as plain rows");
+        assert!(next.top() >= bar.top() && next.top() < later.top());
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn separate_message_text_blocks_select_their_own_text(cx: &mut gpui_kit::TestAppContext) {
+        use super::{ContentBlock, Workspace, block, v_flex};
+        use gpui_kit::{
+            AppContext, Context, InteractiveElement, IntoElement, Modifiers, MouseButton,
+            MouseDownEvent, MouseUpEvent, ParentElement, Render, Styled, TestSupportExt,
+            VisualTestContext, Window, component::Root,
+        };
+
+        struct MarkdownHarness;
+        impl Render for MarkdownHarness {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let owner = gpui_kit::WeakEntity::<Workspace>::new_invalid();
+                let first = ContentBlock::Text("First paragraph".into());
+                let second = ContentBlock::Text(
+                    "Second paragraph with enough different words to expose shared rich-text state."
+                        .into(),
+                );
+                v_flex()
+                    .id("markdown-blocks")
+                    .debug_selector(|| "markdown-blocks".into())
+                    .test_support()
+                    .w(gpui_kit::px(420.))
+                    .p_3()
+                    .gap_3()
+                    .child(block(&first, "message:0".into(), &owner, cx))
+                    .child(block(&second, "message:1".into(), &owner, cx))
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, None, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            let content = cx.new(|_| MarkdownHarness);
+            Root::new(content, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let blocks = visual
+            .debug_bounds("markdown-blocks")
+            .expect("Markdown blocks should render");
+        let position = gpui_kit::point(
+            blocks.left() + gpui_kit::px(20.),
+            blocks.top() + gpui_kit::px(20.),
+        );
+        visual.simulate_event(MouseDownEvent {
+            position,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 3,
+            first_mouse: false,
+        });
+        visual.simulate_event(MouseUpEvent {
+            position,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 3,
+        });
+        visual.update(|window, cx| {
+            assert_eq!(
+                gpui_kit::base::TextSelection::selected_text(window, cx).trim(),
+                "First paragraph"
+            );
+        });
+        visual.update(|window, cx| {
+            gpui_kit::base::TextSelection::clear(window, cx);
+        });
+        let position = gpui_kit::point(
+            blocks.left() + gpui_kit::px(20.),
+            blocks.bottom() - gpui_kit::px(20.),
+        );
+        visual.simulate_event(MouseDownEvent {
+            position,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 3,
+            first_mouse: false,
+        });
+        visual.simulate_event(MouseUpEvent {
+            position,
+            modifiers: Modifiers::default(),
+            button: MouseButton::Left,
+            click_count: 3,
+        });
+        visual.update(|window, cx| {
+            assert_eq!(
+                gpui_kit::base::TextSelection::selected_text(window, cx).trim(),
+                "Second paragraph with enough different words to expose shared rich-text state."
+            );
+        });
+    }
+
+    #[test]
+    fn reasoning_reads_like_omp_instead_of_hiding_behind_a_generic_label() {
+        assert_eq!(
+            thinking_for_display(
+                "**Planning the change**\n\n<!-- -->\n\n```rust\nlet hidden = true;\n```\n\nChecking the result"
+            ),
+            "**Planning the change**...\n\n\n\nChecking the result"
+        );
+        assert_eq!(thinking_for_display(" ... \n…"), "");
+    }
+
+    #[test]
+    fn collapsed_tools_keep_a_bounded_result_preview_visible() {
+        let blocks = [ContentBlock::Text(
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven".into(),
+        )];
+        assert_eq!(
+            collapsed_tool_result_preview(&blocks).as_deref(),
+            Some("one\ntwo\nthree\nfour\nfive\nsix\n…")
+        );
+        let wide = [ContentBlock::Text("x".repeat(300))];
+        let preview = collapsed_tool_result_preview(&wide).unwrap();
+        assert_eq!(preview.lines().next().unwrap().chars().count(), 240);
+        assert!(preview.ends_with("\n…"));
+        assert!(
+            collapsed_tool_result_preview(&[ContentBlock::Thinking("hidden".into())]).is_none()
+        );
     }
 
     #[test]

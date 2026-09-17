@@ -21,7 +21,7 @@ use gpui_kit::{
     prelude::FluentBuilder,
     *,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, fmt, path::PathBuf};
 use uuid::Uuid;
 
@@ -85,20 +85,36 @@ fn field_error(key: &'static str, message: impl Into<String>) -> anyhow::Error {
     }
     .into()
 }
+fn retain_concurrent_value(initial: &str, draft: String, current: &str) -> String {
+    if draft == initial && current != initial {
+        current.to_owned()
+    } else {
+        draft
+    }
+}
 
 #[derive(Clone)]
 pub enum DialogKind {
     AddProject,
+    NewSpace,
+    RenameSpace(Uuid),
+    DeleteSpace(Uuid),
     RenameProject(Uuid),
     RenameThread(Uuid),
     ArchiveProject(Uuid),
     ArchiveThread(Uuid),
     Settings(Option<Uuid>),
 }
+pub enum SurfaceOutcome {
+    Applied,
+    SpaceCreated(Uuid),
+    DeleteSpace(Uuid),
+}
 pub struct Field {
     pub key: &'static str,
     pub label: &'static str,
     pub input: Entity<InputState>,
+    pub(crate) initial: String,
 }
 pub struct SurfaceContent {
     pub kind: DialogKind,
@@ -126,15 +142,32 @@ impl SurfaceContent {
             let mut selects = Vec::new();
             let mut fields = Vec::new();
             let mut field = |key, label, value: String| {
+                let initial = value.clone();
                 let input = cx.new(|cx| {
                     let mut input = InputState::new(window, cx);
                     input.set_value(value, window, cx);
                     input
                 });
-                fields.push(Field { key, label, input });
+                fields.push(Field {
+                    key,
+                    label,
+                    input,
+                    initial,
+                });
             };
             match &kind {
                 DialogKind::AddProject => field("path", "Existing Git working tree", String::new()),
+                DialogKind::NewSpace => field("name", "Space name", String::new()),
+                DialogKind::RenameSpace(id) => field(
+                    "name",
+                    "Space name",
+                    state
+                        .spaces
+                        .iter()
+                        .find(|space| space.id == *id)
+                        .map(|space| space.name.clone())
+                        .unwrap_or_default(),
+                ),
                 DialogKind::RenameProject(id) => field(
                     "name",
                     "Project name",
@@ -161,7 +194,12 @@ impl SurfaceContent {
                     for (key, label) in [
                         ("nvim", "Neovim executable (blank: discover on PATH)"),
                         ("omp", "OMP executable (blank: discover on PATH)"),
+                        ("pi", "Pi executable (blank: discover on PATH)"),
                         ("claude", "Claude Code executable (blank: discover on PATH)"),
+                        (
+                            "llama",
+                            "llama.cpp executable (blank: discover automatically)",
+                        ),
                         ("factory", "Factory executable (blank: discover on PATH)"),
                     ] {
                         field(
@@ -184,6 +222,17 @@ impl SurfaceContent {
                             .snapshot
                             .settings
                             .get("factory_data_root")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .into(),
+                    );
+                    field(
+                        crate::titles::LLAMA_MODEL_SETTING,
+                        "llama.cpp title model (blank: Gemma 4 26B)",
+                        state
+                            .snapshot
+                            .settings
+                            .get(crate::titles::LLAMA_MODEL_SETTING)
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .into(),
@@ -496,11 +545,18 @@ impl SurfaceContent {
         self.error = Some(format!("{error:#}"));
         cx.notify();
     }
-    pub fn apply(&self, state: &mut AppState, cx: &App) -> anyhow::Result<bool> {
+    pub fn apply(&self, state: &mut AppState, cx: &App) -> anyhow::Result<SurfaceOutcome> {
         if let Some(error) = &state.storage_error {
             anyhow::bail!("Storage is not writable: {error}");
         }
         match self.kind {
+            DialogKind::NewSpace => {
+                return state
+                    .create_space(&self.value("name", cx))
+                    .map(SurfaceOutcome::SpaceCreated);
+            }
+            DialogKind::RenameSpace(id) => state.rename_space(id, &self.value("name", cx))?,
+            DialogKind::DeleteSpace(id) => return Ok(SurfaceOutcome::DeleteSpace(id)),
             DialogKind::AddProject => {
                 let path = self.value("path", cx);
                 if path.is_empty() {
@@ -567,8 +623,7 @@ impl SurfaceContent {
                     .ok_or_else(|| anyhow::anyhow!("Select a project"))?;
                 project.archived = true;
                 state.save_project(project);
-                state.show_archived = true;
-                state.set_setting("show_archived", json!(true));
+                state.set_show_archived(true);
             }
             DialogKind::ArchiveThread(id) => {
                 anyhow::ensure!(
@@ -585,9 +640,9 @@ impl SurfaceContent {
                 thread.archived = true;
                 thread.updated_at = platform::now();
                 state.save_thread(thread);
-                state.show_archived = true;
-                state.set_setting("show_archived", json!(true));
+                state.set_show_archived(true);
             }
+
             DialogKind::Settings(project_id) => {
                 let root = self.value("factory_data_root", cx);
                 if !PathBuf::from(&root).is_absolute() {
@@ -609,7 +664,7 @@ impl SurfaceContent {
                     if !harness::CONVERSATION_HARNESSES.contains(&interactive_harness.as_str()) {
                         return Err(field_error(
                             "interactive_harness",
-                            "Choose omp or claude-code.",
+                            "Choose omp, pi, or claude-code.",
                         ));
                     }
                     let provider = self.value("provider", cx);
@@ -661,16 +716,39 @@ impl SurfaceContent {
                     .map_err(|error| field_error("theme_light", format!("{error:#}")))?;
                 theme::validate_preferences(&mode, None, dark.as_deref(), cx)
                     .map_err(|error| field_error("theme_dark", format!("{error:#}")))?;
+                let pi = {
+                    let value = self.value("pi", cx);
+                    let initial = &self
+                        .fields
+                        .iter()
+                        .find(|field| field.key == "pi")
+                        .expect("Pi settings field")
+                        .initial;
+                    let current = state
+                        .snapshot
+                        .settings
+                        .get("executables")
+                        .and_then(|value| value.get("pi"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    retain_concurrent_value(initial, value, current)
+                };
                 state.set_setting(
                     "executables",
                     json!({
                         "nvim": self.value("nvim", cx),
                         "omp": self.value("omp", cx),
+                        "pi": pi,
                         "claude": self.value("claude", cx),
+                        "llama": self.value("llama", cx),
                         "factory": self.value("factory", cx),
                     }),
                 );
                 state.set_setting("factory_data_root", json!(root));
+                state.set_setting(
+                    crate::titles::LLAMA_MODEL_SETTING,
+                    json!(self.value(crate::titles::LLAMA_MODEL_SETTING, cx)),
+                );
                 state.set_setting(
                     crate::titles::MODEL_SETTING,
                     json!(self.value(crate::titles::MODEL_SETTING, cx)),
@@ -688,11 +766,14 @@ impl SurfaceContent {
                 state.refresh_diagnostics();
             }
         }
-        Ok(true)
+        Ok(SurfaceOutcome::Applied)
     }
     fn title(&self) -> &'static str {
         match self.kind {
             DialogKind::AddProject => "Add project",
+            DialogKind::NewSpace => "New space",
+            DialogKind::RenameSpace(_) => "Rename space",
+            DialogKind::DeleteSpace(_) => "Delete space",
             DialogKind::RenameProject(_) => "Rename project",
             DialogKind::RenameThread(_) => "Rename thread",
             DialogKind::ArchiveProject(_) => "Archive project",
@@ -871,19 +952,24 @@ impl SurfaceContent {
                 ))
                 .keywords(["appearance", "theme", "folder"]),
             );
-        let tools = fields("Tools", &["nvim", "omp", "claude", "factory"]).description(
+        let tools = fields(
+            "Tools",
+            &["nvim", "omp", "pi", "claude", "llama", "factory"],
+        )
+        .description(
             "Tool installation and upgrades run only at your explicit request. DROSTJE. does not authenticate for you.",
         );
         let titles = fields(
             "Conversation titles",
             &[
                 crate::titles::PROVIDER_SETTING,
+                crate::titles::LLAMA_MODEL_SETTING,
                 crate::titles::MODEL_SETTING,
             ],
         )
         .description(format!(
-            "Automatic generation tries llama.cpp at {} before Ollama at {}. The model field applies only to Ollama.",
-            crate::titles::llama_cpp_host(),
+            "Automatic generation runs the local llama.cpp CLI with {} before trying Ollama at {}.",
+            crate::titles::DEFAULT_LLAMA_MODEL,
             crate::titles::ollama_host()
         ));
         let factory = fields(
@@ -937,7 +1023,9 @@ impl SurfaceContent {
         for (name, title) in [
             ("nvim", "Neovim"),
             ("omp", "OMP"),
+            ("pi", "Pi"),
             ("claude", "Claude Code"),
+            ("llama", "llama.cpp"),
             ("factory", "Factory"),
         ] {
             let status = state
@@ -945,20 +1033,47 @@ impl SurfaceContent {
                 .get(name)
                 .cloned()
                 .unwrap_or_else(|| "Not inspected".into());
+            let install_pi =
+                name == "pi" && (state.installing_pi || status.starts_with("Unavailable:"));
+            let install_reason = install_pi
+                .then(|| super::commands::Command::InstallPi.disabled_reason(state))
+                .flatten();
             let owner = owner.clone();
             diagnostics = diagnostics.item(
                 SettingItem::new(
                     title,
                     SettingField::render(move |_, _, _| {
-                        let owner = owner.clone();
-                        Button::new(SharedString::from(format!("refresh-diagnostics-{name}")))
-                            .small()
-                            .label("Refresh diagnostics")
-                            .on_click(move |_, _, cx| {
-                                let _ = owner.update(cx, |surface, cx| {
-                                    surface.state.read(cx).refresh_diagnostics()
-                                });
-                            })
+                        if install_pi {
+                            let tooltip = install_reason.clone().unwrap_or_else(|| {
+                                "Install Pi in DROSTJE.'s application data".into()
+                            });
+                            Button::new("install-pi")
+                                .small()
+                                .label(
+                                    if install_reason.as_deref()
+                                        == Some("Pi installation is already running.")
+                                    {
+                                        "Installing…"
+                                    } else {
+                                        "Install Pi"
+                                    },
+                                )
+                                .disabled(install_reason.is_some())
+                                .tooltip(tooltip)
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(Box::new(super::commands::InstallPi), cx)
+                                })
+                        } else {
+                            let owner = owner.clone();
+                            Button::new(SharedString::from(format!("refresh-diagnostics-{name}")))
+                                .small()
+                                .label("Refresh diagnostics")
+                                .on_click(move |_, _, cx| {
+                                    let _ = owner.update(cx, |surface, cx| {
+                                        surface.state.read(cx).refresh_diagnostics()
+                                    });
+                                })
+                        }
                     }),
                 )
                 .description(status)
@@ -1012,8 +1127,20 @@ impl SurfaceContent {
             DialogKind::ArchiveProject(_) | DialogKind::ArchiveThread(_) => {
                 body = body.child("Archive retains threads, drafts, sessions, and Factory history. It never deletes checkout, session, or Factory files. Archived history remains accessible from Projects.");
             }
-            DialogKind::RenameProject(_) | DialogKind::RenameThread(_) => {
+            DialogKind::NewSpace
+            | DialogKind::RenameSpace(_)
+            | DialogKind::RenameProject(_)
+            | DialogKind::RenameThread(_) => {
                 body = body.child(Form::new().child(self.form_field("name", readonly, cx)));
+            }
+            DialogKind::DeleteSpace(id) => {
+                let name = state
+                    .spaces
+                    .iter()
+                    .find(|space| space.id == id)
+                    .map(|space| space.name.as_str())
+                    .unwrap_or("this space");
+                body = body.child(format!("Delete “{name}”? All its projects and threads move to Default. No projects, threads, drafts, or running agents are deleted."));
             }
         }
         body.when(self.error_field.is_none(), |view| {
@@ -1171,7 +1298,11 @@ fn footer(dialog: &SurfaceContent) -> AnyElement {
             Button::new("dialog-confirm")
                 .primary()
                 .disabled(readonly)
-                .label(if archive {
+                .label(if matches!(dialog.kind, DialogKind::DeleteSpace(_)) {
+                    "Delete space"
+                } else if matches!(dialog.kind, DialogKind::NewSpace) {
+                    "Create space"
+                } else if archive {
                     "Archive"
                 } else if matches!(dialog.kind, DialogKind::AddProject) {
                     "Add project"
@@ -1249,7 +1380,9 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                         .on_close(move |_, _, cx| clear_surface(&close, id, cx))
                 });
             }
-            DialogKind::ArchiveProject(_) | DialogKind::ArchiveThread(_) => {
+            DialogKind::DeleteSpace(_)
+            | DialogKind::ArchiveProject(_)
+            | DialogKind::ArchiveThread(_) => {
                 window.open_alert_dialog(cx, move |alert, window, _| {
                     let close = host_owner.clone();
                     let confirm = host_owner.clone();
@@ -1313,5 +1446,30 @@ pub(super) fn close_surface(kind: &DialogKind, window: &mut Window, cx: &mut App
         window.close_sheet(cx);
     } else {
         window.close_dialog(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_concurrent_value;
+
+    #[test]
+    fn unchanged_settings_draft_preserves_completed_install_path() {
+        assert_eq!(
+            retain_concurrent_value(
+                "",
+                String::new(),
+                "/managed/pi/lib/node_modules/pi/dist/cli.js"
+            ),
+            "/managed/pi/lib/node_modules/pi/dist/cli.js"
+        );
+        assert_eq!(
+            retain_concurrent_value(
+                "/old/pi",
+                "/chosen/pi".into(),
+                "/managed/pi/lib/node_modules/pi/dist/cli.js"
+            ),
+            "/chosen/pi"
+        );
     }
 }

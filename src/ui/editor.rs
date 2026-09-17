@@ -12,6 +12,10 @@ use gpui_kit::component::{ActiveTheme, alert::Alert, label::Label};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::Value;
+use uuid::Uuid;
+
+/// Work that follows a successful draft replacement, run on the app state.
+pub type DraftContinuation = Box<dyn FnOnce(&mut AppState) + 'static>;
 
 /// Owns activation and presentation; Neovim owns every editing revision.
 pub(super) struct PromptEditor {
@@ -476,6 +480,11 @@ impl Workspace {
             return;
         }
         if let Some(reason) = self.state.read(cx).submit_reason(id) {
+            // A running turn turns Submit into Queue; every other reason stays a reason.
+            if self.state.read(cx).queue_reason(id).is_none() {
+                self.queue_prompt(id, window, cx);
+                return;
+            }
             self.state.update(cx, |state, cx| {
                 state.notice(NoticeLevel::Warning, reason);
                 cx.notify();
@@ -514,6 +523,125 @@ impl Workspace {
         editor.update(cx, |editor, cx| editor.focus(window, cx));
     }
 
+    /// Moves the composer draft to the thread's queue; the editor stays focused and empty.
+    pub fn queue_prompt(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_selection != Some(DraftKey::Thread(id)) || self.editor_override.is_some() {
+            return;
+        }
+        let Some(editor) = self.editor.clone() else {
+            return;
+        };
+        let snapshot = editor.update(cx, |editor, cx| {
+            editor.snapshot(&DraftKey::Thread(id), window, cx)
+        });
+        cx.spawn_in(window, async move |workspace, window| {
+            let result = snapshot.await;
+            let _ = workspace.update_in(window, |workspace, _, cx| {
+                workspace.state.update(cx, |state, cx| {
+                    match result {
+                        Ok(snapshot) => state.enqueue_snapshot(id, snapshot, cx),
+                        Err(error) => state.notice(
+                            NoticeLevel::Warning,
+                            format!("Nothing was queued: {error:#}"),
+                        ),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+        editor.update(cx, |editor, cx| editor.focus(window, cx));
+    }
+
+    pub fn send_queued_now(&mut self, id: ThreadId, message_id: Uuid, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.send_queued_now(id, message_id, cx);
+            cx.notify();
+        });
+    }
+
+    /// Takes a queued message back into the composer. A non-empty draft is reviewed before
+    /// it is replaced, exactly like a restored submission.
+    pub fn edit_queued(
+        &mut self,
+        id: ThreadId,
+        message_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_edit_conversation(id, cx) {
+            return;
+        }
+        let Some(message) = self
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .and_then(|thread| thread.queued.iter().find(|m| m.id == message_id).cloned())
+        else {
+            return;
+        };
+        if self.editor_selection != Some(DraftKey::Thread(id)) || self.editor_override.is_some() {
+            self.state.update(cx, |state, cx| {
+                state.notice(
+                    NoticeLevel::Warning,
+                    "Focus this conversation's composer before editing a queued message",
+                );
+                cx.notify();
+            });
+            return;
+        }
+        self.replace_draft_reviewed_then(
+            id,
+            message.text,
+            Some(message.attachments),
+            false,
+            Some(Box::new(move |state: &mut AppState| {
+                state.remove_queued(id, message_id);
+            })),
+            window,
+            cx,
+        );
+    }
+
+    pub fn clear_queued_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, count)) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| (thread.id, thread.queued.len()))
+        else {
+            return;
+        };
+        if count == 0 || !self.can_edit_conversation(id, cx) {
+            return;
+        }
+        let approval = window.prompt(
+            PromptLevel::Warning,
+            &match count {
+                1 => "Remove the queued message?".to_owned(),
+                count => format!("Remove all {count} queued messages?"),
+            },
+            Some("Their text is not kept anywhere else."),
+            &["Remove", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |workspace, window| {
+            if approval.await != Ok(0) {
+                return;
+            }
+            let _ = workspace.update_in(window, |workspace, _, cx| {
+                workspace.state.update(cx, |state, cx| {
+                    state.clear_queued(id);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     pub fn restore_submitted(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_edit_conversation(id, cx) {
             return;
@@ -550,6 +678,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.replace_draft_reviewed_then(id, text, attachments, recovery, None, window, cx);
+    }
+
+    /// `then` runs on the app state once the editor text was replaced, before the view
+    /// regains focus; a declined or failed replacement never runs it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one replacement, one continuation"
+    )]
+    pub fn replace_draft_reviewed_then(
+        &mut self,
+        id: ThreadId,
+        text: String,
+        attachments: Option<Vec<ImageAttachment>>,
+        recovery: bool,
+        then: Option<DraftContinuation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.can_edit_conversation(id, cx) {
             return;
         }
@@ -575,17 +722,21 @@ impl Workspace {
         cx.spawn_in(window, async move |workspace, window| {
             let result = async {
                 let reviewed = reviewed.await?;
-                let approval = workspace.update_in(window, |_, window, cx| {
-                    window.prompt(
-                        PromptLevel::Warning,
-                        "Replace this conversation draft?",
-                        Some("New typing after this review will not be overwritten."),
-                        &["Replace draft", "Cancel"],
-                        cx,
-                    )
-                })?;
-                if approval.await != Ok(0) {
-                    return Ok(false);
+                // An empty composer has nothing to lose, so it is replaced without a review.
+                let blank = reviewed.text.trim().is_empty() && reviewed_attachments.is_empty();
+                if !blank {
+                    let approval = workspace.update_in(window, |_, window, cx| {
+                        window.prompt(
+                            PromptLevel::Warning,
+                            "Replace this conversation draft?",
+                            Some("New typing after this review will not be overwritten."),
+                            &["Replace draft", "Cancel"],
+                            cx,
+                        )
+                    })?;
+                    if approval.await != Ok(0) {
+                        return Ok(false);
+                    }
                 }
                 let unchanged = workspace.update_in(window, |workspace, _, cx| {
                     workspace.can_edit_conversation(id, cx)
@@ -637,6 +788,9 @@ impl Workspace {
                                     thread.submission = None;
                                 }
                                 state.save_thread(thread);
+                            }
+                            if let Some(then) = then {
+                                then(state);
                             }
                         }
                         Ok(false) => {}

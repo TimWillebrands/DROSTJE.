@@ -141,7 +141,9 @@ impl AppState {
         let mut interests: HashMap<ProjectId, (PathBuf, HashSet<ThreadId>)> = HashMap::new();
         if !self.shutting_down {
             for id in ids {
-                if !self.conversation_diff_open(id) {
+                if !self.thread_sidebar_open(id)
+                    || self.thread_sidebar_tab(id) != super::SidebarTab::Changes
+                {
                     continue;
                 }
                 let Some(thread) = self

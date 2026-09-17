@@ -1,21 +1,30 @@
-//! Conversation titles from a local Ollama server.
+//! Conversation titles from the local llama.cpp CLI or an optional Ollama server.
 //!
-//! Ollama is optional: an unreachable server or an empty model list means "no title", not an
-//! error. Only this module knows Ollama's HTTP API. Calls block; run them off the GPUI thread.
+//! A missing llama executable, unreachable Ollama server, or empty Ollama model list means "no
+//! title", not an error. Calls block; run them off the GPUI thread.
 
-use crate::model::{Thread, ThreadKind};
+use crate::{
+    model::{Thread, ThreadKind},
+    platform,
+};
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 use std::{
     io::{Read as _, Write as _},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
-    time::Duration,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 /// Placeholder title of a Conversation that has not been named yet.
 pub const DEFAULT_CONVERSATION_TITLE: &str = "New conversation";
 /// Settings key holding the Ollama model name; blank or absent means the first installed model.
 pub const MODEL_SETTING: &str = "title_model";
+/// Settings key holding the llama.cpp Hugging Face model reference.
+pub const LLAMA_MODEL_SETTING: &str = "llama_title_model";
+/// Installed model used when no llama.cpp title model is configured.
+pub const DEFAULT_LLAMA_MODEL: &str = "ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_0";
 
 /// Settings key holding the selected title generator.
 pub const PROVIDER_SETTING: &str = "title_provider";
@@ -25,14 +34,13 @@ pub const DEFAULT_PROVIDER: TitleProvider = TitleProvider::Automatic;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TitleProvider {
-    /// Try llama.cpp first, then Ollama when its server is unavailable.
+    /// Try the llama.cpp CLI first, then Ollama when the executable is unavailable.
     Automatic,
     LlamaCpp,
     Ollama,
 }
 
 const DEFAULT_OLLAMA_HOST: &str = "127.0.0.1:11434";
-const DEFAULT_LLAMA_CPP_HOST: &str = "127.0.0.1:8080";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Generation includes a cold model load.
@@ -75,15 +83,6 @@ pub fn ollama_host() -> String {
         .unwrap_or_else(|| DEFAULT_OLLAMA_HOST.into())
 }
 
-/// Server address from `LLAMA_CPP_HOST`, else llama.cpp's default server port.
-pub fn llama_cpp_host() -> String {
-    std::env::var("LLAMA_CPP_HOST")
-        .ok()
-        .map(|host| normalize_host(&host, 8080))
-        .filter(|host| !host.is_empty())
-        .unwrap_or_else(|| DEFAULT_LLAMA_CPP_HOST.into())
-}
-
 fn normalize_host(raw: &str, default_port: u16) -> String {
     let host = raw.trim();
     let host = host
@@ -115,28 +114,38 @@ fn normalize_host(raw: &str, default_port: u16) -> String {
 /// Generates a title for `prompt` with the selected local provider.
 pub fn generate_title(
     provider: TitleProvider,
-    model: Option<&str>,
+    llama_executable: Option<&str>,
+    llama_model: Option<&str>,
+    ollama_model: Option<&str>,
     prompt: &str,
 ) -> Result<Option<String>> {
-    generate_title_with_hosts(provider, &llama_cpp_host(), &ollama_host(), model, prompt)
+    generate_title_with_host(
+        provider,
+        llama_executable,
+        llama_model,
+        &ollama_host(),
+        ollama_model,
+        prompt,
+    )
 }
 
-/// Automatic mode prefers llama.cpp and falls back to Ollama only when the llama.cpp server is
-/// unavailable.
-fn generate_title_with_hosts(
+fn generate_title_with_host(
     provider: TitleProvider,
-    llama_cpp_host: &str,
+    llama_executable: Option<&str>,
+    llama_model: Option<&str>,
     ollama_host: &str,
-    model: Option<&str>,
+    ollama_model: Option<&str>,
     prompt: &str,
 ) -> Result<Option<String>> {
     match provider {
-        TitleProvider::Automatic => generate_llama_cpp_title(llama_cpp_host, prompt)?.map_or_else(
-            || generate_ollama_title(ollama_host, model, prompt),
-            |title| Ok(Some(title)),
-        ),
-        TitleProvider::LlamaCpp => generate_llama_cpp_title(llama_cpp_host, prompt),
-        TitleProvider::Ollama => generate_ollama_title(ollama_host, model, prompt),
+        TitleProvider::Automatic => {
+            generate_llama_cli_title(llama_executable, llama_model, prompt)?.map_or_else(
+                || generate_ollama_title(ollama_host, ollama_model, prompt),
+                |title| Ok(Some(title)),
+            )
+        }
+        TitleProvider::LlamaCpp => generate_llama_cli_title(llama_executable, llama_model, prompt),
+        TitleProvider::Ollama => generate_ollama_title(ollama_host, ollama_model, prompt),
     }
 }
 
@@ -283,38 +292,99 @@ fn clean_title(output: &str) -> Option<String> {
     (!title.is_empty()).then_some(title)
 }
 
-fn generate_llama_cpp_title(host: &str, prompt: &str) -> Result<Option<String>> {
-    let Some(address) = resolve(host) else {
+fn generate_llama_cli_title(
+    executable: Option<&str>,
+    model: Option<&str>,
+    prompt: &str,
+) -> Result<Option<String>> {
+    let Ok(executable) = platform::resolve_executable("llama", executable) else {
         return Ok(None);
     };
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) else {
-        return Ok(None);
+    let model = model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or(DEFAULT_LLAMA_MODEL);
+    let prompt = format!(
+        "Name this coding conversation:\n\n{}",
+        truncate(prompt.trim(), PROMPT_LIMIT)
+    );
+    let mut child = Command::new(&executable)
+        .args([
+            "cli",
+            "-hf",
+            model,
+            "-st",
+            "--simple-io",
+            "--reasoning",
+            "off",
+            "--log-disable",
+            "--no-show-timings",
+            "--color",
+            "off",
+            "--log-colors",
+            "off",
+            "-n",
+            "64",
+            "-sys",
+            SYSTEM_PROMPT,
+            "-p",
+            &prompt,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Start llama.cpp at {}", executable.display()))?;
+    let deadline = Instant::now() + GENERATE_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("Wait for llama.cpp title generation")?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("llama.cpp title generation timed out after 120 seconds");
+        }
+        thread::sleep(Duration::from_millis(20));
     };
-    let body = json!({
-        "prompt": format!("{SYSTEM_PROMPT}\n\nUser requests:\n{}", truncate(prompt.trim(), PROMPT_LIMIT)),
-        "n_predict": 24,
-        "temperature": 0.7,
-        "stream": false,
-    });
-    let response = request(
-        &mut stream,
-        host,
-        "POST",
-        "/completion",
-        Some(&body),
-        GENERATE_TIMEOUT,
-    )
-    .context("llama.cpp could not generate a title")?;
-    Ok(response
-        .get("content")
-        .and_then(Value::as_str)
+    anyhow::ensure!(status.success(), "llama.cpp exited with {status}");
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .context("llama.cpp stdout was not captured")?
+        .read_to_string(&mut stdout)
+        .context("Read llama.cpp title")?;
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty() && !line.starts_with("Exiting"))
         .and_then(clean_title))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::{fs, net::TcpListener, os::unix::fs::PermissionsExt, path::PathBuf};
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("drostje-llama-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// Serves `responses` in order, one per connection, and returns the received requests.
     fn serve(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
@@ -409,26 +479,56 @@ mod tests {
     }
 
     #[test]
-    fn automatic_prefers_llama_cpp() {
-        let (llama_cpp_host, llama_cpp) =
-            serve(vec![ok(json!({"content": "Focused Parser Repair"}))]);
-        let unused_ollama = TcpListener::bind("127.0.0.1:0").unwrap();
-        let ollama_host = unused_ollama.local_addr().unwrap().to_string();
-        drop(unused_ollama);
+    fn llama_cli_uses_simple_text_contract() {
+        let temp = TempDirectory::new();
+        let executable = temp.0.join("llama");
+        let arguments = temp.0.join("arguments");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '\\nFocused Parser Repair\\nExiting...\\n'\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
 
-        let title = generate_title_with_hosts(
-            TitleProvider::Automatic,
-            &llama_cpp_host,
-            &ollama_host,
-            None,
+        let title = generate_llama_cli_title(
+            Some(executable.to_str().unwrap()),
+            Some("ggml-org/gemma-test-GGUF:Q4_0"),
             "Fix parser recovery",
         )
         .unwrap();
 
         assert_eq!(title.as_deref(), Some("Focused Parser Repair"));
-        let requests = llama_cpp.join().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].starts_with("POST /completion HTTP/1.0"));
+        let arguments = fs::read_to_string(arguments).unwrap();
+        assert!(arguments.contains("cli\n-hf\nggml-org/gemma-test-GGUF:Q4_0\n"));
+        assert!(arguments.contains("--simple-io\n"));
+        assert!(arguments.contains("--reasoning\noff\n"));
+        assert!(arguments.contains("-sys\n"));
+        assert!(arguments.contains("-p\nName this coding conversation:\n\nFix parser recovery\n"));
+    }
+
+    #[test]
+    fn automatic_falls_back_when_llama_cli_is_unavailable() {
+        let (ollama_host, ollama) = serve(vec![ok(json!({
+            "response": "Reliable Local Titles"
+        }))]);
+
+        let title = generate_title_with_host(
+            TitleProvider::Automatic,
+            Some("/definitely/missing/llama"),
+            None,
+            &ollama_host,
+            Some("local-model"),
+            "Repair title generation",
+        )
+        .unwrap();
+
+        assert_eq!(title.as_deref(), Some("Reliable Local Titles"));
+        ollama.join().unwrap();
     }
 
     #[test]
@@ -450,6 +550,8 @@ mod tests {
     fn local_ollama_names_a_prompt() {
         let title = generate_title(
             TitleProvider::Ollama,
+            None,
+            None,
             None,
             "The sidebar flickers when I resize the window; find out why",
         )

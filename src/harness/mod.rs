@@ -1,30 +1,42 @@
 //! Native conversation boundary. Provider wire objects stay in their harness module.
 mod claude;
 mod omp;
-
+mod pi;
 use crate::model::{ImageAttachment, ModelKey};
 use serde_json::Value;
 use std::{path::PathBuf, time::SystemTime};
-pub const CONVERSATION_HARNESSES: [&str; 2] = ["omp", "claude-code"];
+pub const CONVERSATION_HARNESSES: [&str; 3] = ["omp", "pi", "claude-code"];
 
 pub fn executable_name(harness: &str) -> anyhow::Result<&'static str> {
     match harness {
         "omp" => Ok("omp"),
+        "pi" => Ok("pi"),
         "claude-code" => Ok("claude"),
         harness => anyhow::bail!("Unsupported conversation harness: {harness}"),
+    }
+}
+
+pub fn display_name(harness: &str) -> &str {
+    match harness {
+        "omp" => "OMP",
+        "pi" => "Pi",
+        "claude-code" => "Claude Code",
+        harness => harness,
     }
 }
 
 use uuid::Uuid;
 
 /// Permission modes a harness accepts as a launch flag, as `(value, label)`. Empty when the
-/// harness has none. `bypassPermissions` is never offered: it is `--yolo` under another name.
+/// harness has none.
 pub fn permission_modes(harness: &str) -> &'static [(&'static str, &'static str)] {
     match harness {
         "claude-code" => &[
             ("acceptEdits", "Accept edits"),
             ("plan", "Plan"),
+            ("auto", "Auto"),
             ("dontAsk", "Don't ask"),
+            ("bypassPermissions", "Bypass permissions"),
         ],
         _ => &[],
     }
@@ -239,9 +251,13 @@ pub enum ConversationEvent {
 pub async fn open(config: ConversationConfig) -> anyhow::Result<ConversationHandle> {
     match config.harness.as_str() {
         "claude-code" => claude::open(config).await,
-        "omp" => omp::open(config).await,
+        "omp" | "pi" => omp::open(config).await,
         harness => anyhow::bail!("Unsupported conversation harness: {harness}"),
     }
+}
+
+pub async fn install_pi(data_dir: PathBuf) -> anyhow::Result<PathBuf> {
+    pi::install(data_dir).await
 }
 
 /// Largest physical JSONL request for a supported harness, without loading or
@@ -265,4 +281,23 @@ pub fn submission_size_for_lengths(
             claude::submission_size_for_lengths(request_id, text, images)?,
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::permission_modes;
+
+    #[test]
+    fn claude_code_offers_all_supported_permission_modes() {
+        assert_eq!(
+            permission_modes("claude-code"),
+            [
+                ("acceptEdits", "Accept edits"),
+                ("plan", "Plan"),
+                ("auto", "Auto"),
+                ("dontAsk", "Don't ask"),
+                ("bypassPermissions", "Bypass permissions"),
+            ]
+        );
+    }
 }

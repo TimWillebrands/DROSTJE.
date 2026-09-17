@@ -17,6 +17,27 @@ const CHUNK: usize = 262_144;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dialect {
+    Omp,
+    Pi,
+}
+impl Dialect {
+    fn for_harness(harness: &str) -> Result<Self> {
+        match harness {
+            "omp" => Ok(Self::Omp),
+            "pi" => Ok(Self::Pi),
+            _ => bail!("Unsupported Pi-family conversation harness: {harness}"),
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Omp => "OMP",
+            Self::Pi => "Pi",
+        }
+    }
+}
+
 pub(super) fn submission_size_for_lengths(
     id: Uuid,
     text: &str,
@@ -208,11 +229,10 @@ fn nonblocking(fd: i32) -> Result<()> {
     );
     Ok(())
 }
-fn prepare(config: &mut ConversationConfig) -> Result<OwnedChild> {
+fn prepare(config: &mut ConversationConfig, dialect: Dialect) -> Result<OwnedChild> {
     ensure!(
-        config.harness == "omp",
-        "Unsupported conversation harness: {}",
-        config.harness
+        Dialect::for_harness(&config.harness)? == dialect,
+        "Conversation harness changed while opening"
     );
     config.cwd = fs::canonicalize(&config.cwd).context("Project root is unavailable")?;
     ensure!(config.cwd.is_dir(), "Project root is not a directory");
@@ -220,31 +240,46 @@ fn prepare(config: &mut ConversationConfig) -> Result<OwnedChild> {
     config.session_dir = fs::canonicalize(&config.session_dir)?;
     let mut resume = None;
     if let Some(reference) = &config.session_ref {
-        let saved: Value = serde_json::from_str(reference)
-            .context("Invalid saved OMP session reference; create a new conversation explicitly")?;
+        let saved: Value = serde_json::from_str(reference).with_context(|| {
+            format!(
+                "Invalid saved {} session reference; create a new conversation explicitly",
+                dialect.name()
+            )
+        })?;
         ensure!(
             saved["cwd"].as_str() == config.cwd.to_str()
                 && saved["session_dir"].as_str() == config.session_dir.to_str(),
-            "Saved OMP session belongs to a different project or session directory"
+            "Saved {} session belongs to a different project or session directory",
+            dialect.name()
         );
         let id = saved["id"]
             .as_str()
             .filter(|id| !id.is_empty())
-            .context("Saved OMP session ID is missing")?;
+            .with_context(|| format!("Saved {} session ID is missing", dialect.name()))?;
         if let Some(file) = saved["file"].as_str() {
-            let file = fs::canonicalize(file).context(
-                "Saved OMP session file is missing; create a new conversation explicitly",
-            )?;
+            let file = fs::canonicalize(file).with_context(|| {
+                format!(
+                    "Saved {} session file is missing; create a new conversation explicitly",
+                    dialect.name()
+                )
+            })?;
             ensure!(
                 file.starts_with(&config.session_dir) && file.is_file(),
-                "Saved OMP session file is outside this conversation"
+                "Saved {} session file is outside this conversation",
+                dialect.name()
             );
-            fs::File::open(file).context("Saved OMP session file is unreadable")?;
-            resume = Some(id.to_owned());
+            fs::File::open(&file)
+                .with_context(|| format!("Saved {} session file is unreadable", dialect.name()))?;
+            resume = Some(if dialect == Dialect::Pi {
+                file.into_os_string()
+            } else {
+                id.into()
+            });
         } else {
             ensure!(
                 saved["file"].is_null() && config.allow_empty_session,
-                "Saved OMP session has no durable file and a submission may exist; inspect recovery data or create a new conversation explicitly"
+                "Saved {} session has no durable file and a submission may exist; inspect recovery data or create a new conversation explicitly",
+                dialect.name()
             );
             config.session_ref = None;
         }
@@ -256,12 +291,30 @@ fn prepare(config: &mut ConversationConfig) -> Result<OwnedChild> {
         .arg("--session-dir")
         .arg(&config.session_dir)
         .current_dir(&config.cwd)
-        .env("PI_RPC_EMIT_TITLE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(id) = resume {
-        command.arg("--resume").arg(id);
+    if dialect == Dialect::Omp {
+        command.env("PI_RPC_EMIT_TITLE", "1");
+    } else if let Ok(node) = crate::platform::resolve_executable("node", None)
+        && let Some(directory) = node.parent()
+    {
+        let mut paths = vec![directory.to_path_buf()];
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        if let Ok(path) = std::env::join_paths(paths) {
+            command.env("PATH", path);
+        }
+    }
+    if let Some(reference) = resume {
+        command
+            .arg(if dialect == Dialect::Pi {
+                "--session"
+            } else {
+                "--resume"
+            })
+            .arg(reference);
     }
     unsafe {
         command.pre_exec(|| {
@@ -272,9 +325,13 @@ fn prepare(config: &mut ConversationConfig) -> Result<OwnedChild> {
             }
         });
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("Start OMP at {}", config.executable.display()))?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "Start {} at {}",
+            dialect.name(),
+            config.executable.display()
+        )
+    })?;
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -293,15 +350,16 @@ fn prepare(config: &mut ConversationConfig) -> Result<OwnedChild> {
 }
 
 pub(super) async fn open(mut config: ConversationConfig) -> Result<ConversationHandle> {
+    let dialect = Dialect::for_harness(&config.harness)?;
     let (commands, input) = async_channel::bounded(64);
     let (output, events) = async_channel::bounded(128);
     smol::unblock(move || -> Result<()> {
-        let child = prepare(&mut config)?;
+        let child = prepare(&mut config, dialect)?;
         std::thread::Builder::new()
-            .name("drostje-omp".into())
+            .name(format!("drostje-{}", config.harness))
             .spawn(move || {
-                let mut actor = Actor::new(config, child, input, output);
-                if let Err(error) = actor.run() {
+                let mut actor = Actor::new(config, child, input, output, dialect);
+                if let Err(error) = actor.initialize().and_then(|()| actor.run()) {
                     actor.disconnect(format!("{error:#}"));
                 }
                 actor.child.close();
@@ -312,7 +370,7 @@ pub(super) async fn open(mut config: ConversationConfig) -> Result<ConversationH
                     }
                 }
             })
-            .context("Start OMP actor")?;
+            .with_context(|| format!("Start {} actor", dialect.name()))?;
         Ok(())
     })
     .await?;
@@ -432,6 +490,7 @@ struct Dialog {
 }
 struct Actor {
     config: ConversationConfig,
+    dialect: Dialect,
     child: OwnedChild,
     commands: async_channel::Receiver<ConversationCommand>,
     output: async_channel::Sender<ConversationEvent>,
@@ -473,10 +532,12 @@ impl Actor {
         child: OwnedChild,
         commands: async_channel::Receiver<ConversationCommand>,
         output: async_channel::Sender<ConversationEvent>,
+        dialect: Dialect,
     ) -> Self {
         let initial_model = config.model.clone();
         Self {
             config,
+            dialect,
             child,
             commands,
             output,
@@ -491,7 +552,7 @@ impl Actor {
             turn: Turn::default(),
             state: ConversationState::Starting,
             ready_deadline: Instant::now() + CONTROL_TIMEOUT,
-            negotiated: false,
+            negotiated: dialect == Dialect::Pi,
             initialized: false,
             session_ref: None,
             models: None,
@@ -512,6 +573,13 @@ impl Actor {
             images: ImageCache::default(),
             local_outputs: VecDeque::new(),
         }
+    }
+    fn initialize(&mut self) -> Result<()> {
+        if self.dialect == Dialect::Pi {
+            self.request(json!({"type":"get_state"}), RequestKind::State)?;
+            self.request(json!({"type":"get_available_models"}), RequestKind::Models)?;
+        }
+        Ok(())
     }
     fn emit(&mut self, event: ConversationEvent) {
         self.events.push_back(event);
@@ -542,11 +610,13 @@ impl Actor {
         bytes.push(b'\n');
         ensure!(
             bytes.len() <= FRAME,
-            "OMP request exceeds 1 MiB; optimize images explicitly or reduce the draft"
+            "{} request exceeds 1 MiB; optimize images explicitly or reduce the draft",
+            self.dialect.name()
         );
         ensure!(
             self.writes.len() < 128,
-            "OMP command pipe is not accepting input"
+            "{} command pipe is not accepting input",
+            self.dialect.name()
         );
         self.writes.push_back(bytes);
         Ok(())
@@ -580,10 +650,10 @@ impl Actor {
     fn flush(&mut self) -> Result<()> {
         while let Some(bytes) = self.writes.front() {
             let Some(stdin) = self.child.stdin.as_mut() else {
-                bail!("OMP input closed");
+                bail!("{} input closed", self.dialect.name());
             };
             match stdin.write(&bytes[self.write_offset..]) {
-                Ok(0) => bail!("OMP input closed"),
+                Ok(0) => bail!("{} input closed", self.dialect.name()),
                 Ok(count) => {
                     self.write_offset += count;
                     if self.write_offset == bytes.len() {
@@ -658,18 +728,19 @@ impl Actor {
                     .child
                     .child
                     .try_wait()
-                    .context("Wait for owned OMP child")?
+                    .with_context(|| format!("Wait for owned {} child", self.dialect.name()))?
                 {
                     self.child.reaped = true;
                     self.decoder.eof()?;
                     ensure!(
                         self.line.is_empty(),
-                        "OMP exited with a truncated physical frame"
+                        "{} exited with a truncated physical frame",
+                        self.dialect.name()
                     );
                     if self.closing {
                         self.eof = true;
                     } else {
-                        bail!("OMP process exited: {status}");
+                        bail!("{} process exited: {status}", self.dialect.name());
                     }
                 }
             }
@@ -703,7 +774,7 @@ impl Actor {
                         self.eof = true;
                         return Ok(false);
                     }
-                    bail!("OMP disconnected (stdout EOF)");
+                    bail!("{} disconnected (stdout EOF)", self.dialect.name());
                 }
                 Ok(count) => {
                     self.read_start = 0;
@@ -726,18 +797,26 @@ impl Actor {
             .position(|byte| *byte == b'\n')
             .map(|index| index + 1)
             .unwrap_or(pending.len());
+        let frame_limit = if self.dialect == Dialect::Pi {
+            LOGICAL
+        } else {
+            FRAME
+        };
         ensure!(
-            self.line.len() + length <= FRAME,
-            "OMP physical stdout frame exceeds 1 MiB"
+            self.line.len() + length <= frame_limit,
+            "{} physical stdout frame exceeds {} MiB",
+            self.dialect.name(),
+            frame_limit / 1_048_576
         );
         self.line.extend_from_slice(&pending[..length]);
         self.read_start += length;
         if self.line.last() == Some(&b'\n') {
-            let value: Value =
-                serde_json::from_slice(&self.line).context("Malformed OMP stdout JSON/UTF-8")?;
+            let value: Value = serde_json::from_slice(&self.line)
+                .with_context(|| format!("Malformed {} stdout JSON/UTF-8", self.dialect.name()))?;
             ensure!(
                 self.negotiated || value["type"] != "rpc_chunk",
-                "OMP sent protocol v2 chunks before negotiation succeeded"
+                "{} sent protocol v2 chunks before negotiation succeeded",
+                self.dialect.name()
             );
             self.line.clear();
             if let Some(value) = self.decoder.push(value)? {
@@ -903,8 +982,14 @@ impl Actor {
             self.history_wait = true;
             return Ok(());
         }
-        let mut value = json!({"type":"get_messages_page","limit":128});
-        if let Some(cursor) = &cursor {
+        let mut value = if self.dialect == Dialect::Omp {
+            json!({"type":"get_messages_page","limit":128})
+        } else {
+            json!({"type":"get_messages"})
+        };
+        if self.dialect == Dialect::Omp
+            && let Some(cursor) = &cursor
+        {
             value["cursor"] = json!(cursor);
         }
         self.history_wait = false;
@@ -979,7 +1064,8 @@ impl Actor {
         let now = Instant::now();
         ensure!(
             self.negotiated || now < self.ready_deadline,
-            "OMP did not negotiate protocol v2 within 30 seconds"
+            "{} did not negotiate protocol v2 within 30 seconds",
+            self.dialect.name()
         );
         let expired: Vec<_> = self
             .requests
@@ -1044,6 +1130,10 @@ impl Actor {
     fn frame(&mut self, value: Value) -> Result<()> {
         match value["type"].as_str().unwrap_or("") {
             "ready" => {
+                ensure!(
+                    self.dialect == Dialect::Omp,
+                    "Pi unexpectedly requested OMP protocol negotiation"
+                );
                 if self.closing {
                     return Ok(());
                 }
@@ -1099,7 +1189,21 @@ impl Actor {
                         self.emit(ConversationEvent::MessageUpdated(message));
                     }
                 }
-                if let Some(outcome) = self.turn.agent_end(&value) {
+                if self.dialect == Dialect::Omp
+                    && let Some(outcome) = self.turn.agent_end(&value)
+                {
+                    self.finish(outcome)?;
+                }
+            }
+            "agent_settled" if self.dialect == Dialect::Pi => {
+                let outcome = if self.turn.interrupting {
+                    TurnOutcome::Interrupted
+                } else if self.turn.failed {
+                    TurnOutcome::Failed
+                } else {
+                    TurnOutcome::Completed
+                };
+                if self.turn.id.is_some() {
                     self.finish(outcome)?;
                 }
             }
@@ -1135,7 +1239,7 @@ impl Actor {
                     if kind == "message_end" {
                         self.current_message = None;
                     }
-                } else {
+                } else if !(self.dialect == Dialect::Pi && kind == "message_update") {
                     self.emit(ConversationEvent::Diagnostic {
                         label: "Message event without canonical snapshot".into(),
                         raw: value,
@@ -1182,7 +1286,7 @@ impl Actor {
                 value["message"]
                     .as_str()
                     .or(value["text"].as_str())
-                    .unwrap_or("OMP notice"),
+                    .unwrap_or_else(|| self.dialect.name()),
             ),
             "extension_error" => {
                 self.notice(
@@ -1199,13 +1303,14 @@ impl Actor {
                 });
             }
             "rpc_frame_error" => bail!(
-                "OMP could not transmit a complete frame: {}",
+                "{} could not transmit a complete frame: {}",
+                self.dialect.name(),
                 string(&value, "error")
             ),
             _ => self.emit(ConversationEvent::Diagnostic {
                 label: value["type"]
                     .as_str()
-                    .unwrap_or("Unknown OMP payload")
+                    .unwrap_or("Unknown Pi-family payload")
                     .into(),
                 raw: value,
             }),
@@ -1323,12 +1428,13 @@ impl Actor {
                 let session_id = data["sessionId"]
                     .as_str()
                     .filter(|id| !id.is_empty())
-                    .context("OMP returned no session ID")?;
+                    .with_context(|| format!("{} returned no session ID", self.dialect.name()))?;
                 if let Some(saved) = &self.config.session_ref {
                     let saved: Value = serde_json::from_str(saved)?;
                     ensure!(
                         saved["id"] == session_id,
-                        "OMP resumed a different session; refusing to replace saved history"
+                        "{} resumed a different session; refusing to replace saved history",
+                        self.dialect.name()
                     );
                 }
                 self.session_ref = Some(serde_json::to_string(
@@ -1353,9 +1459,12 @@ impl Actor {
                 self.maybe_ready()?;
             }
             RequestKind::Models => {
-                let values = data["models"]
-                    .as_array()
-                    .context("OMP model discovery returned no catalog")?;
+                let values = data["models"].as_array().with_context(|| {
+                    format!(
+                        "{} model discovery returned no catalog",
+                        self.dialect.name()
+                    )
+                })?;
                 self.models = Some(
                     values
                         .iter()
@@ -1391,9 +1500,9 @@ impl Actor {
             }
             RequestKind::History { generation, cursor } => {
                 if generation == self.history_generation {
-                    let values = data["messages"]
-                        .as_array()
-                        .context("OMP history page has no messages")?;
+                    let values = data["messages"].as_array().with_context(|| {
+                        format!("{} history has no messages", self.dialect.name())
+                    })?;
                     let mut messages: Vec<_> = values
                         .iter()
                         .enumerate()
@@ -1407,10 +1516,13 @@ impl Actor {
                         })
                         .collect();
                     self.history_index += values.len();
-                    let next_cursor = data["nextCursor"].as_str().map(str::to_owned);
+                    let next_cursor = (self.dialect == Dialect::Omp)
+                        .then(|| data["nextCursor"].as_str().map(str::to_owned))
+                        .flatten();
                     ensure!(
                         next_cursor.is_none() || next_cursor != cursor,
-                        "OMP history cursor did not advance"
+                        "{} history cursor did not advance",
+                        self.dialect.name()
                     );
                     if next_cursor.is_none() {
                         messages.extend(self.local_outputs.iter().cloned());
@@ -1472,7 +1584,13 @@ impl Actor {
         });
         if !self.initialized {
             self.initialized = true;
-            self.notice("info", "OMP runs with your local user privileges and configured tool policy, not Factory's Docker sandbox.");
+            self.notice(
+                "info",
+                format!(
+                    "{} runs with your local user privileges and configured tool policy, not Factory's Docker sandbox.",
+                    self.dialect.name()
+                ),
+            );
             if !self.active() {
                 self.state(ConversationState::Ready);
             }
@@ -1917,6 +2035,132 @@ mod tests {
             command: command.into(),
             deadline: Instant::now() + CONTROL_TIMEOUT,
         }
+    }
+
+    fn next_event(events: &async_channel::Receiver<ConversationEvent>) -> ConversationEvent {
+        smol::block_on(smol::future::race(
+            async {
+                events
+                    .recv()
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Pi fixture event channel closed"))
+            },
+            async {
+                smol::Timer::after(Duration::from_secs(3)).await;
+                bail!("Pi fixture timed out")
+            },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn normal_pi_uses_unextended_rpc_and_settles_after_agent_settled() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("drostje-normal-pi-{}", Uuid::new_v4()));
+        let cwd = root.join("repo");
+        let session_dir = root.join("sessions");
+        fs::create_dir_all(&cwd)?;
+        let executable = root.join("pi");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$(dirname "$0")/args"
+session_dir=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--session-dir" ]; then session_dir=$2; shift 2; else shift; fi
+done
+mkdir -p "$session_dir"
+session_file="$session_dir/session.jsonl"
+: > "$session_file"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed 's/.*"id":"\([^"]*\)".*/\1/')
+  case "$line" in
+    *'"type":"get_state"'*)
+      printf '{"id":"%s","type":"response","command":"get_state","success":true,"data":{"sessionId":"pi-session","sessionFile":"%s","model":{"provider":"test","id":"model"},"isStreaming":false,"isCompacting":false}}\n' "$id" "$session_file"
+      ;;
+    *'"type":"get_available_models"'*)
+      printf '{"id":"%s","type":"response","command":"get_available_models","success":true,"data":{"models":[{"provider":"test","id":"model","name":"Test model","input":["text"]}]}}\n' "$id"
+      ;;
+    *'"type":"get_messages"'*)
+      printf '{"id":"%s","type":"response","command":"get_messages","success":true,"data":{"messages":[]}}\n' "$id"
+      ;;
+    *'"type":"prompt"'*)
+      printf '{"id":"%s","type":"response","command":"prompt","success":true}\n' "$id"
+      printf '{"type":"message_start","message":{"role":"assistant","timestamp":1,"content":[]}}\n'
+      printf '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello"}}\n'
+      printf '{"type":"message_end","message":{"role":"assistant","timestamp":1,"content":[{"type":"text","text":"Hello from Pi"}],"stopReason":"stop"}}\n'
+      printf '{"type":"agent_end","messages":[],"willRetry":false}\n'
+      printf '{"type":"agent_settled"}\n'
+      ;;
+    *'"type":"abort"'*)
+      printf '{"id":"%s","type":"response","command":"abort","success":true}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        let handle = smol::block_on(open(ConversationConfig {
+            harness: "pi".into(),
+            executable,
+            cwd,
+            session_dir,
+            session_ref: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            allow_empty_session: true,
+        }))?;
+
+        let mut ready = false;
+        for _ in 0..12 {
+            if matches!(next_event(&handle.events), ConversationEvent::Ready { .. }) {
+                ready = true;
+                break;
+            }
+        }
+        ensure!(ready, "Pi fixture did not become ready");
+
+        let request_id = Uuid::new_v4();
+        handle.commands.send_blocking(ConversationCommand::Submit {
+            request_id,
+            text: "Hello".into(),
+            images: Vec::new(),
+        })?;
+        let mut accepted = false;
+        let mut message = false;
+        let mut settled = false;
+        for _ in 0..20 {
+            match next_event(&handle.events) {
+                ConversationEvent::SubmissionAccepted { request_id: id } if id == request_id => {
+                    accepted = true
+                }
+                ConversationEvent::MessageUpdated(message_value)
+                    if matches!(
+                        &message_value.content[..],
+                        [ContentBlock::Text(text)] if text == "Hello from Pi"
+                    ) =>
+                {
+                    message = true
+                }
+                ConversationEvent::TurnSettled {
+                    request_id: id,
+                    outcome: TurnOutcome::Completed,
+                } if id == request_id => {
+                    settled = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        handle.commands.send_blocking(ConversationCommand::Close)?;
+        let args = fs::read_to_string(root.join("args"))?;
+        assert!(args.contains("--mode\nrpc\n"));
+        assert!(!args.contains("negotiate_protocol"));
+        assert!(accepted && message && settled);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]

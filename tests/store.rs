@@ -2,7 +2,7 @@ use anyhow::Result;
 use drostje::{
     model::{
         FactoryLaunch, FactorySourceKind, FactoryThreadConfig, ImageAttachment, ModelKey, Project,
-        ProjectDefaults, Thread, ThreadKind,
+        ProjectDefaults, QueuedMessage, Thread, ThreadKind,
     },
     store::{Store, StoreError},
 };
@@ -58,6 +58,7 @@ fn conversation(project: &Project) -> Thread {
         draft: "Unsent draft\n日本語 é".into(),
         attachments: Vec::new(),
         submission: None,
+        queued: Vec::new(),
         archived: false,
         created_at: "2026-09-15T12:00:00Z".into(),
         updated_at: "2026-09-15T12:00:00Z".into(),
@@ -163,6 +164,11 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
         thread.submission = Some(
             json!({"request_id": Uuid::new_v4(), "text": "not automatically resent", "state": "pending"}),
         );
+        thread.queued.push(QueuedMessage {
+            id: Uuid::new_v4(),
+            text: "Waiting for the turn\nsecond line".into(),
+            attachments: thread.attachments.clone(),
+        });
         store.save_thread(thread.clone()).await.unwrap();
         let owner = factory_thread(&project);
         store.save_thread(owner.clone()).await.unwrap();
@@ -213,6 +219,7 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
         assert_eq!(saved_thread.session_ref, thread.session_ref);
         assert_eq!(saved_thread.attachments[0].path, attachment_file);
         assert_eq!(saved_thread.submission, thread.submission);
+        assert_eq!(saved_thread.queued, thread.queued);
         assert_eq!(saved_launch.project_id, saved_project.id);
         assert_eq!(saved_launch.factory_thread_id, owner.id);
         assert_eq!(saved_launch.descriptor, launch.descriptor);
@@ -234,7 +241,7 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     });
 }
@@ -325,7 +332,7 @@ fn version_2_database_upgrades_in_place_and_persists_effort() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
     });
 }
@@ -391,14 +398,88 @@ fn version_3_database_upgrades_in_place_and_persists_permission_mode() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
+        );
+    });
+}
+
+#[test]
+fn version_4_database_upgrades_in_place_and_persists_queued_messages() {
+    smol::block_on(async {
+        let directory = TempDirectory::new();
+        let path = directory.0.join("drostje.sqlite3");
+        let project = project(directory.0.join("checkout"));
+        let thread = conversation(&project);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_V2).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE threads ADD COLUMN effort TEXT;
+                 ALTER TABLE threads ADD COLUMN permission_mode TEXT",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects(id, name, root, defaults_json) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    project.id.to_string(),
+                    project.name,
+                    project.root.to_string_lossy().into_owned(),
+                    serde_json::to_string(&project.defaults).unwrap(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads(id, project_id, title, harness, draft, created_at, updated_at, permission_mode)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'plan')",
+                rusqlite::params![
+                    thread.id.to_string(),
+                    project.id.to_string(),
+                    thread.title,
+                    thread.harness,
+                    thread.draft,
+                    thread.created_at,
+                    thread.updated_at,
+                ],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        drop(connection);
+
+        let store = reopen(&directory.0);
+        let snapshot = store.snapshot().await.unwrap();
+        assert_eq!(snapshot.threads[0].permission_mode.as_deref(), Some("plan"));
+        assert!(snapshot.threads[0].queued.is_empty());
+        let mut upgraded = snapshot.threads[0].clone();
+        let queued = QueuedMessage {
+            id: Uuid::new_v4(),
+            text: "After this one".into(),
+            attachments: Vec::new(),
+        };
+        upgraded.queued.push(queued.clone());
+        store.save_thread(upgraded).await.unwrap();
+        store.flush().await.unwrap();
+        drop(store);
+
+        let reopened = reopen(&directory.0);
+        let threads = reopened.snapshot().await.unwrap().threads;
+        assert_eq!(threads[0].permission_mode.as_deref(), Some("plan"));
+        assert_eq!(threads[0].queued, vec![queued]);
+        drop(reopened);
+        let database = Connection::open(&path).unwrap();
+        assert_eq!(
+            database
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            5
         );
     });
 }
 
 #[test]
 fn incompatible_schema_is_refused_without_changing_database_bytes() {
-    for version in [1, 5] {
+    for version in [1, 6] {
         let directory = TempDirectory::new();
         let path = directory.0.join("drostje.sqlite3");
         let connection = Connection::open(&path).unwrap();

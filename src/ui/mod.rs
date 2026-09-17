@@ -9,6 +9,7 @@ pub mod overlays;
 pub mod settings;
 pub mod sidebar;
 pub mod theme;
+mod thread_sidebar;
 mod title_bar;
 mod todo_list;
 pub mod workspace;

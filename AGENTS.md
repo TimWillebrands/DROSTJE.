@@ -59,7 +59,7 @@ only what is specific to DROSTJE.
 - Exact signatures live in the pinned source under `~/.cargo/registry/src/*/gpui-component-0.6.1/src` and `gpui-base-0.6.1/src`; search there; never infer an API from Zed's crates or older gpui examples.
 - A missing theme role is added to the theme setup, never at the call site. `src/ui/theme.rs` owns theme loading and application.
 - Monospace only for code, identifiers, shortcuts and aligned numbers, via `cx.theme().mono_font_family`.
-- Workspace shell: Projects left, thread tabs centre, optional Output below; native TitleBar and dock headers; no permanent Factory sidebar or redundant footer. Save/error status lives in the title bar. Persist open thread identities and user-controlled layout; clamp restored values to preserve usable Thread space.
+- Workspace shell: Projects left, thread tabs centre (a lone thread still shows its tab); each thread's sidebar holds Changes and Output tabs; native TitleBar and dock headers; no permanent Factory sidebar or redundant footer. Save/error status lives in the title bar. Persist open thread identities and user-controlled layout; clamp restored values to preserve usable Thread space.
 - Terminology is stable across palette, menu, tooltip, dialog and docs: Project, Thread, Conversation, Factory thread, Draft, Turn, Launch, Run, Attempt, Task, Region.
 - Instant feedback; keep frames cheap: virtualise history and logs, deliver bounded event batches, never rebuild the whole conversation per token.
 

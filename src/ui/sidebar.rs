@@ -1,7 +1,7 @@
 use super::{
     commands::{
-        AddProject, ArchiveThread, CollapseProject, Command, Dismiss, ExpandProject, SearchThreads,
-        SelectNext, ShowArchived, ToggleProjects,
+        AddProject, ArchiveThread, CollapseProject, Command, Dismiss, ExpandProject, RenameThread,
+        SearchThreads, SelectNext, ShowArchived, ToggleProjects,
     },
     workspace::Workspace,
 };
@@ -20,6 +20,7 @@ use gpui_kit::{
         input::{Input, InputState},
         list::ListItem,
         menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
+        shimmer::ShimmerText,
         tooltip::Tooltip,
         v_flex,
     },
@@ -42,7 +43,11 @@ pub enum Row {
 /// match is hidden, and drops projects without a match.
 pub fn rows(state: &AppState, query: &str) -> Vec<Row> {
     visible_rows(
-        &state.snapshot.projects,
+        state
+            .snapshot
+            .projects
+            .iter()
+            .filter(|project| state.project_in_active_space(project.id)),
         &state.snapshot.threads,
         &state.collapsed,
         state.show_archived,
@@ -50,8 +55,8 @@ pub fn rows(state: &AppState, query: &str) -> Vec<Row> {
     )
 }
 
-fn visible_rows(
-    projects: &[Project],
+fn visible_rows<'a>(
+    projects: impl IntoIterator<Item = &'a Project>,
     threads: &[Thread],
     collapsed: &HashSet<ProjectId>,
     show_archived: bool,
@@ -59,7 +64,10 @@ fn visible_rows(
 ) -> Vec<Row> {
     let query = query.trim().to_lowercase();
     let mut rows = Vec::new();
-    for project in projects.iter().filter(|p| show_archived || !p.archived) {
+    for project in projects
+        .into_iter()
+        .filter(|p| show_archived || !p.archived)
+    {
         let threads = threads
             .iter()
             .filter(|t| t.project_id == project.id && (show_archived || !t.archived));
@@ -188,9 +196,14 @@ fn command_item(
     command: Command,
     state: &AppState,
 ) -> PopupMenuItem {
-    PopupMenuItem::new(label)
-        .action(command.action())
-        .disabled(command.disabled_reason(state).is_some())
+    let label = label.into();
+    let reason = command.disabled_reason(state);
+    PopupMenuItem::new(match &reason {
+        Some(reason) => SharedString::from(format!("{label} — {reason}")),
+        None => label,
+    })
+    .action(command.action())
+    .disabled(reason.is_some())
 }
 
 fn row_menu(
@@ -217,6 +230,11 @@ fn row_menu(
                 state,
             ))
             .item(command_item(
+                "New Pi conversation",
+                Command::NewPiConversation,
+                state,
+            ))
+            .item(command_item(
                 "New Claude Code conversation",
                 Command::NewClaudeCodeConversation,
                 state,
@@ -230,6 +248,11 @@ fn row_menu(
             .item(command_item(
                 "Rename project…",
                 Command::RenameProject,
+                state,
+            ))
+            .item(command_item(
+                Command::MoveProjectToSpace.label(),
+                Command::MoveProjectToSpace,
                 state,
             ))
             .item(command_item(
@@ -382,6 +405,11 @@ pub fn render(
                                                     state,
                                                 ))
                                                 .item(command_item(
+                                                    "Pi",
+                                                    Command::NewPiConversation,
+                                                    state,
+                                                ))
+                                                .item(command_item(
                                                     "Claude Code",
                                                     Command::NewClaudeCodeConversation,
                                                     state,
@@ -453,6 +481,9 @@ pub fn render(
                     ThreadKind::Conversation if thread.harness == "claude-code" => {
                         ("Claude Code conversation", Icon::new(IconName::Asterisk))
                     }
+                    ThreadKind::Conversation if thread.harness == "pi" => {
+                        ("Pi conversation", Icon::new(IconName::Bot))
+                    }
                     ThreadKind::Conversation => ("OMP conversation", Icon::new(IconName::Bot)),
                     ThreadKind::Factory => ("Factory thread", Icon::new(IconName::Cpu)),
                 };
@@ -510,6 +541,8 @@ pub fn render(
                         .child(div().flex_shrink_0().child(age));
                 }
                 let group: SharedString = format!("thread-row-{id}").into();
+                let rename_owner = owner.clone();
+                let rename_reason = state.rename_thread_reason_for(id);
                 let archive_owner = owner.clone();
                 let archive_reason = state.archive_thread_reason_for(id);
                 list = list.child(
@@ -541,52 +574,92 @@ pub fn render(
                                                 icon.small().text_color(theme.muted_foreground),
                                             ),
                                         )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .child(thread.title.clone()),
-                                        )
-                                        // Pointer shortcut only: the context menu and palette
-                                        // carry the same Archive thread… command.
+                                        .child(div().flex_1().min_w_0().truncate().map(|label| {
+                                            match state.is_titling(id) {
+                                                true => label
+                                                    .child(ShimmerText::new(thread.title.clone())),
+                                                false => label.child(thread.title.clone()),
+                                            }
+                                        }))
+                                        // Pointer shortcuts only: the context menu and palette
+                                        // carry the same commands.
                                         .when(!thread.archived, |view| {
                                             view.child(
-                                                Button::new(SharedString::from(format!(
-                                                    "archive-thread-{id}"
-                                                )))
-                                                .ghost()
-                                                .xsmall()
-                                                .cursor_default()
-                                                .icon(Lucide::Archive)
-                                                .invisible()
-                                                .group_hover(group.clone(), |style| style.visible())
-                                                .disabled(archive_reason.is_some())
-                                                .map(|button| match archive_reason {
-                                                    Some(reason) => button.tooltip(reason),
-                                                    None => button.tooltip_with_action(
-                                                        Command::ArchiveThread.label(),
-                                                        &ArchiveThread,
-                                                        Some("Workspace"),
-                                                    ),
-                                                })
-                                                .on_click(move |_, window, cx| {
-                                                    cx.stop_propagation();
-                                                    // Archive the hovered thread, not the
-                                                    // previous selection.
-                                                    let _ = archive_owner.update(
-                                                        cx,
-                                                        |workspace, cx| {
-                                                            workspace
-                                                                .select_row(row, true, window, cx);
-                                                            workspace.execute(
-                                                                Command::ArchiveThread,
-                                                                window,
+                                                h_flex()
+                                                    .flex_shrink_0()
+                                                    .gap_0p5()
+                                                    .invisible()
+                                                    .group_hover(group.clone(), |style| {
+                                                        style.visible()
+                                                    })
+                                                    .child(
+                                                        Button::new(SharedString::from(format!(
+                                                            "rename-thread-{id}"
+                                                        )))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .cursor_default()
+                                                        .icon(Lucide::Pencil)
+                                                        .disabled(rename_reason.is_some())
+                                                        .map(|button| match rename_reason {
+                                                            Some(reason) => button.tooltip(reason),
+                                                            None => button.tooltip_with_action(
+                                                                Command::RenameThread.label(),
+                                                                &RenameThread,
+                                                                Some("Workspace"),
+                                                            ),
+                                                        })
+                                                        .on_click(move |_, window, cx| {
+                                                            cx.stop_propagation();
+                                                            let _ = rename_owner.update(
                                                                 cx,
+                                                                |workspace, cx| {
+                                                                    workspace.select_row(
+                                                                        row, true, window, cx,
+                                                                    );
+                                                                    workspace.execute(
+                                                                        Command::RenameThread,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
                                                             );
-                                                        },
-                                                    );
-                                                }),
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        Button::new(SharedString::from(format!(
+                                                            "archive-thread-{id}"
+                                                        )))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .cursor_default()
+                                                        .icon(Lucide::Archive)
+                                                        .disabled(archive_reason.is_some())
+                                                        .map(|button| match archive_reason {
+                                                            Some(reason) => button.tooltip(reason),
+                                                            None => button.tooltip_with_action(
+                                                                Command::ArchiveThread.label(),
+                                                                &ArchiveThread,
+                                                                Some("Workspace"),
+                                                            ),
+                                                        })
+                                                        .on_click(move |_, window, cx| {
+                                                            cx.stop_propagation();
+                                                            let _ = archive_owner.update(
+                                                                cx,
+                                                                |workspace, cx| {
+                                                                    workspace.select_row(
+                                                                        row, true, window, cx,
+                                                                    );
+                                                                    workspace.execute(
+                                                                        Command::ArchiveThread,
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            );
+                                                        }),
+                                                    ),
                                             )
                                         }),
                                 )
@@ -609,6 +682,7 @@ pub fn render(
         .snapshot
         .projects
         .iter()
+        .filter(|project| state.project_in_active_space(project.id))
         .all(|project| project.archived && !state.show_archived);
     if empty {
         list = list.child(
@@ -617,7 +691,10 @@ pub fn render(
                 .gap_2()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("Add an existing Git working tree to begin.")
+                .child(format!(
+                    "“{}” has no visible projects. Add an existing Git working tree to begin.",
+                    state.active_space_name()
+                ))
                 .child(
                     Button::new("add-project-empty")
                         .small()
@@ -641,6 +718,7 @@ pub fn render(
     }
     let search_owner = owner.clone();
     let search_next_owner = owner.clone();
+    let space_menu_owner = owner.clone();
     v_flex()
         .size_full()
         .bg(theme.sidebar)
@@ -695,6 +773,62 @@ pub fn render(
                         .dropdown_menu(|menu, _, _| {
                             menu.menu(Command::AddProject.label(), Box::new(AddProject))
                                 .menu(Command::ShowArchived.label(), Box::new(ShowArchived))
+                        }),
+                ),
+        )
+        .child(
+            h_flex()
+                .id("space-toolbar")
+                .flex_shrink_0()
+                .gap_1()
+                .p_2()
+                .items_center()
+                .child(
+                    super::commands::button("space-switcher", Command::SwitchSpace, owner, state)
+                        .label(state.active_space_name().to_owned())
+                        .icon(IconName::ChevronDown)
+                        .flex_1()
+                        .min_w_0()
+                        .debug_selector(|| "space-switcher".to_owned()),
+                )
+                .child(
+                    super::commands::button("new-space", Command::NewSpace, owner, state)
+                        .label("")
+                        .icon(IconName::Plus)
+                        .tooltip(
+                            Command::NewSpace
+                                .disabled_reason(state)
+                                .unwrap_or_else(|| Command::NewSpace.label().into()),
+                        )
+                        .debug_selector(|| "new-space".to_owned()),
+                )
+                .child(
+                    Button::new("space-menu")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Ellipsis)
+                        .tooltip("Manage space")
+                        .dropdown_menu(move |menu, _, cx| {
+                            let Some(workspace) = space_menu_owner.upgrade() else {
+                                return menu;
+                            };
+                            let state = workspace.read(cx).state.read(cx);
+                            menu.item(command_item(
+                                Command::RenameSpace.label(),
+                                Command::RenameSpace,
+                                state,
+                            ))
+                            .item(command_item(
+                                Command::MoveProjectToSpace.label(),
+                                Command::MoveProjectToSpace,
+                                state,
+                            ))
+                            .separator()
+                            .item(command_item(
+                                Command::DeleteSpace.label(),
+                                Command::DeleteSpace,
+                                state,
+                            ))
                         }),
                 ),
         )
@@ -797,6 +931,10 @@ pub fn render(
                                 .icon(IconName::Bot),
                             )
                             .item(
+                                command_item("Pi conversation", Command::NewPiConversation, state)
+                                    .icon(IconName::Bot),
+                            )
+                            .item(
                                 command_item(
                                     "Claude Code conversation",
                                     Command::NewClaudeCodeConversation,
@@ -846,6 +984,7 @@ mod tests {
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,
+            queued: Vec::new(),
             archived,
             created_at: "2026-09-16T12:00:00Z".into(),
             updated_at: "2026-09-16T12:00:00Z".into(),

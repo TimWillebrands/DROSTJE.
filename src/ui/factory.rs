@@ -1,4 +1,4 @@
-use super::workspace::{Region, Workspace};
+use super::{commands::Command, workspace::Workspace};
 use crate::{
     app::{AppState, NoticeLevel},
     model::{FactoryLaunch, ThreadId},
@@ -159,14 +159,11 @@ fn read_button(
             workspace.state.update(cx, |state, cx| {
                 state.load_factory_text(path.clone(), before, cx)
             });
-            workspace.focus_region(Region::Output, window, cx);
+            workspace.execute(Command::FocusOutput, window, cx);
         });
     })
 }
 
-fn selected_launch(state: &AppState) -> Option<&FactoryLaunch> {
-    launch_for(state, state.factory_thread()?.id)
-}
 /// The launch recorded for a Factory thread, if it was ever started.
 pub fn launch_for(state: &AppState, thread_id: ThreadId) -> Option<&FactoryLaunch> {
     state
@@ -456,14 +453,17 @@ pub fn render(
         .into_any_element()
 }
 
+/// The Output tab of a thread's sidebar: the thread's Factory launch files, the
+/// file last read, and workspace diagnostics.
 pub fn output(
     state: &AppState,
+    thread_id: ThreadId,
     owner: &WeakEntity<Workspace>,
     scroll: &ScrollHandle,
     cx: &App,
 ) -> AnyElement {
     let mut body = v_flex().p_3().gap_2().text_color(cx.theme().foreground);
-    if let Some(launch) = selected_launch(state) {
+    if let Some(launch) = launch_for(state, thread_id) {
         let launch_dir = state
             .data_dir
             .join("factory-launches")
@@ -581,6 +581,18 @@ pub fn output(
                     .child(format!("{}: {error}", project.name)),
             );
         }
+    }
+    let empty = launch_for(state, thread_id).is_none()
+        && state.factory_text_path.is_none()
+        && state.notices.is_empty()
+        && !state.repositories.values().any(Result::is_err);
+    if empty {
+        body = body.child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("No output yet. Factory launch logs and diagnostics appear here."),
+        );
     }
     FollowingScroll {
         id: "output-detail".into(),

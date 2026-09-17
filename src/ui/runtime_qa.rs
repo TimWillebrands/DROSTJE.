@@ -369,6 +369,84 @@ async fn project_plus_picks_harness_and_clipboard_image_attaches(cx: &mut TestAp
 }
 
 #[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; new thread tabs draw their own title"]
+async fn new_thread_tab_draws_its_title(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let id = new_conversation(cx, &fixture).await;
+    cx.run_until_parked();
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    // A panel docked without its presentation handle falls back to the layout name "Thread".
+    let selector: &'static str = Box::leak(format!("thread-tab-{id}").into_boxed_str());
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(
+        visual.debug_bounds(selector).is_some(),
+        "the tab bar draws the thread's own title element"
+    );
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native sidebar hover actions"]
+async fn thread_sidebar_hover_actions_are_visible_and_rename(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let id = new_conversation(cx, &fixture).await;
+    let row = format!("thread-{id}");
+    let rename = format!("rename-thread-{id}");
+    let archive = format!("archive-thread-{id}");
+
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            !window.find(rename.clone()).visible(),
+            "rename stays quiet until the row is hovered"
+        );
+        assert!(
+            !window.find(archive.clone()).visible(),
+            "archive stays quiet until the row is hovered"
+        );
+        window.hover(row.clone(), cx);
+        assert!(window.find(rename.clone()).visible());
+        assert!(window.find(archive.clone()).visible());
+        window.click(rename.clone(), cx);
+    })
+    .unwrap();
+
+    assert!(cx.read(|cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| matches!(dialog.read(cx).kind, crate::ui::settings::DialogKind::RenameThread(target) if target == id))
+    }));
+    set_dialog(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        "name",
+        "Manually renamed",
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(cx, "manual thread rename", Duration::from_secs(5), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .is_some_and(|thread| thread.title == "Manually renamed")
+    })
+    .await;
+
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native empty-state layout and keyboard"]
 async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
@@ -501,7 +579,7 @@ async fn conversation_diff_sidebar_tracks_working_tree(cx: &mut TestAppContext) 
 
     cx.dispatch_action(fixture.window.into(), commands::ToggleConversationDiffs);
     until(cx, "collapsed diff sidebar", Duration::from_secs(5), |cx| {
-        !fixture.state.read(cx).conversation_diff_open(conversation)
+        !fixture.state.read(cx).thread_sidebar_open(conversation)
     })
     .await;
     for _ in 0..3 {
@@ -1080,7 +1158,8 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
     quit(cx, &fixture).await;
     println!("DROSTJE_QA_DATA={}", fixture.data.display());
     assert_eq!(
-        fixture.store.snapshot().await.unwrap().settings["open_threads"],
+        fixture.store.snapshot().await.unwrap().settings["spaces"]["sessions"]
+            [cx.read(|cx| fixture.state.read(cx).active_space.to_string())]["open_threads"],
         json!([factory, first])
     );
 }
@@ -1224,14 +1303,18 @@ async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
         fixture.workspace.read(cx).palette.is_some()
     })
     .await;
-    cx.update_window(fixture.window.into(), |_, window, cx| {
-        window.draw(cx).clear(cx);
-    })
-    .unwrap();
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
 }
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native palette command"]
-async fn claude_code_conversation_is_visible_and_actionable(cx: &mut TestAppContext) {
+async fn conversation_harness_commands_are_visible_and_actionable(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     assert_eq!(
         cx.read(|cx| {
@@ -1250,6 +1333,25 @@ async fn claude_code_conversation_is_visible_and_actionable(cx: &mut TestAppCont
     open_palette(cx, &fixture).await;
     cx.simulate_keystrokes(
         fixture.window.into(),
+        "n e w space p i space c o n v e r s a t i o n enter",
+    );
+    until(
+        cx,
+        "visible Pi conversation command",
+        Duration::from_secs(5),
+        |cx| {
+            fixture.workspace.read(cx).palette.is_none()
+                && fixture.state.read(cx).snapshot.threads.len() == before + 1
+        },
+    )
+    .await;
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).thread().unwrap().harness.clone()),
+        "pi"
+    );
+    open_palette(cx, &fixture).await;
+    cx.simulate_keystrokes(
+        fixture.window.into(),
         "n e w space c l a u d e space c o d e space c o n v e r s a t i o n enter",
     );
     until(
@@ -1258,7 +1360,7 @@ async fn claude_code_conversation_is_visible_and_actionable(cx: &mut TestAppCont
         Duration::from_secs(5),
         |cx| {
             fixture.workspace.read(cx).palette.is_none()
-                && fixture.state.read(cx).snapshot.threads.len() == before + 1
+                && fixture.state.read(cx).snapshot.threads.len() == before + 2
         },
     )
     .await;
@@ -1435,7 +1537,6 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     for (key, region) in [
         ("secondary-1", Region::Projects),
         ("secondary-2", Region::Thread),
-        ("secondary-3", Region::Output),
     ] {
         cx.simulate_keystrokes(fixture.window.into(), key);
         assert_eq!(
@@ -1742,8 +1843,12 @@ async fn layout_and_factory_runtime_recovery(cx: &mut TestAppContext) {
     );
     let fixture = open_fixture(cx, Some(data)).await;
     let saved = fixture.store.snapshot().await.unwrap();
-    let selected: ThreadId =
-        serde_json::from_value(saved.settings["selected_thread"].clone()).unwrap();
+    let selected: ThreadId = serde_json::from_value(
+        saved.settings["spaces"]["sessions"]
+            [cx.read(|cx| fixture.state.read(cx).active_space.to_string())]["selected_thread"]
+            .clone(),
+    )
+    .unwrap();
     assert_eq!(
         cx.read(|cx| fixture.state.read(cx).selected_thread),
         Some(selected)
@@ -1789,9 +1894,16 @@ async fn layout_and_factory_runtime_recovery(cx: &mut TestAppContext) {
             &fixture.workspace,
             |workspace, window, cx| workspace.focused_region(window, cx)
         ),
-        Region::Output
+        Region::Thread
     );
+    // Focus output opens the selected thread's sidebar on its Output tab.
+    assert!(cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        state.thread_sidebar_open(selected)
+            && state.thread_sidebar_tab(selected) == crate::app::SidebarTab::Output
+    }));
     cx.simulate_keystrokes(fixture.window.into(), "secondary-j cmd-1");
+    assert!(cx.read(|cx| !fixture.state.read(cx).thread_sidebar_open(selected)));
     assert_eq!(
         update_workspace(
             cx,
@@ -1864,4 +1976,363 @@ async fn factory_start_requires_persisted_configuration(cx: &mut TestAppContext)
         |cx| fixture.state.read(cx).shutdown_complete,
     )
     .await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; space isolation, native controls and draft safety without provider turns"]
+async fn spaces_preserve_drafts_tabs_and_project_ownership(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let default = cx.read(|cx| fixture.state.read(cx).active_space);
+    let project = cx.read(|cx| fixture.state.read(cx).selected_project.unwrap());
+    let thread = new_conversation(cx, &fixture).await;
+    let session = cx.read(|cx| fixture.state.read(cx).conversations[&thread].generation);
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.focus_composer(window, cx);
+        },
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "s a f e cmd-escape");
+    wait_for_saved_thread(cx, &fixture, thread, |thread| thread.draft == "safe").await;
+    cx.dispatch_action(fixture.window.into(), commands::ToggleProjects);
+    cx.run_until_parked();
+
+    // Discover creation through the real palette, not a test-only entry point.
+    open_palette(cx, &fixture).await;
+    cx.simulate_keystrokes(fixture.window.into(), "n e w space s p a c e");
+    cx.simulate_keystrokes(fixture.window.into(), "enter");
+    cx.run_until_parked();
+    until(cx, "new space form", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).dialog.is_some()
+    })
+    .await;
+    set_dialog(cx, fixture.window, &fixture.workspace, "name", "Default");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    cx.run_until_parked();
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_some()));
+    assert_eq!(cx.read(|cx| fixture.state.read(cx).spaces.len()), 1);
+    set_dialog(cx, fixture.window, &fixture.workspace, "name", "Research");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(cx, "new empty space", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).active_space != default
+    })
+    .await;
+    let research = cx.read(|cx| fixture.state.read(cx).active_space);
+    assert_eq!(
+        cx.read(|cx| fixture
+            .state
+            .read(cx)
+            .conversations
+            .get(&thread)
+            .map(|session| session.generation)),
+        Some(session),
+        "switching spaces must retain the original harness session"
+    );
+    assert!(cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        state.open_threads.is_empty()
+            && state.selected_thread.is_none()
+            && state.selected_project.is_none()
+            && crate::ui::sidebar::rows(state, "").is_empty()
+    }));
+    assert!(cx.read(|cx| {
+        commands::Command::NewConversation
+            .disabled_reason(fixture.state.read(cx))
+            .is_some()
+    }));
+
+    // The switcher and add control remain usable in both themes at minimum size.
+    for (mode, expected) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
+        fixture.state.update(cx, |state, cx| {
+            state.set_setting("theme_mode", json!(mode));
+            cx.notify();
+        });
+        until(cx, "space theme", Duration::from_secs(5), |cx| {
+            Theme::global(cx).mode == expected
+        })
+        .await;
+        for (width, height) in [(1440., 900.), (900., 600.)] {
+            cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
+            for _ in 0..3 {
+                cx.run_until_parked();
+                cx.update_window(fixture.window.into(), |_, window, cx| {
+                    window.simulate_next_frame(cx);
+                    window.refresh();
+                    window.render_frame(cx);
+                })
+                .unwrap();
+            }
+            cx.update_window(fixture.window.into(), |_, window, _| {
+                let switcher = window.find("space-switcher").bounds();
+                let add = window.find("new-space").bounds();
+                assert!(switcher.size.width > px(0.) && add.size.width > px(0.));
+                assert!(switcher.origin.y >= px(0.));
+                assert!(add.bottom_right().y <= px(height));
+                assert!(add.bottom_right().x <= px(width));
+            })
+            .unwrap();
+        }
+    }
+
+    cx.dispatch_action(fixture.window.into(), commands::RenameSpace);
+    set_dialog(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        "name",
+        "Investigation",
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(cx, "space renamed", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).active_space_name() == "Investigation"
+    })
+    .await;
+    cx.dispatch_action(fixture.window.into(), commands::PreviousSpace);
+    until(
+        cx,
+        "return to original tabs",
+        Duration::from_secs(5),
+        |cx| {
+            let state = fixture.state.read(cx);
+            state.active_space == default && state.selected_thread == Some(thread)
+        },
+    )
+    .await;
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).open_threads.clone()),
+        vec![thread]
+    );
+    assert_eq!(
+        cx.read(
+            |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(thread)]
+                .text
+                .clone()
+        ),
+        "safe"
+    );
+    assert!(cx.read(|cx| {
+        commands::Command::DeleteSpace
+            .disabled_reason(fixture.state.read(cx))
+            .is_some()
+    }));
+    assert!(
+        cx.read(|cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dock
+                .read(cx)
+                .dump(cx)
+                .left_dock
+                .as_ref()
+                .is_some_and(|dock| !dock.open())
+        }),
+        "returning to Default restores its hidden Projects pane"
+    );
+
+    // Moving from the native picker moves the project and every thread, not its data.
+    cx.dispatch_action(fixture.window.into(), commands::MoveProjectToSpace);
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    cx.simulate_keystrokes(fixture.window.into(), "enter");
+    until(
+        cx,
+        "project moved out of Default",
+        Duration::from_secs(5),
+        |cx| !fixture.state.read(cx).project_in_active_space(project),
+    )
+    .await;
+    assert!(cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        state.open_threads.is_empty() && crate::ui::sidebar::rows(state, "").is_empty()
+    }));
+    cx.dispatch_action(fixture.window.into(), commands::NextSpace);
+    until(
+        cx,
+        "project visible in destination",
+        Duration::from_secs(5),
+        |cx| {
+            let state = fixture.state.read(cx);
+            state.active_space == research && state.project_in_active_space(project)
+        },
+    )
+    .await;
+    assert!(cx.read(|cx| {
+        crate::ui::sidebar::rows(fixture.state.read(cx), "")
+            .contains(&crate::ui::sidebar::Row::Thread(thread))
+    }));
+    fixture.state.update(cx, |state, cx| {
+        state.select_thread(thread);
+        cx.notify();
+    });
+    until(cx, "moved draft restored", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).editor_selection == Some(DraftKey::Thread(thread))
+    })
+    .await;
+    assert_eq!(
+        cx.read(
+            |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(thread)]
+                .text
+                .clone()
+        ),
+        "safe"
+    );
+
+    cx.dispatch_action(fixture.window.into(), commands::DeleteSpace);
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    cx.run_until_parked();
+    assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), research);
+    assert_eq!(cx.read(|cx| fixture.state.read(cx).spaces.len()), 2);
+    cx.dispatch_action(fixture.window.into(), commands::DeleteSpace);
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    cx.run_until_parked();
+    until(
+        cx,
+        "space removed without deleting project",
+        Duration::from_secs(5),
+        |cx| {
+            let state = fixture.state.read(cx);
+            state.active_space == default
+                && state.spaces.len() == 1
+                && state.project_in_active_space(project)
+        },
+    )
+    .await;
+    assert!(cx.read(|cx| {
+        fixture
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .any(|saved| saved.id == thread && saved.draft == "safe")
+    }));
+    fixture.state.update(cx, |state, cx| {
+        state.select_thread(thread);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.dispatch_action(fixture.window.into(), commands::NewSpace);
+    set_dialog(cx, fixture.window, &fixture.workspace, "name", "Restart");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(
+        cx,
+        "leave an empty space active for restart",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).active_space_name() == "Restart",
+    )
+    .await;
+    quit(cx, &fixture).await;
+    println!("DROSTJE_SPACES_QA_DATA={}", fixture.data.display());
+}
+
+#[gpui_kit::test]
+#[ignore = "requires DROSTJE_SPACES_QA_DATA from the space lifecycle scenario; restores inactive tabs after process restart"]
+async fn spaces_restore_active_context_and_inactive_tabs(cx: &mut TestAppContext) {
+    let data = PathBuf::from(std::env::var_os("DROSTJE_SPACES_QA_DATA").unwrap());
+    let root = PathBuf::from(std::env::var_os("DROSTJE_RUNTIME_FIXTURE").unwrap());
+    assert!(
+        fs::canonicalize(&data)
+            .unwrap()
+            .starts_with(fs::canonicalize(root).unwrap())
+    );
+    let fixture = open_fixture(cx, Some(data)).await;
+    assert!(cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        state.active_space_name() == "Restart"
+            && state.selected_thread.is_none()
+            && state.open_threads.is_empty()
+            && crate::ui::sidebar::rows(state, "").is_empty()
+    }));
+    cx.dispatch_action(fixture.window.into(), commands::SwitchSpace);
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    cx.simulate_keystrokes(fixture.window.into(), "g g enter");
+    until(
+        cx,
+        "inactive tabs restored after restart",
+        Duration::from_secs(5),
+        |cx| {
+            let state = fixture.state.read(cx);
+            state.active_space == state.default_space_id()
+                && state.thread().is_some_and(|thread| thread.draft == "safe")
+        },
+    )
+    .await;
+    let thread = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).open_threads.clone()),
+        vec![thread]
+    );
+    until(
+        cx,
+        "restored native editor",
+        Duration::from_secs(15),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .editor
+                .as_ref()
+                .is_some_and(|editor| {
+                    editor.read(cx).active_key() == Some(&DraftKey::Thread(thread))
+                })
+        },
+    )
+    .await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.focus_composer(window, cx);
+        },
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "escape :");
+    let notices = cx.read(|cx| fixture.state.read(cx).notice_sequence);
+    cx.dispatch_action(fixture.window.into(), commands::NextSpace);
+    until(
+        cx,
+        "unfinished Vim command blocks switching",
+        Duration::from_secs(15),
+        |cx| fixture.state.read(cx).notice_sequence > notices,
+    )
+    .await;
+    assert!(cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        state.active_space == state.default_space_id() && state.selected_thread == Some(thread)
+    }));
+    cx.dispatch_action(fixture.window.into(), commands::CancelEditorCommand);
+    cx.run_until_parked();
+    quit(cx, &fixture).await;
 }

@@ -16,8 +16,16 @@ gpui_kit::actions!(
     drostje,
     [
         AddProject,
+        NewSpace,
+        RenameSpace,
+        DeleteSpace,
+        SwitchSpace,
+        NextSpace,
+        PreviousSpace,
+        MoveProjectToSpace,
         NewConversation,
         NewOmpConversation,
+        NewPiConversation,
         NewClaudeCodeConversation,
         NewFactoryThread,
         RenameProject,
@@ -32,6 +40,7 @@ gpui_kit::actions!(
         SearchThreads,
         RefreshFactoryRuns,
         Settings,
+        InstallPi,
         ResetLayout,
         FocusProjects,
         FocusThread,
@@ -46,6 +55,9 @@ gpui_kit::actions!(
         CancelEditorCommand,
         CopyDraftRecovery,
         PasteImage,
+        ClearQueuedMessages,
+        SendQueuedNow,
+        EditQueuedMessage,
         OpenPalette,
         FocusLeft,
         FocusDown,
@@ -71,8 +83,16 @@ gpui_kit::actions!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     AddProject,
+    NewSpace,
+    RenameSpace,
+    DeleteSpace,
+    SwitchSpace,
+    NextSpace,
+    PreviousSpace,
+    MoveProjectToSpace,
     NewConversation,
     NewOmpConversation,
+    NewPiConversation,
     NewClaudeCodeConversation,
     NewFactoryThread,
     RenameProject,
@@ -87,6 +107,7 @@ pub enum Command {
     SearchThreads,
     RefreshFactoryRuns,
     Settings,
+    InstallPi,
     ResetLayout,
     FocusProjects,
     FocusThread,
@@ -101,12 +122,23 @@ pub enum Command {
     CancelEditorCommand,
     CopyDraftRecovery,
     PasteImage,
+    ClearQueuedMessages,
+    SendQueuedNow,
+    EditQueuedMessage,
 }
 impl Command {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 43] = [
+        Self::NewSpace,
+        Self::RenameSpace,
+        Self::DeleteSpace,
+        Self::SwitchSpace,
+        Self::NextSpace,
+        Self::PreviousSpace,
+        Self::MoveProjectToSpace,
         Self::AddProject,
         Self::NewConversation,
         Self::NewOmpConversation,
+        Self::NewPiConversation,
         Self::NewClaudeCodeConversation,
         Self::NewFactoryThread,
         Self::RenameProject,
@@ -121,6 +153,7 @@ impl Command {
         Self::SearchThreads,
         Self::RefreshFactoryRuns,
         Self::Settings,
+        Self::InstallPi,
         Self::ResetLayout,
         Self::FocusProjects,
         Self::FocusThread,
@@ -135,13 +168,24 @@ impl Command {
         Self::CancelEditorCommand,
         Self::CopyDraftRecovery,
         Self::PasteImage,
+        Self::SendQueuedNow,
+        Self::EditQueuedMessage,
+        Self::ClearQueuedMessages,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::AddProject => "Add project…",
+            Self::NewSpace => "New space…",
+            Self::RenameSpace => "Rename space…",
+            Self::DeleteSpace => "Delete space…",
+            Self::SwitchSpace => "Switch space…",
+            Self::NextSpace => "Next space",
+            Self::PreviousSpace => "Previous space",
+            Self::MoveProjectToSpace => "Move project to space…",
             Self::NewConversation => "New conversation",
             Self::NewOmpConversation => "New OMP conversation",
+            Self::NewPiConversation => "New Pi conversation",
             Self::NewClaudeCodeConversation => "New Claude Code conversation",
             Self::NewFactoryThread => "New Factory thread",
             Self::RenameProject => "Rename project…",
@@ -156,6 +200,7 @@ impl Command {
             Self::SearchThreads => "Search threads…",
             Self::RefreshFactoryRuns => "Refresh Factory runs",
             Self::Settings => "Settings…",
+            Self::InstallPi => "Install Pi",
             Self::ResetLayout => "Reset layout",
             Self::FocusProjects => "Focus projects",
             Self::FocusThread => "Focus thread",
@@ -170,14 +215,25 @@ impl Command {
             Self::CancelEditorCommand => "Cancel editor command",
             Self::CopyDraftRecovery => "Copy draft recovery",
             Self::PasteImage => "Paste image from clipboard",
+            Self::ClearQueuedMessages => "Clear queued messages",
+            Self::SendQueuedNow => "Send next queued message now",
+            Self::EditQueuedMessage => "Edit last queued message",
         }
     }
 
     pub fn action(self) -> Box<dyn Action> {
         match self {
             Self::AddProject => Box::new(AddProject),
+            Self::NewSpace => Box::new(NewSpace),
+            Self::RenameSpace => Box::new(RenameSpace),
+            Self::DeleteSpace => Box::new(DeleteSpace),
+            Self::SwitchSpace => Box::new(SwitchSpace),
+            Self::NextSpace => Box::new(NextSpace),
+            Self::PreviousSpace => Box::new(PreviousSpace),
+            Self::MoveProjectToSpace => Box::new(MoveProjectToSpace),
             Self::NewConversation => Box::new(NewConversation),
             Self::NewOmpConversation => Box::new(NewOmpConversation),
+            Self::NewPiConversation => Box::new(NewPiConversation),
             Self::NewClaudeCodeConversation => Box::new(NewClaudeCodeConversation),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::RenameProject => Box::new(RenameProject),
@@ -192,6 +248,7 @@ impl Command {
             Self::SearchThreads => Box::new(SearchThreads),
             Self::RefreshFactoryRuns => Box::new(RefreshFactoryRuns),
             Self::Settings => Box::new(Settings),
+            Self::InstallPi => Box::new(InstallPi),
             Self::ResetLayout => Box::new(ResetLayout),
             Self::FocusProjects => Box::new(FocusProjects),
             Self::FocusThread => Box::new(FocusThread),
@@ -206,6 +263,9 @@ impl Command {
             Self::CancelEditorCommand => Box::new(CancelEditorCommand),
             Self::CopyDraftRecovery => Box::new(CopyDraftRecovery),
             Self::PasteImage => Box::new(PasteImage),
+            Self::ClearQueuedMessages => Box::new(ClearQueuedMessages),
+            Self::SendQueuedNow => Box::new(SendQueuedNow),
+            Self::EditQueuedMessage => Box::new(EditQueuedMessage),
         }
     }
 
@@ -214,6 +274,25 @@ impl Command {
             return Some("Application is shutting down.".into());
         }
         match self {
+            Self::DeleteSpace if state.active_space == state.default_space_id() => {
+                Some("Default is the recovery space and cannot be deleted.".into())
+            }
+            Self::SwitchSpace | Self::NextSpace | Self::PreviousSpace if state.spaces.len() < 2 => {
+                Some("Create another space first.".into())
+            }
+            Self::MoveProjectToSpace if state.selected_project.is_none() => {
+                Some("Select a project first.".into())
+            }
+            Self::MoveProjectToSpace if state.spaces.len() < 2 => {
+                Some("Create another space to move this project into.".into())
+            }
+            Self::NewSpace
+            | Self::RenameSpace
+            | Self::DeleteSpace
+            | Self::SwitchSpace
+            | Self::NextSpace
+            | Self::PreviousSpace
+            | Self::MoveProjectToSpace => state.space_mutation_reason(),
             Self::AddProject if state.registering => {
                 Some("A working tree is being inspected.".into())
             }
@@ -222,21 +301,32 @@ impl Command {
             }
             Self::NewConversation
             | Self::NewOmpConversation
+            | Self::NewPiConversation
             | Self::NewClaudeCodeConversation
             | Self::RenameProject => state.mutable_project_reason(),
+            Self::InstallPi if state.installing_pi => {
+                Some("Pi installation is already running.".into())
+            }
+            Self::InstallPi if state.storage_error.is_some() => {
+                Some("Storage is not writable.".into())
+            }
+            Self::InstallPi
+                if state
+                    .diagnostics
+                    .get("pi")
+                    .is_some_and(|status| status.starts_with("Resolved:")) =>
+            {
+                Some("Pi is already available.".into())
+            }
             Self::ArchiveProject => state.archive_project_reason(),
-            Self::RenameThread => state
-                .mutable_project_reason()
-                .or_else(|| match state.thread() {
-                    None => Some("Select a thread first.".into()),
-                    Some(thread) if thread.archived => {
-                        Some("Archived threads are read-only.".into())
-                    }
-                    _ => None,
-                }),
+            Self::RenameThread => state.rename_thread_reason(),
             Self::RegenerateTitle => state.regenerate_title_reason(),
             Self::ArchiveThread => state.archive_thread_reason(),
-            Self::CloseThread if state.thread().is_none() => Some("Select a thread first.".into()),
+            Self::CloseThread | Self::FocusOutput | Self::ToggleOutput
+                if state.thread().is_none() =>
+            {
+                Some("Select a thread first.".into())
+            }
             Self::NextThread | Self::PreviousThread if state.open_threads.len() < 2 => {
                 Some("Open at least two threads.".into())
             }
@@ -268,6 +358,30 @@ impl Command {
                         _ => None,
                     })
             }
+            Self::ClearQueuedMessages | Self::EditQueuedMessage => state
+                .mutable_project_reason()
+                .or_else(|| match state.conversation_thread() {
+                    None => Some("Select a conversation first.".into()),
+                    Some(thread) if thread.archived => {
+                        Some("Archived threads are read-only.".into())
+                    }
+                    Some(thread) if thread.queued.is_empty() => {
+                        Some("No messages are queued.".into())
+                    }
+                    _ => None,
+                }),
+            Self::SendQueuedNow => match state.conversation_thread() {
+                None => Some("Select a conversation first.".into()),
+                // During a turn, Send now stops that turn first; the row button agrees.
+                Some(thread)
+                    if !thread.queued.is_empty() && state.active_threads.contains(&thread.id) =>
+                {
+                    None
+                }
+                Some(thread) => state
+                    .queued_dispatch_reason(thread.id)
+                    .map(|reason| format!("{reason}.")),
+            },
             _ => None,
         }
     }
@@ -313,6 +427,12 @@ pub fn bind_keys(cx: &mut App) {
     );
     cx.bind_keys(vec![
         KeyBinding::new("secondary-shift-p", OpenPalette, workspace),
+        KeyBinding::new("secondary-alt-]", NextSpace, navigation),
+        KeyBinding::new("secondary-alt-[", PreviousSpace, navigation),
+        KeyBinding::new("j", SelectNext, Some("SpacePicker")),
+        KeyBinding::new("k", SelectPrevious, Some("SpacePicker")),
+        KeyBinding::new("g g", SelectFirst, Some("SpacePicker")),
+        KeyBinding::new("shift-g", SelectLast, Some("SpacePicker")),
         KeyBinding::new("ctrl-tab", NextThread, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, workspace),
         KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, workspace),
@@ -409,6 +529,21 @@ pub fn bind_keys(cx: &mut App) {
             Some("(Thread || PromptEditor) && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
+            "secondary-alt-backspace",
+            ClearQueuedMessages,
+            Some("Input && PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog"),
+        ),
+        KeyBinding::new(
+            "secondary-alt-backspace",
+            ClearQueuedMessages,
+            Some("(Thread || PromptEditor) && !Command && !PopupMenu && !Sheet && !Dialog"),
+        ),
+        KeyBinding::new(
+            "secondary-enter",
+            gpui_kit::base::actions::Confirm { secondary: false },
+            Some("Dialog && !DrostjeForm && !Command && !PopupMenu"),
+        ),
+        KeyBinding::new(
             "secondary-enter",
             Confirm,
             Some("DrostjeForm && !Command && !PopupMenu"),
@@ -447,11 +582,17 @@ pub enum PaletteTarget {
     Thread(Uuid),
 }
 
+struct SpacePicker {
+    project: Option<Uuid>,
+    spaces: Vec<crate::model::Space>,
+}
+
 pub struct Palette {
     pub command: Entity<CommandState>,
     owner: WeakEntity<Workspace>,
     state: Entity<AppState>,
     closed: bool,
+    spaces: Option<SpacePicker>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -459,6 +600,36 @@ impl Palette {
     pub fn open(
         owner: WeakEntity<Workspace>,
         state: Entity<AppState>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::open_with_spaces(owner, state, None, window, cx)
+    }
+
+    pub fn open_spaces(
+        owner: WeakEntity<Workspace>,
+        state: Entity<AppState>,
+        moving: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let app = state.read(cx);
+        let picker = SpacePicker {
+            project: if moving { app.selected_project } else { None },
+            spaces: app
+                .spaces
+                .iter()
+                .filter(|space| !moving || space.id != app.active_space)
+                .cloned()
+                .collect(),
+        };
+        Self::open_with_spaces(owner, state, Some(picker), window, cx)
+    }
+
+    fn open_with_spaces(
+        owner: WeakEntity<Workspace>,
+        state: Entity<AppState>,
+        spaces: Option<SpacePicker>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -486,6 +657,7 @@ impl Palette {
                 owner,
                 state,
                 closed: false,
+                spaces,
                 _subscriptions: subscriptions,
             }
         });
@@ -505,7 +677,12 @@ impl Palette {
                     let _ = close_owner.update(cx, |palette, cx| palette.cleanup(cx));
                 })
         });
-        palette.read(cx).command.focus_handle(cx).focus(window, cx);
+        let focus_owner = palette.downgrade();
+        window.on_next_frame(move |window, cx| {
+            if let Some(palette) = focus_owner.upgrade() {
+                palette.read(cx).command.focus_handle(cx).focus(window, cx);
+            }
+        });
         palette
     }
 
@@ -566,10 +743,130 @@ impl Palette {
             cx.notify();
         });
     }
+
+    fn navigate_spaces(
+        &mut self,
+        delta: isize,
+        edge: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        let count = self.spaces.as_ref().map_or(0, |picker| picker.spaces.len());
+        if count == 0 {
+            return;
+        }
+        let current = self
+            .command
+            .read(cx)
+            .selected_index()
+            .map(|index| index.row);
+        let next = if edge {
+            if delta < 0 { 0 } else { count - 1 }
+        } else {
+            current.map_or(if delta < 0 { count - 1 } else { 0 }, |index| {
+                (index as isize + delta).rem_euclid(count as isize) as usize
+            })
+        };
+        self.command.update(cx, |command, cx| {
+            command.set_selected_index(
+                Some(gpui_kit::component::IndexPath::new(0).row(next)),
+                window,
+                cx,
+            );
+        });
+    }
+
+    fn run_space(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closed {
+            return;
+        }
+        let Some(picker) = &self.spaces else { return };
+        let Some(target) = picker.spaces.get(row).map(|space| space.id) else {
+            return;
+        };
+        let project = picker.project;
+        self.closed = true;
+        let id = cx.entity().entity_id();
+        let _ = self.owner.update(cx, |workspace, cx| {
+            if !workspace
+                .palette
+                .as_ref()
+                .is_some_and(|palette| palette.entity_id() == id)
+            {
+                return;
+            }
+            workspace.palette = None;
+            window.close_dialog(cx);
+            let result = if let Some(project) = project {
+                workspace.move_project_to_space(project, target, window, cx)
+            } else {
+                workspace.switch_space(target, window, cx)
+            };
+            if let Err(error) = result {
+                workspace.state.update(cx, |state, cx| {
+                    state.notice(crate::app::NoticeLevel::Warning, format!("{error:#}"));
+                    cx.notify();
+                });
+            }
+            cx.notify();
+        });
+    }
+
+    fn render_spaces(&self, picker: &SpacePicker, cx: &mut Context<Self>) -> AnyElement {
+        let confirm = cx.entity().downgrade();
+        let cancel = cx.entity().downgrade();
+        let mut group = CommandGroup::new().label(if picker.project.is_some() {
+            "Move project and all its threads to"
+        } else {
+            "Switch space"
+        });
+        for space in &picker.spaces {
+            let current = space.id == self.state.read(cx).active_space;
+            group = group.item(CommandItem::new().label(if current {
+                format!("{} — Current", space.name)
+            } else {
+                space.name.clone()
+            }));
+        }
+        div()
+            .id("space-picker")
+            .key_context("SpacePicker")
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                this.navigate_spaces(1, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
+                this.navigate_spaces(-1, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, window, cx| {
+                this.navigate_spaces(-1, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
+                this.navigate_spaces(1, true, window, cx)
+            }))
+            .child(
+                NativeCommand::new(&self.command)
+                    .searchable(false)
+                    .bordered(false)
+                    .max_h(rems(26.))
+                    .group(group)
+                    .on_confirm(move |index, window, cx| {
+                        let _ = confirm
+                            .update(cx, |palette, cx| palette.run_space(index.row, window, cx));
+                    })
+                    .on_cancel(move |_, cx| {
+                        let _ = cancel.update(cx, |palette, cx| palette.cleanup(cx));
+                    }),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for Palette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(picker) = &self.spaces {
+            return self.render_spaces(picker, cx);
+        }
         let state = self.state.read(cx);
         let mut targets = [Vec::new(), Vec::new(), Vec::new()];
         let mut commands = CommandGroup::new().label("Commands");
@@ -593,6 +890,7 @@ impl Render for Palette {
             .projects
             .iter()
             .filter(|project| state.show_archived || !project.archived)
+            .filter(|project| state.project_in_active_space(project.id))
         {
             projects = projects.item(
                 CommandItem::new().label(project.name.clone()).keywords([
@@ -608,15 +906,16 @@ impl Render for Palette {
             targets[1].push(PaletteTarget::Project(project.id));
         }
         let mut threads = CommandGroup::new().label("Threads");
-        for thread in state.snapshot.threads.iter().filter(|thread| {
-            state.show_archived
-                || (!thread.archived
-                    && state
-                        .snapshot
-                        .projects
-                        .iter()
-                        .any(|project| project.id == thread.project_id && !project.archived))
-        }) {
+        for thread in
+            state.snapshot.threads.iter().filter(|thread| {
+                state.project_in_active_space(thread.project_id)
+                    && (state.show_archived
+                        || (!thread.archived
+                            && state.snapshot.projects.iter().any(|project| {
+                                project.id == thread.project_id && !project.archived
+                            })))
+            })
+        {
             let project = state
                 .snapshot
                 .projects
@@ -675,6 +974,27 @@ impl Render for Palette {
             });
         div()
             .key_context("DrostjePalette")
+            .on_action(cx.listener(|this, _: &NewSpace, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewSpace), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RenameSpace, w, cx| {
+                this.run(PaletteTarget::Command(Command::RenameSpace), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSpace, w, cx| {
+                this.run(PaletteTarget::Command(Command::DeleteSpace), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SwitchSpace, w, cx| {
+                this.run(PaletteTarget::Command(Command::SwitchSpace), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NextSpace, w, cx| {
+                this.run(PaletteTarget::Command(Command::NextSpace), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PreviousSpace, w, cx| {
+                this.run(PaletteTarget::Command(Command::PreviousSpace), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &MoveProjectToSpace, w, cx| {
+                this.run(PaletteTarget::Command(Command::MoveProjectToSpace), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &AddProject, w, cx| {
                 this.run(PaletteTarget::Command(Command::AddProject), w, cx)
             }))
@@ -684,12 +1004,18 @@ impl Render for Palette {
             .on_action(cx.listener(|this, _: &NewOmpConversation, w, cx| {
                 this.run(PaletteTarget::Command(Command::NewOmpConversation), w, cx)
             }))
+            .on_action(cx.listener(|this, _: &NewPiConversation, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewPiConversation), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &NewClaudeCodeConversation, w, cx| {
                 this.run(
                     PaletteTarget::Command(Command::NewClaudeCodeConversation),
                     w,
                     cx,
                 )
+            }))
+            .on_action(cx.listener(|this, _: &InstallPi, w, cx| {
+                this.run(PaletteTarget::Command(Command::InstallPi), w, cx)
             }))
             .on_action(cx.listener(|this, _: &NewFactoryThread, w, cx| {
                 this.run(PaletteTarget::Command(Command::NewFactoryThread), w, cx)
@@ -770,6 +1096,7 @@ impl Render for Palette {
             }))
             .w_full()
             .child(command)
+            .into_any_element()
     }
 }
 
@@ -777,6 +1104,5 @@ pub fn region_action(region: Region) -> &'static str {
     match region {
         Region::Projects => "Projects",
         Region::Thread => "Thread",
-        Region::Output => "Output",
     }
 }

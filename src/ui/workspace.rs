@@ -1,27 +1,30 @@
 use super::{
     commands::{self, *},
     conversation, factory,
-    settings::{DialogKind, SurfaceContent},
+    settings::{DialogKind, SurfaceContent, SurfaceOutcome},
     sidebar::{self, Row},
+    thread_sidebar,
     title_bar::{WorkspaceDockSkin, WorkspaceTitle},
 };
 use crate::{
-    app::{AppState, NoticeLevel, PresentationChange},
-    model::{PaneDirection, ThreadId, ThreadKind},
+    app::{AppState, NoticeLevel, PresentationChange, SidebarTab},
+    model::{PaneDirection, ProjectId, SpaceId, ThreadId, ThreadKind},
 };
 use gpui_kit::{
     component::{
-        ActiveTheme, Root, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
-        button::Button,
+        ActiveTheme, IconName, Root, Sizable, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
+        button::{Button, ButtonVariants},
         dock::{
             BasePanel, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSizing,
-            DockSkin, InsertTarget, Panel, PanelEvent, PanelId, PanelInfo, PanelState, TabGroup,
-            panel_handle, register_panel,
+            DockSkin, InsertTarget, Panel, PanelEvent, PanelId, PanelInfo, PanelState, PanelStyle,
+            TabGroup, panel_handle, register_panel,
         },
         h_flex,
         input::{InputEvent, InputState},
         menu::{PopupMenu, PopupMenuItem},
         notification::Notification,
+        shimmer::ShimmerText,
+        spinner::Spinner,
         v_flex,
     },
     prelude::FluentBuilder,
@@ -38,7 +41,6 @@ use std::{
 pub enum Region {
     Projects,
     Thread,
-    Output,
 }
 impl Region {
     pub fn name(self) -> &'static str {
@@ -46,7 +48,7 @@ impl Region {
     }
 }
 
-/// What one dock panel shows. Projects and Output exist once; every open thread
+/// What one dock panel shows. Projects exists once; every open thread
 /// is its own panel so it can be tabbed, split and dragged like a Zed pane; the
 /// Welcome panel holds the centre only while no thread is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,14 +56,12 @@ pub enum PanelKind {
     Projects,
     Welcome,
     Thread(ThreadId),
-    Output,
 }
 impl PanelKind {
     pub fn region(self) -> Region {
         match self {
             Self::Projects => Region::Projects,
             Self::Welcome | Self::Thread(_) => Region::Thread,
-            Self::Output => Region::Output,
         }
     }
     /// Persisted layout name; never change it.
@@ -70,14 +70,12 @@ impl PanelKind {
             Self::Projects => "Projects",
             Self::Welcome => "Welcome",
             Self::Thread(_) => "Thread",
-            Self::Output => "Output",
         }
     }
     fn context(self) -> &'static str {
         match self {
             Self::Projects => "List ProjectsList",
             Self::Welcome | Self::Thread(_) => "Thread",
-            Self::Output => "List",
         }
     }
     fn debug_name(self) -> String {
@@ -102,14 +100,21 @@ fn thread_of(state: &PanelState) -> Option<ThreadId> {
     }
 }
 type ThreadPanels = Rc<RefCell<BTreeMap<ThreadId, Entity<WorkspacePanel>>>>;
-const LAYOUT_VERSION: usize = 3;
+/// Version 4 dropped the bottom Output dock; Output is a thread sidebar tab.
+const LAYOUT_VERSION: usize = 4;
 const OUTDATED_LAYOUT: &str = "Layout was saved by another version";
+
+#[derive(Clone, Copy)]
+enum SpaceChange {
+    Switch(SpaceId),
+    Move(ProjectId, SpaceId),
+    Delete(SpaceId),
+}
 
 pub struct Workspace {
     pub state: Entity<AppState>,
     pub(super) dock: Entity<DockArea>,
     projects: Entity<WorkspacePanel>,
-    output: Entity<WorkspacePanel>,
     /// Shared with the panel registry so a restored layout rebuilds into the same map.
     threads: ThreadPanels,
     welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>>,
@@ -135,6 +140,8 @@ pub struct Workspace {
     pub(super) detail_surface: Option<super::overlays::SurfaceKey>,
     pub(super) quit_requested: bool,
     layout_save: Option<Task<()>>,
+    presented_space: SpaceId,
+    preparing_space_change: bool,
     seen_notice_sequence: u64,
     reopening: Option<Region>,
     dock_measurement: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -154,16 +161,13 @@ impl Workspace {
                 cx,
             )
         });
-        let output = cx.new(|cx| {
-            WorkspacePanel::new(PanelKind::Output, state.clone(), owner.clone(), window, cx)
-        });
         let threads: ThreadPanels = Rc::default();
         let welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>> = Rc::default();
-        for (kind, panel) in [
-            (PanelKind::Projects, projects.clone()),
-            (PanelKind::Output, output.clone()),
-        ] {
-            register_panel(cx, kind.name(), move |_, _, _| panel_handle(panel.clone()));
+        {
+            let panel = projects.clone();
+            register_panel(cx, PanelKind::Projects.name(), move |_, _, _| {
+                panel_handle(panel.clone())
+            });
         }
         {
             let (welcome, state, owner) = (welcome.clone(), state.clone(), owner.clone());
@@ -184,18 +188,23 @@ impl Workspace {
             );
         }
         let title = cx.new(|cx| WorkspaceTitle::new(state.clone(), owner.clone(), cx));
+        let mut inner = None;
         let dock = cx.new(|cx| {
-            let inner = DockSkin::new(cx);
+            let skin = DockSkin::new(cx);
+            inner = Some(skin.clone());
             DockArea::new("drostje-workspace", Some(LAYOUT_VERSION), window, cx)
-                .with_renderer(Rc::new(WorkspaceDockSkin { inner, title }))
+                .with_renderer(Rc::new(WorkspaceDockSkin { inner: skin, title }))
         });
-        let saved = state.read(cx).snapshot.settings.get("layout").cloned();
+        let inner = inner.expect("DockSkin::new ran inside the DockArea constructor");
+        // A lone thread keeps its tab, like Zed, instead of a larger title.
+        inner.set_panel_style(PanelStyle::TabBar, cx);
+        let saved = state.read(cx).space_layout().cloned();
+        let presented_space = state.read(cx).active_space;
         let thread_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads…"));
         let mut workspace = Self {
             state,
             dock,
             projects,
-            output,
             threads,
             welcome,
             rebuilding: false,
@@ -219,6 +228,8 @@ impl Workspace {
             palette: None,
             dialog: None,
             layout_save: None,
+            presented_space,
+            preparing_space_change: false,
             seen_notice_sequence: 0,
             reopening: None,
             dock_measurement: Rc::new(Cell::new(None)),
@@ -253,11 +264,7 @@ impl Workspace {
             }
         }
         workspace.dock.update(cx, |dock, cx| {
-            for placement in [
-                DockPlacement::Left,
-                DockPlacement::Right,
-                DockPlacement::Bottom,
-            ] {
+            for placement in [DockPlacement::Left, DockPlacement::Right] {
                 dock.set_dock_collapsible(placement, true, window, cx);
             }
         });
@@ -287,6 +294,7 @@ impl Workspace {
                 if workspace.state.read(cx).shutdown_error.is_some() {
                     workspace.quit_requested = false;
                 }
+                workspace.sync_space(window, cx);
                 workspace.sync_thread_panels(window, cx);
                 workspace.sync_session(window, cx);
                 workspace.sync_factory_form(window, cx);
@@ -306,6 +314,7 @@ impl Workspace {
             |workspace, _, event: &PresentationChange, window, cx| {
                 match *event {
                     PresentationChange::Selection => {
+                        workspace.sync_space(window, cx);
                         workspace.sync_session(window, cx);
                         workspace.sync_factory_form(window, cx);
                         workspace.sync_model_picker(window, cx);
@@ -334,6 +343,8 @@ impl Workspace {
             |workspace, _, event: &DockEvent, window, cx| {
                 if matches!(event, DockEvent::LayoutChanged)
                     && !workspace.state.read(cx).shutting_down
+                    && !workspace.rebuilding
+                    && workspace.presented_space == workspace.state.read(cx).active_space
                 {
                     workspace.invalidate_panel_bounds(cx);
                     workspace.normalize_layout(workspace.reopening, window, cx);
@@ -396,6 +407,210 @@ impl Workspace {
         workspace
     }
 
+    fn space_transition_reason(&self, cx: &App) -> Option<String> {
+        self.state.read(cx).space_mutation_reason().or_else(|| {
+            if self.preparing_space_change {
+                Some("Wait for the editor draft to finish saving before changing spaces.".into())
+            } else if self.extension.is_some() {
+                Some("Finish or dismiss the agent request before changing spaces.".into())
+            } else if self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).has_composition())
+            {
+                Some("Complete or cancel input composition before changing spaces.".into())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub(super) fn switch_space(
+        &mut self,
+        id: SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        if id == self.state.read(cx).active_space {
+            return Ok(());
+        }
+        self.change_space(SpaceChange::Switch(id), window, cx)
+    }
+
+    pub(super) fn move_project_to_space(
+        &mut self,
+        project: ProjectId,
+        target: SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.change_space(SpaceChange::Move(project, target), window, cx)
+    }
+
+    fn change_space(
+        &mut self,
+        change: SpaceChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        if let Some(reason) = self.space_transition_reason(cx) {
+            anyhow::bail!("{reason}");
+        }
+        let editor = self.editor.clone().and_then(|editor| {
+            let key = editor.read(cx).active_key().cloned()?;
+            Some((editor, key))
+        });
+        let Some((editor, key)) = editor else {
+            return self.apply_space_change(change, window, cx);
+        };
+        let snapshot = editor.update(cx, |editor, cx| editor.snapshot(&key, window, cx));
+        let origin = self.state.read(cx).active_space;
+        self.preparing_space_change = true;
+        cx.spawn_in(window, async move |workspace, window| {
+            let result = snapshot.await;
+            let _ = workspace.update_in(window, |workspace, window, cx| {
+                workspace.preparing_space_change = false;
+                let result = result.and_then(|draft| {
+                    workspace.state.update(cx, |state, _| {
+                        let thread = match &draft.key {
+                            crate::model::DraftKey::Thread(id) | crate::model::DraftKey::Extension { thread: id, .. } => *id,
+                        };
+                        state.record_draft(draft);
+                        state.commit_thread_edits(thread);
+                    });
+                    anyhow::ensure!(workspace.state.read(cx).active_space == origin,
+                        "Space changed while saving the draft; choose the destination again");
+                    if let Some(reason) = workspace.space_transition_reason(cx) {
+                        anyhow::bail!("{reason}");
+                    }
+                    workspace.apply_space_change(change, window, cx)
+                });
+                if let Err(error) = result {
+                    workspace.space_error(error.context("Space was not changed; finish or cancel the editor command and try again"), cx);
+                }
+                cx.notify();
+            });
+        }).detach();
+        Ok(())
+    }
+
+    fn apply_space_change(
+        &mut self,
+        change: SpaceChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.layout_save.take();
+        self.flush_layout(cx);
+        self.state.update(cx, |state, _| -> anyhow::Result<()> {
+            match change {
+                SpaceChange::Switch(id) => state.switch_space(id)?,
+                SpaceChange::Move(project, target) => {
+                    state.move_project_to_space(project, target)?
+                }
+                SpaceChange::Delete(id) => {
+                    anyhow::ensure!(id != state.default_space_id(), "Default cannot be deleted");
+                    if state.active_space == id {
+                        state.switch_space(state.default_space_id())?;
+                    }
+                    state.delete_space(id)?;
+                }
+            }
+            Ok(())
+        })?;
+        self.sync_space(window, cx);
+        self.sync_thread_panels(window, cx);
+        self.sync_session(window, cx);
+        if matches!(change, SpaceChange::Move(..)) {
+            self.cursor = None;
+            self.flush_layout(cx);
+            self.focus_region(Region::Projects, window, cx);
+        }
+        self.state.update(cx, |_, cx| cx.notify());
+        Ok(())
+    }
+
+    fn sync_space(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.state.read(cx).active_space;
+        if active == self.presented_space {
+            return;
+        }
+        self.layout_save.take();
+        self.presented_space = active;
+        self.rebuilding = true;
+        self.threads.borrow_mut().clear();
+        self.welcome.borrow_mut().take();
+        self.cursor = None;
+        self.presented_thread = None;
+        self.reopening = None;
+        self.thread_search
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        let saved = self.state.read(cx).space_layout().cloned();
+        let restored = saved.map(|saved| -> anyhow::Result<()> {
+            let layout: DockAreaState = serde_json::from_value(saved)?;
+            validate_layout(&layout)?;
+            self.dock
+                .update(cx, |dock, cx| dock.load(layout, window, cx))
+        });
+        self.rebuilding = false;
+        if !matches!(restored, Some(Ok(()))) {
+            if let Some(Err(error)) = restored
+                && error.to_string() != OUTDATED_LAYOUT
+            {
+                self.state.update(cx, |state, _| {
+                    state.notice(
+                        NoticeLevel::Warning,
+                        format!("Only this space's saved layout was reset: {error:#}"),
+                    )
+                });
+            }
+            self.reset_layout(window, cx);
+        } else {
+            self.sync_thread_panels(window, cx);
+            self.invalidate_panel_bounds(cx);
+            self.normalize_layout(None, window, cx);
+        }
+        self.sync_session(window, cx);
+        self.sync_factory_form(window, cx);
+        self.sync_selection_panels(cx);
+        self.projects.update(cx, |_, cx| cx.notify());
+        cx.defer_in(window, move |workspace, window, cx| {
+            if workspace.presented_space == active {
+                let region = if workspace.state.read(cx).selected_thread.is_some() {
+                    Region::Thread
+                } else {
+                    Region::Projects
+                };
+                workspace.focus_region(region, window, cx);
+            }
+        });
+        cx.notify();
+    }
+
+    fn space_error(&self, error: anyhow::Error, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.notice(NoticeLevel::Warning, format!("{error:#}"));
+            cx.notify();
+        });
+    }
+
+    fn open_space_picker(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.space_transition_reason(cx) {
+            self.space_error(anyhow::anyhow!(reason), cx);
+            return;
+        }
+        self.dismiss(window, cx);
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        self.palette = Some(Palette::open_spaces(
+            cx.entity().downgrade(),
+            self.state.clone(),
+            moving,
+            window,
+            cx,
+        ));
+    }
     fn cycle_thread(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             let count = state.open_threads.len();
@@ -437,25 +652,17 @@ impl Workspace {
             }
         }
         let left = DockLayout::tabs().panel_view(panel_handle(self.projects.clone()), cx);
-        let bottom = DockLayout::tabs().panel_view(panel_handle(self.output.clone()), cx);
         // Dock APIs consume pixels; application geometry is resolved from rem here.
         let rem = window.rem_size();
         self.rebuilding = true;
         self.dock.update(cx, |dock, cx| {
             dock.set_version(Some(LAYOUT_VERSION), cx);
             dock.remove_dock(DockPlacement::Right, window, cx);
+            dock.remove_dock(DockPlacement::Bottom, window, cx);
             dock.set_center(center, window, cx);
-            for (placement, layout, size) in [
-                (DockPlacement::Left, left, rem * 16.),
-                (DockPlacement::Bottom, bottom, rem * 12.),
-            ] {
-                dock.set_dock(placement, layout, window, cx);
-                dock.set_dock_size(placement, size, window, cx);
-                dock.set_dock_collapsible(placement, true, window, cx);
-            }
-            if dock.is_dock_open(DockPlacement::Bottom) {
-                dock.toggle_dock(DockPlacement::Bottom, window, cx);
-            }
+            dock.set_dock(DockPlacement::Left, left, window, cx);
+            dock.set_dock_size(DockPlacement::Left, rem * 16., window, cx);
+            dock.set_dock_collapsible(DockPlacement::Left, true, window, cx);
         });
         self.rebuilding = false;
         self.sync_thread_panels(window, cx);
@@ -471,11 +678,11 @@ impl Workspace {
             .open_threads
             .iter()
             .copied()
-            .filter(|id| state.snapshot.threads.iter().any(|thread| thread.id == *id))
+            .filter(|id| state.thread_in_active_space(*id))
             .collect()
     }
     fn all_panels(&self) -> Vec<Entity<WorkspacePanel>> {
-        let mut panels = vec![self.projects.clone(), self.output.clone()];
+        let mut panels = vec![self.projects.clone()];
         panels.extend(self.welcome.borrow().iter().cloned());
         panels.extend(self.threads.borrow().values().cloned());
         panels
@@ -517,7 +724,13 @@ impl Workspace {
             if self.welcome.borrow().is_none() {
                 let welcome = welcome_panel(&self.welcome, &self.state, &owner, window, cx);
                 self.dock.update(cx, |dock, cx| {
-                    dock.add_panel(welcome, DockPlacement::Center, None, window, cx)
+                    dock.add_panel_view(
+                        panel_handle(welcome),
+                        DockPlacement::Center,
+                        None,
+                        window,
+                        cx,
+                    )
                 });
             }
         } else {
@@ -542,7 +755,8 @@ impl Workspace {
             let panel = thread_panel(&self.threads, id, &self.state, &owner, window, cx);
             let panel_id = PanelId::from(panel.entity_id());
             self.dock.update(cx, |dock, cx| {
-                dock.add_panel(panel, DockPlacement::Center, None, window, cx);
+                // Wrapped so the tab bar draws the panel's own title, not its layout name.
+                dock.add_panel_view(panel_handle(panel), DockPlacement::Center, None, window, cx);
                 if let Some(node) = anchor {
                     dock.move_panel(
                         panel_id,
@@ -593,8 +807,26 @@ impl Workspace {
     }
 
     /// A pane that gained focus (click, tab, Ctrl-W) is the selected thread.
-    fn thread_focused(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.rebuilding || self.state.read(cx).selected_thread == Some(id) {
+    fn thread_focused(
+        &mut self,
+        id: ThreadId,
+        panel: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.rebuilding
+            || self.preparing_space_change
+            || !self.state.read(cx).thread_in_active_space(id)
+            || self.state.read(cx).selected_thread == Some(id)
+        {
+            return;
+        }
+        if !self
+            .threads
+            .borrow()
+            .get(&id)
+            .is_some_and(|registered| registered.entity_id() == panel)
+        {
             return;
         }
         if !self
@@ -626,7 +858,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.rebuilding {
+        if self.rebuilding || !self.state.read(cx).thread_in_active_space(id) {
             return;
         }
         let registered = self.threads.borrow().get(&id).is_some_and(|p| p == panel);
@@ -648,6 +880,7 @@ impl Workspace {
 
     fn navigation_blocked(&self, window: &mut Window, cx: &mut App) -> bool {
         self.quit_requested
+            || self.preparing_space_change
             || self.state.read(cx).shutting_down
             || self.palette.is_some()
             || self.dialog.is_some()
@@ -743,12 +976,7 @@ impl Workspace {
                 }
             }
         }
-        let order = if priority == Some(Region::Output) {
-            [Region::Projects, Region::Output]
-        } else {
-            [Region::Output, Region::Projects]
-        };
-        for region in order {
+        for region in [Region::Projects] {
             if fits(&open, &sizes) {
                 break;
             }
@@ -796,20 +1024,33 @@ impl Workspace {
     }
 
     fn schedule_layout_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rebuilding || self.presented_space != self.state.read(cx).active_space {
+            return;
+        }
+        let space = self.presented_space;
         self.layout_save = Some(cx.spawn_in(window, async move |workspace, window| {
             smol::Timer::after(std::time::Duration::from_millis(250)).await;
-            let _ = workspace.update_in(window, |workspace, _, cx| workspace.flush_layout(cx));
+            let _ = workspace.update_in(window, |workspace, _, cx| {
+                if workspace.presented_space == space
+                    && workspace.state.read(cx).active_space == space
+                {
+                    workspace.flush_layout(cx);
+                }
+            });
         }));
     }
 
     pub(super) fn flush_layout(&mut self, cx: &mut Context<Self>) {
-        if self.state.read(cx).shutting_down {
+        if self.state.read(cx).shutting_down
+            || self.rebuilding
+            || self.presented_space != self.state.read(cx).active_space
+        {
             return;
         }
         let layout = json!(self.dock.read(cx).dump(cx));
-        if self.state.read(cx).snapshot.settings.get("layout") != Some(&layout) {
+        if self.state.read(cx).space_layout() != Some(&layout) {
             self.state.update(cx, |state, cx| {
-                state.set_setting("layout", layout);
+                state.set_space_layout(layout);
                 cx.notify();
             });
         }
@@ -873,6 +1114,52 @@ impl Workspace {
             _ => None,
         }
     }
+    /// Close a thread's tab. The thread stays in its project, and a running
+    /// turn keeps running.
+    pub(super) fn close_thread_tab(
+        &mut self,
+        id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preparing_space_change
+            || self.state.read(cx).shutting_down
+            || !self.state.read(cx).thread_in_active_space(id)
+        {
+            return;
+        }
+        self.state.update(cx, |state, cx| {
+            state.close_thread(id);
+            cx.notify();
+        });
+        self.sync_thread_panels(window, cx);
+    }
+    /// Show `tab` in a thread's sidebar (tab click, Focus output).
+    pub(super) fn show_sidebar_tab(
+        &mut self,
+        id: ThreadId,
+        tab: SidebarTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, cx| {
+            state.show_thread_sidebar(id, tab);
+            cx.emit(PresentationChange::Thread(id));
+        });
+        self.sync_diff_interest(cx);
+        let panel = self.threads.borrow().get(&id).cloned();
+        if let Some(panel) = panel {
+            self.focus_panel(panel, window, cx);
+        }
+    }
+    /// Show `tab` in a thread's sidebar, or hide the sidebar when `tab` is on screen.
+    fn toggle_sidebar_tab(&mut self, id: ThreadId, tab: SidebarTab, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.toggle_thread_sidebar(id, tab);
+            cx.emit(PresentationChange::Thread(id));
+        });
+        self.sync_diff_interest(cx);
+    }
     /// Fold or unfold one of the conversation's sticky docks (task list, background jobs).
     fn toggle_dock(&mut self, dock: &str, cx: &mut Context<Self>) {
         let Some(id) = self
@@ -896,7 +1183,6 @@ impl Workspace {
         }
         let target = match region {
             Region::Projects => Some(self.projects.clone()),
-            Region::Output => Some(self.output.clone()),
             Region::Thread => self.thread_target(cx),
         };
         if let Some(panel) = target {
@@ -1017,6 +1303,18 @@ impl Workspace {
         if self.state.read(cx).shutting_down {
             return;
         }
+        if self.preparing_space_change
+            && !matches!(
+                command,
+                Command::CancelEditorCommand | Command::CopyDraftRecovery
+            )
+        {
+            self.space_error(
+                anyhow::anyhow!("Wait for the editor draft to finish saving before navigating"),
+                cx,
+            );
+            return;
+        }
         if matches!(
             command,
             Command::NextThread
@@ -1024,6 +1322,7 @@ impl Workspace {
                 | Command::CloseThread
                 | Command::NewConversation
                 | Command::NewOmpConversation
+                | Command::NewPiConversation
                 | Command::NewClaudeCodeConversation
                 | Command::NewFactoryThread
         ) && self
@@ -1041,6 +1340,39 @@ impl Workspace {
             return;
         }
         let kind = match command {
+            Command::NewSpace => Some(DialogKind::NewSpace),
+            Command::RenameSpace => Some(DialogKind::RenameSpace(self.state.read(cx).active_space)),
+            Command::DeleteSpace => Some(DialogKind::DeleteSpace(self.state.read(cx).active_space)),
+            Command::SwitchSpace | Command::MoveProjectToSpace => {
+                self.open_space_picker(command == Command::MoveProjectToSpace, window, cx);
+                None
+            }
+            Command::NextSpace | Command::PreviousSpace => {
+                let state = self.state.read(cx);
+                let count = state.spaces.len();
+                let current = state
+                    .spaces
+                    .iter()
+                    .position(|space| space.id == state.active_space)
+                    .unwrap_or(0);
+                let index = if command == Command::NextSpace {
+                    (current + 1) % count
+                } else {
+                    (current + count - 1) % count
+                };
+                let target = state.spaces[index].id;
+                if let Err(error) = self.switch_space(target, window, cx) {
+                    self.space_error(error, cx);
+                }
+                None
+            }
+            Command::InstallPi => {
+                self.state.update(cx, |state, cx| {
+                    state.install_pi();
+                    cx.notify();
+                });
+                None
+            }
             Command::RestartEditor => {
                 self.restart_editor(window, cx);
                 None
@@ -1057,15 +1389,36 @@ impl Workspace {
                 self.paste_image(window, cx);
                 None
             }
+            Command::ClearQueuedMessages => {
+                self.clear_queued_messages(window, cx);
+                None
+            }
+            Command::SendQueuedNow => {
+                if let Some((id, message)) = self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .and_then(|thread| thread.queued.first().map(|message| (thread.id, message.id)))
+                {
+                    self.send_queued_now(id, message, cx);
+                }
+                None
+            }
+            Command::EditQueuedMessage => {
+                if let Some((id, message)) = self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .and_then(|thread| thread.queued.last().map(|message| (thread.id, message.id)))
+                {
+                    self.edit_queued(id, message, window, cx);
+                }
+                None
+            }
             Command::ToggleConversationDiffs => {
-                self.state.update(cx, |state, cx| {
-                    if let Some(id) = state.conversation_thread().map(|thread| thread.id) {
-                        let open = !state.conversation_diff_open(id);
-                        state.set_conversation_diff_open(id, open);
-                        cx.emit(PresentationChange::Thread(id));
-                    }
-                });
-                self.sync_diff_interest(cx);
+                if let Some(id) = self.state.read(cx).conversation_thread().map(|t| t.id) {
+                    self.toggle_sidebar_tab(id, SidebarTab::Changes, cx);
+                }
                 None
             }
             Command::ToggleTaskList => {
@@ -1113,6 +1466,7 @@ impl Workspace {
             Command::Settings => Some(DialogKind::Settings(self.state.read(cx).selected_project)),
             Command::NewConversation
             | Command::NewOmpConversation
+            | Command::NewPiConversation
             | Command::NewClaudeCodeConversation
             | Command::NewFactoryThread => {
                 self.state.update(cx, |state, cx| {
@@ -1120,6 +1474,8 @@ impl Workspace {
                         state.new_thread(ThreadKind::Conversation)
                     } else if command == Command::NewOmpConversation {
                         state.new_conversation("omp")
+                    } else if command == Command::NewPiConversation {
+                        state.new_conversation("pi")
                     } else if command == Command::NewClaudeCodeConversation {
                         state.new_conversation("claude-code")
                     } else {
@@ -1135,8 +1491,7 @@ impl Workspace {
             }
             Command::ShowArchived => {
                 self.state.update(cx, |state, cx| {
-                    state.show_archived = !state.show_archived;
-                    state.set_setting("show_archived", json!(state.show_archived));
+                    state.set_show_archived(!state.show_archived);
                     cx.notify();
                 });
                 None
@@ -1161,23 +1516,19 @@ impl Workspace {
                 None
             }
             Command::CloseThread => {
-                self.state.update(cx, |state, cx| {
-                    if let Some(id) = state.selected_thread {
-                        state.close_thread(id);
-                    }
-                    cx.notify();
-                });
+                if let Some(id) = self.state.read(cx).selected_thread {
+                    self.close_thread_tab(id, window, cx);
+                }
                 None
             }
             Command::NextThread | Command::PreviousThread => {
                 self.cycle_thread(command == Command::NextThread, window, cx);
                 None
             }
-            Command::FocusProjects | Command::FocusThread | Command::FocusOutput => {
+            Command::FocusProjects | Command::FocusThread => {
                 self.focus_region(
                     match command {
                         Command::FocusProjects => Region::Projects,
-                        Command::FocusOutput => Region::Output,
                         _ => Region::Thread,
                     },
                     window,
@@ -1185,12 +1536,20 @@ impl Workspace {
                 );
                 None
             }
+            Command::FocusOutput => {
+                if let Some(id) = self.state.read(cx).thread().map(|thread| thread.id) {
+                    self.show_sidebar_tab(id, SidebarTab::Output, window, cx);
+                }
+                None
+            }
             Command::ToggleProjects => {
                 self.toggle_region(Region::Projects, window, cx);
                 None
             }
             Command::ToggleOutput => {
-                self.toggle_region(Region::Output, window, cx);
+                if let Some(id) = self.state.read(cx).thread().map(|thread| thread.id) {
+                    self.toggle_sidebar_tab(id, SidebarTab::Output, cx);
+                }
                 None
             }
         };
@@ -1255,6 +1614,17 @@ impl Workspace {
         let Some(dialog) = self.dialog.take() else {
             return;
         };
+        if matches!(
+            dialog.read(cx).kind,
+            DialogKind::NewSpace | DialogKind::DeleteSpace(_)
+        ) && let Some(reason) = self.space_transition_reason(cx)
+        {
+            dialog.update(cx, |dialog, cx| {
+                dialog.set_error(&anyhow::anyhow!(reason), cx)
+            });
+            self.dialog = Some(dialog);
+            return;
+        }
         let result = self.state.update(cx, |state, cx| {
             let result = dialog.read(cx).apply(state, cx);
             if result.is_ok() {
@@ -1262,13 +1632,22 @@ impl Workspace {
             }
             result
         });
+        let result = result.and_then(|outcome| {
+            match outcome {
+                SurfaceOutcome::Applied => {}
+                SurfaceOutcome::SpaceCreated(id) => self.switch_space(id, window, cx)?,
+                SurfaceOutcome::DeleteSpace(id) => {
+                    self.change_space(SpaceChange::Delete(id), window, cx)?
+                }
+            }
+            Ok(())
+        });
         match result {
-            Ok(true) => {
+            Ok(()) => {
                 let kind = dialog.read(cx).kind.clone();
                 super::settings::close_surface(&kind, window, cx);
                 cx.notify();
             }
-            Ok(false) => self.dialog = Some(dialog),
             Err(error) => {
                 dialog.update(cx, |dialog, cx| dialog.set_error(&error, cx));
                 self.dialog = Some(dialog);
@@ -1282,6 +1661,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let member = match row {
+            Row::Project(id) => self.state.read(cx).project_in_active_space(id),
+            Row::Thread(id) => self.state.read(cx).thread_in_active_space(id),
+        };
+        if !member || self.preparing_space_change {
+            return;
+        }
         self.cursor = Some(row);
         self.state.update(cx, |state, cx| {
             match row {
@@ -1392,11 +1778,7 @@ impl Workspace {
         };
         if let Some(id) = id {
             self.state.update(cx, |state, cx| {
-                if collapsed {
-                    state.collapsed.insert(id);
-                } else {
-                    state.collapsed.remove(&id);
-                }
+                state.set_project_collapsed(id, collapsed);
                 cx.emit(PresentationChange::Projects);
             });
             self.cursor = Some(Row::Project(id));
@@ -1495,6 +1877,29 @@ impl Render for Workspace {
                 .relative()
                 .bg(cx.theme().background)
                 .text_color(cx.theme().foreground)
+                .on_action(
+                    cx.listener(|this, _: &NewSpace, w, cx| this.execute(Command::NewSpace, w, cx)),
+                )
+                .on_action(cx.listener(|this, _: &RenameSpace, w, cx| {
+                    this.execute(Command::RenameSpace, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &DeleteSpace, w, cx| {
+                    this.execute(Command::DeleteSpace, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SwitchSpace, w, cx| {
+                    this.execute(Command::SwitchSpace, w, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &NextSpace, w, cx| {
+                        this.execute(Command::NextSpace, w, cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &PreviousSpace, w, cx| {
+                    this.execute(Command::PreviousSpace, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &MoveProjectToSpace, w, cx| {
+                    this.execute(Command::MoveProjectToSpace, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &AddProject, w, cx| {
                     this.execute(Command::AddProject, w, cx)
                 }))
@@ -1504,9 +1909,17 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &NewOmpConversation, w, cx| {
                     this.execute(Command::NewOmpConversation, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &NewPiConversation, w, cx| {
+                    this.execute(Command::NewPiConversation, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &NewClaudeCodeConversation, w, cx| {
                     this.execute(Command::NewClaudeCodeConversation, w, cx)
                 }))
+                .on_action(
+                    cx.listener(|this, _: &InstallPi, w, cx| {
+                        this.execute(Command::InstallPi, w, cx)
+                    }),
+                )
                 .on_action(cx.listener(|this, _: &RenameProject, w, cx| {
                     this.execute(Command::RenameProject, w, cx)
                 }))
@@ -1558,6 +1971,15 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &PasteImage, w, cx| {
                     this.execute(Command::PasteImage, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &ClearQueuedMessages, w, cx| {
+                    this.execute(Command::ClearQueuedMessages, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SendQueuedNow, w, cx| {
+                    this.execute(Command::SendQueuedNow, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &EditQueuedMessage, w, cx| {
+                    this.execute(Command::EditQueuedMessage, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &ToggleConversationDiffs, w, cx| {
                     this.execute(Command::ToggleConversationDiffs, w, cx)
                 }))
@@ -1581,7 +2003,7 @@ impl Render for Workspace {
                     this.focus_region(Region::Thread, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &FocusOutput, w, cx| {
-                    this.focus_region(Region::Output, w, cx)
+                    this.execute(Command::FocusOutput, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &FocusLeft, w, cx| {
                     this.spatial_focus(PaneDirection::Left, w, cx)
@@ -1739,6 +2161,8 @@ pub struct WorkspacePanel {
     workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
     scroll: ScrollHandle,
+    /// The sidebar Output tab scrolls on its own, beside the thread's main scroll.
+    output_scroll: ScrollHandle,
     group: Option<WeakEntity<TabGroup>>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     transcript: Option<Entity<conversation::TranscriptView>>,
@@ -1796,8 +2220,11 @@ impl WorkspacePanel {
         if let PanelKind::Thread(id) = kind {
             // Focus, however it arrived (click, tab, Ctrl-W), is what selects a thread.
             let owner = workspace.clone();
+            let entity_id = cx.entity().entity_id();
             subscriptions.push(cx.on_focus_in(&focus, window, move |_, window, cx| {
-                let _ = owner.update(cx, |workspace, cx| workspace.thread_focused(id, window, cx));
+                let _ = owner.update(cx, |workspace, cx| {
+                    workspace.thread_focused(id, entity_id, window, cx)
+                });
             }));
         }
         Self {
@@ -1806,6 +2233,7 @@ impl WorkspacePanel {
             workspace,
             focus,
             scroll: ScrollHandle::new(),
+            output_scroll: ScrollHandle::new(),
             group: None,
             bounds: Rc::new(Cell::new(None)),
             transcript,
@@ -1815,7 +2243,6 @@ impl WorkspacePanel {
     fn panel_title(&self, cx: &App) -> String {
         match self.kind {
             PanelKind::Projects => "Projects".into(),
-            PanelKind::Output => "Output".into(),
             PanelKind::Welcome => "Threads".into(),
             PanelKind::Thread(id) => self
                 .state
@@ -1868,11 +2295,65 @@ impl BasePanel for WorkspacePanel {
     }
 }
 impl Panel for WorkspacePanel {
+    /// A thread tab shows a spinner while its agent works and a close control on
+    /// hover; a middle click closes it too. Closing only closes the tab.
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.panel_title(cx)
+        let title = self.panel_title(cx);
+        let PanelKind::Thread(id) = self.kind else {
+            return title.into_any_element();
+        };
+        let state = self.state.read(cx);
+        let working = state.active_threads.contains(&id);
+        let titling = state.is_titling(id);
+        let group = SharedString::from(format!("thread-tab-{id}"));
+        let (middle, close) = (self.workspace.clone(), self.workspace.clone());
+        let selector = group.clone();
+        h_flex()
+            .id(group.clone())
+            .debug_selector(move || selector.to_string())
+            .group(group.clone())
+            .items_center()
+            .gap_1()
+            .min_w_0()
+            .on_aux_click(move |event, window, cx| {
+                if event.is_middle_click() {
+                    cx.stop_propagation();
+                    let _ = middle.update(cx, |workspace, cx| {
+                        workspace.close_thread_tab(id, window, cx)
+                    });
+                }
+            })
+            .when(working, |tab| tab.child(Spinner::new().xsmall()))
+            .map(|tab| match titling {
+                true => tab.child(ShimmerText::new(title)),
+                false => tab.child(title),
+            })
+            .child(
+                div()
+                    .invisible()
+                    .group_hover(group, |style| style.visible())
+                    .child(
+                        Button::new(SharedString::from(format!("close-thread-tab-{id}")))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Close tab")
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                let _ = close.update(cx, |workspace, cx| {
+                                    workspace.close_thread_tab(id, window, cx)
+                                });
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
     fn tab_name(&self, cx: &App) -> Option<SharedString> {
-        Some(self.panel_title(cx).into())
+        // Threads draw their own tab (spinner, close control); the rest use the name.
+        match self.kind {
+            PanelKind::Thread(_) => None,
+            _ => Some(self.panel_title(cx).into()),
+        }
     }
     fn inner_padding(&self, _: &App) -> bool {
         false
@@ -1891,6 +2372,9 @@ impl Panel for WorkspacePanel {
                     let owner = self.workspace.clone();
                     move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                         let _ = owner.update(cx, |workspace, cx| {
+                            if !workspace.state.read(cx).thread_in_active_space(id) {
+                                return;
+                            }
                             workspace.state.update(cx, |state, cx| {
                                 state.select_thread(id);
                                 cx.notify();
@@ -1921,6 +2405,9 @@ impl Panel for WorkspacePanel {
                 .item(
                     PopupMenuItem::new("Thread details").on_click(move |_, window, cx| {
                         let _ = details.update(cx, |workspace, cx| {
+                            if !workspace.state.read(cx).thread_in_active_space(id) {
+                                return;
+                            }
                             workspace.toggle_thread_details(id, window, cx)
                         });
                     }),
@@ -1935,7 +2422,6 @@ impl Panel for WorkspacePanel {
             PanelKind::Projects => menu
                 .menu("Add project…", Box::new(AddProject))
                 .menu("Show archived", Box::new(ShowArchived)),
-            PanelKind::Output => menu.menu("Refresh Factory runs", Box::new(RefreshFactoryRuns)),
         }
     }
 }
@@ -1961,7 +2447,6 @@ impl Render for WorkspacePanel {
                     cx,
                 ),
                 PanelKind::Welcome => conversation::welcome(state, &self.workspace, cx),
-                PanelKind::Output => factory::output(state, &self.workspace, scroll, cx),
                 PanelKind::Thread(id) => {
                     let Some(thread) = state.snapshot.threads.iter().find(|t| t.id == id) else {
                         return div()
@@ -1977,7 +2462,7 @@ impl Render for WorkspacePanel {
                                     state,
                                     id,
                                     &self.workspace,
-                                    scroll,
+                                    &self.output_scroll,
                                     transcript,
                                     cx,
                                 )
@@ -1985,29 +2470,44 @@ impl Render for WorkspacePanel {
                                 div().into_any_element()
                             }
                         }
-                        ThreadKind::Factory => {
-                            if factory::launch_for(state, id).is_some() {
-                                factory::render(state, id, &self.workspace, scroll, cx)
-                            } else if let Some(form) = workspace
-                                .factory_form
-                                .as_ref()
-                                .filter(|form| form.read(cx).thread_id == id)
-                            {
-                                form.clone()
-                                    .cached(StyleRefinement::default().size_full())
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .p_3()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if state.selected_thread == Some(id) {
-                                        "Loading Factory configuration…"
+                        ThreadKind::Factory => h_flex()
+                            .size_full()
+                            .min_h_0()
+                            .items_stretch()
+                            .child(
+                                div().flex_1().min_w_0().h_full().child(
+                                    if factory::launch_for(state, id).is_some() {
+                                        factory::render(state, id, &self.workspace, scroll, cx)
+                                    } else if let Some(form) = workspace
+                                        .factory_form
+                                        .as_ref()
+                                        .filter(|form| form.read(cx).thread_id == id)
+                                    {
+                                        form.clone()
+                                            .cached(StyleRefinement::default().size_full())
+                                            .into_any_element()
                                     } else {
-                                        "Focus this pane to configure the Factory thread."
-                                    })
-                                    .into_any_element()
-                            }
-                        }
+                                        div()
+                                            .p_3()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(if state.selected_thread == Some(id) {
+                                                "Loading Factory configuration…"
+                                            } else {
+                                                "Focus this pane to configure the Factory thread."
+                                            })
+                                            .into_any_element()
+                                    },
+                                ),
+                            )
+                            .child(thread_sidebar::render(
+                                state,
+                                id,
+                                false,
+                                &self.workspace,
+                                &self.output_scroll,
+                                cx,
+                            ))
+                            .into_any_element(),
                     }
                 }
             }
@@ -2157,13 +2657,13 @@ fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
     }
     let count = |name: &str| names.iter().filter(|candidate| **candidate == name).count();
     anyhow::ensure!(
-        count("Projects") == 1 && count("Output") == 1 && count("Welcome") <= 1,
-        "Layout must contain exactly one Projects and one Output panel"
+        count("Projects") == 1 && count("Welcome") <= 1,
+        "Layout must contain exactly one Projects panel"
     );
     anyhow::ensure!(
         names
             .iter()
-            .all(|name| matches!(*name, "Projects" | "Output" | "Welcome" | "Thread")),
+            .all(|name| matches!(*name, "Projects" | "Welcome" | "Thread")),
         "Layout contains an unknown panel"
     );
     Ok(())

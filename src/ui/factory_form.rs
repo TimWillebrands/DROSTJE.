@@ -132,7 +132,12 @@ impl FactoryThreadForm {
                 input.set_value(value.clone(), window, cx);
                 input
             });
-            fields.push(Field { key, label, input });
+            fields.push(Field {
+                key,
+                label,
+                input,
+                initial: value.clone(),
+            });
         }
         let source = cx.new(|cx| {
             let mut select =

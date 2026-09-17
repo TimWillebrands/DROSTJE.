@@ -142,6 +142,7 @@ esac
                 draft: String::new(),
                 attachments: Vec::new(),
                 submission: None,
+                queued: Vec::new(),
                 archived: false,
                 created_at: "2026-09-15T12:00:00Z".into(),
                 updated_at: "2026-09-15T12:00:00Z".into(),

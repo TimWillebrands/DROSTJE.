@@ -127,6 +127,34 @@ impl AppState {
     }
 
     pub fn submit_reason(&self, id: ThreadId) -> Option<String> {
+        if self.editor.is_none() || self.editor_error.is_some() {
+            return Some("Connect or restart Neovim before sending".into());
+        }
+        self.turn_start_reason(id, false)
+    }
+
+    /// Why a draft cannot join the thread's queue. Queueing needs a turn in flight and a
+    /// conversation that could otherwise send; the queue never covers for a broken setup.
+    pub fn queue_reason(&self, id: ThreadId) -> Option<String> {
+        if self.editor.is_none() || self.editor_error.is_some() {
+            return Some("Connect or restart Neovim before queueing".into());
+        }
+        let reason = self.turn_start_reason(id, true);
+        if reason.is_some() {
+            return reason;
+        }
+        let Some(session) = self.conversations.get(&id) else {
+            return Some("Open the conversation harness first".into());
+        };
+        if !(session.preparing || self.active_threads.contains(&id)) {
+            return Some("No turn is running; the draft can be sent directly".into());
+        }
+        None
+    }
+
+    /// Why a new turn cannot start, wherever its text comes from. With `ignore_active` a
+    /// running turn is not a reason, which is the check a queued message needs.
+    fn turn_start_reason(&self, id: ThreadId, ignore_active: bool) -> Option<String> {
         if self.shutting_down {
             return Some("Application is shutting down".into());
         }
@@ -151,25 +179,30 @@ impl AppState {
         if !matches!(self.repositories.get(&thread.project_id), Some(Ok(_))) {
             return Some("Project root is unavailable".into());
         }
-        if self.editor.is_none() || self.editor_error.is_some() {
-            return Some("Connect or restart Neovim before sending".into());
-        }
         let Some(session) = self.conversations.get(&id) else {
             return Some("Open the conversation harness first".into());
         };
-        if session.preparing
+        let busy = session.preparing
             || self.active_threads.contains(&id)
-            || session.state != ConversationState::Ready
-        {
+            || session.state != ConversationState::Ready;
+        if busy && !ignore_active {
             return Some(format!(
                 "Conversation is {:?}; only one foreground turn is allowed",
                 session.state
             ));
         }
+        if ignore_active
+            && matches!(
+                session.state,
+                ConversationState::Disconnected | ConversationState::Failed
+            )
+        {
+            return Some(format!("Conversation is {:?}", session.state));
+        }
         if !session.persisted {
             return Some("Saving the provider session reference".into());
         }
-        if thread.submission.is_some() {
+        if thread.submission.is_some() && !(ignore_active && busy) {
             return Some("Review the previous submitted draft before starting another turn".into());
         }
         // An empty model list means the harness has not reported models yet; its Submit then
@@ -306,7 +339,7 @@ impl AppState {
     }
 
     pub fn submit_snapshot(&mut self, id: ThreadId, draft: DraftSnapshot, cx: &mut Context<Self>) {
-        let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+        let Some(thread) = self.snapshot.threads.iter().find(|t| t.id == id) else {
             return;
         };
         if thread.kind != ThreadKind::Conversation {
@@ -324,6 +357,26 @@ impl AppState {
             self.submission_failed(id, "Enter a prompt or attach an image".into());
             return;
         }
+        let images = thread.attachments.clone();
+        self.submit_message(id, draft.text.clone(), images, Some(draft), cx);
+    }
+
+    /// Starts a turn with `text` and `images`. `draft` is the editor snapshot the text came
+    /// from, cleared once the harness accepts the prompt; queued messages have none.
+    fn submit_message(
+        &mut self,
+        id: ThreadId,
+        text: String,
+        images: Vec<ImageAttachment>,
+        draft: Option<DraftSnapshot>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        if thread.kind != ThreadKind::Conversation || self.storage_error.is_some() {
+            return;
+        }
         let Some(session) = self.conversations.get_mut(&id) else {
             return;
         };
@@ -333,27 +386,30 @@ impl AppState {
         };
         let request_id = Uuid::new_v4();
         let generation = session.generation;
-        session.submitted.insert(request_id, draft.clone());
+        session.preparing = true;
+        session.error = None;
+        if let Some(draft) = draft {
+            session.submitted.insert(request_id, draft);
+        }
+        self.active_threads.insert(id);
         thread.submission = Some(
-            json!({"request_id":request_id,"text":draft.text,"attachments":thread.attachments,"state":"pending"}),
+            json!({"request_id":request_id,"text":text,"attachments":images,"state":"pending"}),
         );
         thread.updated_at = platform::now();
-        let images = thread.attachments.clone();
-        let wants_title = titles::accepts_generated_title(&thread) && !draft.text.trim().is_empty();
+        let wants_title = titles::accepts_generated_title(&thread) && !text.trim().is_empty();
         let saved = self.persist_thread(thread);
         let sender = self.events.clone();
         cx.spawn(async move |this, cx| {
-            let text = draft.text.clone();
             let result = async {
                 let checked = images.clone(); let prompt = text.clone();
                 let size = smol::unblock(move || harness::submission_size(request_id, &prompt, &checked)).await?;
                 anyhow::ensure!(size <= crate::attachments::FRAME_LIMIT, "Prompt exceeds 1 MiB. Use Optimize images for sending, remove images, or reduce text.");
                 saved.recv().await.context("Persistence owner closed")?.map_err(anyhow::Error::msg)?;
-                commands.send(ConversationCommand::Submit { request_id, text, images }).await.context("Harness disconnected before submission")?;
+                commands.send(ConversationCommand::Submit { request_id, text: text.clone(), images }).await.context("Harness disconnected before submission")?;
                 Ok::<_, anyhow::Error>(())
             }.await;
             if result.is_ok() && wants_title {
-                let _ = this.update(cx, |this, cx| this.generate_title(id, draft.text.clone(), false, cx));
+                let _ = this.update(cx, |this, cx| this.generate_title(id, text.clone(), false, cx));
             }
             if let Err(error) = result {
                 let _ = sender.send(AppEvent::Harness(id, generation, ConversationEvent::Failed { request_id: Some(request_id), message: format!("{error:#}") })).await;
@@ -369,6 +425,175 @@ impl AppState {
             });
         }).detach();
     }
+
+    /// Moves the composer draft and its attachments to the back of the thread's queue and
+    /// empties the editor, so the next prompt can be written while the turn runs.
+    pub fn enqueue_snapshot(&mut self, id: ThreadId, draft: DraftSnapshot, cx: &mut Context<Self>) {
+        let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        if let Some(reason) = self.queue_reason(id) {
+            self.notice(NoticeLevel::Warning, reason);
+            return;
+        }
+        if draft.key != DraftKey::Thread(id) {
+            self.notice(
+                NoticeLevel::Warning,
+                "Editor snapshot belongs to another draft",
+            );
+            return;
+        }
+        if draft.text.trim().is_empty() && thread.attachments.is_empty() {
+            self.notice(NoticeLevel::Warning, "Enter a prompt or attach an image");
+            return;
+        }
+        let Some(editor) = self.editor.clone() else {
+            return;
+        };
+        let message = QueuedMessage {
+            id: Uuid::new_v4(),
+            text: draft.text.clone(),
+            attachments: std::mem::take(&mut thread.attachments),
+        };
+        thread.queued.push(message);
+        thread.updated_at = platform::now();
+        if let Some(session) = self.conversations.get_mut(&id) {
+            session.auto_dispatch = true;
+        }
+        let saved = self.persist_thread(thread);
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                saved
+                    .recv()
+                    .await
+                    .context("Persistence owner closed")?
+                    .map_err(anyhow::Error::msg)?;
+                editor
+                    .replace_if_revision(draft.key.clone(), draft.revision(), String::new())
+                    .await
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => this.notice(
+                        NoticeLevel::Warning,
+                        "Queued; the draft changed meanwhile and was kept in the editor",
+                    ),
+                    Err(error) => this.notice(
+                        NoticeLevel::Warning,
+                        format!("Queued; the editor text was kept: {error:#}"),
+                    ),
+                }
+                cx.emit(PresentationChange::Thread(id));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Why the front of the queue cannot start a turn right now, or `None` when a
+    /// dispatch is possible.
+    pub fn queued_dispatch_reason(&self, id: ThreadId) -> Option<String> {
+        let queued = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .map(|thread| thread.queued.len())
+            .unwrap_or(0);
+        if queued == 0 {
+            return Some("No queued messages".into());
+        }
+        self.turn_start_reason(id, false)
+    }
+
+    /// Starts the next queued turn when the queue is allowed to continue on its own.
+    fn dispatch_queued(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        let allowed = self
+            .conversations
+            .get(&id)
+            .is_some_and(|session| session.auto_dispatch);
+        if !allowed || self.queued_dispatch_reason(id).is_some() {
+            return;
+        }
+        let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let message = thread.queued.remove(0);
+        self.edit_thread(thread);
+        self.submit_message(id, message.text, message.attachments, None, cx);
+    }
+
+    /// Sends one queued message ahead of the rest: immediately while idle, otherwise after
+    /// interrupting the running turn at the user's request.
+    pub fn send_queued_now(&mut self, id: ThreadId, message_id: Uuid, cx: &mut Context<Self>) {
+        let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
+            return;
+        };
+        let Some(position) = thread.queued.iter().position(|m| m.id == message_id) else {
+            return;
+        };
+        if let Some(reason) = self.turn_start_reason(id, true) {
+            self.notice(NoticeLevel::Warning, reason);
+            return;
+        }
+        if position != 0 {
+            let message = thread.queued.remove(position);
+            thread.queued.insert(0, message);
+            self.save_thread(thread);
+        }
+        let Some(session) = self.conversations.get_mut(&id) else {
+            return;
+        };
+        session.auto_dispatch = true;
+        if self.active_threads.contains(&id) {
+            session.interrupt_for_queue = true;
+            self.send_command(id, ConversationCommand::Interrupt);
+        } else {
+            self.dispatch_queued(id, cx);
+        }
+    }
+
+    pub fn remove_queued(&mut self, id: ThreadId, message_id: Uuid) {
+        if let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned()
+            && thread.queued.iter().any(|m| m.id == message_id)
+        {
+            thread.queued.retain(|m| m.id != message_id);
+            self.save_thread(thread);
+        }
+    }
+
+    /// Removes a queued message so its text can go back into the composer.
+    pub fn take_queued(&mut self, id: ThreadId, message_id: Uuid) -> Option<QueuedMessage> {
+        let mut thread = self.snapshot.threads.iter().find(|t| t.id == id).cloned()?;
+        let position = thread.queued.iter().position(|m| m.id == message_id)?;
+        let message = thread.queued.remove(position);
+        self.save_thread(thread);
+        Some(message)
+    }
+
+    pub fn clear_queued(&mut self, id: ThreadId) {
+        if let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned()
+            && !thread.queued.is_empty()
+        {
+            let count = thread.queued.len();
+            thread.queued.clear();
+            self.save_thread(thread);
+            self.notice(
+                NoticeLevel::Info,
+                match count {
+                    1 => "Removed 1 queued message".to_owned(),
+                    count => format!("Removed {count} queued messages"),
+                },
+            );
+        }
+    }
+    /// Whether a title is being generated for this thread.
+    pub fn is_titling(&self, id: ThreadId) -> bool {
+        self.titling.contains(&id)
+    }
+
     pub fn regenerate_title_reason(&self) -> Option<String> {
         let Some(thread) = self.conversation_thread() else {
             return Some("Select a conversation first.".into());
@@ -431,8 +656,8 @@ impl AppState {
         self.generate_title(id, prompt, true, cx);
     }
 
-    /// Names a Conversation with the configured local title provider. Automatic mode tries
-    /// llama.cpp before falling back to Ollama.
+    /// Names a Conversation with the configured local title provider. Automatic mode tries the
+    /// llama.cpp CLI before falling back to Ollama.
     fn generate_title(
         &mut self,
         id: ThreadId,
@@ -453,16 +678,38 @@ impl AppState {
             Some("ollama") => titles::TitleProvider::Ollama,
             _ => titles::DEFAULT_PROVIDER,
         };
-        let model = self
+        let llama_executable = self
+            .snapshot
+            .settings
+            .get("executables")
+            .and_then(|value| value.get("llama"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .map(str::to_owned);
+        let llama_model = self
+            .snapshot
+            .settings
+            .get(titles::LLAMA_MODEL_SETTING)
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let ollama_model = self
             .snapshot
             .settings
             .get(titles::MODEL_SETTING)
             .and_then(Value::as_str)
             .map(str::to_owned);
         cx.emit(PresentationChange::Thread(id));
+        // The Projects list shimmers the row too, and only observes notifications.
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = smol::unblock(move || {
-                titles::generate_title(provider, model.as_deref(), &prompt)
+                titles::generate_title(
+                    provider,
+                    llama_executable.as_deref(),
+                    llama_model.as_deref(),
+                    ollama_model.as_deref(),
+                    &prompt,
+                )
             })
             .await;
             let _ = this.update(cx, |this, cx| {
@@ -471,7 +718,7 @@ impl AppState {
                     Ok(Some(title)) => this.apply_generated_title(id, title, replace, cx),
                     Ok(None) if replace => this.notice(
                         NoticeLevel::Warning,
-                        "No title generated: start llama.cpp or Ollama, then try again.",
+                        "No title generated: configure the llama.cpp executable or start Ollama, then try again.",
                     ),
                     Ok(None) => {}
                     Err(error) => this.notice(
@@ -750,6 +997,10 @@ impl AppState {
                 session.outcome = Some(outcome.clone());
                 session.requests.clear();
                 session.submitted.remove(&request_id);
+                if !queue_continues(&outcome, session.interrupt_for_queue) {
+                    session.auto_dispatch = false;
+                }
+                session.interrupt_for_queue = false;
                 if let Some(mut thread) = thread.take() {
                     if thread
                         .submission
@@ -871,6 +1122,7 @@ impl AppState {
             } => {
                 session.error = Some(message.clone());
                 session.preparing = false;
+                session.auto_dispatch = false;
                 if request_id.is_some() {
                     self.active_threads.remove(&id);
                     session.outcome = Some(TurnOutcome::Failed);
@@ -896,5 +1148,33 @@ impl AppState {
             self.queue_conversation_diff(id, cx);
         }
         cx.emit(presentation);
+        // The harness reports the settled turn before it reports Ready, so the queue is
+        // checked after every event rather than on one of them.
+        self.dispatch_queued(id, cx);
+    }
+}
+
+/// Whether the queue may start its next turn after a turn settled this way. Only a completed
+/// turn, or an interrupt the user requested through Send now, continues; a failure or an
+/// unexplained end leaves the queue for the user to resume.
+fn queue_continues(outcome: &TurnOutcome, interrupt_for_queue: bool) -> bool {
+    match outcome {
+        TurnOutcome::Completed => true,
+        TurnOutcome::Interrupted => interrupt_for_queue,
+        TurnOutcome::Failed | TurnOutcome::Unknown => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TurnOutcome, queue_continues};
+
+    #[test]
+    fn queue_continues_only_after_completion_or_a_requested_interrupt() {
+        assert!(queue_continues(&TurnOutcome::Completed, false));
+        assert!(queue_continues(&TurnOutcome::Interrupted, true));
+        assert!(!queue_continues(&TurnOutcome::Interrupted, false));
+        assert!(!queue_continues(&TurnOutcome::Failed, true));
+        assert!(!queue_continues(&TurnOutcome::Unknown, true));
     }
 }

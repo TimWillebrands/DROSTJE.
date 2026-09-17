@@ -71,7 +71,6 @@ impl AppState {
 
     pub(super) fn select_launch_output(&mut self, id: Option<LaunchId>) {
         self.selected_launch = id;
-        self.set_setting("selected_launch", json!(id));
         self.factory_text = None;
         self.factory_text_path = None;
         self.factory_text_generation = Uuid::new_v4();
