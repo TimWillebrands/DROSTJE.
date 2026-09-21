@@ -1,17 +1,16 @@
 #!/bin/bash
 
 # DROSTJE. Installer
-# This script builds a macOS .app bundle and installs it to /Applications or a custom directory.
+# Builds a release binary and installs it for the current desktop:
+#   macOS  → an unsigned "DROSTJE.app" bundle in /Applications (or INSTALL_DIR)
+#   Linux  → binary, desktop entry and icons under the ~/.local prefix (or INSTALL_DIR)
 
 set -e
 
 APP_NAME="DROSTJE."
 BINARY_NAME="drostje"
-INSTALL_DIR="${INSTALL_DIR:-/Applications}"
-# The bundle folder is "DROSTJE.app": brand plus extension, so Finder never shows "DROSTJE..app".
-BUNDLE_NAME="DROSTJE.app"
-LEGACY_BUNDLE_NAME="Drostje.app"
 BUILD_DIR="target/release"
+ICON_SRC="assets/drostje-app-icon.png"
 
 echo "--- Installing $APP_NAME ---"
 
@@ -34,21 +33,36 @@ echo "Detected version: $VERSION"
 echo "Step 1: Building release binary..."
 cargo build --release
 
-# 4. Create App Bundle
-echo "Step 2: Creating macOS app bundle..."
-DIST_DIR="dist"
-APP_BUNDLE="$DIST_DIR/$BUNDLE_NAME"
+# Run a command directly when the target is writable, otherwise through sudo.
+as_owner() {
+    if [ "$NEED_SUDO" = 1 ]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
-# Clean previous builds
-rm -rf "$DIST_DIR"
-mkdir -p "$APP_BUNDLE/Contents/MacOS"
-mkdir -p "$APP_BUNDLE/Contents/Resources"
+install_macos() {
+    INSTALL_DIR="${INSTALL_DIR:-/Applications}"
+    # The bundle folder is "DROSTJE.app": brand plus extension, so Finder never shows "DROSTJE..app".
+    BUNDLE_NAME="DROSTJE.app"
+    LEGACY_BUNDLE_NAME="Drostje.app"
 
-# Copy binary
-cp "$BUILD_DIR/$BINARY_NAME" "$APP_BUNDLE/Contents/MacOS/"
+    # 4. Create App Bundle
+    echo "Step 2: Creating macOS app bundle..."
+    DIST_DIR="dist"
+    APP_BUNDLE="$DIST_DIR/$BUNDLE_NAME"
 
-# Create Info.plist
-cat <<EOF > "$APP_BUNDLE/Contents/Info.plist"
+    # Clean previous builds
+    rm -rf "$DIST_DIR"
+    mkdir -p "$APP_BUNDLE/Contents/MacOS"
+    mkdir -p "$APP_BUNDLE/Contents/Resources"
+
+    # Copy binary
+    cp "$BUILD_DIR/$BINARY_NAME" "$APP_BUNDLE/Contents/MacOS/"
+
+    # Create Info.plist
+    cat <<PLIST > "$APP_BUNDLE/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -75,45 +89,122 @@ cat <<EOF > "$APP_BUNDLE/Contents/Info.plist"
     <string>AppIcon</string>
 </dict>
 </plist>
-EOF
+PLIST
 
-# Build the .icns icon set. Finder, Launchpad and Spotlight only read .icns declared
-# via CFBundleIconFile; a bare PNG in Resources is ignored (the Dock icon comes from
-# the binary itself at runtime, which is why it showed even without this).
-ICON_SRC="assets/drostje-app-icon.png"
-if [ -f "$ICON_SRC" ]; then
-    echo "Adding app icon..."
-    ICONSET="$DIST_DIR/AppIcon.iconset"
-    mkdir -p "$ICONSET"
-    for size in 16 32 128 256 512; do
-        sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-        double=$((size * 2))
-        sips -z "$double" "$double" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
-    done
-    iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
-    rm -rf "$ICONSET"
-fi
+    # Build the .icns icon set. Finder, Launchpad and Spotlight only read .icns declared
+    # via CFBundleIconFile; a bare PNG in Resources is ignored (the Dock icon comes from
+    # the binary itself at runtime, which is why it showed even without this).
+    if [ -f "$ICON_SRC" ]; then
+        echo "Adding app icon..."
+        ICONSET="$DIST_DIR/AppIcon.iconset"
+        mkdir -p "$ICONSET"
+        for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+            double=$((size * 2))
+            sips -z "$double" "$double" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+        done
+        iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+        rm -rf "$ICONSET"
+    fi
 
-# 5. Install
-echo "Step 3: Installing to $INSTALL_DIR..."
+    # 5. Install
+    echo "Step 3: Installing to $INSTALL_DIR..."
+    NEED_SUDO=0
+    if [ ! -w "$INSTALL_DIR" ]; then
+        echo "Target directory $INSTALL_DIR is not writable. Requesting sudo..."
+        NEED_SUDO=1
+    fi
 
-# Replace any previous install (including the pre-rename "Drostje.app") instead of
-# merging into it, so stale files and a duplicate Launchpad entry do not linger.
-if [ ! -w "$INSTALL_DIR" ]; then
-    echo "Target directory $INSTALL_DIR is not writable. Requesting sudo..."
-    sudo rm -rf "$INSTALL_DIR/$BUNDLE_NAME" "$INSTALL_DIR/$LEGACY_BUNDLE_NAME"
-    sudo cp -R "$APP_BUNDLE" "$INSTALL_DIR/"
-else
-    rm -rf "$INSTALL_DIR/$BUNDLE_NAME" "$INSTALL_DIR/$LEGACY_BUNDLE_NAME"
-    cp -R "$APP_BUNDLE" "$INSTALL_DIR/"
-fi
+    # Replace any previous install (including the pre-rename "Drostje.app") instead of
+    # merging into it, so stale files and a duplicate Launchpad entry do not linger.
+    as_owner rm -rf "$INSTALL_DIR/$BUNDLE_NAME" "$INSTALL_DIR/$LEGACY_BUNDLE_NAME"
+    as_owner cp -R "$APP_BUNDLE" "$INSTALL_DIR/"
 
-# Finder caches bundle icons; bump the mtime so it re-reads Info.plist and the .icns.
-touch "$INSTALL_DIR/$BUNDLE_NAME"
+    # Finder caches bundle icons; bump the mtime so it re-reads Info.plist and the .icns.
+    as_owner touch "$INSTALL_DIR/$BUNDLE_NAME"
 
-# Cleanup build artifacts (optional, user might want to keep them for dev)
-# rm -rf "$DIST_DIR"
+    echo "--- Installation Complete! ---"
+    echo "You can find $APP_NAME in $INSTALL_DIR"
+    echo "To run from terminal: $INSTALL_DIR/$BUNDLE_NAME/Contents/MacOS/$BINARY_NAME"
+}
 
-echo "--- Installation Complete! ---"
-echo "You can find $APP_NAME in $INSTALL_DIR"
-echo "To run from terminal: $INSTALL_DIR/$BUNDLE_NAME/Contents/MacOS/$BINARY_NAME"
+install_linux() {
+    # INSTALL_DIR is a prefix here: bin/ for the binary, share/ for the desktop entry and
+    # icons. ~/.local needs no privileges and is on the default XDG_DATA_DIRS search path.
+    INSTALL_DIR="${INSTALL_DIR:-$HOME/.local}"
+    BIN_DIR="$INSTALL_DIR/bin"
+    SHARE_DIR="$INSTALL_DIR/share"
+    APPLICATIONS_DIR="$SHARE_DIR/applications"
+    ICON_ROOT="$SHARE_DIR/icons/hicolor"
+
+    echo "Step 2: Installing to $INSTALL_DIR..."
+    NEED_SUDO=0
+    if ! mkdir -p "$BIN_DIR" "$APPLICATIONS_DIR" 2>/dev/null || [ ! -w "$BIN_DIR" ]; then
+        echo "Prefix $INSTALL_DIR is not writable. Requesting sudo..."
+        NEED_SUDO=1
+        sudo mkdir -p "$BIN_DIR" "$APPLICATIONS_DIR"
+    fi
+
+    as_owner install -m 755 "$BUILD_DIR/$BINARY_NAME" "$BIN_DIR/$BINARY_NAME"
+
+    # Icons go into the hicolor theme, which every icon theme inherits from. ImageMagick
+    # renders the standard sizes; without it the launcher scales the source image itself.
+    if [ -f "$ICON_SRC" ]; then
+        echo "Adding app icon..."
+        if command -v magick >/dev/null 2>&1; then
+            for size in 16 32 48 64 128 256 512; do
+                target="$ICON_ROOT/${size}x${size}/apps"
+                as_owner mkdir -p "$target"
+                magick "$ICON_SRC" -resize "${size}x${size}" "png:-" \
+                    | as_owner tee "$target/$BINARY_NAME.png" >/dev/null
+            done
+        else
+            echo "ImageMagick (magick) not found; installing the 1024 px icon unscaled."
+            target="$ICON_ROOT/512x512/apps"
+            as_owner mkdir -p "$target"
+            as_owner install -m 644 "$ICON_SRC" "$target/$BINARY_NAME.png"
+        fi
+    fi
+
+    # The desktop entry is named after the window's app id ("drostje") so the desktop
+    # pairs running windows with this entry and its icon.
+    echo "Adding desktop entry..."
+    cat <<DESKTOP | as_owner tee "$APPLICATIONS_DIR/$BINARY_NAME.desktop" >/dev/null
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=$APP_NAME
+Comment=Drive local coding agents and dispatch work to the Compliance Software Factory
+Exec="$BIN_DIR/$BINARY_NAME"
+Icon=$BINARY_NAME
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=$BINARY_NAME
+DESKTOP
+    as_owner chmod 644 "$APPLICATIONS_DIR/$BINARY_NAME.desktop"
+
+    # Cache refreshes are best effort: launchers rescan on their own eventually.
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        as_owner update-desktop-database -q "$APPLICATIONS_DIR" || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -f "$ICON_ROOT/index.theme" ]; then
+        as_owner gtk-update-icon-cache -q -t -f "$ICON_ROOT" || true
+    fi
+
+    echo "--- Installation Complete! ---"
+    echo "Binary: $BIN_DIR/$BINARY_NAME"
+    echo "Desktop entry: $APPLICATIONS_DIR/$BINARY_NAME.desktop"
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *) echo "Note: $BIN_DIR is not on your PATH; the launcher entry works regardless." ;;
+    esac
+}
+
+case "$(uname -s)" in
+    Darwin) install_macos ;;
+    Linux) install_linux ;;
+    *)
+        echo "Error: unsupported platform $(uname -s). Build with 'cargo build --release' and run $BUILD_DIR/$BINARY_NAME." >&2
+        exit 1
+        ;;
+esac

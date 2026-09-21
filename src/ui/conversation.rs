@@ -1,8 +1,8 @@
 use super::{
-    commands::{ClearQueuedMessages, Command, button},
+    commands::{ClearQueuedMessages, Command, SelectLast, button},
     job_notice::{self, JobKind, JobNotice, JobOutput, JobResult, JobStart},
     todo_list::{self, TodoList, TodoStatus},
-    workspace::Workspace,
+    workspace::{Motion, PAGE_SHARE, Workspace},
 };
 use crate::{
     app::{AppState, ConversationSession},
@@ -27,6 +27,7 @@ use gpui_kit::{
         label::Label,
         menu::{DropdownMenu, PopupMenuItem},
         progress::ProgressCircle,
+        scroll::ScrollableElement,
         searchable_list::SearchableListItem,
         select::{Select, SelectEvent, SelectState},
         spinner::Spinner,
@@ -99,11 +100,21 @@ impl TranscriptView {
                 },
             ));
         }
+        let list = ListState::new(0, ListAlignment::Bottom, px(500.));
+        list.set_follow_mode(FollowMode::Tail);
+        // The jump button depends on scroll position; defer so the list's borrow is released.
+        let view = cx.weak_entity();
+        list.set_scroll_handler(move |_, _, cx| {
+            let view = view.clone();
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |_, cx| cx.notify());
+            });
+        });
         Self {
             id,
             state,
             owner,
-            list: ListState::new(0, ListAlignment::Bottom, px(500.)),
+            list,
             generation: None,
             revision: 0,
             count: 0,
@@ -149,26 +160,39 @@ impl TranscriptView {
         self.invalidate_rows = false;
     }
 
-    pub(super) fn scroll(
-        &mut self,
-        delta: isize,
-        endpoint: bool,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn scroll(&mut self, motion: Motion, window: &Window, cx: &mut Context<Self>) {
         self.sync(cx);
-        if endpoint {
-            if delta < 0 {
-                self.list.scroll_to_reveal_item(0);
-            } else {
-                self.list.scroll_to_end();
-            }
-        } else {
-            self.list
-                .scroll_by(window.rem_size() * (delta as f32 * 2.25));
-        }
+        scroll_list(&self.list, motion, window.rem_size() * 2.25);
         cx.notify();
     }
+}
+
+fn scroll_list(list: &ListState, motion: Motion, line: Pixels) {
+    match motion {
+        // `scroll_to` pauses tail following; revealing an item would snap back to the end.
+        Motion::First => list.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        }),
+        Motion::Last => scroll_to_latest(list),
+        Motion::Line(delta) => list.scroll_by(line * delta as f32),
+        Motion::Page(delta) => {
+            list.scroll_by(list.viewport_bounds().size.height * (delta as f32 * PAGE_SHARE))
+        }
+    }
+}
+
+/// Returns to the latest message and resumes following new output.
+fn scroll_to_latest(list: &ListState) {
+    list.set_follow_mode(FollowMode::Tail);
+    list.scroll_to_end();
+}
+
+/// Unmeasured rows leave the end unknown; a list that stopped following is then away from it.
+fn scrolled_up(list: &ListState) -> bool {
+    list.max_offset_for_scrollbar().y > px(0.)
+        && !list.is_following_tail()
+        && !list.is_scrolled_to_end().unwrap_or(false)
 }
 
 impl Render for TranscriptView {
@@ -177,7 +201,8 @@ impl Render for TranscriptView {
         let state = self.state.clone();
         let owner = self.owner.clone();
         let id = self.id;
-        list(self.list.clone(), move |index, _, cx| {
+        let scrolled_up = scrolled_up(&self.list);
+        let rows = list(self.list.clone(), move |index, _, cx| {
             let state = state.read(cx);
             let Some(session) = state.conversations.get(&id) else {
                 return div().into_any_element();
@@ -198,7 +223,39 @@ impl Render for TranscriptView {
                 })
                 .unwrap_or_else(|| div().into_any_element())
         })
-        .size_full()
+        .size_full();
+        div()
+            .id("transcript")
+            .relative()
+            .size_full()
+            .child(rows)
+            .vertical_scrollbar(&self.list)
+            .when(scrolled_up, |this| {
+                this.child(
+                    h_flex()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_2()
+                        .justify_center()
+                        .child(
+                            Button::new("transcript-to-latest")
+                                .small()
+                                .secondary()
+                                .rounded(cx.theme().radius_full())
+                                .icon(IconName::ArrowDown)
+                                .tooltip_with_action(
+                                    "Scroll to latest",
+                                    &SelectLast,
+                                    Some("Thread"),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    scroll_to_latest(&this.list);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
     }
 }
 
@@ -971,10 +1028,10 @@ fn code_fence(text: &str, language: &str) -> String {
 /// Tools whose results are plain output rather than prose, with the language
 /// the code block should highlight. `None` keeps the Markdown rendering.
 fn result_language<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
-    match name {
+    match name.to_ascii_lowercase().as_str() {
         "bash" | "eval" | "grep" | "glob" => Some("text"),
         "read" | "write" | "edit" => Some(
-            text_field(input, "path")
+            path_field(input)
                 .and_then(|path| path.rsplit_once('.'))
                 .map(|(_, extension)| extension)
                 .filter(|extension| {
@@ -994,6 +1051,10 @@ pub struct ToolSummary {
 const SUMMARY_LIMIT: usize = 200;
 fn text_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
     input[key].as_str().filter(|value| !value.trim().is_empty())
+}
+/// OMP names the file `path`, Claude Code `file_path`.
+fn path_field(input: &Value) -> Option<&str> {
+    text_field(input, "path").or_else(|| text_field(input, "file_path"))
 }
 fn compact_json(input: &Value) -> String {
     let text = match input {
@@ -1020,31 +1081,26 @@ fn patch_paths(patch: &str) -> Vec<&str> {
         .filter(|path| !path.is_empty())
         .collect()
 }
+/// Harnesses disagree on case (`read`, `Read`), so names match case-insensitively.
 pub fn tool_summary(name: &str, input: &Value) -> ToolSummary {
-    let (icon, body) = match name {
+    let (icon, body) = match name.to_ascii_lowercase().as_str() {
         "bash" => (
             Lucide::Terminal,
             text_field(input, "command").map(str::to_owned),
         ),
-        "read" => (
-            Lucide::FileText,
-            text_field(input, "path").map(str::to_owned),
-        ),
-        "write" => (
-            Lucide::FilePlus,
-            text_field(input, "path").map(str::to_owned),
-        ),
+        "read" => (Lucide::FileText, path_field(input).map(str::to_owned)),
+        "write" => (Lucide::FilePlus, path_field(input).map(str::to_owned)),
         "edit" => (
             Lucide::FilePen,
             text_field(input, "input")
                 .map(patch_paths)
                 .filter(|paths| !paths.is_empty())
                 .map(|paths| paths.join("\n"))
-                .or_else(|| text_field(input, "path").map(str::to_owned)),
+                .or_else(|| path_field(input).map(str::to_owned)),
         ),
         "grep" => (
             Lucide::Search,
-            text_field(input, "pattern").map(|pattern| match text_field(input, "path") {
+            text_field(input, "pattern").map(|pattern| match path_field(input) {
                 Some(path) => format!("{pattern}  in {path}"),
                 None => pattern.to_owned(),
             }),
@@ -1052,16 +1108,19 @@ pub fn tool_summary(name: &str, input: &Value) -> ToolSummary {
         "glob" => (
             Lucide::FolderSearch,
             text_field(input, "pattern")
-                .or_else(|| text_field(input, "path"))
+                .or_else(|| path_field(input))
                 .map(str::to_owned),
         ),
         "todo" => (Lucide::ListTodo, todo_list::describe_change(input)),
         "task" => (
             Lucide::Workflow,
-            input["tasks"].as_array().map(|tasks| match tasks.len() {
-                1 => "1 task".to_owned(),
-                n => format!("{n} tasks"),
-            }),
+            input["tasks"]
+                .as_array()
+                .map(|tasks| match tasks.len() {
+                    1 => "1 task".to_owned(),
+                    n => format!("{n} tasks"),
+                })
+                .or_else(|| text_field(input, "description").map(str::to_owned)),
         ),
         "eval" => (
             Lucide::FlaskConical,
@@ -1076,7 +1135,10 @@ pub fn tool_summary(name: &str, input: &Value) -> ToolSummary {
                 .or_else(|| text_field(input, "question"))
                 .map(str::to_owned),
         ),
-        "web_search" => (Lucide::Globe, text_field(input, "query").map(str::to_owned)),
+        "web_search" | "websearch" => {
+            (Lucide::Globe, text_field(input, "query").map(str::to_owned))
+        }
+        "webfetch" => (Lucide::Globe, text_field(input, "url").map(str::to_owned)),
         _ => (Lucide::Wrench, None),
     };
     ToolSummary {
@@ -1117,47 +1179,21 @@ impl ToolResult<'_> {
         }
     }
 }
-const COLLAPSED_TOOL_RESULT_LINES: usize = 6;
-const COLLAPSED_TOOL_RESULT_COLUMNS: usize = 240;
-
-/// Keep the useful head of a tool result visible like OMP's compact tool rows,
-/// without allowing one unbroken line or a large result to dominate the timeline.
-fn collapsed_tool_result_preview(blocks: &[ContentBlock]) -> Option<String> {
-    let mut lines = Vec::new();
-    let mut truncated = false;
-    'blocks: for block in blocks {
-        let ContentBlock::Text(text) = block else {
-            continue;
-        };
-        for raw_line in text.lines() {
-            if lines.len() == COLLAPSED_TOOL_RESULT_LINES {
-                truncated = true;
-                break 'blocks;
-            }
-            let mut chars = raw_line.chars();
-            lines.push(
-                chars
-                    .by_ref()
-                    .take(COLLAPSED_TOOL_RESULT_COLUMNS)
-                    .collect::<String>(),
-            );
-            if chars.next().is_some() {
-                truncated = true;
-                break 'blocks;
-            }
-        }
+/// What a collapsed tool row shows of the summary: its first line, marked when
+/// more is folded away. The row itself truncates to the available width.
+fn summary_line(body: &str) -> String {
+    let mut lines = body.lines().filter(|line| !line.trim().is_empty());
+    let first = lines.next().unwrap_or_default().trim();
+    if lines.next().is_some() {
+        format!("{first} …")
+    } else {
+        first.to_owned()
     }
-    if lines.iter().all(|line| line.trim().is_empty()) {
-        return None;
-    }
-    if truncated {
-        lines.push("…".into());
-    }
-    Some(lines.join("\n"))
 }
 
-/// One card for a tool call, live or historical. A failed card opens its result
-/// automatically, otherwise the disclosure does.
+/// One row for a tool call, live or historical: icon, caption and the first line
+/// of the call, about one line high. The disclosure opens the full call and its
+/// result; a failed call opens automatically.
 fn tool_card(
     key: String,
     call: ToolCall<'_>,
@@ -1186,6 +1222,7 @@ fn tool_card(
     }
     let summary = tool_summary(name, input);
     let has_result = !result.is_empty() || exit_code.is_some();
+    let has_detail = has_result || !summary.body.is_empty();
     let expanded = outcome == ToolOutcome::Failed || is_expanded(owner, &key, cx);
     let caption = intent.unwrap_or(name).to_owned();
     let mark: Option<AnyElement> = match outcome {
@@ -1216,12 +1253,20 @@ fn tool_card(
         )
         .child(
             div()
-                .flex_1()
-                .min_w_0()
+                .flex_shrink_0()
+                .max_w(relative(0.5))
                 .truncate()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(caption),
+        )
+        .child(
+            mono(cx)
+                .debug_selector(|| "conversation-tool-summary-line".into())
+                .flex_1()
+                .truncate()
+                .text_color(cx.theme().muted_foreground)
+                .when(!expanded, |line| line.child(summary_line(&summary.body))),
         );
     if intent.is_some() {
         header = header.child(
@@ -1232,15 +1277,15 @@ fn tool_card(
         );
     }
     header = header.when_some(mark, |row, mark| row.child(mark));
-    if has_result && outcome != ToolOutcome::Failed {
+    if has_detail && outcome != ToolOutcome::Failed {
         header = header.child(disclosure(
             key.clone(),
             expanded,
             owner,
             if expanded {
-                "Hide result"
+                "Hide details"
             } else {
-                "Show result"
+                "Show details"
             },
         ));
     }
@@ -1252,37 +1297,22 @@ fn tool_card(
         .w_full()
         .min_w_0()
         .gap_1()
-        .p_3()
+        .px_3()
+        .py_1()
         .rounded(cx.theme().radius)
         .bg(cx.theme().muted)
         .child(header)
-        .when(!summary.body.is_empty(), |card| {
-            card.child(mono(cx).child(summary.body))
+        .when(expanded && !summary.body.is_empty(), |card| {
+            card.child(mono(cx).pb_1().child(summary.body))
         });
-    if has_result {
+    if has_detail {
         card = card.on_click(toggle(owner, key.clone()));
-    }
-    if has_result
-        && !expanded
-        && let Some(preview) = collapsed_tool_result_preview(result)
-    {
-        card = card.child(
-            mono(cx)
-                .debug_selector(|| "conversation-tool-result-preview".into())
-                .pt_2()
-                .mt_1()
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .text_color(cx.theme().muted_foreground)
-                .child(preview),
-        );
     }
     if has_result && expanded {
         let mut output = v_flex()
             .debug_selector(|| "conversation-tool-full-result".into())
             .gap_2()
-            .pt_2()
-            .mt_1()
+            .py_2()
             .border_t_1()
             .border_color(cx.theme().border);
         if let Some(code) = exit_code.filter(|code| *code != 0 || outcome == ToolOutcome::Failed) {
@@ -3083,9 +3113,9 @@ fn render_content(
 mod tests {
     use super::{
         ContentBlock, ContextUsage, Duration, LimitWindow, Lucide, Message, SUMMARY_LIMIT,
-        SystemTime, ToolSummary, UsageLimit, Value, code_fence, collapsed_tool_result_preview,
-        compact_duration, compact_tokens, context_percent, harness_note_hidden, humanise_key,
-        limit_description, result_language, thinking_for_display, tool_summary,
+        SystemTime, ToolSummary, UsageLimit, Value, code_fence, compact_duration, compact_tokens,
+        context_percent, harness_note_hidden, humanise_key, limit_description, result_language,
+        summary_line, thinking_for_display, tool_summary,
     };
     use serde_json::json;
 
@@ -3175,6 +3205,68 @@ mod tests {
 
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
+    fn transcript_leaves_and_rejoins_the_latest_message(cx: &mut gpui_kit::TestAppContext) {
+        use super::{Motion, scroll_list, scrolled_up};
+        use gpui_kit::{
+            AppContext, Context, FollowMode, IntoElement, ListAlignment, ListState, Render, Styled,
+            Window, component::Root, div, list, px,
+        };
+
+        struct Rows(ListState);
+        impl Render for Rows {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(40.)).w_full().into_any_element()
+                })
+                .size_full()
+            }
+        }
+
+        cx.update(gpui_kit::init);
+        let rows = ListState::new(200, ListAlignment::Bottom, px(500.));
+        rows.set_follow_mode(FollowMode::Tail);
+        let window = cx.add_window({
+            let rows = rows.clone();
+            |window, cx| Root::new(cx.new(|_| Rows(rows)), window, cx)
+        });
+        let draw = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+        draw(cx);
+        assert!(!scrolled_up(&rows));
+
+        // `gg` must stay at the top instead of being pulled back by tail following.
+        scroll_list(&rows, Motion::First, px(36.));
+        draw(cx);
+        assert!(scrolled_up(&rows));
+        assert_eq!(rows.logical_scroll_top().item_ix, 0);
+
+        // A page is most of the viewport, in whole 40px rows here.
+        let page = (rows.viewport_bounds().size.height * super::PAGE_SHARE / px(40.)) as usize;
+        assert!(page > 1);
+        scroll_list(&rows, Motion::Page(1), px(36.));
+        draw(cx);
+        assert_eq!(rows.logical_scroll_top().item_ix, page);
+        scroll_list(&rows, Motion::Page(-1), px(36.));
+        draw(cx);
+        assert_eq!(rows.logical_scroll_top().item_ix, 0);
+
+        rows.splice(200..200, 1);
+        draw(cx);
+        assert!(scrolled_up(&rows), "new output must not move a reader");
+
+        scroll_list(&rows, Motion::Last, px(36.));
+        draw(cx);
+        assert!(!scrolled_up(&rows));
+        assert!(rows.is_following_tail());
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
     fn compact_timeline_states_render_on_the_native_surface(cx: &mut gpui_kit::TestAppContext) {
         use super::{ToolCall, ToolOutcome, ToolResult, Workspace, block, tool_card, v_flex};
         use gpui_kit::{
@@ -3248,7 +3340,7 @@ mod tests {
         assert!(visual.debug_bounds("conversation-thinking").is_some());
         assert!(
             visual
-                .debug_bounds("conversation-tool-result-preview")
+                .debug_bounds("conversation-tool-summary-line")
                 .is_some()
         );
         assert!(
@@ -3465,21 +3557,10 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_tools_keep_a_bounded_result_preview_visible() {
-        let blocks = [ContentBlock::Text(
-            "one\ntwo\nthree\nfour\nfive\nsix\nseven".into(),
-        )];
-        assert_eq!(
-            collapsed_tool_result_preview(&blocks).as_deref(),
-            Some("one\ntwo\nthree\nfour\nfive\nsix\n…")
-        );
-        let wide = [ContentBlock::Text("x".repeat(300))];
-        let preview = collapsed_tool_result_preview(&wide).unwrap();
-        assert_eq!(preview.lines().next().unwrap().chars().count(), 240);
-        assert!(preview.ends_with("\n…"));
-        assert!(
-            collapsed_tool_result_preview(&[ContentBlock::Thinking("hidden".into())]).is_none()
-        );
+    fn collapsed_tools_show_one_line_of_the_call() {
+        assert_eq!(summary_line("cargo test"), "cargo test");
+        assert_eq!(summary_line("\n  src/a.rs\nsrc/b.rs"), "src/a.rs …");
+        assert_eq!(summary_line(""), "");
     }
 
     #[test]
@@ -3584,6 +3665,18 @@ mod tests {
                 icon: Lucide::CircleQuestionMark,
                 body: "Which one?".into()
             }
+        );
+        // Claude Code capitalises names and calls the file `file_path`.
+        assert_eq!(
+            tool_summary("Read", &json!({"file_path":"src/effects/pools.ts"})),
+            ToolSummary {
+                icon: Lucide::FileText,
+                body: "src/effects/pools.ts".into()
+            }
+        );
+        assert_eq!(
+            tool_summary("Bash", &json!({"command":"ls","description":"List"})).body,
+            "ls"
         );
         let unknown = tool_summary("hub", &json!({"op":"cancel","ids":["bg_7"]}));
         assert_eq!(unknown.icon, Lucide::Wrench);

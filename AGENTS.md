@@ -1,6 +1,6 @@
 # AGENTS.md — DROSTJE.
 
-DROSTJE. is a macOS desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.1"`) that
+DROSTJE. is a macOS and Linux desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.1"`) that
 drives local coding agents (OMP over native RPC), edits prompts in embedded
 Neovim within a GPUI Kit-styled composer, and dispatches work to the Compliance Software Factory CLI. The README
 is Dutch and user-facing; code, comments, commits, docs and UI strings are

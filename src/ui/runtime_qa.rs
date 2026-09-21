@@ -1618,6 +1618,20 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         threads.last().copied().map(Row::Thread),
         "entering Projects anchors the visible keyboard cursor on the selected thread"
     );
+    let rows = cx.read(|cx| crate::ui::sidebar::rows(fixture.state.read(cx), ""));
+    for (keys, expected) in [
+        ("home", rows.first()),
+        ("end", rows.last()),
+        ("pageup", rows.first()),
+        ("pagedown", rows.last()),
+    ] {
+        cx.simulate_keystrokes(fixture.window.into(), keys);
+        assert_eq!(
+            cx.read(|cx| fixture.workspace.read(cx).cursor),
+            expected.copied(),
+            "{keys} must move the Projects cursor like its Vim motion"
+        );
+    }
     cx.simulate_keystrokes(fixture.window.into(), "k");
     assert_eq!(
         cx.read(|cx| fixture.workspace.read(cx).cursor),

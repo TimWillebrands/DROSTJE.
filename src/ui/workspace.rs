@@ -37,6 +37,18 @@ use std::{
     rc::Rc,
 };
 
+/// A list or scroll motion, shared by the Projects list, thread panels and the transcript.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Motion {
+    Line(isize),
+    Page(isize),
+    First,
+    Last,
+}
+
+/// Share of the viewport one page motion covers, so a line of context survives the jump.
+pub(super) const PAGE_SHARE: f32 = 0.9;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
     Projects,
@@ -123,6 +135,8 @@ pub struct Workspace {
     focus: FocusHandle,
     pub cursor: Option<Row>,
     hovered_sidebar_row: Option<Row>,
+    /// Two-finger swipe over Projects, reduced to Space steps by the sidebar.
+    pub(super) space_swipe: super::sidebar::SpaceSwipe,
     /// Filter text for the Projects list; empty shows every visible row.
     thread_search: Entity<InputState>,
     pub palette: Option<Entity<Palette>>,
@@ -224,6 +238,7 @@ impl Workspace {
             quit_requested: false,
             cursor: None,
             hovered_sidebar_row: None,
+            space_swipe: Default::default(),
             thread_search,
             model_picker: None,
             effort_picker: None,
@@ -1814,13 +1829,7 @@ impl Workspace {
         }
         self.focus_region(Region::Projects, window, cx);
     }
-    fn navigate(
-        &mut self,
-        delta: isize,
-        endpoint: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn navigate(&mut self, motion: Motion, window: &mut Window, cx: &mut Context<Self>) {
         if self.navigation_blocked(window, cx) {
             return;
         }
@@ -1830,9 +1839,7 @@ impl Workspace {
                 .focused_panel(window, cx)
                 .and_then(|panel| panel.read(cx).transcript.clone())
         {
-            transcript.update(cx, |transcript, cx| {
-                transcript.scroll(delta, endpoint, window, cx)
-            });
+            transcript.update(cx, |transcript, cx| transcript.scroll(motion, window, cx));
             return;
         }
         if region != Region::Projects {
@@ -1840,18 +1847,17 @@ impl Workspace {
                 return;
             };
             let scroll = panel.read(cx).scroll.clone();
-            if endpoint {
-                if delta < 0 {
-                    scroll.set_offset(point(px(0.), px(0.)));
-                } else {
-                    scroll.scroll_to_bottom();
-                }
-            } else {
+            let scroll_by = |distance: Pixels| {
                 let offset = scroll.offset();
-                scroll.set_offset(point(
-                    offset.x,
-                    (offset.y - window.rem_size() * (delta as f32 * 2.25)).min(px(0.)),
-                ));
+                scroll.set_offset(point(offset.x, (offset.y - distance).min(px(0.))));
+            };
+            match motion {
+                Motion::First => scroll.set_offset(point(px(0.), px(0.))),
+                Motion::Last => scroll.scroll_to_bottom(),
+                Motion::Line(delta) => scroll_by(window.rem_size() * (delta as f32 * 2.25)),
+                Motion::Page(delta) => {
+                    scroll_by(scroll.bounds().size.height * (delta as f32 * PAGE_SHARE))
+                }
             }
             panel.update(cx, |_, cx| cx.notify());
             return;
@@ -1865,10 +1871,23 @@ impl Workspace {
             .iter()
             .position(|row| Some(*row) == self.cursor)
             .unwrap_or(0);
-        let next = if endpoint {
-            if delta < 0 { 0 } else { rows.len() - 1 }
-        } else {
-            (index as isize + delta).clamp(0, rows.len().saturating_sub(1) as isize) as usize
+        let last = rows.len() - 1;
+        let step = |delta: isize| (index as isize + delta).clamp(0, last as isize) as usize;
+        let next = match motion {
+            Motion::First => 0,
+            Motion::Last => last,
+            Motion::Line(delta) => step(delta),
+            Motion::Page(delta) => {
+                let scroll = &self.projects.read(cx).scroll;
+                // Rows share one height; an unmeasured list falls back to a short page.
+                let page = scroll
+                    .bounds_for_item(index)
+                    .filter(|row| row.size.height > px(0.))
+                    .map_or(10, |row| {
+                        (scroll.bounds().size.height * PAGE_SHARE / row.size.height) as isize
+                    });
+                step(delta * page.max(1))
+            }
         };
         self.cursor = rows.get(next).copied();
         self.projects.read(cx).scroll.scroll_to_item(next);
@@ -2153,15 +2172,25 @@ impl Render for Workspace {
                     this.spatial_focus(PaneDirection::Down, w, cx)
                 }))
                 .on_action(
-                    cx.listener(|this, _: &SelectNext, w, cx| this.navigate(1, false, w, cx)),
+                    cx.listener(|this, _: &SelectNext, w, cx| {
+                        this.navigate(Motion::Line(1), w, cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &SelectPrevious, w, cx| {
+                    this.navigate(Motion::Line(-1), w, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &SelectFirst, w, cx| this.navigate(Motion::First, w, cx)),
                 )
                 .on_action(
-                    cx.listener(|this, _: &SelectPrevious, w, cx| this.navigate(-1, false, w, cx)),
+                    cx.listener(|this, _: &SelectLast, w, cx| this.navigate(Motion::Last, w, cx)),
                 )
-                .on_action(
-                    cx.listener(|this, _: &SelectFirst, w, cx| this.navigate(-1, true, w, cx)),
-                )
-                .on_action(cx.listener(|this, _: &SelectLast, w, cx| this.navigate(1, true, w, cx)))
+                .on_action(cx.listener(|this, _: &SelectPageUp, w, cx| {
+                    this.navigate(Motion::Page(-1), w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SelectPageDown, w, cx| {
+                    this.navigate(Motion::Page(1), w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &CollapseProject, _, cx| this.fold(true, cx)))
                 .on_action(cx.listener(|this, _: &ExpandProject, _, cx| this.fold(false, cx)))
                 .on_action(cx.listener(|this, _: &OpenSelection, w, cx| this.open_selection(w, cx)))

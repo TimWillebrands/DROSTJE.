@@ -1,7 +1,7 @@
 use super::{
     commands::{
-        AddProject, ArchiveThread, CollapseProject, Command, Dismiss, ExpandProject, RenameThread,
-        SearchThreads, SelectNext, ShowArchived, ToggleProjects,
+        AddProject, ArchiveThread, CollapseProject, Command, Dismiss, ExpandProject, NextSpace,
+        PreviousSpace, RenameThread, SearchThreads, SelectNext, ShowArchived, ToggleProjects,
     },
     workspace::Workspace,
 };
@@ -27,11 +27,58 @@ use gpui_kit::{
     prelude::FluentBuilder,
     *,
 };
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 /// External geometry: the macOS traffic lights sit over the leading edge of the left dock,
 /// the same inset `TitleBar` reserves for them.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
+
+/// Horizontal travel that turns a two-finger swipe over Projects into one Space step.
+const SPACE_SWIPE_DISTANCE: f32 = 80.;
+/// Scroll events further apart than this belong to different gestures. Touch phases
+/// cannot mark the boundary: Wayland never reports them and macOS keeps sending
+/// momentum after `Ended`.
+const SPACE_SWIPE_IDLE: Duration = Duration::from_millis(150);
+
+/// Reduces precise scroll deltas over Projects to at most one Space step per gesture.
+/// Momentum keeps a finished gesture alive, so it cannot step a second time.
+#[derive(Debug, Default)]
+pub struct SpaceSwipe {
+    travelled: Point<f32>,
+    stepped: bool,
+    last_event: Option<Instant>,
+}
+
+impl SpaceSwipe {
+    /// Positive `delta.x` is fingers moving right, which goes back like a browser swipe.
+    pub fn feed(&mut self, delta: Point<f32>, phase: TouchPhase, now: Instant) -> Option<Command> {
+        let idle = self
+            .last_event
+            .is_none_or(|last| now.duration_since(last) > SPACE_SWIPE_IDLE);
+        if idle || phase == TouchPhase::Started {
+            *self = Self::default();
+        }
+        self.last_event = Some(now);
+        if self.stepped {
+            return None;
+        }
+        self.travelled.x += delta.x;
+        self.travelled.y += delta.y;
+        let (across, along) = (self.travelled.x.abs(), self.travelled.y.abs());
+        if across < SPACE_SWIPE_DISTANCE || across < 2. * along {
+            return None;
+        }
+        self.stepped = true;
+        Some(if self.travelled.x > 0. {
+            Command::PreviousSpace
+        } else {
+            Command::NextSpace
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
@@ -291,6 +338,8 @@ pub fn render(
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
+        // A sideways swipe switches Space; it must not also scroll the rows.
+        .restrict_scroll_to_axis()
         .track_scroll(scroll);
     let rows = rows(state, &query);
     let mut first_project = true;
@@ -769,10 +818,35 @@ pub fn render(
     let search_owner = owner.clone();
     let search_next_owner = owner.clone();
     let space_menu_owner = owner.clone();
+    let swipe_owner = owner.clone();
     v_flex()
         .size_full()
         .bg(theme.sidebar)
         .text_color(theme.sidebar_foreground)
+        // Mouse back/forward buttons; macOS also reports three-finger swipes this way.
+        .on_mouse_down(
+            MouseButton::Navigate(NavigationDirection::Back),
+            |_, window, cx| window.dispatch_action(Box::new(PreviousSpace), cx),
+        )
+        .on_mouse_down(
+            MouseButton::Navigate(NavigationDirection::Forward),
+            |_, window, cx| window.dispatch_action(Box::new(NextSpace), cx),
+        )
+        .on_scroll_wheel(move |event, window, cx| {
+            let ScrollDelta::Pixels(delta) = event.delta else {
+                return;
+            };
+            let command = swipe_owner.update(cx, |workspace, _| {
+                workspace.space_swipe.feed(
+                    delta.map(|axis| axis.as_f32()),
+                    event.touch_phase,
+                    Instant::now(),
+                )
+            });
+            if let Ok(Some(command)) = command {
+                window.dispatch_action(command.action(), cx);
+            }
+        })
         .child(
             h_flex()
                 .id("thread-search-row")
@@ -806,24 +880,16 @@ pub fn render(
                             });
                         })
                         .child(
-                            Input::new(search).small().cleanable(true).prefix(
-                                Icon::new(IconName::Search)
-                                    .small()
-                                    .text_color(theme.muted_foreground),
-                            ),
+                            Input::new(search)
+                                .small()
+                                .appearance(false)
+                                .cleanable(true)
+                                .prefix(
+                                    Icon::new(IconName::Search)
+                                        .small()
+                                        .text_color(theme.muted_foreground),
+                                ),
                         ),
-                )
-                .child(
-                    Button::new("projects-menu")
-                        .ghost()
-                        .small()
-                        .cursor_default()
-                        .icon(IconName::Ellipsis)
-                        .tooltip("Projects menu")
-                        .dropdown_menu(|menu, _, _| {
-                            menu.menu(Command::AddProject.label(), Box::new(AddProject))
-                                .menu(Command::ShowArchived.label(), Box::new(ShowArchived))
-                        }),
                 ),
         )
         .child(
@@ -1078,6 +1144,49 @@ mod tests {
             [Row::Project(lighting.id), Row::Thread(threads[3].id)]
         );
         assert!(visible_rows(&projects, &threads, &collapsed, false, "nothing").is_empty());
+    }
+
+    #[test]
+    fn sideways_swipe_steps_one_space_per_gesture() {
+        use super::{Command, SpaceSwipe};
+        use gpui_kit::{TouchPhase, point};
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut swipe = SpaceSwipe::default();
+
+        // Fingers right goes back; momentum after the step does not step again.
+        assert_eq!(swipe.feed(point(50., 2.), TouchPhase::Started, at(0)), None);
+        assert_eq!(
+            swipe.feed(point(40., 1.), TouchPhase::Moved, at(16)),
+            Some(Command::PreviousSpace)
+        );
+        assert_eq!(swipe.feed(point(0., 0.), TouchPhase::Ended, at(32)), None);
+        assert_eq!(swipe.feed(point(200., 0.), TouchPhase::Moved, at(48)), None);
+
+        // Without touch phases (Wayland) an idle gap starts the next gesture.
+        assert_eq!(
+            swipe.feed(point(-90., 0.), TouchPhase::Moved, at(400)),
+            Some(Command::NextSpace)
+        );
+
+        // Vertical scrolling with sideways wobble never steps.
+        assert_eq!(
+            swipe.feed(point(90., 300.), TouchPhase::Moved, at(800)),
+            None
+        );
+        assert_eq!(swipe.feed(point(90., 0.), TouchPhase::Moved, at(816)), None);
+
+        // Short travel is abandoned once the gesture goes idle.
+        assert_eq!(
+            swipe.feed(point(-60., 0.), TouchPhase::Moved, at(1200)),
+            None
+        );
+        assert_eq!(
+            swipe.feed(point(-60., 0.), TouchPhase::Moved, at(1600)),
+            None
+        );
     }
 
     #[test]
