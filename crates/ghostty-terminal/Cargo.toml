@@ -1,0 +1,21 @@
+[package]
+name = "ghostty-terminal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+gpui-kit = "=0.6.1"
+async-channel = "2.5"
+image = { version = "0.25", default-features = false }
+raw-window-handle = "0.6"
+smallvec = "1.15"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+khronos-egl = { version = "6.0", features = ["dynamic"] }
+libc = "0.2"
+libloading = "0.8"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }

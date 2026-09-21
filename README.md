@@ -166,9 +166,12 @@ cargo test --features runtime-qa --lib factory_start_requires_persisted_configur
 cargo test --features runtime-qa --lib typing_saves_on_focus_loss_and_quit_not_idle -- --ignored --nocapture
 cargo test --features runtime-qa --lib factory_typing_stays_local_until_focus_loss_or_commit -- --ignored --nocapture
 cargo test --features runtime-qa --lib spaces_preserve_drafts_tabs_and_project_ownership -- --ignored --nocapture
+cargo test --features runtime-qa --lib terminal_tabs_keep_failure_local_and_do_not_persist_sessions -- --ignored --nocapture
 ```
 
 Deze scenario's versturen geen provider-turns en starten geen remote Factory-run. Ze controleren native draftwissels, nieuwe regels, live Git-wijzigingen, bescherming tegen verouderde acknowledgements, openen/sluiten/herstellen van threadtabs, beide threadsoorten, palette-/focusgedrag, themawijzigingen, veilige afsluiting en de opslagbarrière vóór Factory Start.
+
+Het terminalscenario gebruikt het GPUI-testvenster zonder native terminalbackend: het controleert foutisolatie, toetsenbordnavigatie tussen Factory en Terminal, en het uitsluiten van terminalsessies uit opgeslagen layouts. Renderer, shellinvoer, klembord en procesbeëindiging moeten daarnaast in een echt macOS- of Wayland-venster worden gecontroleerd. De bridge-regressies draaien met `cargo test -p ghostty-terminal`.
 
 Het Space-scenario controleert aanmaken, dubbele namen, hernoemen, wisselen, verplaatsen, annuleren en verwijderen, plus concepten, eigen paneelindelingen, beide thema's en het minimale vensterformaat. Gebruik daarna de afgedrukte `DROSTJE_SPACES_QA_DATA`-map voor een afzonderlijke herstartcontrole:
 
