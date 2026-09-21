@@ -2316,7 +2316,7 @@ fn request_card(
     for (index, (label, description, answer)) in answers.into_iter().enumerate() {
         let owner = owner.clone();
         let request_id = request.id.clone();
-        let mut label = Label::new(label);
+        let mut label = Label::new(label).w_full().min_w_0().whitespace_normal();
         if let Some(description) = description {
             label = label.secondary(description);
         }
@@ -2328,6 +2328,8 @@ fn request_card(
             .small()
             .outline()
             .w_full()
+            .h_auto()
+            .py_1p5()
             .child(label)
             .on_click(move |_, _, cx| {
                 let _ = owner.update(cx, |workspace, cx| {
@@ -3563,6 +3565,83 @@ mod tests {
             .debug_bounds("queued-row")
             .expect("later messages render as plain rows");
         assert!(next.top() >= bar.top() && next.top() < later.top());
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn request_choices_wrap_long_labels_inside_the_card(cx: &mut gpui_kit::TestAppContext) {
+        use super::{UserRequest, UserRequestKind, Workspace, request_card, v_flex};
+        use crate::harness::UserOption;
+        use gpui_kit::{
+            AppContext, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+            TestSupportExt, WeakEntity, Window, component::Root, px, test::TestWindowExt,
+        };
+        use uuid::Uuid;
+
+        struct RequestHarness;
+        impl Render for RequestHarness {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let owner = WeakEntity::<Workspace>::new_invalid();
+                let request = UserRequest {
+                    id: "kpi".into(),
+                    kind: UserRequestKind::Select,
+                    title: "KPI cards".into(),
+                    options: vec![
+                        UserOption {
+                            value: "Possible".into(),
+                            description: Some(
+                                "Open services have status OPEN, filled services have status FILLED, \
+                                 conflict or sick means BLOCKED plus CANCELLED, and proposals remain zero."
+                                    .into(),
+                            ),
+                        },
+                        UserOption {
+                            value: "None".into(),
+                            description: None,
+                        },
+                    ],
+                    text: "What should the four top KPI cards show?".into(),
+                    placeholder: None,
+                    deadline: None,
+                };
+                v_flex()
+                    .id("request-harness")
+                    .test_support()
+                    .w(px(420.))
+                    .child(request_card(Uuid::from_u128(1), &request, &owner, cx))
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, None, cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            let content = cx.new(|_| RequestHarness);
+            Root::new(content, window, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            for mode in ["light", "dark"] {
+                let settings = std::collections::BTreeMap::from([(
+                    "theme_mode".to_owned(),
+                    json!(mode),
+                )]);
+                crate::ui::theme::initialize(Some(&settings), None, cx);
+                window.render_frame(cx);
+                let card = window.find("request-harness").bounds();
+                let long_choice = window.find("request-kpi-0").bounds();
+                let short_choice = window.find("request-kpi-1").bounds();
+                assert!(
+                    long_choice.size.height > short_choice.size.height,
+                    "{mode} theme must wrap long option text instead of clipping it to the short button height"
+                );
+                assert!(
+                    long_choice.left() >= card.left() && long_choice.right() <= card.right(),
+                    "{mode} choice must stay inside the request card: card={card:?}, choice={long_choice:?}"
+                );
+            }
+        })
+        .unwrap();
     }
 
     #[cfg(feature = "runtime-qa")]
