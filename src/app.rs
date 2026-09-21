@@ -1321,7 +1321,9 @@ impl AppState {
             updated_at: timestamp,
         };
         let id = thread.id;
+        let project = thread.project_id;
         self.save_thread(thread);
+        self.register_thread_membership(id, project, self.active_space)?;
         self.select_thread(id);
         Ok(())
     }

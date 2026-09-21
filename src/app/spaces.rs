@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 const SETTING: &str = "spaces";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const DEFAULT_SPACE: SpaceId = Uuid::from_u128(0);
 const MAX_NAME_LENGTH: usize = 80;
 
@@ -27,6 +27,7 @@ pub(super) struct Spaces {
     pub active: SpaceId,
     pub spaces: Vec<Space>,
     projects: BTreeMap<ProjectId, BTreeSet<SpaceId>>,
+    threads: BTreeMap<ThreadId, SpaceId>,
     sessions: BTreeMap<SpaceId, SpaceSession>,
 }
 
@@ -40,10 +41,20 @@ struct SpacesV1 {
     sessions: BTreeMap<SpaceId, SpaceSession>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpacesV2 {
+    version: u32,
+    active: SpaceId,
+    spaces: Vec<Space>,
+    projects: BTreeMap<ProjectId, BTreeSet<SpaceId>>,
+    sessions: BTreeMap<SpaceId, SpaceSession>,
+}
+
 impl SpacesV1 {
-    fn upgrade(self) -> Spaces {
-        Spaces {
-            version: VERSION,
+    fn upgrade(self) -> SpacesV2 {
+        SpacesV2 {
+            version: 2,
             active: self.active,
             spaces: self.spaces,
             projects: self
@@ -53,6 +64,22 @@ impl SpacesV1 {
                 .collect(),
             sessions: self.sessions,
         }
+    }
+}
+
+impl SpacesV2 {
+    fn upgrade(self, snapshot: &WorkspaceSnapshot) -> Spaces {
+        let mut spaces = Spaces {
+            version: VERSION,
+            active: self.active,
+            spaces: self.spaces,
+            projects: self.projects,
+            threads: BTreeMap::new(),
+            sessions: self.sessions,
+        };
+        spaces.recover_missing_memberships(snapshot);
+        spaces.remove_cross_space_thread_state();
+        spaces
     }
 }
 
@@ -69,6 +96,99 @@ impl Spaces {
             .or_default()
             .insert(destination);
         (destination, inserted)
+    }
+
+    fn register_thread(
+        &mut self,
+        thread: ThreadId,
+        project: ProjectId,
+        space: SpaceId,
+    ) -> Result<SpaceId> {
+        let destination = if self.sessions.contains_key(&space) {
+            space
+        } else {
+            DEFAULT_SPACE
+        };
+        self.projects
+            .entry(project)
+            .or_default()
+            .insert(destination);
+        if let Some(existing) = self.threads.get(&thread) {
+            anyhow::ensure!(
+                *existing == destination,
+                "Thread already belongs to another space"
+            );
+        } else {
+            self.threads.insert(thread, destination);
+        }
+        Ok(destination)
+    }
+
+    fn inferred_thread_space(&self, thread: &Thread) -> SpaceId {
+        let project_spaces = self.projects.get(&thread.project_id);
+        let member =
+            |space: SpaceId| project_spaces.is_some_and(|memberships| memberships.contains(&space));
+        let mentioned = |space: SpaceId| {
+            self.sessions.get(&space).is_some_and(|session| {
+                session.selected_thread == Some(thread.id)
+                    || session.open_threads.contains(&thread.id)
+            })
+        };
+        std::iter::once(self.active)
+            .chain(
+                self.spaces
+                    .iter()
+                    .map(|space| space.id)
+                    .filter(|space| *space != self.active),
+            )
+            .find(|space| member(*space) && mentioned(*space))
+            .or_else(|| {
+                std::iter::once(self.active)
+                    .chain(
+                        self.spaces
+                            .iter()
+                            .map(|space| space.id)
+                            .filter(|space| *space != self.active),
+                    )
+                    .find(|space| member(*space))
+            })
+            .unwrap_or(DEFAULT_SPACE)
+    }
+
+    fn recover_missing_memberships(&mut self, snapshot: &WorkspaceSnapshot) {
+        for project in &snapshot.projects {
+            self.projects
+                .entry(project.id)
+                .or_insert_with(|| BTreeSet::from([DEFAULT_SPACE]));
+        }
+        for thread in &snapshot.threads {
+            if !self.threads.contains_key(&thread.id) {
+                let destination = self.inferred_thread_space(thread);
+                self.projects
+                    .entry(thread.project_id)
+                    .or_default()
+                    .insert(destination);
+                self.threads.insert(thread.id, destination);
+            }
+        }
+    }
+
+    fn remove_cross_space_thread_state(&mut self) {
+        for (space, session) in &mut self.sessions {
+            let before = session.open_threads.len();
+            session
+                .open_threads
+                .retain(|thread| self.threads.get(thread) == Some(space));
+            let cleared_selection = session
+                .selected_thread
+                .is_some_and(|thread| self.threads.get(&thread) != Some(space));
+            if cleared_selection {
+                session.selected_thread = None;
+            }
+            if before != session.open_threads.len() || cleared_selection {
+                session.layout = None;
+            }
+        }
     }
 
     pub fn load(snapshot: &WorkspaceSnapshot) -> Result<Self> {
@@ -88,7 +208,18 @@ impl Spaces {
                     "Unsupported saved spaces version {}; original metadata preserved",
                     legacy.version
                 );
-                legacy.upgrade()
+                legacy.upgrade().upgrade(snapshot)
+            }
+            2 => {
+                let legacy: SpacesV2 = serde_json::from_value(value.clone()).context(
+                    "Cannot read saved spaces; the original metadata has been preserved",
+                )?;
+                anyhow::ensure!(
+                    legacy.version == 2,
+                    "Unsupported saved spaces version {}; original metadata preserved",
+                    legacy.version
+                );
+                legacy.upgrade(snapshot)
             }
             version if version == u64::from(VERSION) => serde_json::from_value(value.clone())
                 .context("Cannot read saved spaces; the original metadata has been preserved")?,
@@ -96,15 +227,8 @@ impl Spaces {
                 "Unsupported saved spaces version {version}; original metadata preserved"
             ),
         };
+        spaces.recover_missing_memberships(snapshot);
         spaces.validate(snapshot)?;
-        // A crash can occur after a new project is saved but before membership.
-        // Recover that project into Default rather than hide it.
-        for project in &snapshot.projects {
-            spaces
-                .projects
-                .entry(project.id)
-                .or_insert_with(|| BTreeSet::from([DEFAULT_SPACE]));
-        }
         Ok(spaces)
     }
 
@@ -194,6 +318,11 @@ impl Spaces {
                 .iter()
                 .map(|project| (project.id, BTreeSet::from([DEFAULT_SPACE])))
                 .collect(),
+            threads: snapshot
+                .threads
+                .iter()
+                .map(|thread| (thread.id, DEFAULT_SPACE))
+                .collect(),
             sessions: BTreeMap::from([(
                 DEFAULT_SPACE,
                 SpaceSession {
@@ -243,18 +372,27 @@ impl Spaces {
             }),
             "Invalid saved project membership; original metadata preserved"
         );
+        anyhow::ensure!(
+            self.threads.len() == snapshot.threads.len()
+                && self.threads.iter().all(|(thread, space)| {
+                    ids.contains(space)
+                        && snapshot.threads.iter().any(|item| {
+                            item.id == *thread
+                                && self
+                                    .projects
+                                    .get(&item.project_id)
+                                    .is_some_and(|spaces| spaces.contains(space))
+                        })
+                }),
+            "Invalid saved thread membership; original metadata preserved"
+        );
         for (id, session) in &self.sessions {
             let project_member = |project: &ProjectId| {
                 self.projects
                     .get(project)
                     .is_some_and(|spaces| spaces.contains(id))
             };
-            let thread_member = |thread: &ThreadId| {
-                snapshot
-                    .threads
-                    .iter()
-                    .any(|item| item.id == *thread && project_member(&item.project_id))
-            };
+            let thread_member = |thread: &ThreadId| self.threads.get(thread) == Some(id);
             let mut seen = HashSet::new();
             anyhow::ensure!(
                 session.selected_project.as_ref().is_none_or(project_member)
@@ -352,9 +490,14 @@ impl Spaces {
         let threads: HashSet<_> = snapshot
             .threads
             .iter()
-            .filter(|thread| thread.project_id == project)
+            .filter(|thread| {
+                thread.project_id == project && self.threads.get(&thread.id) == Some(&source)
+            })
             .map(|thread| thread.id)
             .collect();
+        for thread in &threads {
+            self.threads.insert(*thread, target);
+        }
         if let Some(session) = self.sessions.get_mut(&source) {
             session
                 .open_threads
@@ -376,15 +519,57 @@ impl Spaces {
         Ok(())
     }
 
-    fn delete(&mut self, id: SpaceId) -> Result<()> {
+    fn move_thread(
+        &mut self,
+        thread: ThreadId,
+        project: ProjectId,
+        source: SpaceId,
+        target: SpaceId,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.sessions.contains_key(&target),
+            "Destination space no longer exists"
+        );
+        anyhow::ensure!(
+            self.threads.get(&thread) == Some(&source),
+            "Thread is not in the source space"
+        );
+        if source == target {
+            return Ok(());
+        }
+        self.projects.entry(project).or_default().insert(target);
+        self.threads.insert(thread, target);
+        if let Some(session) = self.sessions.get_mut(&source) {
+            session.open_threads.retain(|open| *open != thread);
+            if session.selected_thread == Some(thread) {
+                session.selected_thread = None;
+            }
+            session.layout = None;
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, id: SpaceId, snapshot: &WorkspaceSnapshot) -> Result<()> {
         anyhow::ensure!(id != DEFAULT_SPACE, "Default cannot be deleted");
         anyhow::ensure!(
             id != self.active,
             "Switch away from this space before deleting it"
         );
         anyhow::ensure!(self.sessions.contains_key(&id), "Space no longer exists");
-        for memberships in self.projects.values_mut() {
-            if memberships.remove(&id) && memberships.is_empty() {
+        let moved_projects: HashSet<_> = snapshot
+            .threads
+            .iter()
+            .filter(|thread| self.threads.get(&thread.id) == Some(&id))
+            .map(|thread| thread.project_id)
+            .collect();
+        for space in self.threads.values_mut() {
+            if *space == id {
+                *space = DEFAULT_SPACE;
+            }
+        }
+        for (project, memberships) in &mut self.projects {
+            memberships.remove(&id);
+            if memberships.is_empty() || moved_projects.contains(project) {
                 memberships.insert(DEFAULT_SPACE);
             }
         }
@@ -437,10 +622,16 @@ impl AppState {
     }
 
     pub fn thread_in_active_space(&self, id: ThreadId) -> bool {
-        self.snapshot
-            .threads
-            .iter()
-            .any(|thread| thread.id == id && self.project_in_active_space(thread.project_id))
+        self.space_state.threads.get(&id) == Some(&self.active_space)
+    }
+
+    pub(super) fn register_thread_membership(
+        &mut self,
+        thread: ThreadId,
+        project: ProjectId,
+        space: SpaceId,
+    ) -> Result<SpaceId> {
+        self.change_spaces(|spaces, _| spaces.register_thread(thread, project, space))
     }
 
     pub fn space_mutation_reason(&self) -> Option<String> {
@@ -539,8 +730,24 @@ impl AppState {
         })
     }
 
+    pub fn move_thread_to_space(&mut self, thread: ThreadId, target: SpaceId) -> Result<()> {
+        anyhow::ensure!(
+            self.thread_in_active_space(thread),
+            "Select a thread in the active space"
+        );
+        let project = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|item| item.id == thread)
+            .map(|item| item.project_id)
+            .context("Thread no longer exists")?;
+        let source = self.active_space;
+        self.change_spaces(|spaces, _| spaces.move_thread(thread, project, source, target))
+    }
+
     pub fn delete_space(&mut self, id: SpaceId) -> Result<()> {
-        self.change_spaces(|spaces, _| spaces.delete(id))
+        self.change_spaces(|spaces, snapshot| spaces.delete(id, snapshot))
     }
 
     pub fn space_layout(&self) -> Option<&Value> {
@@ -705,6 +912,7 @@ mod tests {
         let mut legacy = serde_json::to_value(&spaces).unwrap();
         legacy["version"] = json!(1);
         legacy["projects"][snapshot.projects[0].id.to_string()] = json!(DEFAULT_SPACE);
+        legacy.as_object_mut().unwrap().remove("threads");
         snapshot.settings.insert(SETTING.into(), legacy);
 
         let upgraded = Spaces::load(&snapshot).unwrap();
@@ -720,6 +928,39 @@ mod tests {
         let saved = serde_json::to_value(upgraded).unwrap();
         assert_eq!(saved["version"], json!(VERSION));
         assert!(saved["projects"][snapshot.projects[0].id.to_string()].is_array());
+        assert_eq!(
+            saved["threads"][snapshot.threads[0].id.to_string()],
+            json!(DEFAULT_SPACE)
+        );
+    }
+
+    #[test]
+    fn version_two_shared_thread_is_assigned_to_one_session() {
+        let mut snapshot = fixture();
+        let mut spaces = Spaces::load(&snapshot).unwrap();
+        let project = snapshot.projects[0].id;
+        let thread = snapshot.threads[0].id;
+        let research = spaces.create("Research").unwrap();
+        spaces.register_project(project, research);
+        let session = spaces.sessions.get_mut(&research).unwrap();
+        session.selected_project = Some(project);
+        session.selected_thread = Some(thread);
+        session.open_threads.push(thread);
+        spaces.active = research;
+        let mut legacy = serde_json::to_value(spaces).unwrap();
+        legacy["version"] = json!(2);
+        legacy.as_object_mut().unwrap().remove("threads");
+        snapshot.settings.insert(SETTING.into(), legacy);
+
+        let upgraded = Spaces::load(&snapshot).unwrap();
+
+        assert_eq!(upgraded.threads[&thread], research);
+        assert_eq!(upgraded.sessions[&research].selected_thread, Some(thread));
+        assert!(
+            !upgraded.sessions[&DEFAULT_SPACE]
+                .open_threads
+                .contains(&thread)
+        );
     }
 
     #[test]
@@ -750,6 +991,32 @@ mod tests {
                 .selected_thread,
             Some(snapshot.threads[0].id)
         );
+    }
+
+    #[test]
+    fn moving_project_moves_only_threads_from_the_source_space() {
+        let mut snapshot = fixture();
+        let project = snapshot.projects[0].id;
+        let source_thread = snapshot.threads[0].id;
+        let mut other_thread = snapshot.threads[0].clone();
+        other_thread.id = Uuid::from_u128(7);
+        let other_thread_id = other_thread.id;
+        snapshot.threads.push(other_thread);
+        let mut spaces = Spaces::load(&snapshot).unwrap();
+        let target = spaces.create("Research").unwrap();
+        let other = spaces.create("Personal").unwrap();
+        spaces.register_project(project, target);
+        spaces
+            .move_thread(other_thread_id, project, DEFAULT_SPACE, other)
+            .unwrap();
+
+        spaces
+            .move_project(project, DEFAULT_SPACE, target, &snapshot)
+            .unwrap();
+
+        assert_eq!(spaces.threads[&source_thread], target);
+        assert_eq!(spaces.threads[&other_thread_id], other);
+        assert_eq!(spaces.projects[&project], BTreeSet::from([target, other]));
     }
 
     #[test]
@@ -800,11 +1067,11 @@ mod tests {
             Some(json!({"destination": "layout"}))
         );
         assert!(
-            spaces.delete(target).is_err(),
+            spaces.delete(target, &snapshot).is_err(),
             "Deleting active space is rejected"
         );
         spaces.switch(DEFAULT_SPACE).unwrap();
-        spaces.delete(target).unwrap();
+        spaces.delete(target, &snapshot).unwrap();
         spaces = reload(&spaces, &snapshot);
         assert_eq!(spaces.projects[&project], BTreeSet::from([DEFAULT_SPACE]));
         assert!(!spaces.sessions.contains_key(&target));
@@ -834,8 +1101,8 @@ mod tests {
                 .move_project(missing, DEFAULT_SPACE, work, &snapshot)
                 .is_err()
         );
-        assert!(spaces.delete(missing).is_err());
-        assert!(spaces.delete(DEFAULT_SPACE).is_err());
+        assert!(spaces.delete(missing, &snapshot).is_err());
+        assert!(spaces.delete(DEFAULT_SPACE, &snapshot).is_err());
         assert_eq!(serde_json::to_value(&spaces).unwrap(), before);
         spaces.rename(work, "  Personal  ").unwrap();
         assert_eq!(
@@ -925,6 +1192,44 @@ mod tests {
     }
 
     #[test]
+    fn sharing_project_with_another_space_does_not_share_its_threads() {
+        let snapshot = fixture();
+        let mut spaces = Spaces::load(&snapshot).unwrap();
+        let project = snapshot.projects[0].id;
+        let thread = snapshot.threads[0].id;
+        let other = spaces.create("Research").unwrap();
+
+        spaces.register_project(project, other);
+
+        let saved = serde_json::to_value(&spaces).unwrap();
+        assert_eq!(saved["threads"][thread.to_string()], json!(DEFAULT_SPACE));
+        assert_ne!(saved["threads"][thread.to_string()], json!(other));
+    }
+
+    #[test]
+    fn moving_thread_reassigns_it_once_and_keeps_project_in_both_spaces() {
+        let snapshot = fixture();
+        let mut spaces = Spaces::load(&snapshot).unwrap();
+        let project = snapshot.projects[0].id;
+        let thread = snapshot.threads[0].id;
+        let other = spaces.create("Research").unwrap();
+
+        spaces
+            .move_thread(thread, project, DEFAULT_SPACE, other)
+            .unwrap();
+
+        assert_eq!(spaces.threads.get(&thread), Some(&other));
+        assert_eq!(
+            spaces.projects[&project],
+            BTreeSet::from([DEFAULT_SPACE, other])
+        );
+        let saved = serde_json::to_value(&spaces).unwrap();
+        assert_eq!(saved["threads"][thread.to_string()], json!(other));
+        assert!(spaces.active_session().open_threads.is_empty());
+        assert!(spaces.active_session().selected_thread.is_none());
+    }
+
+    #[test]
     fn delayed_registration_keeps_origin_or_recovers_deleted_origin() {
         let snapshot = fixture();
         let mut spaces = Spaces::load(&snapshot).unwrap();
@@ -936,7 +1241,7 @@ mod tests {
         assert_eq!(spaces.projects[&project], BTreeSet::from([origin]));
         assert_eq!(spaces.active, other);
         assert!(spaces.active_session().selected_project.is_none());
-        spaces.delete(origin).unwrap();
+        spaces.delete(origin, &snapshot).unwrap();
         assert_eq!(spaces.projects[&project], BTreeSet::from([DEFAULT_SPACE]));
         let later_project = Uuid::from_u128(6);
         spaces.register_project(later_project, origin);

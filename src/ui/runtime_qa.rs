@@ -2437,6 +2437,45 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
             .disabled_reason(fixture.state.read(cx))
             .is_none()
     }));
+    assert!(cx.read(|cx| {
+        !crate::ui::sidebar::rows(fixture.state.read(cx), "").contains(&Row::Thread(thread))
+    }));
+    let research_thread = new_conversation(cx, &fixture).await;
+    assert!(cx.read(|cx| {
+        let rows = crate::ui::sidebar::rows(fixture.state.read(cx), "");
+        rows.contains(&Row::Thread(research_thread)) && !rows.contains(&Row::Thread(thread))
+    }));
+
+    // Exercise the same Workspace transition used by the thread context-menu
+    // destination. The destination gains the project, and the thread disappears
+    // from this Space without being duplicated.
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace
+                .move_thread_to_space(research_thread, default, window, cx)
+                .unwrap();
+        },
+    );
+    until(
+        cx,
+        "thread moved between spaces",
+        Duration::from_secs(10),
+        |cx| {
+            !fixture
+                .state
+                .read(cx)
+                .thread_in_active_space(research_thread)
+        },
+    )
+    .await;
+    assert!(cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        state.project_in_active_space(project)
+            && !crate::ui::sidebar::rows(state, "").contains(&Row::Thread(research_thread))
+    }));
 
     // The switcher and add control remain usable in both themes at minimum size.
     for (mode, expected) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
@@ -2549,7 +2588,12 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
         let state = fixture.state.read(cx);
         state.open_threads.is_empty() && crate::ui::sidebar::rows(state, "").is_empty()
     }));
-    cx.dispatch_action(fixture.window.into(), commands::NextSpace);
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.switch_space(research, window, cx).unwrap(),
+    );
     until(
         cx,
         "project visible in destination",

@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform::IdleSleepAssertion;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -322,6 +323,7 @@ struct Actor {
     history: Vec<Value>,
     sequence: usize,
     turn: Turn,
+    idle_sleep_assertion: Option<IdleSleepAssertion>,
     permissions: HashMap<String, Permission>,
     tools: HashMap<String, ToolActivity>,
     /// `set_model` control requests awaiting the CLI's answer.
@@ -368,6 +370,7 @@ impl Actor {
             history,
             sequence,
             turn: Turn::default(),
+            idle_sleep_assertion: None,
             permissions: HashMap::new(),
             tools: HashMap::new(),
             model_requests: HashMap::new(),
@@ -710,6 +713,15 @@ impl Actor {
                         "images":images,
                     });
                     self.queue(frame, Some((request_id, history)))?;
+                    match IdleSleepAssertion::acquire("DROSTJE. conversation turn") {
+                        Ok(assertion) => self.idle_sleep_assertion = Some(assertion),
+                        Err(error) => self.emit(ConversationEvent::Notice {
+                            level: "warning".into(),
+                            text: format!(
+                                "Could not prevent idle sleep during this conversation turn: {error:#}. Keep your Mac awake manually until the turn finishes."
+                            ),
+                        }),
+                    }
                     if !self.initialized && self.init_deadline.is_none() {
                         self.init_deadline = Some(Instant::now() + READY_TIMEOUT);
                     }
@@ -957,6 +969,7 @@ impl Actor {
     }
 
     fn settle(&mut self, outcome: TurnOutcome) {
+        self.idle_sleep_assertion = None;
         if let Some(request_id) = self.turn.id.take() {
             self.permissions.clear();
             self.emit(ConversationEvent::TurnSettled {

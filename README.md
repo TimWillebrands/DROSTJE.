@@ -63,13 +63,19 @@ De standaardmap is `~/Library/Application Support/Drostje` op macOS en `$XDG_DAT
 
 Kies in Settings zo nodig expliciete executable-paden, de Conversation-harness per project en de gedeelde Factory-data-root. OMP, Pi en Claude Code draaien met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
 
+### Agents laten doorwerken op macOS
+
+DROSTJE. voorkomt automatische sluimerstand zolang een Conversation-turn actief is of een door de app gestart Factory-proces draait. Het scherm mag wel uitgaan of vergrendelen. Zodra het werk klaar is, vervalt de bescherming; alleen een Conversation open laten staan houdt de Mac niet wakker. Er worden geen systeeminstellingen gewijzigd.
+
+Gebruik **Control-Cmd-Q** om het scherm te vergrendelen en laat DROSTJE. open. **Shift-Cmd-Q logt uit** en is dus niet geschikt om je agents te laten doorwerken. Expliciete sluimerstand, het sluiten van de MacBook-klep en sluimerstand door een lege accu worden niet tegengehouden. Bij het afsluiten van DROSTJE. vervalt ook de slaapbescherming voor nog draaiende Factory-processen.
+
 ### Spaces
 
 Een **Space** is een eigen werkcontext voor een groep projecten, geïnspireerd door [Zen](https://docs.zen-browser.app/user-manual/workspaces). De Space-kiezer in Projects wisselt de hele context; de `+` ernaast maakt een lege Space. Bestaande projecten en open threads komen bij de eerste start in **Default** terecht.
 
 Elke Space bewaart zijn eigen open tabs, geselecteerde project en thread, ingeklapte projecten, archiefweergave en paneelindeling. Projects, zoeken en de project- en threadresultaten in de command palette tonen alleen de actieve Space. Wisselen stopt geen lopende agent of Factory-run en bewaart concepten. Onvoltooide Neovim-opdrachten of tekstcompositie moeten eerst worden afgerond of geannuleerd.
 
-Via het Space-menu of de command palette kun je een Space hernoemen, een project vanuit de actieve Space verplaatsen, of een Space verwijderen. Een project kan in meerdere Spaces staan: voeg dezelfde Git-werkboom in een andere Space opnieuw toe om het project en zijn gedeelde threadgeschiedenis daar ook te gebruiken. **Move project to space…** verwijdert alleen het lidmaatschap van de actieve Space en laat andere Spaces ongemoeid. Bij het verwijderen van een Space blijven gedeelde projecten in hun andere Spaces staan; projecten zonder andere Space gaan naar Default. Historie, concepten en bestanden blijven behouden. Default zelf kan niet worden verwijderd.
+Via het Space-menu of de command palette kun je een Space hernoemen, een project vanuit de actieve Space verplaatsen, of een Space verwijderen. Een project kan in meerdere Spaces staan: voeg dezelfde Git-werkboom in een andere Space opnieuw toe om hem daar ook te gebruiken. Elke Conversation- of Factory-thread hoort bij precies één combinatie van project en Space; een nieuwe thread blijft dus alleen zichtbaar in de Space waar je hem maakt. Verplaats één thread via **Move thread to space** in het contextmenu van die thread; het project wordt zo nodig automatisch aan de doel-Space toegevoegd. **Move project to space…** verplaatst het project en alleen zijn threads uit de actieve Space, zonder lidmaatschappen of threads in andere Spaces te wijzigen. Bij het verwijderen van een Space gaan de threads en projecten zonder andere plek naar Default. Historie, concepten en bestanden blijven behouden. Default zelf kan niet worden verwijderd.
 
 Gebruik **Switch space…** voor de toetsenbordkiezer: `j/k`, pijlen, `gg/G`, Return en Escape. **Next space** en **Previous space** wisselen direct buiten invoervelden en overlays. Spaces scheiden organisatie, niet accounts, credentials of bestandstoegang; tools en thema-instellingen blijven gedeeld.
 

@@ -514,3 +514,134 @@ fn recovered_correlation_is_saved_without_losing_exit_metadata_or_spawning() {
         assert!(!fixture.directory.0.join("invocations").exists());
     });
 }
+
+#[cfg(target_os = "macos")]
+fn factory_idle_sleep_assertions() -> usize {
+    let output = Command::new("/usr/bin/pmset")
+        .args(["-g", "assertions"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let owner = format!("pid {}(", std::process::id());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            line.trim_start().starts_with(&owner)
+                && line.contains("PreventUserIdleSystemSleep")
+                && line.contains("named: \"DROSTJE. Factory run\"")
+        })
+        .count()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn idle_sleep_protection_tracks_owned_processes_through_overlap_and_observer_close() {
+    const ISOLATED: &str = "DROSTJE_FACTORY_POWER_TEST";
+    if std::env::var_os(ISOLATED).is_none() {
+        // Other launch tests run concurrently. Isolate this process's native
+        // assertion set rather than depending on the rest of the test suite.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "idle_sleep_protection_tracks_owned_processes_through_overlap_and_observer_close",
+                "--nocapture",
+            ])
+            .env(ISOLATED, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    smol::block_on(async {
+        assert_eq!(factory_idle_sleep_assertions(), 0);
+        let first = Fixture::new("exit 0", WAIT_RUN).await;
+        let first_manager = first.manager(Vec::new());
+        let first_spec = first.spec();
+        first_manager
+            .dispatch(first.owner().await, first_spec.clone())
+            .await
+            .unwrap();
+        wait_until(|| {
+            fs::read_to_string(output_path(&first_spec))
+                .is_ok_and(|text| text.contains("before close"))
+        })
+        .await;
+        wait_until(|| factory_idle_sleep_assertions() == 1).await;
+
+        // A terminal event is only Factory's report, not proof of child exit.
+        let events = first_spec.data_root.join("events");
+        fs::create_dir_all(&events).unwrap();
+        let records = [
+            (
+                "run-started",
+                json!({"userStoryId": 42, "logPath": first_spec.log_dir.join("run.log")}),
+            ),
+            ("run-completed", json!({"text": "completed"})),
+        ];
+        let text: String = records.into_iter().map(|(kind, payload)| {
+            format!("{}\n", json!({"schemaVersion": 1, "timestampUtc": "2026-09-15T12:01:00Z", "eventType": kind, "payload": payload}))
+        }).collect();
+        fs::write(events.join("run.jsonl"), text).unwrap();
+        let snapshot = first_manager.refresh(first_spec.id).await.unwrap();
+        assert_eq!(snapshot.reported_state, ReportedState::Completed);
+        assert_eq!(snapshot.liveness, Liveness::OwnedRunning);
+        assert_eq!(factory_idle_sleep_assertions(), 1);
+
+        let second = Fixture::new("exit 0", WAIT_RUN).await;
+        let second_manager = second.manager(Vec::new());
+        let second_spec = second.spec();
+        second_manager
+            .dispatch(second.owner().await, second_spec.clone())
+            .await
+            .unwrap();
+        wait_until(|| factory_idle_sleep_assertions() == 2).await;
+
+        let observer_events = first_manager.events.clone();
+        drop(first_manager);
+        wait_until(|| observer_events.is_closed()).await;
+        assert_eq!(factory_idle_sleep_assertions(), 2);
+        fs::remove_file(events.join("run.jsonl")).unwrap();
+        let recovered = first.manager(first.store.snapshot().await.unwrap().launches);
+        let snapshot = recovered.refresh(first_spec.id).await.unwrap();
+        assert_eq!(snapshot.liveness, Liveness::Unverified);
+        assert_eq!(snapshot.reported_state, ReportedState::Pending);
+        // Recovering an unverified launch adds no assertion of its own.
+        assert_eq!(factory_idle_sleep_assertions(), 2);
+
+        fs::write(second.directory.0.join("release-run"), "release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if second_manager
+                .refresh(second_spec.id)
+                .await
+                .unwrap()
+                .liveness
+                == Liveness::Exited(0)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            smol::Timer::after(Duration::from_millis(10)).await;
+        }
+        wait_until(|| factory_idle_sleep_assertions() == 1).await;
+        fs::write(first.directory.0.join("release-run"), "release").unwrap();
+        wait_until(|| factory_idle_sleep_assertions() == 0).await;
+        // The recovered observer remains open with an unknown process outcome,
+        // but it must not leave an indefinite idle-sleep inhibitor.
+        assert_eq!(
+            recovered.refresh(first_spec.id).await.unwrap().liveness,
+            Liveness::Unverified
+        );
+        assert_eq!(factory_idle_sleep_assertions(), 0);
+    });
+}

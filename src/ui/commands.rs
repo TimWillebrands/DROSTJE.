@@ -968,7 +968,7 @@ impl Render for Palette {
         let mut threads = CommandGroup::new().label("Threads");
         for thread in
             state.snapshot.threads.iter().filter(|thread| {
-                state.project_in_active_space(thread.project_id)
+                state.thread_in_active_space(thread.id)
                     && (state.show_archived
                         || (!thread.archived
                             && state.snapshot.projects.iter().any(|project| {

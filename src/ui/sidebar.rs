@@ -95,7 +95,11 @@ pub fn rows(state: &AppState, query: &str) -> Vec<Row> {
             .projects
             .iter()
             .filter(|project| state.project_in_active_space(project.id)),
-        &state.snapshot.threads,
+        state
+            .snapshot
+            .threads
+            .iter()
+            .filter(|thread| state.thread_in_active_space(thread.id)),
         &state.collapsed,
         state.show_archived,
         query,
@@ -104,7 +108,7 @@ pub fn rows(state: &AppState, query: &str) -> Vec<Row> {
 
 fn visible_rows<'a>(
     projects: impl IntoIterator<Item = &'a Project>,
-    threads: &[Thread],
+    threads: impl IntoIterator<Item = &'a Thread> + Clone,
     collapsed: &HashSet<ProjectId>,
     show_archived: bool,
     query: &str,
@@ -116,7 +120,8 @@ fn visible_rows<'a>(
         .filter(|p| show_archived || !p.archived)
     {
         let threads = threads
-            .iter()
+            .clone()
+            .into_iter()
             .filter(|t| t.project_id == project.id && (show_archived || !t.archived));
         if query.is_empty() {
             rows.push(Row::Project(project.id));
@@ -268,10 +273,10 @@ fn row_menu(
     let Some(workspace) = owner.upgrade() else {
         return menu;
     };
-    let state = workspace.read(cx).state.read(cx);
     match row {
-        Row::Project(_) => menu
-            .item(command_item(
+        Row::Project(_) => {
+            let state = workspace.read(cx).state.read(cx);
+            menu.item(command_item(
                 "New OMP conversation",
                 Command::NewOmpConversation,
                 state,
@@ -311,20 +316,69 @@ fn row_menu(
                 "Archive project…",
                 Command::ArchiveProject,
                 state,
-            )),
-        Row::Thread(_) => menu
-            .item(command_item("Rename thread…", Command::RenameThread, state))
-            .item(command_item(
-                "Archive thread…",
-                Command::ArchiveThread,
-                state,
             ))
-            .separator()
-            .item(command_item(
+        }
+        Row::Thread(thread) => {
+            let (destinations, reason) = {
+                let state = workspace.read(cx).state.read(cx);
+                let destinations = state
+                    .spaces
+                    .iter()
+                    .filter(|space| space.id != state.active_space)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let reason = state.space_mutation_reason().or_else(|| {
+                    destinations
+                        .is_empty()
+                        .then(|| "Create another space first.".into())
+                });
+                (destinations, reason)
+            };
+            let mut menu = {
+                let state = workspace.read(cx).state.read(cx);
+                menu.item(command_item("Rename thread…", Command::RenameThread, state))
+                    .item(command_item(
+                        "Archive thread…",
+                        Command::ArchiveThread,
+                        state,
+                    ))
+            };
+            if let Some(reason) = reason {
+                menu =
+                    menu.item(PopupMenuItem::new(format!("Move thread — {reason}")).disabled(true));
+            } else {
+                for destination in destinations {
+                    let owner = owner.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format!("Move thread to {}", destination.name))
+                            .on_click(move |_, window, cx| {
+                                let _ = owner.update(cx, |workspace, cx| {
+                                    if let Err(error) = workspace.move_thread_to_space(
+                                        thread,
+                                        destination.id,
+                                        window,
+                                        cx,
+                                    ) {
+                                        workspace.state.update(cx, |state, cx| {
+                                            state.notice(
+                                                crate::app::NoticeLevel::Warning,
+                                                format!("{error:#}"),
+                                            );
+                                            cx.notify();
+                                        });
+                                    }
+                                });
+                            }),
+                    );
+                }
+            }
+            let state = workspace.read(cx).state.read(cx);
+            menu.separator().item(command_item(
                 Command::CloseThread.label(),
                 Command::CloseThread,
                 state,
-            )),
+            ))
+        }
     }
 }
 

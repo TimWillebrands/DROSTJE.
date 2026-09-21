@@ -37,6 +37,160 @@ pub fn set_application_icon() -> Result<()> {
     Ok(())
 }
 
+/// Keeps background work running through screen lock and display sleep on macOS.
+/// Does not override explicit sleep, lid closure, logout, or low-battery sleep.
+/// Acquire and drop on the worker that owns the activity, never the UI thread.
+pub struct IdleSleepAssertion {
+    #[cfg(target_os = "macos")]
+    id: u32,
+}
+
+impl IdleSleepAssertion {
+    pub fn acquire(reason: &str) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(Self {
+                id: idle_sleep::acquire(reason)?,
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = reason;
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for IdleSleepAssertion {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        idle_sleep::release(self.id);
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod idle_sleep {
+    use anyhow::{Context, Result, ensure};
+    use std::ffi::c_void;
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOPMAssertionCreateWithName(
+            kind: CFTypeRef,
+            level: u32,
+            name: CFTypeRef,
+            id: *mut u32,
+        ) -> i32;
+        fn IOPMAssertionRelease(id: u32) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithBytes(
+            allocator: CFTypeRef,
+            bytes: *const u8,
+            length: isize,
+            encoding: u32,
+            external: u8,
+        ) -> CFTypeRef;
+        fn CFRelease(value: CFTypeRef);
+    }
+
+    struct CFString(CFTypeRef);
+
+    impl CFString {
+        fn new(value: &str) -> Result<Self> {
+            let length = value
+                .len()
+                .try_into()
+                .context("Power assertion name too long")?;
+            // SAFETY: bytes are valid UTF-8 and live for this copying call; NULL selects
+            // the default allocator. 0x08000100 is kCFStringEncodingUTF8.
+            let string = unsafe {
+                CFStringCreateWithBytes(std::ptr::null(), value.as_ptr(), length, 0x08000100, 0)
+            };
+            ensure!(!string.is_null(), "Allocate power assertion string");
+            Ok(Self(string))
+        }
+    }
+
+    impl Drop for CFString {
+        fn drop(&mut self) {
+            // SAFETY: this is the non-null, owned reference returned by Create.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    pub(super) fn acquire(reason: &str) -> Result<u32> {
+        let kind = CFString::new("PreventUserIdleSystemSleep")?;
+        let name = CFString::new(reason)?;
+        let mut id = 0;
+        // SAFETY: both CFStrings remain alive for the call, and id is writable.
+        // 255 is kIOPMAssertionLevelOn; IOKit owns copies of the strings on success.
+        let result = unsafe { IOPMAssertionCreateWithName(kind.0, 255, name.0, &mut id) };
+        ensure!(
+            result == 0,
+            "Prevent macOS idle sleep: IOKit error {result:#x}"
+        );
+        Ok(id)
+    }
+
+    pub(super) fn release(id: u32) {
+        // SAFETY: id is owned by one non-cloneable IdleSleepAssertion and released once.
+        let result = unsafe { IOPMAssertionRelease(id) };
+        if result != 0 {
+            eprintln!("Release macOS idle sleep protection: IOKit error {result:#x}");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::platform::IdleSleepAssertion;
+
+        unsafe extern "C" {
+            fn IOPMAssertionCopyProperties(id: u32) -> CFTypeRef;
+            fn CFDictionaryGetValue(dictionary: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
+            fn CFEqual(left: CFTypeRef, right: CFTypeRef) -> u8;
+        }
+
+        fn prevents_idle_system_sleep(id: u32) -> bool {
+            // SAFETY: IOKit accepts any assertion ID and returns NULL for released IDs.
+            let properties = unsafe { IOPMAssertionCopyProperties(id) };
+            if properties.is_null() {
+                return false;
+            }
+            let key = CFString::new("AssertType").unwrap();
+            let expected = CFString::new("PreventUserIdleSystemSleep").unwrap();
+            // SAFETY: properties is an owned dictionary; key and expected are live
+            // CFStrings. The borrowed dictionary value is compared before release.
+            unsafe {
+                let kind = CFDictionaryGetValue(properties, key.0);
+                let matches = !kind.is_null() && CFEqual(kind, expected.0) != 0;
+                CFRelease(properties);
+                matches
+            }
+        }
+
+        #[test]
+        fn overlapping_work_releases_only_its_own_sleep_assertion() {
+            let first = IdleSleepAssertion::acquire("DROSTJE. power lifecycle test").unwrap();
+            let second = IdleSleepAssertion::acquire("DROSTJE. power lifecycle test").unwrap();
+            let first_id = first.id;
+            let second_id = second.id;
+            assert!(prevents_idle_system_sleep(first_id));
+            assert!(prevents_idle_system_sleep(second_id));
+            drop(first);
+            assert!(!prevents_idle_system_sleep(first_id));
+            assert!(prevents_idle_system_sleep(second_id));
+            drop(second);
+            assert!(!prevents_idle_system_sleep(second_id));
+        }
+    }
+}
+
 pub fn home() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)

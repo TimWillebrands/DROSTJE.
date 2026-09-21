@@ -1,4 +1,5 @@
 use super::*;
+use crate::platform::IdleSleepAssertion;
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::json;
@@ -503,6 +504,7 @@ struct Actor {
     dialogs: HashMap<String, Dialog>,
     tools: HashMap<String, ToolActivity>,
     turn: Turn,
+    idle_sleep_assertion: Option<IdleSleepAssertion>,
     state: ConversationState,
     ready_deadline: Instant,
     negotiated: bool,
@@ -550,6 +552,7 @@ impl Actor {
             dialogs: HashMap::new(),
             tools: HashMap::new(),
             turn: Turn::default(),
+            idle_sleep_assertion: None,
             state: ConversationState::Starting,
             ready_deadline: Instant::now() + CONTROL_TIMEOUT,
             negotiated: dialect == Dialect::Pi,
@@ -591,6 +594,12 @@ impl Actor {
         });
     }
     fn state(&mut self, state: ConversationState) {
+        // Ready can precede prompt acceptance. Keep protection until that turn settles.
+        if state == ConversationState::Disconnected
+            || (state == ConversationState::Ready && self.turn.id.is_none())
+        {
+            self.idle_sleep_assertion = None;
+        }
         if self.state != state {
             self.state = state.clone();
             self.emit(ConversationEvent::StateChanged(state));
@@ -955,6 +964,15 @@ impl Actor {
                         self.submissions.pop_front();
                     }
                     self.submissions.push_back(request_id);
+                    match IdleSleepAssertion::acquire("DROSTJE. conversation turn") {
+                        Ok(assertion) => self.idle_sleep_assertion = Some(assertion),
+                        Err(error) => self.notice(
+                            "warning",
+                            format!(
+                                "Could not prevent idle sleep during this conversation turn: {error:#}. Keep your Mac awake manually until the turn finishes."
+                            ),
+                        ),
+                    }
                     self.turn.begin(request_id);
                     self.state(ConversationState::Running);
                     Ok(())
@@ -2160,6 +2178,136 @@ done
         assert!(!args.contains("negotiate_protocol"));
         assert!(accepted && message && settled);
         let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn idle_sleep_protection_follows_owned_turn_lifecycle() -> Result<()> {
+        const CHILD: &str = "DROSTJE_OMP_POWER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "harness::omp::tests::idle_sleep_protection_follows_owned_turn_lifecycle",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "Isolated OMP power test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Ok(());
+        }
+
+        fn assertions() -> Result<Vec<String>> {
+            let output = Command::new("/usr/bin/pmset")
+                .args(["-g", "assertions"])
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "Could not inspect power assertions"
+            );
+            let pid = format!("pid {}(", std::process::id());
+            String::from_utf8(output.stdout)?
+                .lines()
+                .filter(|line| {
+                    line.trim_start().starts_with(&pid)
+                        && line.contains("PreventUserIdleSystemSleep")
+                        && line.contains("named: \"DROSTJE. conversation turn\"")
+                })
+                .map(|line| {
+                    line.split_whitespace()
+                        .find(|part| part.starts_with("[0x"))
+                        .map(str::to_owned)
+                        .context("Power assertion omitted its identifier")
+                })
+                .collect()
+        }
+
+        let root = std::env::temp_dir().join(format!("drostje-omp-power-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        let mut config = ConversationConfig {
+            harness: "omp".into(),
+            executable: "/usr/bin/true".into(),
+            cwd: root.clone(),
+            session_dir: root.join("session"),
+            session_ref: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            allow_empty_session: true,
+        };
+        // Drive the actual actor handlers; this child requires no external agent or credentials.
+        let child = prepare(&mut config, Dialect::Omp)?;
+        let (_commands, input) = async_channel::bounded(64);
+        let (output, _events) = async_channel::bounded(128);
+        let mut actor = Actor::new(config, child, input, output, Dialect::Omp);
+        actor.initialized = true;
+        actor.negotiated = true;
+        actor.state(ConversationState::Ready);
+        assert!(assertions()?.is_empty());
+
+        let submit = |actor: &mut Actor| -> Result<Uuid> {
+            let request_id = Uuid::new_v4();
+            actor.command(ConversationCommand::Submit {
+                request_id,
+                text: "Check lifecycle".into(),
+                images: Vec::new(),
+            })?;
+            Ok(request_id)
+        };
+        let id = submit(&mut actor)?;
+        let active = assertions()?;
+        assert_eq!(active.len(), 1);
+        actor.frame(json!({"type":"agent_end","isTerminal":false}))?;
+        assert_eq!(
+            assertions()?,
+            active,
+            "Continuation must retain the same assertion"
+        );
+        actor.frame(json!({"type":"agent_end","isTerminal":true}))?;
+        assert_eq!(
+            assertions()?,
+            active,
+            "Terminal-before-acceptance is not settled yet"
+        );
+        actor.frame(json!({"id":id,"type":"response","command":"prompt","success":true}))?;
+        assert!(
+            assertions()?.is_empty(),
+            "Accepted terminal turn must release protection"
+        );
+
+        let id = submit(&mut actor)?;
+        actor.frame(json!({"id":id,"type":"response","command":"prompt","success":true}))?;
+        let active = assertions()?;
+        assert_eq!(active.len(), 1);
+        actor.extension(json!({"id":"confirm","method":"confirm","title":"Continue?"}))?;
+        assert_eq!(
+            assertions()?,
+            active,
+            "Waiting for input must retain protection"
+        );
+        actor.command(ConversationCommand::Interrupt)?;
+        assert_eq!(assertions()?, active, "Interrupt request is not terminal");
+        actor.frame(json!({"type":"agent_end","isTerminal":true}))?;
+        assert!(
+            assertions()?.is_empty(),
+            "Interrupted terminal turn must release protection"
+        );
+
+        submit(&mut actor)?;
+        assert_eq!(assertions()?.len(), 1);
+        actor.disconnect("Fixture EOF".into());
+        assert!(
+            assertions()?.is_empty(),
+            "Disconnect must release protection"
+        );
+        drop(actor);
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

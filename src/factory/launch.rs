@@ -122,6 +122,17 @@ struct Pending {
     reply: Reply<LaunchId>,
 }
 
+struct OwnedChild {
+    process: Child,
+    _idle_sleep: Option<platform::IdleSleepAssertion>,
+}
+
+impl OwnedChild {
+    fn wait(mut self) {
+        let _ = self.process.wait();
+    }
+}
+
 struct Actor {
     store: Store,
     data_dir: PathBuf,
@@ -129,8 +140,9 @@ struct Actor {
     snapshots: BTreeMap<LaunchId, FactorySnapshot>,
     liveness: BTreeMap<LaunchId, Liveness>,
     pending: BTreeMap<LaunchId, Pending>,
-    children: BTreeMap<LaunchId, Child>,
+    children: BTreeMap<LaunchId, OwnedChild>,
     wait_errors: BTreeMap<LaunchId, String>,
+    power_errors: BTreeMap<LaunchId, String>,
     storage_failure: Option<String>,
     tracker: EventTracker,
     updates: Sender<FactorySnapshot>,
@@ -167,6 +179,7 @@ impl Actor {
             pending: BTreeMap::new(),
             children: BTreeMap::new(),
             wait_errors: BTreeMap::new(),
+            power_errors: BTreeMap::new(),
             storage_failure: None,
             tracker: EventTracker::new(),
             updates,
@@ -250,14 +263,12 @@ impl Actor {
                 anyhow!("Factory observer closed before the process was spawned"),
             );
         }
-        // Dropping Child never kills it. Reap detached children if the application
-        // remains alive after this handle closes; the reaper owns no Store handle.
-        for (_, mut child) in self.children {
-            let _ = thread::Builder::new()
-                .name("drostje-factory-reaper".into())
-                .spawn(move || {
-                    let _ = child.wait();
-                });
+        // The closed observer's actor becomes the reaper. Release Store and
+        // observation state, but retain each child's assertion until it is reaped.
+        let children = std::mem::take(&mut self.children);
+        drop(self);
+        for (_, child) in children {
+            child.wait();
         }
     }
 
@@ -384,7 +395,22 @@ impl Actor {
             let stderr = append_log(&launch_dir(&spec).join("stderr.log"))?;
             // Prerequisites succeeding cannot override a subsequent Store failure.
             self.writable()?;
-            spawn_run(&spec, stdout, stderr)
+            let idle_sleep = match platform::IdleSleepAssertion::acquire("DROSTJE. Factory run") {
+                Ok(assertion) => Some(assertion),
+                Err(error) => {
+                    self.power_errors.insert(
+                        id,
+                        format!(
+                            "Cannot prevent idle system sleep during this Factory run: {error:#}. Keep your Mac awake manually until the run exits."
+                        ),
+                    );
+                    None
+                }
+            };
+            Ok(OwnedChild {
+                process: spawn_run(&spec, stdout, stderr)?,
+                _idle_sleep: idle_sleep,
+            })
         })();
         match result {
             Ok(child) => {
@@ -446,7 +472,7 @@ impl Actor {
     fn wait_children(&mut self) {
         let mut exited = Vec::new();
         for (&id, child) in &mut self.children {
-            match child.try_wait() {
+            match child.process.try_wait() {
                 Ok(Some(status)) => exited.push((
                     id,
                     status
@@ -507,6 +533,9 @@ impl Actor {
                 snapshot.diagnostics.push("Pending dispatch: checking prerequisites; no Factory run process has been spawned.".into());
             }
             if let Some(error) = self.wait_errors.get(&snapshot.launch.id) {
+                snapshot.diagnostics.push(error.clone());
+            }
+            if let Some(error) = self.power_errors.get(&snapshot.launch.id) {
                 snapshot.diagnostics.push(error.clone());
             }
             if self.snapshots.get(&snapshot.launch.id) != Some(&snapshot) {

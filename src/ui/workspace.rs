@@ -132,6 +132,7 @@ const OUTDATED_LAYOUT: &str = "Layout was saved by another version";
 enum SpaceChange {
     Switch(SpaceId),
     Move(ProjectId, SpaceId),
+    MoveThread(ThreadId, SpaceId),
     Delete(SpaceId),
 }
 
@@ -531,6 +532,16 @@ impl Workspace {
         self.change_space(SpaceChange::Move(project, target), window, cx)
     }
 
+    pub(super) fn move_thread_to_space(
+        &mut self,
+        thread: ThreadId,
+        target: SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.change_space(SpaceChange::MoveThread(thread, target), window, cx)
+    }
+
     fn change_space(
         &mut self,
         change: SpaceChange,
@@ -592,6 +603,9 @@ impl Workspace {
                 SpaceChange::Move(project, target) => {
                     state.move_project_to_space(project, target)?
                 }
+                SpaceChange::MoveThread(thread, target) => {
+                    state.move_thread_to_space(thread, target)?
+                }
                 SpaceChange::Delete(id) => {
                     anyhow::ensure!(id != state.default_space_id(), "Default cannot be deleted");
                     if state.active_space == id {
@@ -643,7 +657,7 @@ impl Workspace {
         self.sync_space(window, cx);
         self.sync_thread_panels(window, cx);
         self.sync_session(window, cx);
-        if matches!(change, SpaceChange::Move(..)) {
+        if matches!(change, SpaceChange::Move(..) | SpaceChange::MoveThread(..)) {
             self.cursor = None;
             self.flush_layout(cx);
             self.focus_region(Region::Projects, window, cx);
