@@ -4726,10 +4726,7 @@ pub fn finalize(self: *Config) !void {
                 log.info("default shell source=env value={s}", .{value});
 
                 const copy = try alloc.dupeZ(u8, value);
-                // DROSTJE treats the shell path as an executable, never shell source.
-                const args = try alloc.alloc([:0]const u8, 1);
-                args[0] = copy;
-                self.command = .{ .direct = args };
+                self.command = .{ .direct = try @import("default_shell.zig").argv(alloc, copy) };
 
                 // If we don't need the working directory, then we can exit now.
                 if (wd != .home) break :command;
@@ -4760,9 +4757,7 @@ pub fn finalize(self: *Config) !void {
                     if (self.command == null) {
                         if (pw.shell) |sh| {
                             log.info("default shell src=passwd value={s}", .{sh});
-                            const args = try alloc.alloc([:0]const u8, 1);
-                            args[0] = sh;
-                            self.command = .{ .direct = args };
+                            self.command = .{ .direct = try @import("default_shell.zig").argv(alloc, sh) };
                         }
                     }
 
@@ -4777,9 +4772,7 @@ pub fn finalize(self: *Config) !void {
 
                     if (self.command == null) {
                         log.warn("no default shell found, will default to using sh", .{});
-                        const args = try alloc.alloc([:0]const u8, 1);
-                        args[0] = "/bin/sh";
-                        self.command = .{ .direct = args };
+                        self.command = .{ .direct = try @import("default_shell.zig").argv(alloc, "/bin/sh") };
                     }
                 },
             }
