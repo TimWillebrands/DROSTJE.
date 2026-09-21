@@ -1146,6 +1146,19 @@ impl AppState {
         }
         self.persist_space_session();
     }
+    /// A terminal has a project but no thread; keep open tabs and commit the previous draft.
+    pub fn select_terminal_project(&mut self, id: ProjectId) {
+        if !self.project_in_active_space(id) {
+            return;
+        }
+        if let Some(previous) = self.selected_thread {
+            self.commit_thread_edits(previous);
+        }
+        self.selected_project = Some(id);
+        self.selected_thread = None;
+        self.select_launch_output(None);
+        self.persist_space_session();
+    }
     pub fn select_thread(&mut self, id: ThreadId) {
         if !self.thread_in_active_space(id) {
             return;

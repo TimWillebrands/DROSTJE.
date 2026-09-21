@@ -15,6 +15,7 @@ Een **drost** (of drossaard, als je het deftig wilt zeggen) was vroeger de rentm
 - 🗂️ **Je projecten bij elkaar houden.** Gewoon je bestaande git-repo's, geen gedoe.
 - **Werk scheiden met Spaces.** Groepeer projecten en hun threads, met eigen open tabs, selectie en paneelindeling per Space.
 - **Meerdere threads openhouden.** Conversations en Factory-threads staan naast elkaar in tabs; de open tabs worden bewaard.
+- **Een echte terminal naast je threads.** Open een libghostty-terminal in de projectmap, als eigen tab of gesplitst paneel. Shellsessies blijven alleen tijdens deze app-sessie bestaan.
 - **Prompts met Neovim schrijven.** Echte normal-, insert- en visual-modi, operators, registers en undo/redo, ingebed in de bestaande composer zonder regelnummers of terminalvenster.
 - **Factory-runs starten.** Een bestaande User Story of PRD/issues-map kiezen, launch-parameters instellen en daarna de native events en resultaten volgen.
 - 📜 **Terugzien wat er gebeurd is.** Elke run blijft bewaard, ook als je DROSTJE. tussendoor even dichtdoet.
@@ -33,6 +34,8 @@ cargo run
 ```
 
 Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor testen)? Zet `DROSTJE_DATA_DIR`.
+
+Een bronbuild vereist **Zig 0.16** (`zig` op PATH, of `ZIG=/pad/naar/zig`) voor de ingebedde libghostty-adapter. Op macOS is ook Xcode nodig; Linux vereist Wayland/EGL/OpenGL, libxml2 en de libc++-runtime van LLVM 21 of nieuwer. De eerste build compileert de meegeleverde Ghostty-broncode; volgende builds hergebruiken een cache op basis van broncode en toolchain. `GHOSTTY_NATIVE_CACHE_DIR` kan die cache verplaatsen. Een gebouwde app heeft geen Zig of afzonderlijk geïnstalleerde Ghostty nodig.
 
 ### Installeren
 
@@ -77,13 +80,17 @@ Projects bevat binnen de actieve Space een lijst met twee soorten threads:
 - **Conversation:** een interactieve OMP- of Claude Code-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Klik op de `+` naast een project en kies eerst **OMP** of **Claude Code**. Dezelfde keuzes staan onder **New thread** en in de command palette; `Cmd-N` gebruikt de gekozen projectstandaard. Rechts toont een inklapbare zijbalk de actuele Git-wijzigingen terwijl een turn loopt; `Toggle conversation changes` en `Refresh conversation changes` staan ook in de command palette. Het model kies je onderaan de composer.
 - **Factory:** parameters voor een bestaande Azure DevOps User Story of een bestaande PRD/issues-map. `Advanced` bevat de branch en het optionele thought level. `Start run` slaat de definitieve configuratie eerst op; een opslagfout start niets.
 
+**Terminal** is een derde soort centraal paneel, geen opgeslagen thread. Kies **New terminal** in het projectmenu, het tabmenu of de command palette (`Cmd-Alt-T`). De standaard-shell start in de projectmap met je eigen gebruikersrechten. Tabs, splitsingen, `Ctrl-Tab` en `Ctrl-W` + `h/j/k/l` werken ook voor terminals. `Cmd-Escape` verlaat de terminalinvoer zonder de shell te stoppen; `Ctrl-C` blijft een terminaltoets.
+
+Een terminal blijft draaien bij tab- en Space-wissels. Sluiten of **Restart terminal** vraagt bevestiging zolang de shell draait en stopt die shell plus het actieve proces op de voorgrond. Na een gewone shell-exit blijft het paneel zichtbaar met een herstartactie. Afsluiten van de app stopt alle terminals na bevestiging; terminaltabs en shellsessies worden niet bewaard of automatisch opnieuw gestart. Opstart- en rendererfouten blijven in het betreffende paneel zichtbaar, zonder Conversations of Factory-threads te blokkeren. De native backend gebruikt Metal op macOS en EGL/OpenGL op Linux/Wayland; X11 wordt voor Terminal niet ondersteund.
+
 De Conversation-tijdlijn toont denkstappen als gedempte inline tekst. Ingeklapte tools houden een begrensd voorbeeld van hun resultaat zichtbaar; open de kaart voor de volledige uitvoer. Mislukte tools openen hun foutdetails automatisch.
 
 Na de eerste duurzame launch wordt de Factory-thread een alleen-lezen monitor met native events, resultaten en ruwe details. Ook een geweigerde launch blijft als historie bewaard. Een volgende poging begint in een **nieuwe Factory-thread**. Er is geen taakpakket-generator, handoff vanuit een bericht of Factory-composer.
 
-De werkruimte heeft Projects links, threads centraal en een optioneel Output-dock onderaan. Elke open thread is een eigen dock-paneel: sleep een tab naast of onder een andere om meerdere Conversations tegelijk in beeld te hebben, of laat ze als tabs bij elkaar. Je kunt de native docks verplaatsen, groeperen en schalen; de indeling, inclusief welke threads open staan, wordt bewaard. Het paneel dat focus krijgt (klik, tab, of `Ctrl-W` + `h/j/k/l`) is de geselecteerde thread; alleen dat paneel host de Neovim-editor, andere zichtbare Conversations tonen hun bewaarde concept met de hint `Press i to edit`. `Close thread` sluit alleen dat paneel en eventueel een inactieve Conversation-sessie, niet de historie of een lopende turn of Factory-run. Bij sluiten van de actieve thread krijgt een aangrenzende thread focus. Concepttekst blijft behouden bij wisselen, sluiten en opnieuw openen.
+De werkruimte heeft Projects links en Conversations, Factory-threads en terminals centraal. Changes en Output horen bij de zijbalk van hun thread. Elk centraal paneel is een eigen dock-paneel: sleep een tab naast of onder een andere om meerdere panelen tegelijk in beeld te hebben, of laat ze als tabs bij elkaar. Je kunt de native docks verplaatsen, groeperen en schalen; threadtabs en hun indeling worden bewaard, terminaltabs alleen tijdens de huidige app-sessie. Het paneel dat focus krijgt (klik, tab, of `Ctrl-W` + `h/j/k/l`) is het geselecteerde paneel; alleen de geselecteerde Conversation host de Neovim-editor, andere zichtbare Conversations tonen hun bewaarde concept met de hint `Press i to edit`. Bij een thread sluit `Close tab` alleen het paneel en eventueel een inactieve Conversation-sessie, niet de historie of een lopende turn of Factory-run. Bij sluiten krijgt een aangrenzende tab focus. Concepttekst blijft behouden bij wisselen, sluiten en opnieuw openen.
 
-Zonder geopende thread zie je compacte startacties in het midden; een lege tabstrip wordt niet getoond. Opslagstatus staat in de titelbalk, niet in een aparte onderbalk. Output blijft bereikbaar via de dockkop, `Cmd-J` en de command palette.
+Zonder geopende centrale panelen zie je compacte startacties in het midden; een lege tabstrip wordt niet getoond. Opslagstatus staat in de titelbalk, niet in een aparte onderbalk. De zijbalk van een thread blijft bereikbaar via `Cmd-J` en de command palette.
 
 Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het geheugen bijgewerkt: er loopt geen opslagtimer en de melding ‘Saving changes…’ verschijnt niet voor wachtende edits. Opslag begint bij het verlaten van de editor of een veld, het wisselen of sluiten van een thread, of een expliciete bevestiging. Return bevestigt een Factory-veld. Verzenden, Factory Start en normaal afsluiten wachten op de benodigde opslag. Bij een crash kunnen wijzigingen sinds de laatste bevestiging of focuswissel verloren gaan.
 
@@ -95,18 +102,19 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |---|---|
 |`Cmd-Shift-P`|Command palette: opdrachten, projecten en beide threadsoorten|
 |`Cmd-N` / `Cmd-Shift-N`|Nieuwe Conversation / Factory-thread|
+|`Cmd-Alt-T`|Nieuwe Terminal in het geselecteerde project|
 |`Cmd-1` / `Cmd-2` / `Cmd-3`|Focus Projects / Thread / Output; opent zo nodig het dock|
 |`Cmd-B` / `Cmd-J`|Projects / Output tonen of verbergen|
-|`Ctrl-Tab` / `Ctrl-Shift-Tab`|Volgende / vorige open threadtab|
+|`Ctrl-Tab` / `Ctrl-Shift-Tab`|Volgende / vorige centrale tab, inclusief terminals|
 |`Cmd-Alt-]` / `Cmd-Alt-[`|Volgende / vorige Space, buiten invoervelden en overlays|
-|`Cmd-W` (Linux: `Ctrl-Shift-W`)|Huidige threadtab sluiten|
-|`Ctrl-W`, daarna `h/j/k/l`|Naar het dichtstbijzijnde zichtbare paneel in die richting, ook vanuit de prompt-editor; zonder buur blijft focus staan, zonder omslaan of diagonale sprongen|
+|`Cmd-W` (Linux: `Ctrl-Shift-W`)|Huidige tab sluiten; bij een draaiende terminal met bevestiging|
+|`Ctrl-W`, daarna `h/j/k/l`|Naar het dichtstbijzijnde zichtbare paneel in die richting, ook vanuit de prompteditor of terminal; zonder buur blijft focus staan, zonder omslaan of diagonale sprongen|
 |`j/k`, pijlen, `gg/G`, Home/End, Page Up/Down, `h/l`, Return|Navigeren, springen, bladeren, invouwen/uitvouwen en openen in Projects; in een Conversation scrollen dezelfde toetsen de geschiedenis|
 |`i` in een Conversation|Focus naar de prompteditor|
 |`Cmd-V` in een Conversation|Afbeelding van het klembord als bijlage toevoegen (PNG, JPEG, WebP, TIFF); tekst plakt in de editor|
 |`Cmd-Enter`|Prompt versturen, Factory-configuratie starten of formulier bevestigen|
 |`Cmd-.`|Interactieve turn onderbreken|
-|`Cmd-Escape`|Van de prompteditor terug naar Thread|
+|`Cmd-Escape`|Prompteditor- of terminalinvoer verlaten|
 |`Cmd-,`|Settings|
 |Escape|Bovenste menu of venster sluiten; in de palette eerst de zoektekst wissen|
 

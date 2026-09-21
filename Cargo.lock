@@ -1507,6 +1507,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64 0.22.1",
+ "ghostty-terminal",
  "gpui-kit",
  "image",
  "libc",
@@ -2169,6 +2170,23 @@ dependencies = [
  "r-efi 6.0.0",
  "rand_core 0.10.1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "ghostty-terminal"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "gpui-kit",
+ "image",
+ "khronos-egl",
+ "libc",
+ "libloading",
+ "raw-window-handle",
+ "smallvec",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

@@ -2774,3 +2774,102 @@ async fn projects_selection_displays_the_threads_tab(cx: &mut TestAppContext) {
     assert_eq!(displayed(cx), vec![threads[2].to_string()]);
     quit(cx, &fixture).await;
 }
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; tests real unsupported-native-host error, mixed tabs and persistence without a provider turn"]
+async fn terminal_tabs_keep_failure_local_and_do_not_persist_sessions(cx: &mut TestAppContext) {
+    let fixture = open_fixture_with_editor(cx, None, Some("/nonexistent/drostje-qa-neovim")).await;
+    cx.dispatch_action(fixture.window.into(), commands::NewFactoryThread);
+    let factory = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+    cx.dispatch_action(fixture.window.into(), commands::NewTerminal);
+    until(
+        cx,
+        "terminal host failure is visible",
+        Duration::from_secs(10),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .active_terminal(cx)
+                .is_some_and(|terminal| terminal.read(cx).error().is_some())
+        },
+    )
+    .await;
+    let press = |cx: &mut TestAppContext, key: &str| {
+        cx.update_window(fixture.window.into(), |_, window, cx| window.press(key, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    assert_eq!(cx.read(|cx| fixture.state.read(cx).selected_thread), None);
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).open_threads.clone()),
+        [factory]
+    );
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).snapshot.threads.len()),
+        1
+    );
+    assert!(cx.read(|cx| {
+        commands::Command::RestartTerminal
+            .disabled_reason_in_workspace(fixture.workspace.read(cx), cx)
+            .is_none()
+    }));
+
+    // Typing on a terminal pane must never start a Factory run or enter the composer.
+    for key in ["j", "k", "i", "secondary-enter"] {
+        press(cx, key);
+    }
+    assert!(cx.read(|cx| fixture.state.read(cx).pending_factory.is_empty()));
+    assert!(cx.read(|cx| fixture.state.read(cx).snapshot.launches.is_empty()));
+    press(cx, "ctrl-shift-tab");
+    until(cx, "cycle back to Factory", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).selected_thread == Some(factory)
+    })
+    .await;
+    press(cx, "ctrl-tab");
+    until(cx, "cycle back to terminal", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).has_active_terminal(cx)
+    })
+    .await;
+
+    // A failed native surface still owns a real tab; palette close stays enabled.
+    open_palette(cx, &fixture).await;
+    assert!(cx.read(|cx| {
+        commands::Command::CloseThread
+            .disabled_reason_in_workspace(fixture.workspace.read(cx), cx)
+            .is_none()
+    }));
+    press(cx, "escape");
+    cx.run_until_parked();
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, _, cx| {
+            workspace.flush_layout(cx);
+        },
+    );
+    fixture.store.flush().await.unwrap();
+    let snapshot = fixture.store.snapshot().await.unwrap();
+    let saved = serde_json::to_string(&snapshot.settings).unwrap();
+    assert!(
+        !saved.contains("\"Terminal\""),
+        "ephemeral terminal leaf leaked into saved layout"
+    );
+    assert_eq!(snapshot.threads.len(), 1);
+    assert_eq!(snapshot.threads[0].id, factory);
+
+    press(cx, commands::CLOSE_THREAD_KEY);
+    until(
+        cx,
+        "close removes terminal but retains Factory",
+        Duration::from_secs(5),
+        |cx| {
+            let workspace = fixture.workspace.read(cx);
+            workspace.terminal_count(cx) == 0
+                && fixture.state.read(cx).selected_thread == Some(factory)
+        },
+    )
+    .await;
+    quit(cx, &fixture).await;
+}

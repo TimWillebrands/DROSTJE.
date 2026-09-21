@@ -3,6 +3,7 @@ use super::{
     conversation, factory,
     settings::{DialogKind, SurfaceContent, SurfaceOutcome},
     sidebar::{self, Row},
+    terminal::{TerminalId, TerminalPane},
     thread_sidebar,
     title_bar::{WorkspaceDockSkin, WorkspaceTitle},
 };
@@ -14,10 +15,11 @@ use gpui_kit::{
     component::{
         ActiveTheme, IconName, Root, Sizable, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
         button::{Button, ButtonVariants},
+        dialog::DialogButtonProps,
         dock::{
             BasePanel, DockArea, DockAreaState, DockEvent, DockLayout, DockPlacement, DockSizing,
-            DockSkin, InsertTarget, Panel, PanelEvent, PanelId, PanelInfo, PanelState, PanelStyle,
-            TabGroup, panel_handle, register_panel,
+            DockSkin, DockState, InsertTarget, Panel, PanelEvent, PanelId, PanelInfo, PanelState,
+            PanelStyle, TabGroup, panel_handle, register_panel,
         },
         h_flex,
         input::{InputEvent, InputState},
@@ -59,21 +61,20 @@ impl Region {
         commands::region_action(self)
     }
 }
-
-/// What one dock panel shows. Projects exists once; every open thread
-/// is its own panel so it can be tabbed, split and dragged like a Zed pane; the
-/// Welcome panel holds the centre only while no thread is open.
+/// What one dock panel shows. Threads and ephemeral terminals can be tabbed,
+/// split and dragged. Welcome holds the center only while no content is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelKind {
     Projects,
     Welcome,
     Thread(ThreadId),
+    Terminal(TerminalId),
 }
 impl PanelKind {
     pub fn region(self) -> Region {
         match self {
             Self::Projects => Region::Projects,
-            Self::Welcome | Self::Thread(_) => Region::Thread,
+            Self::Welcome | Self::Thread(_) | Self::Terminal(_) => Region::Thread,
         }
     }
     /// Persisted layout name; never change it.
@@ -82,17 +83,20 @@ impl PanelKind {
             Self::Projects => "Projects",
             Self::Welcome => "Welcome",
             Self::Thread(_) => "Thread",
+            Self::Terminal(_) => "Terminal",
         }
     }
     fn context(self) -> &'static str {
         match self {
             Self::Projects => "List ProjectsList",
             Self::Welcome | Self::Thread(_) => "Thread",
+            Self::Terminal(_) => "TerminalPane",
         }
     }
     fn debug_name(self) -> String {
         match self {
             Self::Thread(id) => format!("Thread:{id}"),
+            Self::Terminal(id) => format!("Terminal:{id}"),
             other => other.name().to_owned(),
         }
     }
@@ -100,6 +104,7 @@ impl PanelKind {
         state.panel_name == self.name()
             && match self {
                 Self::Thread(id) => thread_of(state) == Some(id),
+                Self::Terminal(id) => terminal_of(state) == Some(id),
                 _ => true,
             }
     }
@@ -111,6 +116,13 @@ fn thread_of(state: &PanelState) -> Option<ThreadId> {
         _ => None,
     }
 }
+fn terminal_of(state: &PanelState) -> Option<TerminalId> {
+    match &state.info {
+        PanelInfo::Panel(value) => serde_json::from_value(value.get("terminal")?.clone()).ok(),
+        _ => None,
+    }
+}
+type TerminalPanels = Rc<RefCell<BTreeMap<TerminalId, Entity<WorkspacePanel>>>>;
 type ThreadPanels = Rc<RefCell<BTreeMap<ThreadId, Entity<WorkspacePanel>>>>;
 /// Version 4 dropped the bottom Output dock; Output is a thread sidebar tab.
 const LAYOUT_VERSION: usize = 4;
@@ -129,6 +141,12 @@ pub struct Workspace {
     projects: Entity<WorkspacePanel>,
     /// Shared with the panel registry so a restored layout rebuilds into the same map.
     threads: ThreadPanels,
+    terminals: TerminalPanels,
+    /// Live layouts may refer to retained terminals; durable layouts never do.
+    live_layouts: BTreeMap<SpaceId, DockAreaState>,
+    active_terminal: Option<TerminalId>,
+    space_terminals: BTreeMap<SpaceId, TerminalId>,
+    terminal_confirmation: bool,
     welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>>,
     /// While a layout is loaded or reset, panel callbacks must not touch thread state.
     rebuilding: bool,
@@ -180,6 +198,7 @@ impl Workspace {
             )
         });
         let threads: ThreadPanels = Rc::default();
+        let terminals: TerminalPanels = Rc::default();
         let welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>> = Rc::default();
         {
             let panel = projects.clone();
@@ -205,6 +224,21 @@ impl Workspace {
                 },
             );
         }
+        {
+            let (terminals, welcome, state, owner) = (
+                terminals.clone(),
+                welcome.clone(),
+                state.clone(),
+                owner.clone(),
+            );
+            register_panel(cx, "Terminal", move |ctx, window, cx| {
+                // Only in-memory IDs resolve. A stale reference never spawns a shell.
+                let panel = terminal_of(ctx.state())
+                    .and_then(|id| terminals.borrow().get(&id).cloned())
+                    .unwrap_or_else(|| welcome_panel(&welcome, &state, &owner, window, cx));
+                panel_handle(panel)
+            });
+        }
         let title = cx.new(|cx| WorkspaceTitle::new(state.clone(), owner.clone(), cx));
         let mut inner = None;
         let dock = cx.new(|cx| {
@@ -224,6 +258,11 @@ impl Workspace {
             dock,
             projects,
             threads,
+            terminals,
+            live_layouts: BTreeMap::new(),
+            active_terminal: None,
+            space_terminals: BTreeMap::new(),
+            terminal_confirmation: false,
             welcome,
             rebuilding: false,
             focus,
@@ -256,6 +295,22 @@ impl Workspace {
             dock_measurement: Rc::new(Cell::new(None)),
             _subscriptions: Vec::new(),
         };
+        workspace._subscriptions.push(cx.on_focus_in(
+            &workspace.focus,
+            window,
+            |workspace, window, cx| {
+                workspace.sync_terminal_visibility(window, cx);
+                cx.notify();
+            },
+        ));
+        workspace._subscriptions.push(cx.on_focus_out(
+            &workspace.focus,
+            window,
+            |workspace, _, window, cx| {
+                workspace.sync_terminal_visibility(window, cx);
+                cx.notify();
+            },
+        ));
         let restored = saved.map(|saved| {
             let layout: DockAreaState = serde_json::from_value(saved)?;
             validate_layout(&layout)?;
@@ -316,6 +371,7 @@ impl Workspace {
                     workspace.quit_requested = false;
                 }
                 workspace.sync_space(window, cx);
+                workspace.sync_terminal_visibility(window, cx);
                 workspace.sync_thread_panels(window, cx);
                 workspace.sync_session(window, cx);
                 workspace.sync_factory_form(window, cx);
@@ -371,6 +427,7 @@ impl Workspace {
                     workspace.normalize_layout(workspace.reopening, window, cx);
                     workspace.schedule_layout_save(window, cx);
                     workspace.sync_diff_interest(cx);
+                    workspace.sync_terminal_visibility(window, cx);
                 }
             },
         ));
@@ -431,6 +488,11 @@ impl Workspace {
 
     fn space_transition_reason(&self, cx: &App) -> Option<String> {
         self.state.read(cx).space_mutation_reason().or_else(|| {
+            if self.terminal_confirmation {
+                return Some(
+                    "Finish or cancel the terminal confirmation before changing spaces.".into(),
+                );
+            }
             if self.preparing_space_change {
                 Some("Wait for the editor draft to finish saving before changing spaces.".into())
             } else if self.extension.is_some() {
@@ -540,6 +602,44 @@ impl Workspace {
             }
             Ok(())
         })?;
+        for panel in self.terminals.borrow().values() {
+            if let Some(pane) = panel.read(cx).terminal.clone() {
+                let target = match change {
+                    SpaceChange::Move(project, target) if pane.read(cx).project_id == project => {
+                        Some(target)
+                    }
+                    SpaceChange::Delete(space) if pane.read(cx).space_id == space => {
+                        Some(self.state.read(cx).default_space_id())
+                    }
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    pane.update(cx, |pane, cx| {
+                        pane.space_id = target;
+                        pane.set_visible(false, cx);
+                    });
+                }
+            }
+        }
+        // A moved terminal is reattached in its project's destination, not duplicated
+        // by a stale cached layout. The process and working directory stay intact.
+        let terminal_spaces: BTreeMap<_, _> = self
+            .terminals
+            .borrow()
+            .iter()
+            .filter_map(|(id, panel)| {
+                panel
+                    .read(cx)
+                    .terminal
+                    .as_ref()
+                    .map(|pane| (*id, pane.read(cx).space_id))
+            })
+            .collect();
+        for (space, layout) in &mut self.live_layouts {
+            *layout = filter_layout(layout.clone(), &|panel| {
+                terminal_of(panel).is_none_or(|id| terminal_spaces.get(&id) == Some(space))
+            });
+        }
         self.sync_space(window, cx);
         self.sync_thread_panels(window, cx);
         self.sync_session(window, cx);
@@ -558,6 +658,23 @@ impl Workspace {
             return;
         }
         self.layout_save.take();
+        self.hide_terminals(cx);
+        self.live_layouts.insert(
+            self.presented_space,
+            filter_layout(self.dock.read(cx).dump(cx), &|panel| {
+                terminal_of(panel).is_none_or(|id| {
+                    self.terminals
+                        .borrow()
+                        .get(&id)
+                        .and_then(|panel| panel.read(cx).terminal.as_ref())
+                        .is_some_and(|pane| pane.read(cx).space_id == self.presented_space)
+                })
+            }),
+        );
+        if let Some(id) = self.active_terminal {
+            self.space_terminals.insert(self.presented_space, id);
+        }
+        self.active_terminal = self.space_terminals.get(&active).copied();
         self.presented_space = active;
         self.rebuilding = true;
         self.threads.borrow_mut().clear();
@@ -568,10 +685,16 @@ impl Workspace {
         self.reopening = None;
         self.thread_search
             .update(cx, |input, cx| input.set_value("", window, cx));
-        let saved = self.state.read(cx).space_layout().cloned();
+        let saved = self.live_layouts.get(&active).cloned().map(Ok).or_else(|| {
+            self.state
+                .read(cx)
+                .space_layout()
+                .cloned()
+                .map(serde_json::from_value)
+        });
         let restored = saved.map(|saved| -> anyhow::Result<()> {
-            let layout: DockAreaState = serde_json::from_value(saved)?;
-            validate_layout(&layout)?;
+            let layout: DockAreaState = saved?;
+            validate_layout(&durable_layout(layout.clone()))?;
             self.dock
                 .update(cx, |dock, cx| dock.load(layout, window, cx))
         });
@@ -599,7 +722,9 @@ impl Workspace {
         self.projects.update(cx, |_, cx| cx.notify());
         cx.defer_in(window, move |workspace, window, cx| {
             if workspace.presented_space == active {
-                let region = if workspace.state.read(cx).selected_thread.is_some() {
+                let region = if workspace.state.read(cx).selected_thread.is_some()
+                    || workspace.has_active_terminal(cx)
+                {
                     Region::Thread
                 } else {
                     Region::Projects
@@ -634,26 +759,320 @@ impl Workspace {
             cx,
         ));
     }
-    fn cycle_thread(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            let count = state.open_threads.len();
-            if count == 0 {
-                return;
+    pub(super) fn has_active_terminal(&self, cx: &App) -> bool {
+        self.active_terminal(cx).is_some()
+    }
+    pub(super) fn active_terminal(&self, cx: &App) -> Option<Entity<TerminalPane>> {
+        self.active_terminal
+            .and_then(|id| self.terminals.borrow().get(&id).cloned())
+            .and_then(|panel| panel.read(cx).terminal.clone())
+            .filter(|pane| pane.read(cx).space_id == self.presented_space)
+    }
+    pub(super) fn center_panel_count(&self, cx: &App) -> usize {
+        self.open_thread_ids(cx).len() + self.active_space_terminals(cx).len()
+    }
+    #[cfg(all(test, feature = "runtime-qa"))]
+    pub(super) fn terminal_count(&self, _: &App) -> usize {
+        self.terminals.borrow().len()
+    }
+    pub(super) fn has_running_terminals(&self, cx: &App) -> bool {
+        self.terminals.borrow().values().any(|panel| {
+            panel
+                .read(cx)
+                .terminal
+                .as_ref()
+                .is_some_and(|pane| pane.read(cx).is_alive(cx))
+        })
+    }
+    pub(super) fn close_all_terminals(&mut self, cx: &mut Context<Self>) {
+        for (_, panel) in std::mem::take(&mut *self.terminals.borrow_mut()) {
+            if let Some(pane) = panel.read(cx).terminal.clone() {
+                pane.update(cx, |pane, cx| pane.close(cx));
             }
-            let current = state
-                .open_threads
-                .iter()
-                .position(|id| Some(*id) == state.selected_thread);
-            let next = match current {
-                Some(ix) if forward => (ix + 1) % count,
-                Some(ix) => (ix + count - 1) % count,
-                None if forward => 0,
-                None => count - 1,
-            };
-            state.select_thread(state.open_threads[next]);
+        }
+        self.active_terminal = None;
+        self.space_terminals.clear();
+        self.live_layouts.clear();
+    }
+    fn active_space_terminals(&self, cx: &App) -> Vec<Entity<WorkspacePanel>> {
+        self.terminals
+            .borrow()
+            .values()
+            .filter(|panel| {
+                panel
+                    .read(cx)
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|pane| pane.read(cx).space_id == self.presented_space)
+            })
+            .cloned()
+            .collect()
+    }
+    fn hide_terminals(&self, cx: &mut App) {
+        for panel in self.terminals.borrow().values() {
+            if let Some(pane) = panel.read(cx).terminal.clone() {
+                pane.update(cx, |pane, cx| pane.set_visible(false, cx));
+            }
+        }
+    }
+    fn sync_terminal_visibility(&self, _: &mut Window, cx: &mut App) {
+        // Ghostty frames are GPUI scene content: overlays cover them normally.
+        // Only inactive tabs/Spaces are occluded; focus independently gates input.
+        let dock = self.dock.read(cx);
+        let layout = dock.dump(cx);
+        let panes: Vec<_> = self
+            .terminals
+            .borrow()
+            .values()
+            .filter_map(|panel| {
+                let pane = panel.read(cx).terminal.clone()?;
+                let visible = pane.read(cx).space_id == self.presented_space
+                    && panel_visible(panel, dock, &layout, cx);
+                Some((pane, visible))
+            })
+            .collect();
+        for (pane, visible) in panes {
+            pane.update(cx, |pane, cx| pane.set_visible(visible, cx));
+        }
+    }
+    fn terminal_focused(&mut self, id: TerminalId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rebuilding || self.preparing_space_change {
+            return;
+        }
+        let Some(panel) = self.terminals.borrow().get(&id).cloned() else {
+            return;
+        };
+        let Some(pane) = panel.read(cx).terminal.clone() else {
+            return;
+        };
+        if pane.read(cx).space_id != self.presented_space {
+            return;
+        }
+        let project = pane.read(cx).project_id;
+        self.active_terminal = Some(id);
+        self.space_terminals.insert(self.presented_space, id);
+        self.state.update(cx, |state, cx| {
+            state.select_terminal_project(project);
             cx.emit(PresentationChange::Selection);
         });
+        self.sync_session(window, cx);
+        self.sync_terminal_visibility(window, cx);
+        cx.notify();
+    }
+    pub(super) fn new_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        let Some(project) = self
+            .state
+            .read(cx)
+            .selected_project
+            .and_then(|id| {
+                self.state
+                    .read(cx)
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.id == id)
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let id = TerminalId::new();
+        let owner = cx.entity().downgrade();
+        let state = self.state.clone();
+        let space = self.presented_space;
+        let anchor = self
+            .thread_target(cx)
+            .and_then(|panel| panel.read(cx).group.clone())
+            .and_then(|group| group.upgrade())
+            .map(|group| group.read(cx).node());
+        let pane = cx.new(|cx| TerminalPane::new(project.id, space, project.root, window, cx));
+        let panel = cx.new(|cx| {
+            let mut panel = WorkspacePanel::new(PanelKind::Terminal(id), state, owner, window, cx);
+            panel.terminal = Some(pane);
+            panel
+        });
+        self.terminals.borrow_mut().insert(id, panel.clone());
+        let panel_id = PanelId::from(panel.entity_id());
+        self.dock.update(cx, |dock, cx| {
+            dock.add_panel_view(
+                panel_handle(panel.clone()),
+                DockPlacement::Center,
+                None,
+                window,
+                cx,
+            );
+            if let Some(node) = anchor {
+                dock.move_panel(
+                    panel_id,
+                    InsertTarget::Tabs {
+                        node,
+                        ix: None,
+                        activate: true,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
+        self.terminal_focused(id, window, cx);
+        self.sync_thread_panels(window, cx);
+        self.focus_panel(panel, window, cx);
+        self.flush_layout(cx);
+    }
+    pub(super) fn cycle_panel(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut panels = Vec::new();
+        fn collect(state: &PanelState, kinds: &mut Vec<PanelKind>) {
+            if let Some(id) = thread_of(state).filter(|_| state.panel_name == "Thread") {
+                kinds.push(PanelKind::Thread(id));
+            }
+            if let Some(id) = terminal_of(state).filter(|_| state.panel_name == "Terminal") {
+                kinds.push(PanelKind::Terminal(id));
+            }
+            for child in &state.children {
+                collect(child, kinds);
+            }
+        }
+        let layout = self.dock.read(cx).dump(cx);
+        collect(&layout.center, &mut panels);
+        for dock in [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
+            .into_iter()
+            .flatten()
+        {
+            collect(dock.panel(), &mut panels);
+        }
+        if panels.is_empty() {
+            return;
+        }
+        let current = self.thread_target(cx).map(|panel| panel.read(cx).kind);
+        let index = panels.iter().position(|kind| Some(*kind) == current);
+        let next = match index {
+            Some(index) if forward => (index + 1) % panels.len(),
+            Some(index) => (index + panels.len() - 1) % panels.len(),
+            None if forward => 0,
+            None => panels.len() - 1,
+        };
+        let target = match panels[next] {
+            PanelKind::Thread(id) => self.threads.borrow().get(&id).cloned(),
+            PanelKind::Terminal(id) => self.terminals.borrow().get(&id).cloned(),
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.focus_panel(target, window, cx);
+        }
+    }
+    pub(super) fn close_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_terminal {
+            self.close_terminal_tab(id, window, cx);
+        } else if let Some(id) = self.state.read(cx).selected_thread {
+            self.close_thread_tab(id, window, cx);
+        }
+    }
+    pub(super) fn restart_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_terminal {
+            self.confirm_terminal_stop(id, true, window, cx);
+        }
+    }
+    fn close_terminal_tab(&mut self, id: TerminalId, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_terminal_stop(id, false, window, cx);
+    }
+    fn confirm_terminal_stop(
+        &mut self,
+        id: TerminalId,
+        restart: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.terminal_confirmation
+            || self.preparing_space_change
+            || self.state.read(cx).shutting_down
+        {
+            return;
+        }
+        let Some(panel) = self.terminals.borrow().get(&id).cloned() else {
+            return;
+        };
+        let Some(pane) = panel.read(cx).terminal.clone() else {
+            return;
+        };
+        if !pane.read(cx).is_alive(cx) {
+            self.finish_terminal_stop(id, restart, window, cx);
+            return;
+        }
+        self.terminal_confirmation = true;
+        let title = format!(
+            "{} {}?",
+            if restart { "Restart" } else { "Close" },
+            panel.read(cx).panel_title(cx)
+        );
+        let owner = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let confirm = owner.clone();
+            let cancel = owner.clone();
+            alert
+                .title(div().id("terminal-stop-confirmation").test_support().child(title.clone()))
+                .description("This stops this terminal's shell and any running jobs. Other terminals are not affected.")
+                .button_props(DialogButtonProps::default()
+                    .ok_text(if restart { "Restart terminal" } else { "Close terminal" })
+                    .cancel_text("Cancel").show_cancel(true))
+                .on_ok(move |_, window, cx| {
+                    let confirm = confirm.clone();
+                    // Own close ordering: restore modal focus before replacing its terminal.
+                    window.defer(cx, move |window, cx| {
+                        window.close_dialog(cx);
+                        let _ = confirm.update(cx, |workspace, cx| {
+                            workspace.terminal_confirmation = false;
+                            workspace.finish_terminal_stop(id, restart, window, cx);
+                            cx.notify();
+                        });
+                    });
+                    false
+                })
+                .on_cancel(move |_, _, cx| {
+                    let _ = cancel.update(cx, |workspace, cx| {
+                        workspace.terminal_confirmation = false;
+                        cx.notify();
+                    });
+                    true
+                })
+        });
+    }
+    fn finish_terminal_stop(
+        &mut self,
+        id: TerminalId,
+        restart: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.terminals.borrow().get(&id).cloned() else {
+            return;
+        };
+        let Some(pane) = panel.read(cx).terminal.clone() else {
+            return;
+        };
+        if restart {
+            pane.update(cx, |pane, cx| pane.restart(window, cx));
+            self.focus_panel(panel, window, cx);
+            return;
+        }
+        pane.update(cx, |pane, cx| pane.close(cx));
+        self.terminals.borrow_mut().remove(&id);
+        self.space_terminals.retain(|_, terminal| *terminal != id);
+        if self.active_terminal == Some(id) {
+            self.active_terminal = None;
+        }
+        self.dock
+            .update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
+        self.sync_thread_panels(window, cx);
         self.focus_region(Region::Thread, window, cx);
+        self.flush_layout(cx);
     }
 
     pub fn reset_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -662,7 +1081,8 @@ impl Workspace {
         let selected = self.state.read(cx).selected_thread;
         let owner = cx.entity().downgrade();
         let mut center = DockLayout::tabs();
-        if open.is_empty() {
+        let terminals = self.active_space_terminals(cx);
+        if open.is_empty() && terminals.is_empty() {
             let welcome = welcome_panel(&self.welcome, &self.state, &owner, window, cx);
             center = center.panel_view(panel_handle(welcome), cx);
         } else {
@@ -673,6 +1093,9 @@ impl Workspace {
                     center = center.active_index(ix);
                 }
             }
+        }
+        for terminal in terminals {
+            center = center.panel_view(panel_handle(terminal), cx);
         }
         let left = DockLayout::tabs().panel_view(panel_handle(self.projects.clone()), cx);
         // Dock APIs consume pixels; application geometry is resolved from rem here.
@@ -708,13 +1131,32 @@ impl Workspace {
         let mut panels = vec![self.projects.clone()];
         panels.extend(self.welcome.borrow().iter().cloned());
         panels.extend(self.threads.borrow().values().cloned());
+        panels.extend(self.terminals.borrow().values().cloned());
         panels
     }
     fn thread_target(&self, cx: &App) -> Option<Entity<WorkspacePanel>> {
-        self.state
-            .read(cx)
-            .selected_thread
-            .and_then(|id| self.threads.borrow().get(&id).cloned())
+        self.active_terminal
+            .and_then(|id| self.terminals.borrow().get(&id).cloned())
+            .or_else(|| {
+                self.state
+                    .read(cx)
+                    .selected_thread
+                    .and_then(|id| self.threads.borrow().get(&id).cloned())
+            })
+            .or_else(|| {
+                self.terminals
+                    .borrow()
+                    .values()
+                    .find(|panel| {
+                        panel
+                            .read(cx)
+                            .terminal
+                            .as_ref()
+                            .is_some_and(|pane| pane.read(cx).space_id == self.presented_space)
+                    })
+                    .cloned()
+            })
+            .or_else(|| self.threads.borrow().values().next().cloned())
             .or_else(|| self.welcome.borrow().clone())
     }
 
@@ -724,6 +1166,9 @@ impl Workspace {
     pub(super) fn sync_thread_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.rebuilding || self.state.read(cx).shutting_down {
             return;
+        }
+        if self.active_terminal.is_some() && !self.has_active_terminal(cx) {
+            self.active_terminal = None;
         }
         let open = self.open_thread_ids(cx);
         let stale: Vec<ThreadId> = self
@@ -743,7 +1188,7 @@ impl Workspace {
             }
         }
         let owner = cx.entity().downgrade();
-        if open.is_empty() {
+        if open.is_empty() && self.active_space_terminals(cx).is_empty() {
             if self.welcome.borrow().is_none() {
                 let welcome = welcome_panel(&self.welcome, &self.state, &owner, window, cx);
                 self.dock.update(cx, |dock, cx| {
@@ -766,7 +1211,12 @@ impl Workspace {
         let selected = self.state.read(cx).selected_thread;
         let anchor = self
             .focused_panel(window, cx)
-            .filter(|panel| matches!(panel.read(cx).kind, PanelKind::Thread(_)))
+            .filter(|panel| {
+                matches!(
+                    panel.read(cx).kind,
+                    PanelKind::Thread(_) | PanelKind::Terminal(_)
+                )
+            })
             .or_else(|| selected.and_then(|id| self.threads.borrow().get(&id).cloned()))
             .and_then(|panel| panel.read(cx).group.clone())
             .and_then(|group| group.upgrade())
@@ -794,6 +1244,33 @@ impl Workspace {
                 }
             });
         }
+        for panel in self.terminals.borrow().values() {
+            let current = panel
+                .read(cx)
+                .terminal
+                .as_ref()
+                .is_some_and(|pane| pane.read(cx).space_id == self.presented_space);
+            let attached = panel
+                .read(cx)
+                .group
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .is_some();
+            if current && !attached {
+                self.dock.update(cx, |dock, cx| {
+                    dock.add_panel_view(
+                        panel_handle(panel.clone()),
+                        DockPlacement::Center,
+                        None,
+                        window,
+                        cx,
+                    )
+                });
+            } else if !current && attached {
+                self.dock
+                    .update(cx, |dock, cx| dock.remove_panel(panel.clone(), window, cx));
+            }
+        }
         if lost_focus {
             // The closed pane held focus; keyboard control continues in the next thread.
             if let Some(target) = self.thread_target(cx) {
@@ -804,6 +1281,9 @@ impl Workspace {
     }
     fn sync_selection_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.state.read(cx).selected_thread;
+        if selected.is_some() {
+            self.active_terminal = None;
+        }
         if selected != self.presented_thread {
             for id in self.presented_thread.into_iter().chain(selected) {
                 if let Some(panel) = self.threads.borrow().get(&id) {
@@ -919,10 +1399,12 @@ impl Workspace {
             return;
         }
         self.state.update(cx, |state, cx| {
+            // Selecting a thread leaves any previously active terminal intact.
             state.select_thread(id);
             cx.emit(PresentationChange::Selection);
         });
         self.sync_session(window, cx);
+        self.active_terminal = None;
         cx.notify();
     }
     /// The dock dropped a thread panel (tab close button or a closed split).
@@ -960,6 +1442,7 @@ impl Workspace {
     fn navigation_blocked(&self, window: &mut Window, cx: &mut App) -> bool {
         self.quit_requested
             || self.preparing_space_change
+            || self.terminal_confirmation
             || self.state.read(cx).shutting_down
             || self.palette.is_some()
             || self.dialog.is_some()
@@ -1126,7 +1609,9 @@ impl Workspace {
         {
             return;
         }
-        let layout = json!(self.dock.read(cx).dump(cx));
+        let live = self.dock.read(cx).dump(cx);
+        self.live_layouts.insert(self.presented_space, live.clone());
+        let layout = json!(durable_layout(live));
         if self.state.read(cx).space_layout() != Some(&layout) {
             self.state.update(cx, |state, cx| {
                 state.set_space_layout(layout);
@@ -1357,7 +1842,18 @@ impl Workspace {
                 }
             });
         }
+        // A newly activated tab has not entered the rendered focus tree yet.
+        // Commit selection here; focus callbacks cover already-visible panes.
+        match kind {
+            PanelKind::Thread(id) => self.thread_focused(id, panel.entity_id(), window, cx),
+            PanelKind::Terminal(id) => self.terminal_focused(id, window, cx),
+            PanelKind::Projects | PanelKind::Welcome => {}
+        }
         focus.focus(window, cx);
+        if let Some(terminal) = panel.read(cx).terminal.clone() {
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+        self.sync_terminal_visibility(window, cx);
         cx.notify();
     }
     pub fn spatial_focus(
@@ -1424,6 +1920,9 @@ impl Workspace {
     }
 
     pub fn execute(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_thread.is_some() {
+            self.active_terminal = None;
+        }
         if self.state.read(cx).shutting_down {
             return;
         }
@@ -1449,6 +1948,8 @@ impl Workspace {
                 | Command::NewPiConversation
                 | Command::NewClaudeCodeConversation
                 | Command::NewFactoryThread
+                | Command::NewTerminal
+                | Command::RestartTerminal
         ) && self
             .editor
             .as_ref()
@@ -1456,7 +1957,7 @@ impl Workspace {
         {
             return;
         }
-        if let Some(reason) = command.disabled_reason(self.state.read(cx)) {
+        if let Some(reason) = command.disabled_reason_in_workspace(self, cx) {
             self.state.update(cx, |state, cx| {
                 state.notice(crate::app::NoticeLevel::Warning, reason);
                 cx.notify();
@@ -1464,6 +1965,14 @@ impl Workspace {
             return;
         }
         let kind = match command {
+            Command::NewTerminal => {
+                self.new_terminal(window, cx);
+                None
+            }
+            Command::RestartTerminal => {
+                self.restart_terminal(window, cx);
+                None
+            }
             Command::NewSpace => Some(DialogKind::NewSpace),
             Command::RenameSpace => Some(DialogKind::RenameSpace(self.state.read(cx).active_space)),
             Command::DeleteSpace => Some(DialogKind::DeleteSpace(self.state.read(cx).active_space)),
@@ -1640,13 +2149,11 @@ impl Workspace {
                 None
             }
             Command::CloseThread => {
-                if let Some(id) = self.state.read(cx).selected_thread {
-                    self.close_thread_tab(id, window, cx);
-                }
+                self.close_active_panel(window, cx);
                 None
             }
             Command::NextThread | Command::PreviousThread => {
-                self.cycle_thread(command == Command::NextThread, window, cx);
+                self.cycle_panel(command == Command::NextThread, window, cx);
                 None
             }
             Command::FocusProjects | Command::FocusThread => {
@@ -2000,6 +2507,9 @@ pub struct WorkspaceRoot {
 
 impl Render for WorkspaceRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.sync_terminal_visibility(window, cx)
+        });
         let show_layers = !self.workspace.read(cx).state.read(cx).shutting_down;
         let sheet = Root::render_sheet_layer(window, cx);
         let dialog = Root::render_dialog_layer(window, cx);
@@ -2017,7 +2527,8 @@ impl Render for WorkspaceRoot {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_terminal_visibility(window, cx);
         let owner = cx.entity().downgrade();
         let state = self.state.read(cx);
         let dock_measurement = self.dock_measurement.clone();
@@ -2031,6 +2542,12 @@ impl Render for Workspace {
                 .relative()
                 .bg(cx.theme().background)
                 .text_color(cx.theme().foreground)
+                .on_action(cx.listener(|this, _: &NewTerminal, w, cx| {
+                    this.execute(Command::NewTerminal, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RestartTerminal, w, cx| {
+                    this.execute(Command::RestartTerminal, w, cx)
+                }))
                 .on_action(
                     cx.listener(|this, _: &NewSpace, w, cx| this.execute(Command::NewSpace, w, cx)),
                 )
@@ -2196,7 +2713,14 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &OpenSelection, w, cx| this.open_selection(w, cx)))
                 .on_action(cx.listener(|this, _: &FocusComposer, w, cx| this.focus_composer(w, cx)))
                 .on_action(cx.listener(|this, _: &LeaveEditor, w, cx| {
-                    this.focus_region(Region::Thread, w, cx)
+                    if let Some(panel) = this
+                        .active_terminal
+                        .and_then(|id| this.terminals.borrow().get(&id).cloned())
+                    {
+                        panel.read(cx).focus.clone().focus(w, cx);
+                    } else {
+                        this.focus_region(Region::Thread, w, cx)
+                    }
                 }))
                 .on_action(cx.listener(|this, _: &Submit, w, cx| {
                     if this.state.read(cx).factory_thread().is_some() {
@@ -2330,6 +2854,7 @@ pub struct WorkspacePanel {
     group: Option<WeakEntity<TabGroup>>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     transcript: Option<Entity<conversation::TranscriptView>>,
+    terminal: Option<Entity<TerminalPane>>,
     _subscriptions: Vec<Subscription>,
 }
 impl WorkspacePanel {
@@ -2398,6 +2923,25 @@ impl WorkspacePanel {
                 });
             }));
         }
+        if let PanelKind::Terminal(id) = kind {
+            let owner = workspace.clone();
+            subscriptions.push(cx.on_focus_in(&focus, window, move |_, window, cx| {
+                let owner = owner.clone();
+                window.defer(cx, move |window, cx| {
+                    let _ = owner.update(cx, |workspace, cx| {
+                        if workspace
+                            .focused_panel(window, cx)
+                            .is_some_and(|panel| panel.read(cx).kind == PanelKind::Terminal(id))
+                        {
+                            workspace.terminal_focused(id, window, cx);
+                            if let Some(pane) = workspace.active_terminal(cx) {
+                                pane.update(cx, |pane, cx| pane.focus(window, cx));
+                            }
+                        }
+                    });
+                });
+            }));
+        }
         Self {
             kind,
             state,
@@ -2408,6 +2952,7 @@ impl WorkspacePanel {
             group: None,
             bounds: Rc::new(Cell::new(None)),
             transcript,
+            terminal: None,
             _subscriptions: subscriptions,
         }
     }
@@ -2415,6 +2960,19 @@ impl WorkspacePanel {
         match self.kind {
             PanelKind::Projects => "Projects".into(),
             PanelKind::Welcome => "Threads".into(),
+            PanelKind::Terminal(_) => {
+                let project = self.terminal.as_ref().map(|pane| pane.read(cx).project_id);
+                let name = self
+                    .state
+                    .read(cx)
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|candidate| Some(candidate.id) == project)
+                    .map(|project| project.name.as_str())
+                    .unwrap_or("Project");
+                format!("Terminal — {name}")
+            }
             PanelKind::Thread(id) => self
                 .state
                 .read(cx)
@@ -2434,6 +2992,21 @@ impl BasePanel for WorkspacePanel {
     fn closable(&self, _: &App) -> bool {
         matches!(self.kind, PanelKind::Thread(_))
     }
+    fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(terminal) = &self.terminal {
+            terminal.update(cx, |terminal, cx| terminal.set_visible(false, cx));
+            let owner = self.workspace.clone();
+            // Do not re-lease this panel: visibility dumps every live dock leaf.
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |workspace, cx| {
+                    workspace.sync_terminal_visibility(window, cx)
+                });
+            });
+        }
+        if !active {
+            self.bounds.set(None);
+        }
+    }
     fn on_added_to(&mut self, group: WeakEntity<TabGroup>, _: &mut Window, _: &mut Context<Self>) {
         self.group = Some(group);
         self.bounds.set(None);
@@ -2441,6 +3014,9 @@ impl BasePanel for WorkspacePanel {
     fn on_removed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.group = None;
         self.bounds.set(None);
+        if let Some(terminal) = &self.terminal {
+            terminal.update(cx, |terminal, cx| terminal.set_visible(false, cx));
+        }
         if let PanelKind::Thread(id) = self.kind {
             // The dock often fires this from inside a `Workspace` update
             // (`sync_thread_panels`, `reset_layout`), and updating an entity that
@@ -2462,6 +3038,9 @@ impl BasePanel for WorkspacePanel {
         if let PanelKind::Thread(id) = self.kind {
             state.info = PanelInfo::panel(json!({ "thread": id }));
         }
+        if let PanelKind::Terminal(id) = self.kind {
+            state.info = PanelInfo::panel(json!({ "terminal": id }));
+        }
         state
     }
 }
@@ -2470,6 +3049,38 @@ impl Panel for WorkspacePanel {
     /// hover; a middle click closes it too. Closing only closes the tab.
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.panel_title(cx);
+        if let PanelKind::Terminal(id) = self.kind {
+            let close = self.workspace.clone();
+            let middle = close.clone();
+            return h_flex()
+                .gap_1()
+                .items_center()
+                .min_w_0()
+                .id(SharedString::from(format!("terminal-tab-{id}")))
+                .on_aux_click(move |event, window, cx| {
+                    if event.is_middle_click() {
+                        cx.stop_propagation();
+                        let _ = middle.update(cx, |workspace, cx| {
+                            workspace.close_terminal_tab(id, window, cx)
+                        });
+                    }
+                })
+                .child(title)
+                .child(
+                    Button::new(SharedString::from(format!("close-terminal-{id}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Close tab")
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            let _ = close.update(cx, |workspace, cx| {
+                                workspace.close_terminal_tab(id, window, cx)
+                            });
+                        }),
+                )
+                .into_any_element();
+        }
         let PanelKind::Thread(id) = self.kind else {
             return title.into_any_element();
         };
@@ -2522,7 +3133,7 @@ impl Panel for WorkspacePanel {
     fn tab_name(&self, cx: &App) -> Option<SharedString> {
         // Threads draw their own tab (spinner, close control); the rest use the name.
         match self.kind {
-            PanelKind::Thread(_) => None,
+            PanelKind::Thread(_) | PanelKind::Terminal(_) => None,
             _ => Some(self.panel_title(cx).into()),
         }
     }
@@ -2537,6 +3148,29 @@ impl Panel for WorkspacePanel {
     ) -> PopupMenu {
         let state = self.state.read(cx);
         match self.kind {
+            PanelKind::Terminal(id) => {
+                let owned = |command: Command| {
+                    let owner = self.workspace.clone();
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                        let _ = owner.update(cx, |workspace, cx| {
+                            workspace.terminal_focused(id, window, cx);
+                            workspace.execute(command, window, cx);
+                        });
+                    }
+                };
+                menu.item(
+                    PopupMenuItem::new(Command::NewTerminal.label())
+                        .on_click(owned(Command::NewTerminal)),
+                )
+                .item(
+                    PopupMenuItem::new(Command::RestartTerminal.label())
+                        .on_click(owned(Command::RestartTerminal)),
+                )
+                .item(
+                    PopupMenuItem::new(Command::CloseThread.label())
+                        .on_click(owned(Command::CloseThread)),
+                )
+            }
             PanelKind::Thread(id) => {
                 // The menu belongs to this pane: select its thread before the command runs.
                 let owned = |command: Command| {
@@ -2569,7 +3203,7 @@ impl Panel for WorkspacePanel {
                         .on_click(owned(Command::ArchiveThread)),
                 )
                 .item(
-                    PopupMenuItem::new("Close thread")
+                    PopupMenuItem::new(Command::CloseThread.label())
                         .disabled(disabled(Command::CloseThread))
                         .on_click(owned(Command::CloseThread)),
                 )
@@ -2621,6 +3255,11 @@ impl Render for WorkspacePanel {
                     cx,
                 ),
                 PanelKind::Welcome => conversation::welcome(state, &self.workspace, cx),
+                PanelKind::Terminal(_) => self
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| terminal.clone().into_any_element())
+                    .unwrap_or_else(|| div().into_any_element()),
                 PanelKind::Thread(id) => {
                     let Some(thread) = state.snapshot.threads.iter().find(|t| t.id == id) else {
                         return div()
@@ -2759,6 +3398,70 @@ fn panel_visible(
             .is_some_and(|active| active.panel_id(cx) == PanelId::from(entity.entity_id()))
 }
 
+/// Preserve all durable leaves and repair their containers after removing live
+/// terminals. Active tabs follow the nearest surviving tab; split sizes keep the
+/// same association with their surviving children.
+fn filter_layout(mut layout: DockAreaState, keep: &impl Fn(&PanelState) -> bool) -> DockAreaState {
+    fn filter(mut panel: PanelState, keep: &impl Fn(&PanelState) -> bool) -> Option<PanelState> {
+        if matches!(panel.info, PanelInfo::Panel(_)) {
+            return keep(&panel).then_some(panel);
+        }
+        let children = std::mem::take(&mut panel.children);
+        let retained: Vec<_> = children
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, child)| filter(child, keep).map(|child| (index, child)))
+            .collect();
+        if retained.is_empty() {
+            return None;
+        }
+        match &mut panel.info {
+            PanelInfo::Tabs { active_index } => {
+                *active_index = retained
+                    .iter()
+                    .position(|(index, _)| *index >= *active_index)
+                    .unwrap_or(retained.len() - 1);
+            }
+            PanelInfo::Stack { sizes, .. } => {
+                if !sizes.is_empty() {
+                    *sizes = retained
+                        .iter()
+                        .filter_map(|(index, _)| sizes.get(*index).copied())
+                        .collect();
+                }
+            }
+            PanelInfo::Tiles { metas } => {
+                *metas = retained
+                    .iter()
+                    .filter_map(|(index, _)| metas.get(*index).copied())
+                    .collect();
+            }
+            PanelInfo::Panel(_) => {}
+        }
+        panel.children = retained.into_iter().map(|(_, child)| child).collect();
+        Some(panel)
+    }
+    layout.center = filter(layout.center, keep).unwrap_or_else(|| PanelState {
+        panel_name: "TabPanel".into(),
+        info: PanelInfo::Tabs { active_index: 0 },
+        children: vec![PanelState::new("Welcome")],
+    });
+    for edge in [
+        &mut layout.left_dock,
+        &mut layout.right_dock,
+        &mut layout.bottom_dock,
+    ] {
+        *edge = edge.take().and_then(|dock| {
+            filter(dock.panel().clone(), keep)
+                .map(|panel| DockState::new(panel, dock.placement(), dock.size(), dock.open()))
+        });
+    }
+    layout
+}
+fn durable_layout(layout: DockAreaState) -> DockAreaState {
+    filter_layout(layout, &|panel| panel.panel_name != "Terminal")
+}
+
 fn contains_panel(panel: &PanelState, name: &str) -> bool {
     panel.panel_name == name
         || panel
@@ -2877,4 +3580,60 @@ fn first_thread_row(rows: &[Row]) -> Option<Row> {
         .copied()
         .find(|row| matches!(row, Row::Thread(_)))
         .or_else(|| rows.first().copied())
+}
+
+#[cfg(test)]
+mod terminal_layout_tests {
+    use super::{DockAreaState, LAYOUT_VERSION, durable_layout, validate_layout};
+    use serde_json::json;
+
+    #[test]
+    fn saving_mixed_layout_preserves_thread_selection_and_split_sizes() {
+        let first = crate::model::ThreadId::new_v4();
+        let second = crate::model::ThreadId::new_v4();
+        let thread = |id: crate::model::ThreadId| {
+            json!({
+                "panel_name": "Thread", "children": [], "info": {"panel": {"thread": id}}
+            })
+        };
+        let terminal = json!({
+            "panel_name": "Terminal", "children": [], "info": {"panel": {"terminal": "ephemeral"}}
+        });
+        let tabs = |children, active| {
+            json!({
+                "panel_name": "TabPanel", "children": children, "info": {"tabs": {"active_index": active}}
+            })
+        };
+        let layout: DockAreaState = serde_json::from_value(json!({
+            "version": LAYOUT_VERSION,
+            "center": {
+                "panel_name": "StackPanel",
+                "children": [
+                    tabs(json!([thread(first), terminal, thread(second)]), 1),
+                    tabs(json!([terminal]), 0),
+                    tabs(json!([thread(first)]), 0)
+                ],
+                "info": {"stack": {"sizes": [350., 200., 450.], "axis": 0}}
+            },
+            "left_dock": {
+                "panel": tabs(json!([{"panel_name": "Projects", "children": [], "info": {"panel": null}}]), 0),
+                "placement": "left", "size": 240., "open": true
+            }
+        })).unwrap();
+        let saved = durable_layout(layout);
+        validate_layout(&saved).unwrap();
+        let saved = serde_json::to_value(saved).unwrap();
+        assert_eq!(
+            saved["center"]["info"]["stack"]["sizes"],
+            json!([350., 450.])
+        );
+        assert_eq!(
+            saved["center"]["children"][0],
+            tabs(json!([thread(first), thread(second)]), 1)
+        );
+        assert_eq!(
+            saved["center"]["children"][1],
+            tabs(json!([thread(first)]), 0)
+        );
+    }
 }

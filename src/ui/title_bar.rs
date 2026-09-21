@@ -3,7 +3,7 @@
 
 use super::{
     commands::{
-        AddProject, NewConversation, NewFactoryThread, OpenPalette, ResetLayout, Settings,
+        AddProject, Command, NewConversation, NewFactoryThread, OpenPalette, ResetLayout, Settings,
         ShowArchived, ToggleOutput, ToggleProjects,
     },
     workspace::{PanelKind, Workspace},
@@ -202,6 +202,10 @@ impl Render for WorkspaceTitle {
                                         menu.menu("Add project…", Box::new(AddProject))
                                             .menu("New conversation", Box::new(NewConversation))
                                             .menu("New Factory thread", Box::new(NewFactoryThread))
+                                            .menu(
+                                                Command::NewTerminal.label(),
+                                                Command::NewTerminal.action(),
+                                            )
                                             .separator()
                                             .menu("Toggle projects", Box::new(ToggleProjects))
                                             .menu("Toggle output", Box::new(ToggleOutput))

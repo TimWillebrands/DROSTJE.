@@ -8,7 +8,9 @@ use crate::{
     neovim::{NvimConfig, NvimEditor},
     platform,
 };
-use gpui_kit::component::{ActiveTheme, alert::Alert, label::Label};
+use gpui_kit::component::{
+    ActiveTheme, WindowExt, alert::Alert, dialog::DialogButtonProps, label::Label,
+};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use serde_json::Value;
@@ -1158,6 +1160,10 @@ impl Workspace {
                 && let Some(editor) = &editor { let _ = editor.resume_input().await; }
             let _ = workspace.update_in(window, |workspace, _, cx| {
                 workspace.quit_requested = false;
+                // A rejected editor barrier cancels quit without killing terminal sessions.
+                if snapshots.is_ok() || allow_data_loss {
+                    workspace.close_all_terminals(cx);
+                }
                 workspace.state.update(cx, |state, cx| {
                     match snapshots {
                         Ok(drafts) => {
@@ -1181,36 +1187,61 @@ impl Workspace {
         if self.state.read(cx).shutting_down || self.quit_requested {
             return;
         }
+        // Quit is one modal layer, never a second dialog over a picker or form.
+        self.dismiss(window, cx);
+        if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
+            return;
+        }
         self.quit_requested = true;
         let state = self.state.read(cx);
         let allow_data_loss = state.storage_error.is_some() || state.shutdown_error.is_some();
-        if state.active_threads.is_empty() && state.pending_factory.is_empty() && !allow_data_loss {
+        if state.active_threads.is_empty()
+            && state.pending_factory.is_empty()
+            && !allow_data_loss
+            && !self.has_running_terminals(cx)
+        {
             self.begin_orderly_quit(false, window, cx);
             return;
         }
-        let message = if allow_data_loss {
-            "Some edits could not be saved. Copy Draft Recovery before quitting to retain them. Active interactive turns stop; Factory jobs already started continue."
+        let mut message = if allow_data_loss {
+            "Some edits could not be saved. Copy Draft Recovery before quitting to retain them. Active interactive turns stop; Factory jobs already started continue.".to_owned()
         } else {
-            "Active interactive turns will stop. Saved drafts and session references are retained. Factory jobs already started continue; a pending dispatch may require outcome review after reopening."
+            "Saved drafts and session references are retained. Active interactive turns stop. Factory jobs already started continue; a pending dispatch may require outcome review after reopening.".to_owned()
         };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            "Quit DROSTJE.?",
-            Some(message),
-            &["Cancel", "Quit"],
-            cx,
-        );
-        cx.spawn_in(window, async move |workspace, window| {
-            let confirmed = answer.await == Ok(1);
-            let _ = workspace.update_in(window, |workspace, window, cx| {
-                workspace.quit_requested = false;
-                if confirmed {
-                    workspace.begin_orderly_quit(allow_data_loss, window, cx);
-                } else {
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        if self.has_running_terminals(cx) {
+            message.push_str(" All terminal shells and their foreground jobs will be stopped. Terminal sessions cannot be restored.");
+        }
+        let owner = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, window, _| {
+            let confirm = owner.clone();
+            let close = owner.clone();
+            alert
+                .title("Quit DROSTJE.")
+                .description(message.clone())
+                .width((window.rem_size() * 32.).min(window.viewport_size().width))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Quit")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let confirm = confirm.clone();
+                    window.defer(cx, move |window, cx| {
+                        window.close_dialog(cx);
+                        let _ = confirm.update(cx, |workspace, cx| {
+                            workspace.quit_requested = true;
+                            workspace.begin_orderly_quit(allow_data_loss, window, cx);
+                        });
+                    });
+                    false
+                })
+                .on_cancel(move |_, _, cx| {
+                    let _ = close.update(cx, |workspace, cx| {
+                        workspace.quit_requested = false;
+                        cx.notify();
+                    });
+                    true
+                })
+        });
     }
 }

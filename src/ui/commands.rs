@@ -28,6 +28,8 @@ gpui_kit::actions!(
         NewPiConversation,
         NewClaudeCodeConversation,
         NewFactoryThread,
+        NewTerminal,
+        RestartTerminal,
         RenameProject,
         ArchiveProject,
         RenameThread,
@@ -97,6 +99,8 @@ pub enum Command {
     NewPiConversation,
     NewClaudeCodeConversation,
     NewFactoryThread,
+    NewTerminal,
+    RestartTerminal,
     RenameProject,
     ArchiveProject,
     RenameThread,
@@ -129,7 +133,7 @@ pub enum Command {
     EditQueuedMessage,
 }
 impl Command {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 45] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -143,6 +147,8 @@ impl Command {
         Self::NewPiConversation,
         Self::NewClaudeCodeConversation,
         Self::NewFactoryThread,
+        Self::NewTerminal,
+        Self::RestartTerminal,
         Self::RenameProject,
         Self::ArchiveProject,
         Self::RenameThread,
@@ -190,14 +196,16 @@ impl Command {
             Self::NewPiConversation => "New Pi conversation",
             Self::NewClaudeCodeConversation => "New Claude Code conversation",
             Self::NewFactoryThread => "New Factory thread",
+            Self::NewTerminal => "New terminal",
+            Self::RestartTerminal => "Restart terminal",
             Self::RenameProject => "Rename project…",
             Self::ArchiveProject => "Archive project…",
             Self::RenameThread => "Rename thread…",
             Self::RegenerateTitle => "Regenerate conversation title",
             Self::ArchiveThread => "Archive thread…",
-            Self::CloseThread => "Close thread",
-            Self::NextThread => "Next thread",
-            Self::PreviousThread => "Previous thread",
+            Self::CloseThread => "Close tab",
+            Self::NextThread => "Next tab",
+            Self::PreviousThread => "Previous tab",
             Self::ShowArchived => "Show archived threads",
             Self::SearchThreads => "Search threads…",
             Self::RefreshFactoryRuns => "Refresh Factory runs",
@@ -238,6 +246,8 @@ impl Command {
             Self::NewPiConversation => Box::new(NewPiConversation),
             Self::NewClaudeCodeConversation => Box::new(NewClaudeCodeConversation),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
+            Self::NewTerminal => Box::new(NewTerminal),
+            Self::RestartTerminal => Box::new(RestartTerminal),
             Self::RenameProject => Box::new(RenameProject),
             Self::ArchiveProject => Box::new(ArchiveProject),
             Self::RenameThread => Box::new(RenameThread),
@@ -274,6 +284,9 @@ impl Command {
     pub fn disabled_reason(self, state: &AppState) -> Option<String> {
         if state.shutting_down {
             return Some("Application is shutting down.".into());
+        }
+        if self == Self::RestartTerminal {
+            return Some("Select a terminal first.".into());
         }
         match self {
             Self::DeleteSpace if state.active_space == state.default_space_id() => {
@@ -332,6 +345,15 @@ impl Command {
             Self::NextThread | Self::PreviousThread if state.open_threads.len() < 2 => {
                 Some("Open at least two threads.".into())
             }
+            Self::NewTerminal => state.mutable_project_reason().or_else(|| {
+                state
+                    .selected_project
+                    .and_then(|id| match state.repositories.get(&id) {
+                        Some(Ok(_)) => None,
+                        Some(Err(error)) => Some(format!("Project root is unavailable: {error}")),
+                        None => Some("The project working tree has not been inspected.".into()),
+                    })
+            }),
             Self::NewFactoryThread => state.mutable_project_reason().or_else(|| {
                 state
                     .selected_project
@@ -387,6 +409,22 @@ impl Command {
             _ => None,
         }
     }
+
+    /// Tab commands depend on ephemeral panes as well as persisted threads.
+    pub fn disabled_reason_in_workspace(self, workspace: &Workspace, cx: &App) -> Option<String> {
+        let state = workspace.state.read(cx);
+        if state.shutting_down {
+            return Some("Application is shutting down.".into());
+        }
+        match self {
+            Self::CloseThread if workspace.has_active_terminal(cx) => None,
+            Self::NextThread | Self::PreviousThread => {
+                (workspace.center_panel_count(cx) < 2).then(|| "Open at least two tabs.".into())
+            }
+            Self::RestartTerminal if workspace.has_active_terminal(cx) => None,
+            _ => self.disabled_reason(state),
+        }
+    }
 }
 
 // Workspace chords use GPUI's `secondary-` modifier: Cmd on macOS, Ctrl elsewhere.
@@ -414,9 +452,10 @@ pub fn bind_keys(cx: &mut App) {
     let command = Some("DrostjePalette");
     let navigation =
         Some("Workspace && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
-    // The prompt buffer is the one native input whose Ctrl-W belongs to DROSTJE., not to the
-    // editor's: a single-window Neovim has no window to move to.
-    let editor_navigation = Some("PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog");
+    // Embedded editors and terminals reserve the same pane-navigation prefix.
+    let editor_navigation = Some(
+        "(PromptEditor || Terminal || TerminalPane) && !Command && !PopupMenu && !Sheet && !Dialog",
+    );
     let list =
         Some("List && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
     let projects = Some(
@@ -447,6 +486,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleOutput, workspace),
         KeyBinding::new("secondary-n", NewConversation, workspace),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
+        KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
         KeyBinding::new("secondary-,", Settings, workspace),
         KeyBinding::new("secondary-q", Quit, None),
         // The native Command rows resolve hints against the palette's own action host.
@@ -457,6 +497,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleOutput, command),
         KeyBinding::new("secondary-n", NewConversation, command),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, command),
+        KeyBinding::new("secondary-alt-t", NewTerminal, command),
         KeyBinding::new("secondary-,", Settings, command),
         KeyBinding::new("ctrl-tab", NextThread, command),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, command),
@@ -522,7 +563,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "secondary-escape",
             LeaveEditor,
-            Some("PromptEditor && !Dialog && !Sheet"),
+            Some("(PromptEditor || Terminal) && !Dialog && !Sheet"),
         ),
         KeyBinding::new("secondary-enter", Submit, submit),
         KeyBinding::new(
@@ -731,7 +772,11 @@ impl Palette {
             return;
         }
         if let PaletteTarget::Command(command) = target
-            && command.disabled_reason(self.state.read(cx)).is_some()
+            && self.owner.upgrade().is_none_or(|owner| {
+                command
+                    .disabled_reason_in_workspace(owner.read(cx), cx)
+                    .is_some()
+            })
         {
             return;
         }
@@ -883,7 +928,10 @@ impl Render for Palette {
         let mut targets = [Vec::new(), Vec::new(), Vec::new()];
         let mut commands = CommandGroup::new().label("Commands");
         for command in Command::ALL {
-            let reason = command.disabled_reason(state);
+            let reason = self.owner.upgrade().map_or_else(
+                || command.disabled_reason(state),
+                |owner| command.disabled_reason_in_workspace(owner.read(cx), cx),
+            );
             let label = match &reason {
                 Some(reason) => format!("{} — {reason}", command.label()),
                 None => command.label().to_owned(),
@@ -1031,6 +1079,12 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &NewFactoryThread, w, cx| {
                 this.run(PaletteTarget::Command(Command::NewFactoryThread), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewTerminal, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewTerminal), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RestartTerminal, w, cx| {
+                this.run(PaletteTarget::Command(Command::RestartTerminal), w, cx)
             }))
             .on_action(cx.listener(|this, _: &RenameProject, w, cx| {
                 this.run(PaletteTarget::Command(Command::RenameProject), w, cx)

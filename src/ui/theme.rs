@@ -17,6 +17,52 @@ use crate::app::{AppState, NoticeLevel};
 /// about them: `ThemeRegistry::load_themes_from_str` entries are dropped on
 /// every directory reload, so bundled themes live here instead.
 const BUNDLED_THEMES: &str = include_str!("../../assets/themes/drostje.json");
+/// Base UI size when a theme sets no `font.size`. Kit uses it as the window's
+/// rem, so it scales spacing and every `text_*` step along with the prose.
+const UI_FONT_SIZE: Pixels = px(15.);
+
+/// Terminal ANSI colors share the active theme's base palette; literal ANSI black/white
+/// stay ordered by luminance even in light mode, independently of default text colors.
+pub(super) fn terminal_theme(cx: &App) -> ghostty_terminal::TerminalTheme {
+    use ghostty_terminal::{TerminalColor, TerminalTheme};
+    let theme = Theme::global(cx);
+    let color = |value: Hsla| {
+        let rgba: Rgba = value.into();
+        TerminalColor::new(
+            (rgba.r * 255.).round() as u8,
+            (rgba.g * 255.).round() as u8,
+            (rgba.b * 255.).round() as u8,
+        )
+    };
+    let (black, white) = if theme.mode.is_dark() {
+        (theme.background, theme.foreground)
+    } else {
+        (theme.foreground, theme.background)
+    };
+    TerminalTheme::new(
+        color(theme.background),
+        color(theme.foreground),
+        [
+            black,
+            theme.red,
+            theme.green,
+            theme.yellow,
+            theme.blue,
+            theme.magenta,
+            theme.cyan,
+            white,
+            theme.muted_foreground,
+            theme.red_light,
+            theme.green_light,
+            theme.yellow_light,
+            theme.blue_light,
+            theme.magenta_light,
+            theme.cyan_light,
+            white,
+        ]
+        .map(color),
+    )
+}
 
 fn parse_bundled() -> BTreeMap<ThemeMode, Rc<ThemeConfig>> {
     let set: ThemeSet =
@@ -335,7 +381,7 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
         let defaults = Theme::default();
         let theme = Theme::global_mut(cx);
         theme.font_family = defaults.font_family;
-        theme.font_size = defaults.font_size;
+        theme.font_size = UI_FONT_SIZE;
         theme.mono_font_family = defaults.mono_font_family;
         theme.mono_font_size = defaults.mono_font_size;
         theme.radius = defaults.radius;

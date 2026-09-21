@@ -32,7 +32,10 @@ use gpui_kit::{
         select::{Select, SelectEvent, SelectState},
         spinner::Spinner,
         tag::Tag,
-        text::{MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, markdown_ast},
+        text::{
+            MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, TextViewStyle,
+            markdown_ast,
+        },
         tooltip::Tooltip,
         v_flex,
     },
@@ -749,8 +752,24 @@ impl MarkdownPlugin for InertResources {
         div().whitespace_normal().child(node.as_text().to_owned())
     }
 }
-pub fn markdown_text(id: impl Into<ElementId>, text: String) -> impl IntoElement {
+/// Transcript prose stays close to body size: headings step up modestly and
+/// paragraphs sit half a line apart, so a reply reads as a message, not a page.
+fn transcript_text_style(cx: &App) -> TextViewStyle {
+    let body = cx.theme().font_size;
+    TextViewStyle::default()
+        .paragraph_gap(rems(0.5))
+        .heading_font_size(move |level, _| {
+            body * match level {
+                1 => 1.3,
+                2 => 1.2,
+                3 => 1.1,
+                _ => 1.,
+            }
+        })
+}
+pub fn markdown_text(id: impl Into<ElementId>, text: String, cx: &App) -> impl IntoElement {
     TextView::markdown(id, text)
+        .style(transcript_text_style(cx))
         .plugin(InertResources)
         .selectable(true)
         .on_link_click(|url, event, _, cx| {
@@ -910,6 +929,118 @@ fn thinking_for_display(text: &str) -> String {
     }
 }
 
+/// The `**Title**` lines a model heads its reasoning steps with, including
+/// those `thinking_for_display` closed with an ellipsis.
+fn thinking_titles(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim().trim_end_matches(['.', '…']);
+            let title = line.strip_prefix("**")?.strip_suffix("**")?.trim();
+            (!title.is_empty() && !title.contains("**")).then_some(title)
+        })
+        .collect()
+}
+
+/// Reasoning folds to a muted label and its step titles; the disclosure opens
+/// the full text behind the same left rule.
+fn thinking_block(
+    identity: String,
+    display: String,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    let key = format!("{identity}:thinking");
+    let expanded = is_expanded(owner, &key, cx);
+    let group: SharedString = format!("{key}:group").into();
+    // Only the label row toggles, so selecting the reasoning text never folds it.
+    let header = h_flex()
+        .id(SharedString::from(format!("{key}:header")))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .py_1()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .on_click(toggle(owner, key.clone()))
+        .child(Icon::new(Lucide::Lightbulb).xsmall())
+        .child(div().flex_1().child("Thinking"))
+        .child(
+            div()
+                .when(!expanded, |chevron| {
+                    chevron
+                        .invisible()
+                        .group_hover(group.clone(), |style| style.visible())
+                })
+                .child(disclosure(
+                    key.clone(),
+                    expanded,
+                    owner,
+                    if expanded {
+                        "Hide reasoning"
+                    } else {
+                        "Show reasoning"
+                    },
+                )),
+        );
+    let detail: Option<AnyElement> = if expanded {
+        let markdown_id = format!("{identity}:markdown");
+        let rendered = display.clone();
+        Some(guarded_content(
+            identity,
+            &display,
+            owner,
+            cx,
+            "thinking",
+            || markdown_text(markdown_id, rendered, cx).into_any_element(),
+        ))
+    } else {
+        let titles = thinking_titles(&display);
+        if titles.is_empty() {
+            // Untitled reasoning still shows where it starts rather than a bare label.
+            display
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| {
+                    div()
+                        .truncate()
+                        .child(line.trim().to_owned())
+                        .into_any_element()
+                })
+        } else {
+            Some(
+                v_flex()
+                    .gap_1()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .children(
+                        titles
+                            .into_iter()
+                            .map(|title| div().whitespace_normal().child(title.to_owned())),
+                    )
+                    .into_any_element(),
+            )
+        }
+    };
+    v_flex()
+        .id(SharedString::from(format!("{key}:block")))
+        .debug_selector(|| "conversation-thinking".into())
+        .group(group)
+        .w_full()
+        .min_w_0()
+        .child(header)
+        .when_some(detail, |block, detail| {
+            block.child(
+                div()
+                    .ml_1p5()
+                    .pl_3()
+                    .border_l_1()
+                    .border_color(cx.theme().border)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(detail),
+            )
+        })
+        .into_any_element()
+}
+
 pub(super) fn block(
     content: &ContentBlock,
     identity: String,
@@ -920,7 +1051,7 @@ pub(super) fn block(
         ContentBlock::Text(text) => {
             let markdown_id = format!("{identity}:markdown");
             guarded_text(identity, text, owner, cx, || {
-                markdown_text(markdown_id, text.clone()).into_any_element()
+                markdown_text(markdown_id, text.clone(), cx).into_any_element()
             })
         }
         ContentBlock::Thinking(text) => {
@@ -928,16 +1059,7 @@ pub(super) fn block(
             if display.is_empty() {
                 return div().into_any_element();
             }
-            let rendered = display.clone();
-            let markdown_id = format!("{identity}:markdown");
-            guarded_content(identity, &display, owner, cx, "thinking", || {
-                div()
-                    .debug_selector(|| "conversation-thinking".into())
-                    .italic()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(markdown_text(markdown_id, rendered))
-                    .into_any_element()
-            })
+            thinking_block(identity, display, owner, cx)
         }
         ContentBlock::Image(image) => image_thumbnail(image, owner, cx),
         ContentBlock::ImageError(error) => Alert::error(
@@ -1014,8 +1136,13 @@ fn guarded_content(
 /// Plain output (compiler messages, grep hits, file contents) rendered through
 /// the kit's Markdown code block, which brings the code font, background,
 /// highlighting for a known language and copy support.
-fn code_block(identity: impl Into<ElementId>, text: &str, language: &str) -> impl IntoElement {
-    markdown_text(identity, code_fence(text, language))
+fn code_block(
+    identity: impl Into<ElementId>,
+    text: &str,
+    language: &str,
+    cx: &App,
+) -> impl IntoElement {
+    markdown_text(identity, code_fence(text, language), cx)
 }
 /// Wrap `text` in a fence longer than any backtick run it contains, so the
 /// block always closes where intended.
@@ -1242,22 +1369,22 @@ fn tool_card(
                 .into_any_element(),
         ),
     };
+    let group: SharedString = format!("{key}:group").into();
+    // Only the row toggles, so selecting text in the opened detail never folds it.
     let mut header = h_flex()
+        .id(SharedString::from(format!("{key}:header")))
         .w_full()
         .items_center()
         .gap_2()
-        .child(
-            Icon::new(summary.icon)
-                .xsmall()
-                .text_color(cx.theme().muted_foreground),
-        )
+        .py_1()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(Icon::new(summary.icon).xsmall())
         .child(
             div()
                 .flex_shrink_0()
                 .max_w(relative(0.5))
                 .truncate()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
                 .child(caption),
         )
         .child(
@@ -1265,56 +1392,62 @@ fn tool_card(
                 .debug_selector(|| "conversation-tool-summary-line".into())
                 .flex_1()
                 .truncate()
-                .text_color(cx.theme().muted_foreground)
                 .when(!expanded, |line| line.child(summary_line(&summary.body))),
         );
-    if intent.is_some() {
-        header = header.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(name.to_owned()),
-        );
+    // The icon names the tool while folded; the opened row spells it out.
+    if intent.is_some() && expanded {
+        header = header.child(div().flex_shrink_0().child(name.to_owned()));
     }
     header = header.when_some(mark, |row, mark| row.child(mark));
     if has_detail && outcome != ToolOutcome::Failed {
-        header = header.child(disclosure(
-            key.clone(),
-            expanded,
-            owner,
-            if expanded {
-                "Hide details"
-            } else {
-                "Show details"
-            },
-        ));
+        header = header.on_click(toggle(owner, key.clone())).child(
+            div()
+                .when(!expanded, |chevron| {
+                    chevron
+                        .invisible()
+                        .group_hover(group.clone(), |style| style.visible())
+                })
+                .child(disclosure(
+                    key.clone(),
+                    expanded,
+                    owner,
+                    if expanded {
+                        "Hide details"
+                    } else {
+                        "Show details"
+                    },
+                )),
+        );
     }
     let card_selector = format!("{key}:card");
     let mut card = v_flex()
         .id(SharedString::from(card_selector))
         .debug_selector(|| "conversation-tool-card".into())
         .test_support()
+        .group(group)
         .w_full()
         .min_w_0()
-        .gap_1()
+        .child(header);
+    let has_body = !summary.body.is_empty();
+    let mut detail = v_flex()
+        .w_full()
+        .min_w_0()
+        .mb_1()
         .px_3()
-        .py_1()
+        .border_1()
+        .border_color(cx.theme().border)
         .rounded(cx.theme().radius)
-        .bg(cx.theme().muted)
-        .child(header)
-        .when(expanded && !summary.body.is_empty(), |card| {
-            card.child(mono(cx).pb_1().child(summary.body))
+        .when(expanded && has_body, |detail| {
+            detail.child(mono(cx).py_2().child(summary.body))
         });
-    if has_detail {
-        card = card.on_click(toggle(owner, key.clone()));
-    }
     if has_result && expanded {
         let mut output = v_flex()
             .debug_selector(|| "conversation-tool-full-result".into())
             .gap_2()
             .py_2()
-            .border_t_1()
-            .border_color(cx.theme().border);
+            .when(has_body, |output| {
+                output.border_t_1().border_color(cx.theme().border)
+            });
         if let Some(code) = exit_code.filter(|code| *code != 0 || outcome == ToolOutcome::Failed) {
             output = output.child(mono(cx).child(format!("Exit code {code}")));
         }
@@ -1325,13 +1458,16 @@ fn tool_card(
                 (ContentBlock::Text(text), Some(language)) => {
                     let markdown_id = format!("{identity}:markdown");
                     guarded_text(identity, text, owner, cx, || {
-                        code_block(markdown_id, text, language).into_any_element()
+                        code_block(markdown_id, text, language, cx).into_any_element()
                     })
                 }
                 _ => self::block(block, identity, owner, cx),
             });
         }
-        card = card.child(output);
+        detail = detail.child(output);
+    }
+    if expanded && has_detail {
+        card = card.child(detail);
     }
     card.into_any_element()
 }
@@ -1361,29 +1497,24 @@ fn todo_card(
         .clone()
         .unwrap_or_else(|| format!("{done}/{total} done"));
     let header = h_flex()
+        .id(SharedString::from(format!("{key}:header")))
         .w_full()
         .items_center()
         .gap_2()
-        .child(
-            Icon::new(Lucide::ListTodo)
-                .xsmall()
-                .text_color(cx.theme().muted_foreground),
-        )
+        .py_1()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .on_click(toggle(owner, key.clone()))
+        .child(Icon::new(Lucide::ListTodo).xsmall())
         .child(
             div()
-                .flex_1()
-                .min_w_0()
+                .flex_shrink_0()
+                .max_w(relative(0.5))
                 .truncate()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
                 .child(intent.unwrap_or(name).to_owned()),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(tally),
-        )
+        .child(div().flex_1().min_w_0().truncate().child(change))
+        .child(div().flex_shrink_0().child(tally))
         .when(outcome == ToolOutcome::Running, |row| {
             row.child(Spinner::new().xsmall())
         })
@@ -1397,20 +1528,16 @@ fn todo_card(
         .id(SharedString::from(format!("{key}:card")))
         .w_full()
         .min_w_0()
-        .gap_1()
-        .p_3()
-        .rounded(cx.theme().radius)
-        .bg(cx.theme().muted)
-        .on_click(toggle(owner, key.clone()))
         .child(header)
-        .child(div().text_sm().child(change))
         .when(open, |card| {
             card.child(
                 div()
-                    .pt_2()
-                    .mt_1()
-                    .border_t_1()
+                    .mb_1()
+                    .px_3()
+                    .py_2()
+                    .border_1()
                     .border_color(cx.theme().border)
+                    .rounded(cx.theme().radius)
                     .child(todo_checklist(list, cx)),
             )
         })
@@ -1623,11 +1750,15 @@ fn message(
     let group: SharedString = format!("message-group-{id}-{}", message.id).into();
     let copy_message = message.clone();
     // Actions stay out of the way until the pointer is over the message; each
-    // one is an icon button with its own tooltip rather than a hidden menu.
+    // one is an icon button with its own tooltip rather than a hidden menu. They
+    // float over the top-right corner so a hidden row never pads the transcript.
     let mut actions = h_flex()
-        .w_full()
-        .justify_end()
+        .absolute()
+        .top_0()
+        .right_0()
         .gap_1()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().background)
         .invisible()
         .group_hover(group.clone(), |style| style.visible())
         .child(
@@ -1724,7 +1855,8 @@ fn message(
         body = body.child(mono(cx).child(raw.to_string()));
     }
     let body = if user_message {
-        body.p_3()
+        body.px_3()
+            .py_2()
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius)
@@ -1740,9 +1872,10 @@ fn message(
             .min_w_0()
             .id(SharedString::from(format!("message-{id}-{}", message.id)))
             .group(group)
-            .py_2()
-            .child(actions)
-            .child(body),
+            .relative()
+            .map(|row| if user_message { row.py_2() } else { row.py_1() })
+            .child(body)
+            .child(actions),
     )
 }
 
@@ -1945,74 +2078,62 @@ fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &Ap
         tag.small().child(status.to_owned()).into_any_element()
     });
     let mut header = h_flex()
+        .id(SharedString::from(format!("{key}:header")))
         .w_full()
         .items_center()
         .gap_2()
+        .py_1()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
         .child(
             Icon::new(if job.agent.is_some() {
                 Lucide::Workflow
             } else {
                 Lucide::Terminal
             })
-            .xsmall()
-            .text_color(cx.theme().muted_foreground),
+            .xsmall(),
         )
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
                 .child(format!("Background job {}", job.id)),
         );
     for detail in [job.agent.as_deref(), job.duration.as_deref()]
         .into_iter()
         .flatten()
     {
-        header = header.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(detail.to_owned()),
-        );
+        header = header.child(div().flex_shrink_0().child(detail.to_owned()));
+    }
+    if !has_output {
+        header = header.child(div().flex_shrink_0().child("No output"));
     }
     header = header.when_some(status, |row, status| row.child(status));
     if has_output {
-        header = header.child(disclosure(
-            key.clone(),
-            open,
-            owner,
-            if open { "Hide output" } else { "Show output" },
-        ));
+        header = header
+            .on_click(toggle(owner, key.clone()))
+            .child(disclosure(
+                key.clone(),
+                open,
+                owner,
+                if open { "Hide output" } else { "Show output" },
+            ));
     }
     let mut card = v_flex()
         .id(SharedString::from(format!("{key}:card")))
         .w_full()
         .min_w_0()
-        .gap_1()
-        .p_3()
-        .rounded(cx.theme().radius)
-        .bg(cx.theme().muted)
         .child(header);
-    if has_output {
-        card = card.on_click(toggle(owner, key.clone()));
-    }
-    if !has_output {
-        card = card.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child("No output"),
-        );
-    }
     if open {
         let mut output = v_flex()
             .gap_2()
-            .pt_2()
-            .mt_1()
-            .border_t_1()
-            .border_color(cx.theme().border);
+            .mb_1()
+            .px_3()
+            .py_2()
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius);
         if let Some(full) = &job.full_output {
             output = output.child(
                 div()
@@ -2034,7 +2155,7 @@ fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &Ap
                 let identity = format!("{key}:output");
                 let markdown_id = format!("{identity}:markdown");
                 output.child(guarded_text(identity, text, owner, cx, || {
-                    code_block(markdown_id, text, language).into_any_element()
+                    code_block(markdown_id, text, language, cx).into_any_element()
                 }))
             }
             JobOutput::Empty => output,
@@ -2084,7 +2205,7 @@ fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> A
                 .map(|item| format!("- {}", item.replace('\n', "\n  ")))
                 .collect::<Vec<_>>()
                 .join("\n");
-            markdown_text(identity, list).into_any_element()
+            markdown_text(identity, list, cx).into_any_element()
         }
         Value::Array(items)
             if depth < MAX_DEPTH
@@ -2108,7 +2229,7 @@ fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> A
             }
             column.into_any_element()
         }
-        Value::String(text) => markdown_text(identity, text.clone()).into_any_element(),
+        Value::String(text) => markdown_text(identity, text.clone(), cx).into_any_element(),
         Value::Null => div()
             .text_color(cx.theme().muted_foreground)
             .child("None")
@@ -2118,6 +2239,7 @@ fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> A
             identity,
             &serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
             "json",
+            cx,
         )
         .into_any_element(),
     }
@@ -3115,7 +3237,7 @@ mod tests {
         ContentBlock, ContextUsage, Duration, LimitWindow, Lucide, Message, SUMMARY_LIMIT,
         SystemTime, ToolSummary, UsageLimit, Value, code_fence, compact_duration, compact_tokens,
         context_percent, harness_note_hidden, humanise_key, limit_description, result_language,
-        summary_line, thinking_for_display, tool_summary,
+        summary_line, thinking_for_display, thinking_titles, tool_summary,
     };
     use serde_json::json;
 
@@ -3554,6 +3676,17 @@ mod tests {
             "**Planning the change**...\n\n\n\nChecking the result"
         );
         assert_eq!(thinking_for_display(" ... \n…"), "");
+    }
+
+    #[test]
+    fn folded_reasoning_lists_its_step_titles() {
+        assert_eq!(
+            thinking_titles(
+                "**Planning the change**...\n\nprose with **bold** inside\n\n  **Checking the result**  \n****"
+            ),
+            ["Planning the change", "Checking the result"]
+        );
+        assert!(thinking_titles("Just prose.").is_empty());
     }
 
     #[test]

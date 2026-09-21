@@ -8,6 +8,7 @@ mod nvim;
 pub mod overlays;
 pub mod settings;
 pub mod sidebar;
+pub mod terminal;
 pub mod theme;
 mod thread_sidebar;
 mod title_bar;

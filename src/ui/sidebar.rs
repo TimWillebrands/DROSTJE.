@@ -291,6 +291,11 @@ fn row_menu(
                 Command::NewFactoryThread,
                 state,
             ))
+            .item(command_item(
+                Command::NewTerminal.label(),
+                Command::NewTerminal,
+                state,
+            ))
             .separator()
             .item(command_item(
                 "Rename project…",
@@ -315,7 +320,11 @@ fn row_menu(
                 state,
             ))
             .separator()
-            .item(command_item("Close thread", Command::CloseThread, state)),
+            .item(command_item(
+                Command::CloseThread.label(),
+                Command::CloseThread,
+                state,
+            )),
     }
 }
 
@@ -1032,7 +1041,7 @@ pub fn render(
                         .small()
                         .cursor_default()
                         .icon(IconName::Plus)
-                        .tooltip("New thread…")
+                        .tooltip("New tab…")
                         .dropdown_menu(move |menu, _, cx| {
                             let Some(workspace) = new_owner.upgrade() else {
                                 return menu;
@@ -1062,6 +1071,11 @@ pub fn render(
                                 command_item("Factory thread", Command::NewFactoryThread, state)
                                     .icon(IconName::Cpu),
                             )
+                            .item(command_item(
+                                Command::NewTerminal.label(),
+                                Command::NewTerminal,
+                                state,
+                            ))
                         }),
                 ),
         )
