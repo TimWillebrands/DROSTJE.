@@ -9,7 +9,7 @@ use drostje::{
 use rusqlite::Connection;
 use serde_json::json;
 use std::{
-    fs,
+    fs::{self, TryLockError},
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -114,6 +114,28 @@ fn reopen(path: &Path) -> Store {
                 thread::sleep(Duration::from_millis(5))
             }
             Err(error) => panic!("Cannot reopen workspace: {error:#}"),
+        }
+    }
+}
+
+// Dropping the last handle is nonblocking: the worker still owns the SQLite connection and
+// the instance lock until it drains. Opening the database file directly while that WAL
+// connection closes deadlocks inside SQLite's unix VFS (the inode mutex against the global
+// VFS mutex), so wait for the worker to release the instance lock before touching the file.
+fn wait_for_release(directory: &Path) {
+    let lock = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(directory.join("instance.lock"))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return,
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) => panic!("Storage worker did not release the instance lock: {error}"),
         }
     }
 }
@@ -327,6 +349,7 @@ fn version_2_database_upgrades_in_place_and_persists_effort() {
         assert_eq!(threads[0].effort.as_deref(), Some("low"));
         assert_eq!(threads[0].permission_mode.as_deref(), Some("plan"));
         drop(reopened);
+        wait_for_release(&directory.0);
         let database = Connection::open(&path).unwrap();
         assert_eq!(
             database
@@ -393,6 +416,7 @@ fn version_3_database_upgrades_in_place_and_persists_permission_mode() {
         assert_eq!(threads[0].effort.as_deref(), Some("high"));
         assert_eq!(threads[0].permission_mode.as_deref(), Some("acceptEdits"));
         drop(reopened);
+        wait_for_release(&directory.0);
         let database = Connection::open(&path).unwrap();
         assert_eq!(
             database
@@ -467,6 +491,7 @@ fn version_4_database_upgrades_in_place_and_persists_queued_messages() {
         assert_eq!(threads[0].permission_mode.as_deref(), Some("plan"));
         assert_eq!(threads[0].queued, vec![queued]);
         drop(reopened);
+        wait_for_release(&directory.0);
         let database = Connection::open(&path).unwrap();
         assert_eq!(
             database

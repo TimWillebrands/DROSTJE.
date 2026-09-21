@@ -36,21 +36,27 @@ Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor
 
 ### Installeren
 
-Bouw en installeer een lokale macOS-app in `/Applications`:
+Eén script bouwt een release-build en installeert die voor je desktop:
 
 ```sh
 ./install.sh
 ```
 
-De installer maakt een ongesigneerde `DROSTJE.app`-bundle (weergegeven als DROSTJE.) met een release-build en vraagt alleen bij een niet-schrijfbare `/Applications`-map om beheerdersrechten. Gebruik `INSTALL_DIR` voor een andere locatie:
+Op **macOS** maakt de installer een ongesigneerde `DROSTJE.app`-bundle (weergegeven als DROSTJE.) in `/Applications` en vraagt alleen bij een niet-schrijfbare map om beheerdersrechten. Gebruik `INSTALL_DIR` voor een andere locatie:
 
 ```sh
 INSTALL_DIR="$HOME/Applications" ./install.sh
 ```
 
+Op **Linux** (getest op Arch met COSMIC/Wayland) is `INSTALL_DIR` een prefix, standaard `~/.local`: het binaire bestand komt in `bin/`, een `drostje.desktop`-item en de hicolor-iconen in `share/`. Daarna staat DROSTJE. in je app-launcher; ImageMagick (`magick`) is optioneel voor de geschaalde iconen. Voor een systeembrede installatie:
+
+```sh
+INSTALL_DIR=/usr/local ./install.sh
+```
+
 De app-installer installeert geen Neovim, OMP, Pi, Claude Code, Factory, Docker of andere vereisten. Ontbrekende vereisten configureer je in Settings. Als Pi ontbreekt, kan **Install Pi** daar na een expliciete klik de officiële `@earendil-works/pi-coding-agent`-package zonder lifecycle-scripts in de DROSTJE.-datamap installeren; daarvoor zijn Node.js 22.19 of nieuwer en npm nodig.
 
-De standaardmap is `~/Library/Application Support/Drostje`. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
+De standaardmap is `~/Library/Application Support/Drostje` op macOS en `$XDG_DATA_HOME/drostje` (standaard `~/.local/share/drostje`) op Linux. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
 
 Kies in Settings zo nodig expliciete executable-paden, de Conversation-harness per project en de gedeelde Factory-data-root. OMP, Pi en Claude Code draaien met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
 
@@ -95,7 +101,7 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |`Cmd-Alt-]` / `Cmd-Alt-[`|Volgende / vorige Space, buiten invoervelden en overlays|
 |`Cmd-W` (Linux: `Ctrl-Shift-W`)|Huidige threadtab sluiten|
 |`Ctrl-W`, daarna `h/j/k/l`|Naar het dichtstbijzijnde zichtbare paneel in die richting, ook vanuit de prompt-editor; zonder buur blijft focus staan, zonder omslaan of diagonale sprongen|
-|`j/k`, pijlen, `gg/G`, `h/l`, Return|Navigeren, springen, invouwen/uitvouwen en openen in Projects|
+|`j/k`, pijlen, `gg/G`, Home/End, Page Up/Down, `h/l`, Return|Navigeren, springen, bladeren, invouwen/uitvouwen en openen in Projects; in een Conversation scrollen dezelfde toetsen de geschiedenis|
 |`i` in een Conversation|Focus naar de prompteditor|
 |`Cmd-V` in een Conversation|Afbeelding van het klembord als bijlage toevoegen (PNG, JPEG, WebP, TIFF); tekst plakt in de editor|
 |`Cmd-Enter`|Prompt versturen, Factory-configuratie starten of formulier bevestigen|

@@ -58,6 +58,9 @@ pub fn run() {
             // Ask for client-side decorations so compositors do not stack their own title bar
             // above ours; `Root` draws the Linux frame, shadow and resize edges.
             window_decorations: Some(WindowDecorations::Client),
+            // The Wayland/X11 application id. Desktop launchers match it to
+            // `drostje.desktop` and its icon; without it the window is anonymous.
+            app_id: Some("drostje".into()),
             ..TitleBar::window_options()
         };
         cx.spawn(async move |cx| {
