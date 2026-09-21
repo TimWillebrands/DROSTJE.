@@ -641,16 +641,34 @@ impl AppState {
                             .map(|p| (p.id, p.archived))
                         {
                             self.repositories.insert(id, Ok(info));
-                            if space == self.active_space && self.project_in_active_space(id) {
-                                self.select_project(id);
-                                if archived {
-                                    self.set_show_archived(true);
-                                }
-                                self.notice(NoticeLevel::Info, "This working tree is already registered; selected the existing project.");
-                            } else {
+                            if self.space_mutation_reason().is_none() {
+                                let (destination, added) =
+                                    self.register_project_membership(id, space);
                                 let name =
-                                    self.project_space_name(id).unwrap_or("Default").to_owned();
-                                self.notice(NoticeLevel::Info, format!("This working tree is already registered in space {name}. Switch to that space to open it."));
+                                    self.space_name(destination).unwrap_or("Default").to_owned();
+                                if destination == self.active_space {
+                                    self.select_project(id);
+                                    if archived {
+                                        self.set_show_archived(true);
+                                    }
+                                    self.notice(
+                                        NoticeLevel::Info,
+                                        if added {
+                                            format!("Project added to space {name} and selected.")
+                                        } else {
+                                            "This working tree is already in this space; selected the existing project.".into()
+                                        },
+                                    );
+                                } else {
+                                    self.notice(
+                                        NoticeLevel::Info,
+                                        if added {
+                                            format!("Project added to space {name}. Switch to that space to open it.")
+                                        } else {
+                                            format!("This working tree is already in space {name}. Switch to that space to open it.")
+                                        },
+                                    );
+                                }
                             }
                         } else if self.space_mutation_reason().is_none() {
                             let project = Project {
@@ -666,12 +684,12 @@ impl AppState {
                             };
                             let id = project.id;
                             self.repositories.insert(project.id, Ok(info));
-                            self.save_project_in_space(project, space);
-                            if space == self.active_space {
+                            let destination = self.save_project_in_space(project, space);
+                            if destination == self.active_space {
                                 self.select_project(id);
                             } else {
                                 let name =
-                                    self.project_space_name(id).unwrap_or("Default").to_owned();
+                                    self.space_name(destination).unwrap_or("Default").to_owned();
                                 self.notice(NoticeLevel::Info, format!("Project registered in space {name}. Switch to that space to open it."));
                             }
                         }
@@ -816,11 +834,11 @@ impl AppState {
         self.save_project_in_space(project, self.active_space);
     }
 
-    fn save_project_in_space(&mut self, project: Project, space: SpaceId) {
+    fn save_project_in_space(&mut self, project: Project, space: SpaceId) -> SpaceId {
         let id = project.id;
         let is_new = !self.snapshot.projects.iter().any(|old| old.id == id);
         if is_new && self.space_mutation_reason().is_some() {
-            return;
+            return space;
         }
         if let Some(old) = self
             .snapshot
@@ -834,7 +852,9 @@ impl AppState {
         }
         self.enqueue(Write::Project(project));
         if is_new {
-            self.register_project_membership(id, space);
+            self.register_project_membership(id, space).0
+        } else {
+            space
         }
     }
 

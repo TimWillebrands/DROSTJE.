@@ -2336,10 +2336,22 @@ async fn factory_start_requires_persisted_configuration(cx: &mut TestAppContext)
 
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; space isolation, native controls and draft safety without provider turns"]
-async fn spaces_preserve_drafts_tabs_and_project_ownership(cx: &mut TestAppContext) {
+async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let default = cx.read(|cx| fixture.state.read(cx).active_space);
     let project = cx.read(|cx| fixture.state.read(cx).selected_project.unwrap());
+    let project_root = cx.read(|cx| {
+        fixture
+            .state
+            .read(cx)
+            .snapshot
+            .projects
+            .iter()
+            .find(|item| item.id == project)
+            .unwrap()
+            .root
+            .clone()
+    });
     let thread = new_conversation(cx, &fixture).await;
     let session = cx.read(|cx| fixture.state.read(cx).conversations[&thread].generation);
     update_workspace(
@@ -2397,6 +2409,33 @@ async fn spaces_preserve_drafts_tabs_and_project_ownership(cx: &mut TestAppConte
         commands::Command::NewConversation
             .disabled_reason(fixture.state.read(cx))
             .is_some()
+    }));
+
+    // Re-adding a registered working tree attaches it to this Space instead of
+    // leaving the empty Space without a usable project.
+    cx.dispatch_action(fixture.window.into(), commands::AddProject);
+    set_dialog(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        "path",
+        &project_root.to_string_lossy(),
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(
+        cx,
+        "existing project added to second space",
+        Duration::from_secs(10),
+        |cx| {
+            let state = fixture.state.read(cx);
+            state.project_in_active_space(project) && state.selected_project == Some(project)
+        },
+    )
+    .await;
+    assert!(cx.read(|cx| {
+        commands::Command::NewConversation
+            .disabled_reason(fixture.state.read(cx))
+            .is_none()
     }));
 
     // The switcher and add control remain usable in both themes at minimum size.

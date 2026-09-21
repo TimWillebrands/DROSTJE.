@@ -69,7 +69,7 @@ Een **Space** is een eigen werkcontext voor een groep projecten, geïnspireerd d
 
 Elke Space bewaart zijn eigen open tabs, geselecteerde project en thread, ingeklapte projecten, archiefweergave en paneelindeling. Projects, zoeken en de project- en threadresultaten in de command palette tonen alleen de actieve Space. Wisselen stopt geen lopende agent of Factory-run en bewaart concepten. Onvoltooide Neovim-opdrachten of tekstcompositie moeten eerst worden afgerond of geannuleerd.
 
-Via het Space-menu of de command palette kun je een Space hernoemen, een project met **alle** bijbehorende threads verplaatsen, of een Space verwijderen. Een project hoort bij precies één Space: dezelfde werkboom opnieuw toevoegen verplaatst of dupliceert hem niet. Verwijderen vraagt bevestiging en verplaatst de projecten naar Default; historie, concepten en bestanden blijven behouden. Default zelf kan niet worden verwijderd.
+Via het Space-menu of de command palette kun je een Space hernoemen, een project vanuit de actieve Space verplaatsen, of een Space verwijderen. Een project kan in meerdere Spaces staan: voeg dezelfde Git-werkboom in een andere Space opnieuw toe om het project en zijn gedeelde threadgeschiedenis daar ook te gebruiken. **Move project to space…** verwijdert alleen het lidmaatschap van de actieve Space en laat andere Spaces ongemoeid. Bij het verwijderen van een Space blijven gedeelde projecten in hun andere Spaces staan; projecten zonder andere Space gaan naar Default. Historie, concepten en bestanden blijven behouden. Default zelf kan niet worden verwijderd.
 
 Gebruik **Switch space…** voor de toetsenbordkiezer: `j/k`, pijlen, `gg/G`, Return en Escape. **Next space** en **Previous space** wisselen direct buiten invoervelden en overlays. Spaces scheiden organisatie, niet accounts, credentials of bestandstoegang; tools en thema-instellingen blijven gedeeld.
 
@@ -165,7 +165,7 @@ cargo test --features runtime-qa --lib orderly_quit_flushes_before_platform_dead
 cargo test --features runtime-qa --lib factory_start_requires_persisted_configuration -- --ignored --nocapture
 cargo test --features runtime-qa --lib typing_saves_on_focus_loss_and_quit_not_idle -- --ignored --nocapture
 cargo test --features runtime-qa --lib factory_typing_stays_local_until_focus_loss_or_commit -- --ignored --nocapture
-cargo test --features runtime-qa --lib spaces_preserve_drafts_tabs_and_project_ownership -- --ignored --nocapture
+cargo test --features runtime-qa --lib spaces_preserve_drafts_tabs_and_shared_projects -- --ignored --nocapture
 cargo test --features runtime-qa --lib terminal_tabs_keep_failure_local_and_do_not_persist_sessions -- --ignored --nocapture
 ```
 

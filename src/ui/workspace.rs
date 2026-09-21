@@ -1018,7 +1018,7 @@ impl Workspace {
             let cancel = owner.clone();
             alert
                 .title(div().id("terminal-stop-confirmation").test_support().child(title.clone()))
-                .description("This stops this terminal's shell and any running jobs. Other terminals are not affected.")
+                .description("This stops this terminal's shell and foreground jobs. Other terminals are not affected.")
                 .button_props(DialogButtonProps::default()
                     .ok_text(if restart { "Restart terminal" } else { "Close terminal" })
                     .cancel_text("Cancel").show_cancel(true))

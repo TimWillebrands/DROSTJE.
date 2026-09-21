@@ -77,7 +77,17 @@ impl TerminalPane {
         match Terminal::spawn(options, window, cx) {
             Ok(native) => {
                 native.update(cx, |terminal, _| terminal.set_visible(self.visible));
-                self.native_subscription = Some(cx.observe(&native, |_, _, cx| cx.notify()));
+                self.native_subscription =
+                    Some(cx.observe_in(&native, window, |pane, native, window, cx| {
+                        let terminal = native.read(cx);
+                        if (!terminal.is_alive() || terminal.backend_error().is_some())
+                            && terminal.focus_handle(cx).is_focused(window)
+                        {
+                            // The native input leaves the tree; retain the app's keyboard path.
+                            pane.focus.focus(window, cx);
+                        }
+                        cx.notify();
+                    }));
                 self.native = Some(native);
                 self.error = None;
             }

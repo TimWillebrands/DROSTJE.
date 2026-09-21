@@ -1,8 +1,9 @@
 use super::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 const SETTING: &str = "spaces";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const DEFAULT_SPACE: SpaceId = Uuid::from_u128(0);
 const MAX_NAME_LENGTH: usize = 80;
 
@@ -25,31 +26,84 @@ pub(super) struct Spaces {
     version: u32,
     pub active: SpaceId,
     pub spaces: Vec<Space>,
+    projects: BTreeMap<ProjectId, BTreeSet<SpaceId>>,
+    sessions: BTreeMap<SpaceId, SpaceSession>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpacesV1 {
+    version: u32,
+    active: SpaceId,
+    spaces: Vec<Space>,
     projects: BTreeMap<ProjectId, SpaceId>,
     sessions: BTreeMap<SpaceId, SpaceSession>,
 }
 
+impl SpacesV1 {
+    fn upgrade(self) -> Spaces {
+        Spaces {
+            version: VERSION,
+            active: self.active,
+            spaces: self.spaces,
+            projects: self
+                .projects
+                .into_iter()
+                .map(|(project, space)| (project, BTreeSet::from([space])))
+                .collect(),
+            sessions: self.sessions,
+        }
+    }
+}
+
 impl Spaces {
-    fn register_project(&mut self, project: ProjectId, space: SpaceId) {
+    fn register_project(&mut self, project: ProjectId, space: SpaceId) -> (SpaceId, bool) {
         let destination = if self.sessions.contains_key(&space) {
             space
         } else {
             DEFAULT_SPACE
         };
-        self.projects.insert(project, destination);
+        let inserted = self
+            .projects
+            .entry(project)
+            .or_default()
+            .insert(destination);
+        (destination, inserted)
     }
 
     pub fn load(snapshot: &WorkspaceSnapshot) -> Result<Self> {
         let Some(value) = snapshot.settings.get(SETTING) else {
             return Ok(Self::migrate(snapshot));
         };
-        let mut spaces: Self = serde_json::from_value(value.clone())
-            .context("Cannot read saved spaces; the original metadata has been preserved")?;
+        let version = value.get("version").and_then(Value::as_u64).context(
+            "Cannot read saved spaces version; the original metadata has been preserved",
+        )?;
+        let mut spaces = match version {
+            1 => {
+                let legacy: SpacesV1 = serde_json::from_value(value.clone()).context(
+                    "Cannot read saved spaces; the original metadata has been preserved",
+                )?;
+                anyhow::ensure!(
+                    legacy.version == 1,
+                    "Unsupported saved spaces version {}; original metadata preserved",
+                    legacy.version
+                );
+                legacy.upgrade()
+            }
+            version if version == u64::from(VERSION) => serde_json::from_value(value.clone())
+                .context("Cannot read saved spaces; the original metadata has been preserved")?,
+            version => anyhow::bail!(
+                "Unsupported saved spaces version {version}; original metadata preserved"
+            ),
+        };
         spaces.validate(snapshot)?;
         // A crash can occur after a new project is saved but before membership.
-        // Recover that whole project into Default rather than hide or duplicate it.
+        // Recover that project into Default rather than hide it.
         for project in &snapshot.projects {
-            spaces.projects.entry(project.id).or_insert(DEFAULT_SPACE);
+            spaces
+                .projects
+                .entry(project.id)
+                .or_insert_with(|| BTreeSet::from([DEFAULT_SPACE]));
         }
         Ok(spaces)
     }
@@ -138,7 +192,7 @@ impl Spaces {
             projects: snapshot
                 .projects
                 .iter()
-                .map(|project| (project.id, DEFAULT_SPACE))
+                .map(|project| (project.id, BTreeSet::from([DEFAULT_SPACE])))
                 .collect(),
             sessions: BTreeMap::from([(
                 DEFAULT_SPACE,
@@ -182,14 +236,19 @@ impl Spaces {
             );
         }
         anyhow::ensure!(
-            self.projects
-                .iter()
-                .all(|(project, space)| ids.contains(space)
-                    && snapshot.projects.iter().any(|item| item.id == *project)),
+            self.projects.iter().all(|(project, spaces)| {
+                !spaces.is_empty()
+                    && spaces.iter().all(|space| ids.contains(space))
+                    && snapshot.projects.iter().any(|item| item.id == *project)
+            }),
             "Invalid saved project membership; original metadata preserved"
         );
         for (id, session) in &self.sessions {
-            let project_member = |project: &ProjectId| self.projects.get(project) == Some(id);
+            let project_member = |project: &ProjectId| {
+                self.projects
+                    .get(project)
+                    .is_some_and(|spaces| spaces.contains(id))
+            };
             let thread_member = |thread: &ThreadId| {
                 snapshot
                     .threads
@@ -269,6 +328,7 @@ impl Spaces {
     fn move_project(
         &mut self,
         project: ProjectId,
+        source: SpaceId,
         target: SpaceId,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<()> {
@@ -276,21 +336,26 @@ impl Spaces {
             self.sessions.contains_key(&target),
             "Destination space no longer exists"
         );
-        let source = *self
+        let memberships = self
             .projects
-            .get(&project)
+            .get_mut(&project)
             .context("Project no longer exists")?;
+        anyhow::ensure!(
+            memberships.contains(&source),
+            "Project is not in the source space"
+        );
         if source == target {
             return Ok(());
         }
-        self.projects.insert(project, target);
+        memberships.insert(target);
+        memberships.remove(&source);
         let threads: HashSet<_> = snapshot
             .threads
             .iter()
             .filter(|thread| thread.project_id == project)
             .map(|thread| thread.id)
             .collect();
-        for (id, session) in &mut self.sessions {
+        if let Some(session) = self.sessions.get_mut(&source) {
             session
                 .open_threads
                 .retain(|thread| !threads.contains(thread));
@@ -304,29 +369,24 @@ impl Spaces {
             if session.selected_project == Some(project) {
                 session.selected_project = None;
             }
-            if *id == source || *id == target {
-                // Dock JSON belongs to the UI; rebuilding these two layouts is
-                // safer than retaining panels that now belong to another space.
-                session.layout = None;
-            }
+            // Dock JSON belongs to the UI; rebuild the source layout after its
+            // project panels leave. An existing destination layout stays valid.
+            session.layout = None;
         }
         Ok(())
     }
 
-    fn delete(&mut self, id: SpaceId, snapshot: &WorkspaceSnapshot) -> Result<()> {
+    fn delete(&mut self, id: SpaceId) -> Result<()> {
         anyhow::ensure!(id != DEFAULT_SPACE, "Default cannot be deleted");
         anyhow::ensure!(
             id != self.active,
             "Switch away from this space before deleting it"
         );
         anyhow::ensure!(self.sessions.contains_key(&id), "Space no longer exists");
-        let projects: Vec<_> = self
-            .projects
-            .iter()
-            .filter_map(|(project, space)| (*space == id).then_some(*project))
-            .collect();
-        for project in projects {
-            self.move_project(project, DEFAULT_SPACE, snapshot)?;
+        for memberships in self.projects.values_mut() {
+            if memberships.remove(&id) && memberships.is_empty() {
+                memberships.insert(DEFAULT_SPACE);
+            }
         }
         self.sessions.remove(&id);
         self.spaces.retain(|space| space.id != id);
@@ -339,16 +399,22 @@ impl Spaces {
 }
 
 impl AppState {
-    pub(super) fn register_project_membership(&mut self, id: ProjectId, space: SpaceId) {
-        self.space_state.register_project(id, space);
-        self.persist_space_session();
+    pub(super) fn register_project_membership(
+        &mut self,
+        id: ProjectId,
+        space: SpaceId,
+    ) -> (SpaceId, bool) {
+        let registration = self.space_state.register_project(id, space);
+        if registration.1 {
+            self.persist_space_session();
+        }
+        registration
     }
 
-    pub(super) fn project_space_name(&self, id: ProjectId) -> Option<&str> {
-        let space = self.space_state.projects.get(&id)?;
+    pub(super) fn space_name(&self, id: SpaceId) -> Option<&str> {
         self.spaces
             .iter()
-            .find(|item| item.id == *space)
+            .find(|item| item.id == id)
             .map(|item| item.name.as_str())
     }
 
@@ -364,7 +430,10 @@ impl AppState {
     }
 
     pub fn project_in_active_space(&self, id: ProjectId) -> bool {
-        self.space_state.projects.get(&id) == Some(&self.active_space)
+        self.space_state
+            .projects
+            .get(&id)
+            .is_some_and(|spaces| spaces.contains(&self.active_space))
     }
 
     pub fn thread_in_active_space(&self, id: ThreadId) -> bool {
@@ -464,11 +533,14 @@ impl AppState {
             self.project_in_active_space(project),
             "Select a project in the active space"
         );
-        self.change_spaces(|spaces, snapshot| spaces.move_project(project, target, snapshot))
+        let source = self.active_space;
+        self.change_spaces(|spaces, snapshot| {
+            spaces.move_project(project, source, target, snapshot)
+        })
     }
 
     pub fn delete_space(&mut self, id: SpaceId) -> Result<()> {
-        self.change_spaces(|spaces, snapshot| spaces.delete(id, snapshot))
+        self.change_spaces(|spaces, _| spaces.delete(id))
     }
 
     pub fn space_layout(&self) -> Option<&Value> {
@@ -527,12 +599,15 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SPACE, SETTING, Spaces};
+    use super::{DEFAULT_SPACE, SETTING, Spaces, VERSION};
     use crate::model::{
         FactoryLaunch, Project, ProjectDefaults, Thread, ThreadKind, WorkspaceSnapshot,
     };
     use serde_json::json;
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::PathBuf,
+    };
     use uuid::Uuid;
 
     fn fixture() -> WorkspaceSnapshot {
@@ -624,6 +699,30 @@ mod tests {
     }
 
     #[test]
+    fn version_one_membership_is_upgraded_without_losing_session_state() {
+        let mut snapshot = fixture();
+        let spaces = Spaces::load(&snapshot).unwrap();
+        let mut legacy = serde_json::to_value(&spaces).unwrap();
+        legacy["version"] = json!(1);
+        legacy["projects"][snapshot.projects[0].id.to_string()] = json!(DEFAULT_SPACE);
+        snapshot.settings.insert(SETTING.into(), legacy);
+
+        let upgraded = Spaces::load(&snapshot).unwrap();
+
+        assert_eq!(
+            upgraded.projects[&snapshot.projects[0].id],
+            BTreeSet::from([DEFAULT_SPACE])
+        );
+        assert_eq!(
+            upgraded.active_session().selected_thread,
+            Some(snapshot.threads[0].id)
+        );
+        let saved = serde_json::to_value(upgraded).unwrap();
+        assert_eq!(saved["version"], json!(VERSION));
+        assert!(saved["projects"][snapshot.projects[0].id.to_string()].is_array());
+    }
+
+    #[test]
     fn migration_recovers_legacy_selected_factory_launch() {
         let mut snapshot = fixture();
         let launch = FactoryLaunch {
@@ -670,9 +769,11 @@ mod tests {
         let thread = snapshot.threads[0].id;
         let mut spaces = Spaces::load(&snapshot).unwrap();
         let target = spaces.create("Work").unwrap();
-        spaces.move_project(project, target, &snapshot).unwrap();
+        spaces
+            .move_project(project, DEFAULT_SPACE, target, &snapshot)
+            .unwrap();
         assert_eq!(spaces.active, DEFAULT_SPACE);
-        assert_eq!(spaces.projects[&project], target);
+        assert_eq!(spaces.projects[&project], BTreeSet::from([target]));
         let source = spaces.active_session();
         assert!(source.selected_project.is_none());
         assert!(source.selected_thread.is_none());
@@ -699,13 +800,13 @@ mod tests {
             Some(json!({"destination": "layout"}))
         );
         assert!(
-            spaces.delete(target, &snapshot).is_err(),
+            spaces.delete(target).is_err(),
             "Deleting active space is rejected"
         );
         spaces.switch(DEFAULT_SPACE).unwrap();
-        spaces.delete(target, &snapshot).unwrap();
+        spaces.delete(target).unwrap();
         spaces = reload(&spaces, &snapshot);
-        assert_eq!(spaces.projects[&project], DEFAULT_SPACE);
+        assert_eq!(spaces.projects[&project], BTreeSet::from([DEFAULT_SPACE]));
         assert!(!spaces.sessions.contains_key(&target));
         assert!(spaces.active_session().open_threads.is_empty());
     }
@@ -725,12 +826,16 @@ mod tests {
         assert!(spaces.rename(work, "Default").is_err());
         assert!(
             spaces
-                .move_project(snapshot.projects[0].id, missing, &snapshot)
+                .move_project(snapshot.projects[0].id, DEFAULT_SPACE, missing, &snapshot)
                 .is_err()
         );
-        assert!(spaces.move_project(missing, work, &snapshot).is_err());
-        assert!(spaces.delete(missing, &snapshot).is_err());
-        assert!(spaces.delete(DEFAULT_SPACE, &snapshot).is_err());
+        assert!(
+            spaces
+                .move_project(missing, DEFAULT_SPACE, work, &snapshot)
+                .is_err()
+        );
+        assert!(spaces.delete(missing).is_err());
+        assert!(spaces.delete(DEFAULT_SPACE).is_err());
         assert_eq!(serde_json::to_value(&spaces).unwrap(), before);
         spaces.rename(work, "  Personal  ").unwrap();
         assert_eq!(
@@ -755,7 +860,7 @@ mod tests {
         invalid_active["active"] = json!(Uuid::from_u128(999));
         let mut invalid_membership = serde_json::to_value(&valid).unwrap();
         invalid_membership["projects"][snapshot.projects[0].id.to_string()] =
-            json!(Uuid::from_u128(999));
+            json!([Uuid::from_u128(999)]);
         let mut cross_space_selection = serde_json::to_value(&valid).unwrap();
         cross_space_selection["sessions"][work.to_string()]["selected_thread"] =
             json!(snapshot.threads[0].id);
@@ -787,11 +892,36 @@ mod tests {
         recovered_project.root = PathBuf::from("/fixture/interrupted-registration");
         snapshot.projects.push(recovered_project.clone());
         let spaces = Spaces::load(&snapshot).unwrap();
-        assert_eq!(spaces.projects[&recovered_project.id], DEFAULT_SPACE);
+        assert_eq!(
+            spaces.projects[&recovered_project.id],
+            BTreeSet::from([DEFAULT_SPACE])
+        );
         assert_eq!(
             reload(&spaces, &snapshot).projects[&recovered_project.id],
-            DEFAULT_SPACE
+            BTreeSet::from([DEFAULT_SPACE])
         );
+    }
+
+    #[test]
+    fn registering_project_in_another_space_keeps_both_memberships() {
+        let snapshot = fixture();
+        let mut spaces = Spaces::load(&snapshot).unwrap();
+        let project = snapshot.projects[0].id;
+        let other = spaces.create("Research").unwrap();
+
+        spaces.register_project(project, other);
+
+        let saved = serde_json::to_value(&spaces).unwrap();
+        let memberships = saved["projects"]
+            .as_object()
+            .unwrap()
+            .get(&project.to_string())
+            .unwrap()
+            .as_array()
+            .expect("a project is persisted with every Space membership");
+        assert_eq!(memberships.len(), 2);
+        assert!(memberships.contains(&json!(DEFAULT_SPACE)));
+        assert!(memberships.contains(&json!(other)));
     }
 
     #[test]
@@ -803,14 +933,17 @@ mod tests {
         spaces.switch(other).unwrap();
         let project = Uuid::from_u128(5);
         spaces.register_project(project, origin);
-        assert_eq!(spaces.projects[&project], origin);
+        assert_eq!(spaces.projects[&project], BTreeSet::from([origin]));
         assert_eq!(spaces.active, other);
         assert!(spaces.active_session().selected_project.is_none());
-        spaces.delete(origin, &snapshot).unwrap();
-        assert_eq!(spaces.projects[&project], DEFAULT_SPACE);
+        spaces.delete(origin).unwrap();
+        assert_eq!(spaces.projects[&project], BTreeSet::from([DEFAULT_SPACE]));
         let later_project = Uuid::from_u128(6);
         spaces.register_project(later_project, origin);
-        assert_eq!(spaces.projects[&later_project], DEFAULT_SPACE);
+        assert_eq!(
+            spaces.projects[&later_project],
+            BTreeSet::from([DEFAULT_SPACE])
+        );
         assert_eq!(spaces.active, other);
     }
 }
