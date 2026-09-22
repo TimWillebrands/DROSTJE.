@@ -3066,21 +3066,61 @@ async fn terminal_tabs_keep_failure_local_and_do_not_persist_sessions(cx: &mut T
 #[gpui_kit::test]
 #[ignore = "requires disposable fixture; exercises gesture-linked Space motion and reduced motion"]
 async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
-    use gpui_kit::{PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+    use gpui_kit::{
+        Bounds, Pixels, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, point,
+    };
 
-    fn position(cx: &mut TestAppContext, fixture: &Fixture) -> f32 {
+    struct Geometry {
+        rows: Bounds<Pixels>,
+        controls: [Bounds<Pixels>; 3],
+        preview: Option<Bounds<Pixels>>,
+    }
+
+    fn geometry(cx: &mut TestAppContext, fixture: &Fixture, preview: bool) -> Geometry {
         cx.update_window(fixture.window.into(), |_, window, cx| {
             window.simulate_next_frame(cx);
             window.refresh();
             window.render_frame(cx);
-            assert_eq!(
-                window.find("Projects").bounds().origin.x,
-                px(0.),
-                "Space motion must not translate the sidebar frame or workspace shell"
-            );
-            window.find("project-rows").bounds().origin.x.as_f32()
+            Geometry {
+                rows: window.find("project-rows").bounds(),
+                controls: ["Projects", "space-switcher", "new-space"]
+                    .map(|id| window.find(id).bounds()),
+                preview: preview.then(|| window.find("project-rows-preview").bounds()),
+            }
         })
         .unwrap()
+    }
+
+    fn near(actual: Pixels, expected: Pixels) {
+        assert!(
+            // Layout rounds the two edges independently to device pixels.
+            (actual - expected).as_f32().abs() <= 0.5,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    fn stationary(actual: &Geometry, rest: &Geometry) {
+        assert_eq!(
+            actual.controls, rest.controls,
+            "Space motion must not move or resize Projects or its controls"
+        );
+        near(actual.rows.origin.y, rest.rows.origin.y);
+        near(actual.rows.size.width, rest.rows.size.width);
+        near(actual.rows.size.height, rest.rows.size.height);
+    }
+
+    fn dragged(cx: &mut TestAppContext, fixture: &Fixture, rest: &Geometry, offset: f32) {
+        let actual = geometry(cx, fixture, true);
+        stationary(&actual, rest);
+        near(actual.rows.origin.x, rest.rows.origin.x + px(offset));
+        let preview = actual.preview.unwrap();
+        near(
+            preview.origin.x - actual.rows.origin.x,
+            rest.rows.size.width * -offset.signum(),
+        );
+        near(preview.origin.y, actual.rows.origin.y);
+        near(preview.size.width, rest.rows.size.width);
+        near(preview.size.height, rest.rows.size.height);
     }
 
     fn scroll(cx: &mut TestAppContext, fixture: &Fixture, x: f32, y: f32, phase: TouchPhase) {
@@ -3099,80 +3139,192 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
         .unwrap();
     }
 
-    async fn settle(cx: &mut TestAppContext, fixture: &Fixture, rest: f32) {
+    async fn settle(cx: &mut TestAppContext, fixture: &Fixture, rest: &Geometry) {
         smol::Timer::after(Duration::from_millis(200)).await;
         cx.run_until_parked();
-        assert!((position(cx, fixture) - rest).abs() < 0.5);
+        let actual = geometry(cx, fixture, false);
+        stationary(&actual, rest);
+        near(actual.rows.origin.x, rest.rows.origin.x);
     }
 
     let fixture = open_fixture(cx, None).await;
     let original = cx.read(|cx| fixture.state.read(cx).active_space);
+    let thread = new_conversation(cx, &fixture).await;
     let next = fixture.state.update(cx, |state, cx| {
         let id = state.create_space("Swipe destination").unwrap();
         cx.notify();
         id
     });
+    // Keep real project rows in both Spaces and a real thread in the preview.
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace
+                .move_thread_to_space(thread, next, window, cx)
+                .unwrap();
+        },
+    );
+    cx.dispatch_action(fixture.window.into(), commands::FocusProjects);
     cx.run_until_parked();
-    for (mode, width, height) in [("light", 1440., 900.), ("dark", 900., 600.)] {
+    for (mode, expected) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
         fixture.state.update(cx, |state, cx| {
             state.set_setting("theme_mode", json!(mode));
             cx.notify();
         });
-        cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
-        let rest = position(cx, &fixture);
-        // Vertical scroll does not move the Space; horizontal travel follows and reverses.
-        scroll(cx, &fixture, -10., 80., TouchPhase::Started);
-        assert_eq!(position(cx, &fixture), rest);
-        scroll(cx, &fixture, -40., 0., TouchPhase::Started);
-        let dragged = position(cx, &fixture);
-        assert!(
-            dragged < rest - 5.,
-            "Space must follow the fingers before committing"
-        );
-        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
-        scroll(cx, &fixture, 20., 0., TouchPhase::Moved);
-        let reversed = position(cx, &fixture);
-        assert!(reversed > dragged && reversed < rest);
-        scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
-        scroll(cx, &fixture, -100., 0., TouchPhase::Moved);
-        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
-        settle(cx, &fixture, rest).await;
+        until(cx, "swipe theme", Duration::from_secs(5), |cx| {
+            Theme::global(cx).mode == expected
+        })
+        .await;
+        for (width, height) in [(1440., 900.), (900., 600.)] {
+            cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
+            for _ in 0..3 {
+                cx.run_until_parked();
+                geometry(cx, &fixture, false);
+            }
+            let rest = geometry(cx, &fixture, false);
+            assert!(rest.rows.size.width > px(80.));
 
-        // A platform without touch phases also releases a short abandoned drag.
-        scroll(cx, &fixture, -30., 0., TouchPhase::Moved);
-        assert!(position(cx, &fixture) < rest);
-        smol::Timer::after(Duration::from_millis(170)).await;
-        cx.run_until_parked();
-        settle(cx, &fixture, rest).await;
-        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            // Vertical and insufficiently horizontal gestures never switch Spaces.
+            scroll(cx, &fixture, -10., 80., TouchPhase::Started);
+            let vertical = geometry(cx, &fixture, false);
+            stationary(&vertical, &rest);
+            near(vertical.rows.origin.x, rest.rows.origin.x);
+            scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            settle(cx, &fixture, &rest).await;
+            scroll(cx, &fixture, -90., 46., TouchPhase::Started);
+            scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            settle(cx, &fixture, &rest).await;
 
-        scroll(cx, &fixture, -40., 0., TouchPhase::Started);
-        scroll(cx, &fixture, -45., 0., TouchPhase::Moved);
-        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
-        assert!(
-            position(cx, &fixture) > rest,
-            "destination enters from the other side"
-        );
-        scroll(cx, &fixture, -200., 0., TouchPhase::Moved);
-        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
-        settle(cx, &fixture, rest).await;
+            // Crossing the threshold is still a 1:1 drag, even after a held pause.
+            scroll(cx, &fixture, -40.25, 0., TouchPhase::Started);
+            dragged(cx, &fixture, &rest, -40.25);
+            scroll(cx, &fixture, -44.5, 0., TouchPhase::Moved);
+            dragged(cx, &fixture, &rest, -84.75);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            smol::Timer::after(Duration::from_millis(220)).await;
+            cx.run_until_parked();
+            dragged(cx, &fixture, &rest, -84.75);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            scroll(cx, &fixture, 65., 0., TouchPhase::Moved);
+            dragged(cx, &fixture, &rest, -19.75);
+            scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            // Momentum after a cancelled release must not become a new gesture.
+            scroll(cx, &fixture, -200., 0., TouchPhase::Moved);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            settle(cx, &fixture, &rest).await;
 
-        cx.dispatch_action(fixture.window.into(), commands::PreviousSpace);
-        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
-        assert!(
-            position(cx, &fixture) < rest,
-            "keyboard switching also animates"
-        );
-        settle(cx, &fixture, rest).await;
+            // OS cancellation never commits, even beyond the release threshold.
+            scroll(cx, &fixture, -40.25, 0., TouchPhase::Started);
+            scroll(cx, &fixture, -44.5, 0., TouchPhase::Moved);
+            dragged(cx, &fixture, &rest, -84.75);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            scroll(cx, &fixture, 0., 0., TouchPhase::Cancelled);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            scroll(cx, &fixture, -200., 0., TouchPhase::Moved);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            settle(cx, &fixture, &rest).await;
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+
+            // Exactly 80 pixels commits only on release; the adjacent list enters.
+            scroll(cx, &fixture, -40., 0., TouchPhase::Started);
+            scroll(cx, &fixture, -40., 0., TouchPhase::Moved);
+            dragged(cx, &fixture, &rest, -80.);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+            let incoming = geometry(cx, &fixture, false);
+            stationary(&incoming, &rest);
+            assert!(
+                incoming.rows.origin.x > rest.rows.origin.x,
+                "destination enters from the adjacent preview's side"
+            );
+            scroll(cx, &fixture, -200., 0., TouchPhase::Moved);
+            scroll(cx, &fixture, 200., 0., TouchPhase::Moved);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+            settle(cx, &fixture, &rest).await;
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+
+            cx.simulate_keystrokes(fixture.window.into(), "secondary-alt-[");
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            let keyboard = geometry(cx, &fixture, false);
+            stationary(&keyboard, &rest);
+            assert!(
+                keyboard.rows.origin.x < rest.rows.origin.x,
+                "keyboard switching also animates"
+            );
+            settle(cx, &fixture, &rest).await;
+
+            // Full-width travel is capped without committing before release.
+            let content_width = rest.rows.size.width.as_f32();
+            scroll(cx, &fixture, -content_width - 70., 0., TouchPhase::Started);
+            dragged(cx, &fixture, &rest, -content_width);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+            settle(cx, &fixture, &rest).await;
+            cx.simulate_keystrokes(fixture.window.into(), "secondary-alt-[");
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            settle(cx, &fixture, &rest).await;
+
+            // Phaseless platforms release on idle, using the final net distance.
+            scroll(cx, &fixture, -84.75, 0., TouchPhase::Moved);
+            dragged(cx, &fixture, &rest, -84.75);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            scroll(cx, &fixture, 65., 0., TouchPhase::Moved);
+            dragged(cx, &fixture, &rest, -19.75);
+            smol::Timer::after(Duration::from_millis(220)).await;
+            cx.run_until_parked();
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            settle(cx, &fixture, &rest).await;
+
+            // Positive travel previews the neighbor on the left, including wraparound.
+            scroll(cx, &fixture, 40.25, 0., TouchPhase::Moved);
+            scroll(cx, &fixture, 44.5, 0., TouchPhase::Moved);
+            dragged(cx, &fixture, &rest, 84.75);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            smol::Timer::after(Duration::from_millis(220)).await;
+            cx.run_until_parked();
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+            settle(cx, &fixture, &rest).await;
+            cx.simulate_keystrokes(fixture.window.into(), "secondary-alt-[");
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            settle(cx, &fixture, &rest).await;
+
+            // Reduced motion removes translation, not the held/release boundary.
+            cx.update(|cx| cx.set_reduce_motion(true));
+            scroll(cx, &fixture, -40., 0., TouchPhase::Started);
+            scroll(cx, &fixture, -45., 0., TouchPhase::Moved);
+            let reduced = geometry(cx, &fixture, false);
+            stationary(&reduced, &rest);
+            near(reduced.rows.origin.x, rest.rows.origin.x);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            smol::Timer::after(Duration::from_millis(220)).await;
+            cx.run_until_parked();
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            let held = geometry(cx, &fixture, false);
+            stationary(&held, &rest);
+            near(held.rows.origin.x, rest.rows.origin.x);
+            scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+            let released = geometry(cx, &fixture, false);
+            stationary(&released, &rest);
+            near(released.rows.origin.x, rest.rows.origin.x);
+            scroll(cx, &fixture, -200., 0., TouchPhase::Moved);
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+            settle(cx, &fixture, &rest).await;
+            cx.simulate_keystrokes(fixture.window.into(), "secondary-alt-[");
+            assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+            let keyboard = geometry(cx, &fixture, false);
+            stationary(&keyboard, &rest);
+            near(keyboard.rows.origin.x, rest.rows.origin.x);
+            cx.update(|cx| cx.set_reduce_motion(false));
+        }
     }
-    cx.update(|cx| cx.set_reduce_motion(true));
-    let rest = position(cx, &fixture);
-    scroll(cx, &fixture, -40., 0., TouchPhase::Started);
-    assert_eq!(position(cx, &fixture), rest);
-    scroll(cx, &fixture, -45., 0., TouchPhase::Moved);
-    assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
-    assert_eq!(position(cx, &fixture), rest);
-    cx.update(|cx| cx.set_reduce_motion(false));
     quit(cx, &fixture).await;
 }
 

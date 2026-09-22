@@ -9,7 +9,7 @@ const MAX_NAME_LENGTH: usize = 80;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SpaceSession {
+pub(crate) struct SpaceSession {
     pub selected_project: Option<ProjectId>,
     pub selected_thread: Option<ThreadId>,
     pub open_threads: Vec<ThreadId>,
@@ -615,14 +615,27 @@ impl AppState {
     }
 
     pub fn project_in_active_space(&self, id: ProjectId) -> bool {
-        self.space_state
-            .projects
-            .get(&id)
-            .is_some_and(|spaces| spaces.contains(&self.active_space))
+        self.project_in_space(id, self.active_space)
     }
 
     pub fn thread_in_active_space(&self, id: ThreadId) -> bool {
-        self.space_state.threads.get(&id) == Some(&self.active_space)
+        self.thread_in_space(id, self.active_space)
+    }
+
+    pub(crate) fn project_in_space(&self, id: ProjectId, space: SpaceId) -> bool {
+        self.space_state
+            .projects
+            .get(&id)
+            .is_some_and(|spaces| spaces.contains(&space))
+    }
+
+    pub(crate) fn thread_in_space(&self, id: ThreadId, space: SpaceId) -> bool {
+        self.space_state.threads.get(&id) == Some(&space)
+    }
+
+    /// Borrow an inactive Space's presentation without activating its editors or layout.
+    pub(crate) fn space_session(&self, space: SpaceId) -> Option<&SpaceSession> {
+        self.space_state.sessions.get(&space)
     }
 
     pub(super) fn register_thread_membership(

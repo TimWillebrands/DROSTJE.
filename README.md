@@ -79,7 +79,7 @@ Via het Space-menu of de command palette kun je een Space hernoemen, een project
 
 Gebruik **Switch space…** voor de toetsenbordkiezer: `j/k`, pijlen, `gg/G`, Return en Escape. **Next space** en **Previous space** wisselen direct buiten invoervelden en overlays. Spaces scheiden organisatie, niet accounts, credentials of bestandstoegang; tools en thema-instellingen blijven gedeeld.
 
-Een horizontale tweevingerveeg boven Projects verschuift alleen de project- en threadlijst binnen de zijbalk mee met je vingers. De zijbalkrand, zoekbalk, Space-kiezer, werkbalk en centrale werkruimte blijven op hun plaats. Een korte veeg keert terug; een voldoende lange veeg wisselt één Space, zonder extra wissels door uitrollen. Wisselen via toetsenbord of kiezer krijgt dezelfde korte schuifanimatie. Bij verminderde beweging blijft de wissel direct, zonder animatie.
+Een horizontale tweevingerveeg boven Projects schuift de project- en threadlijst rechtstreeks mee met je vingers; de lijst van de aangrenzende Space komt tegelijk in beeld. Je kunt pauzeren of terugvegen zonder al te wisselen. Pas bij loslaten wisselt een voldoende lange veeg één Space; een korte of teruggedraaide veeg keert terug, zonder extra wissels door uitrollen. Op platforms zonder aanraakfasen geldt een korte pauze als loslaten. De zijbalkrand, zoekbalk, Space-kiezer, werkbalk en centrale werkruimte blijven op hun plaats. Wisselen via toetsenbord of kiezer krijgt dezelfde korte schuifanimatie. Bij verminderde beweging blijft de wissel bij loslaten direct, zonder animatie.
 
 ### Threads en werkruimte
 

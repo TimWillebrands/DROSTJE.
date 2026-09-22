@@ -142,6 +142,9 @@ enum SpaceChange {
 struct SpaceSlide {
     offset: f32,
     started: Option<Instant>,
+    neighbor: Option<SpaceId>,
+    neighbor_query: SharedString,
+    neighbor_scroll: Option<ScrollHandle>,
 }
 
 impl SpaceSlide {
@@ -636,38 +639,62 @@ impl Workspace {
                 .feed(delta.map(|axis| axis.as_f32()), event.touch_phase, now);
         if let Some(command) = command {
             self.space_swipe_idle.take();
-            self.space_slide.settle(now);
             self.execute(command, window, cx);
-            self.projects.update(cx, |_, cx| cx.notify());
-            return;
-        } else if let Some(progress) = self.space_swipe.progress() {
-            // Ordinary vertical scrolling must not redraw the workspace or start timers.
-            if progress == 0. && self.space_slide.sample(now).0 == 0. {
+            if !self.preparing_space_change {
+                self.space_slide.settle(now);
+            }
+        } else if let Some(distance) = self.space_swipe.progress() {
+            // Ordinary vertical scrolling must not redraw or start release timers.
+            if distance == 0. && self.space_slide.sample(now).0 == 0. {
                 return;
             }
+            let width = self
+                .projects
+                .read(cx)
+                .bounds
+                .get()
+                .map_or(1., |bounds| bounds.size.width.as_f32())
+                .max(1.);
+            let progress = (distance / width).clamp(-1., 1.);
             self.space_slide.drag(progress);
-            if progress == 0. {
-                self.space_swipe_idle.take();
-                self.projects.update(cx, |_, cx| cx.notify());
-                return;
+            let state = self.state.read(cx);
+            let current = state
+                .spaces
+                .iter()
+                .position(|space| space.id == state.active_space)
+                .unwrap_or(0);
+            let count = state.spaces.len();
+            let adjacent = if progress > 0. {
+                (current + count - 1) % count
+            } else {
+                (current + 1) % count
+            };
+            self.space_slide.neighbor = (progress != 0.).then_some(state.spaces[adjacent].id);
+            self.space_slide.neighbor_query = SharedString::default();
+            self.space_slide.neighbor_scroll = None;
+            self.space_swipe_idle.take();
+            if self.space_swipe.needs_idle_release() {
+                self.space_swipe_idle =
+                    Some(cx.spawn_in(window, async move |workspace, window| {
+                        smol::Timer::after(sidebar::SPACE_SWIPE_IDLE).await;
+                        let _ = workspace.update_in(window, |workspace, window, cx| {
+                            if let Some(command) = workspace.space_swipe.release() {
+                                workspace.execute(command, window, cx);
+                            }
+                            if !workspace.preparing_space_change {
+                                workspace.space_slide.settle(Instant::now());
+                            }
+                            workspace.projects.update(cx, |_, cx| cx.notify());
+                        });
+                    }));
             }
         } else {
             self.space_swipe_idle.take();
-            if self.space_slide.offset != 0. && self.space_slide.started.is_none() {
-                self.space_slide.settle(now);
-                self.projects.update(cx, |_, cx| cx.notify());
-            }
-            return;
+            self.space_slide.settle(now);
         }
-        // Also release on platforms without touch phases, or if the pointer leaves Projects.
-        self.space_swipe_idle = Some(cx.spawn_in(window, async move |workspace, window| {
-            smol::Timer::after(sidebar::SPACE_SWIPE_IDLE).await;
-            let _ = workspace.update_in(window, |workspace, _, cx| {
-                workspace.space_swipe.finish();
-                workspace.space_slide.settle(Instant::now());
-                workspace.projects.update(cx, |_, cx| cx.notify());
-            });
-        }));
+        if cx.reduce_motion() {
+            self.space_slide = SpaceSlide::default();
+        }
         self.projects.update(cx, |_, cx| cx.notify());
     }
 
@@ -852,8 +879,24 @@ impl Workspace {
         });
         self.space_swipe.finish();
         self.space_swipe_idle.take();
-        self.space_slide.drag(-direction);
-        self.space_slide.settle(Instant::now());
+        let now = Instant::now();
+        let offset = if self.space_slide.neighbor == Some(active) {
+            // Rebase the same two strips: destination becomes active without a jump.
+            self.space_slide.sample(now).0 - direction
+        } else {
+            -direction
+        };
+        self.space_slide.neighbor = Some(self.presented_space);
+        self.space_slide.neighbor_query = self.thread_search.read(cx).value();
+        self.space_slide.neighbor_scroll = Some(
+            self.projects
+                .update(cx, |panel, _| std::mem::take(&mut panel.scroll)),
+        );
+        self.space_slide.drag(offset);
+        self.space_slide.settle(now);
+        if cx.reduce_motion() {
+            self.space_slide = SpaceSlide::default();
+        }
         self.layout_save.take();
         self.hide_terminals(cx);
         self.live_layouts.insert(
@@ -3523,6 +3566,9 @@ impl Render for WorkspacePanel {
                             cursor: workspace.cursor.filter(|_| list_focused),
                             hovered: workspace.hovered_sidebar_row,
                             slide,
+                            neighbor: workspace.space_slide.neighbor,
+                            neighbor_query: &workspace.space_slide.neighbor_query,
+                            neighbor_scroll: workspace.space_slide.neighbor_scroll.as_ref(),
                         },
                         &workspace.thread_search,
                         scroll,

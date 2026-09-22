@@ -9,7 +9,7 @@ use crate::{
     app::AppState,
     factory::{Liveness, ReportedState},
     harness::{ConversationState, TurnOutcome},
-    model::{Project, ProjectId, Thread, ThreadId, ThreadKind},
+    model::{Project, ProjectId, SpaceId, Thread, ThreadId, ThreadKind},
 };
 use gpui_kit::{
     assets::IconName as Lucide,
@@ -36,68 +36,75 @@ use std::{
 /// the same inset `TitleBar` reserves for them.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
 
-/// Horizontal travel that turns a two-finger swipe over Projects into one Space step.
+/// Minimum net travel on release; crossing it while touching never commits.
 const SPACE_SWIPE_DISTANCE: f32 = 80.;
-/// Scroll events further apart than this belong to different gestures. Touch phases
-/// cannot mark the boundary: Wayland never reports them and macOS keeps sending
-/// momentum after `Ended`.
+/// Platforms without touch phases use an idle gap as release.
 pub(super) const SPACE_SWIPE_IDLE: Duration = Duration::from_millis(150);
 
-/// Reduces precise scroll deltas over Projects to at most one Space step per gesture.
-/// Momentum keeps a finished gesture alive, so it cannot step a second time.
+/// One direct-manipulation gesture, followed by ignored momentum.
 #[derive(Debug, Default)]
 pub struct SpaceSwipe {
     travelled: Point<f32>,
     stepped: bool,
+    touching: bool,
     last_event: Option<Instant>,
 }
 
 impl SpaceSwipe {
-    /// Positive `delta.x` is fingers moving right, which goes back like a browser swipe.
+    /// Positive x follows fingers right, towards the previous Space.
     pub fn feed(&mut self, delta: Point<f32>, phase: TouchPhase, now: Instant) -> Option<Command> {
         let idle = self
             .last_event
             .is_none_or(|last| now.duration_since(last) > SPACE_SWIPE_IDLE);
-        if idle || phase == TouchPhase::Started {
+        if phase == TouchPhase::Started || (idle && !self.touching) {
             *self = Self::default();
+            self.touching = phase == TouchPhase::Started;
         }
         self.last_event = Some(now);
-        // A short gesture returns to rest on release; its momentum must not commit it.
-        if phase == TouchPhase::Ended {
-            self.stepped = true;
-        }
         if self.stepped {
+            return None;
+        }
+        if phase == TouchPhase::Cancelled {
+            self.finish();
             return None;
         }
         self.travelled.x += delta.x;
         self.travelled.y += delta.y;
-        let (across, along) = (self.travelled.x.abs(), self.travelled.y.abs());
-        if across < SPACE_SWIPE_DISTANCE || across < 2. * along {
+        if phase == TouchPhase::Ended {
+            return self.release();
+        }
+        None
+    }
+
+    /// Pixels, not an animation fraction: the list stays attached to the fingers.
+    pub(super) fn progress(&self) -> Option<f32> {
+        if self.stepped {
             return None;
         }
-        self.stepped = true;
-        Some(if self.travelled.x > 0. {
+        Some(if self.travelled.x.abs() >= 2. * self.travelled.y.abs() {
+            self.travelled.x
+        } else {
+            0.
+        })
+    }
+
+    pub(super) fn needs_idle_release(&self) -> bool {
+        !self.touching && !self.stepped
+    }
+
+    pub(super) fn release(&mut self) -> Option<Command> {
+        let distance = self.progress().unwrap_or(0.);
+        self.finish();
+        (distance.abs() >= SPACE_SWIPE_DISTANCE).then_some(if distance > 0. {
             Command::PreviousSpace
         } else {
             Command::NextSpace
         })
     }
 
-    /// Signed progress follows the fingers, not a timer. Vertical scrolling stays still.
-    pub(super) fn progress(&self) -> Option<f32> {
-        if self.stepped {
-            return None;
-        }
-        let (across, along) = (self.travelled.x.abs(), self.travelled.y.abs());
-        Some(if across >= 2. * along {
-            (self.travelled.x / SPACE_SWIPE_DISTANCE).clamp(-1., 1.)
-        } else {
-            0.
-        })
-    }
-
     pub(super) fn finish(&mut self) {
         self.stepped = true;
+        self.touching = false;
     }
 }
 
@@ -408,40 +415,84 @@ fn row_menu(
     }
 }
 
-pub(super) struct SidebarPresentation {
+#[derive(Clone, Copy)]
+pub(super) struct SidebarPresentation<'a> {
     pub cursor: Option<Row>,
     pub hovered: Option<Row>,
     pub slide: f32,
+    pub neighbor: Option<SpaceId>,
+    pub neighbor_query: &'a str,
+    pub neighbor_scroll: Option<&'a ScrollHandle>,
 }
 
-pub(super) fn render(
+fn render_list(
     state: &AppState,
     owner: &WeakEntity<Workspace>,
-    presentation: SidebarPresentation,
-    search: &Entity<InputState>,
-    scroll: &ScrollHandle,
+    space: SpaceId,
+    presentation: SidebarPresentation<'_>,
+    query: &str,
+    scroll: Option<&ScrollHandle>,
     cx: &App,
 ) -> AnyElement {
     let SidebarPresentation {
         cursor,
         hovered: hovered_row,
-        slide,
+        ..
     } = presentation;
     let theme = cx.theme();
-    let query = search.read(cx).value();
+    let active = space == state.active_space;
+    let session = state.space_session(space);
+    let collapsed_projects = if active {
+        &state.collapsed
+    } else {
+        session.map_or(&state.collapsed, |session| &session.collapsed)
+    };
+    let show_archived = if active {
+        state.show_archived
+    } else {
+        session.is_some_and(|session| session.show_archived)
+    };
+    let selected_project = if active {
+        state.selected_project
+    } else {
+        session.and_then(|session| session.selected_project)
+    };
+    let selected_thread = if active {
+        state.selected_thread
+    } else {
+        session.and_then(|session| session.selected_thread)
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs() as i64);
     let mut list = v_flex()
-        .id("project-rows")
+        .id(if active {
+            "project-rows"
+        } else {
+            "project-rows-preview"
+        })
         .test_support()
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
         // A sideways swipe switches Space; it must not also scroll the rows.
         .restrict_scroll_to_axis()
-        .track_scroll(scroll);
-    let rows = rows(state, &query);
+        .when_some(scroll, |list, scroll| list.track_scroll(scroll));
+    let rows = visible_rows(
+        state
+            .snapshot
+            .projects
+            .iter()
+            .filter(|project| state.project_in_space(project.id, space)),
+        state
+            .snapshot
+            .threads
+            .iter()
+            .filter(|thread| state.thread_in_space(thread.id, space)),
+        collapsed_projects,
+        show_archived,
+        query,
+    );
     let mut first_project = true;
     for row in rows.iter().copied() {
         let action_owner = owner.clone();
@@ -456,9 +507,8 @@ pub(super) fn render(
                     .iter()
                     .find(|p| p.id == id)
                     .expect("project row");
-                let collapsed = state.collapsed.contains(&id) && query.trim().is_empty();
-                let selected =
-                    state.selected_project == Some(id) && state.selected_thread.is_none();
+                let collapsed = collapsed_projects.contains(&id) && query.trim().is_empty();
+                let selected = selected_project == Some(id) && selected_thread.is_none();
                 // Row actions stay quiet until the header is hovered, selected or under
                 // the keyboard cursor; each has a key or context-menu equivalent.
                 let revealed = keyboard_cursor || selected;
@@ -706,7 +756,7 @@ pub(super) fn render(
                         .text_sm()
                         .text_color(theme.sidebar_foreground)
                         .cursor_default()
-                        .selected(state.selected_thread == Some(id))
+                        .selected(selected_thread == Some(id))
                         .border_l_2()
                         .border_color(if keyboard_cursor {
                             theme.muted_foreground
@@ -876,13 +926,12 @@ pub(super) fn render(
             }
         }
     }
-    let new_owner = owner.clone();
     let empty = state
         .snapshot
         .projects
         .iter()
-        .filter(|project| state.project_in_active_space(project.id))
-        .all(|project| project.archived && !state.show_archived);
+        .filter(|project| state.project_in_space(project.id, space))
+        .all(|project| project.archived && !show_archived);
     if empty {
         list = list.child(
             v_flex()
@@ -892,7 +941,11 @@ pub(super) fn render(
                 .text_color(theme.muted_foreground)
                 .child(format!(
                     "“{}” has no visible projects. Add an existing Git working tree to begin.",
-                    state.active_space_name()
+                    state
+                        .spaces
+                        .iter()
+                        .find(|item| item.id == space)
+                        .map_or("", |item| item.name.as_str())
                 ))
                 .child(
                     Button::new("add-project-empty")
@@ -915,6 +968,45 @@ pub(super) fn render(
                 .child(format!("No threads match “{}”", query.trim())),
         );
     }
+    list.into_any_element()
+}
+
+pub(super) fn render(
+    state: &AppState,
+    owner: &WeakEntity<Workspace>,
+    presentation: SidebarPresentation<'_>,
+    search: &Entity<InputState>,
+    scroll: &ScrollHandle,
+    cx: &App,
+) -> AnyElement {
+    let theme = cx.theme();
+    let query = search.read(cx).value();
+    let slide = presentation.slide;
+    let list = render_list(
+        state,
+        owner,
+        state.active_space,
+        presentation,
+        &query,
+        Some(scroll),
+        cx,
+    );
+    let preview = presentation.neighbor.filter(|_| slide != 0.).map(|space| {
+        render_list(
+            state,
+            owner,
+            space,
+            SidebarPresentation {
+                cursor: None,
+                hovered: None,
+                ..presentation
+            },
+            presentation.neighbor_query,
+            presentation.neighbor_scroll,
+            cx,
+        )
+    });
+    let new_owner = owner.clone();
     let search_owner = owner.clone();
     let search_next_owner = owner.clone();
     let space_menu_owner = owner.clone();
@@ -1049,13 +1141,32 @@ pub(super) fn render(
             )
         })
         .child(
-            div().relative().flex_1().min_h_0().overflow_hidden().child(
-                v_flex()
-                    .relative()
-                    .size_full()
-                    .left(rems(slide * 3.))
-                    .child(list),
-            ),
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(
+                    v_flex()
+                        .relative()
+                        .size_full()
+                        .left(relative(slide))
+                        .child(list),
+                )
+                .when_some(preview, |view, preview| {
+                    view.child(
+                        v_flex()
+                            .absolute()
+                            .top_0()
+                            .size_full()
+                            .left(relative(slide - slide.signum()))
+                            .child(preview),
+                    )
+                })
+                // Neither outgoing nor preview controls may act on a moving Space.
+                .when(slide != 0., |view| {
+                    view.child(div().absolute().inset_0().block_mouse_except_scroll())
+                }),
         )
         .child(
             h_flex()
@@ -1301,37 +1412,50 @@ mod tests {
         let at = |ms| start + Duration::from_millis(ms);
         let mut swipe = SpaceSwipe::default();
 
-        // Fingers right goes back; momentum after the step does not step again.
+        // Crossing the threshold stays attached until release, including a held pause.
         assert_eq!(swipe.feed(point(50., 2.), TouchPhase::Started, at(0)), None);
+        assert_eq!(swipe.feed(point(40., 1.), TouchPhase::Moved, at(16)), None);
+        assert_eq!(swipe.progress(), Some(90.));
+        assert!(!swipe.needs_idle_release());
+        assert_eq!(swipe.feed(point(10., 0.), TouchPhase::Moved, at(500)), None);
+        assert_eq!(swipe.progress(), Some(100.));
         assert_eq!(
-            swipe.feed(point(40., 1.), TouchPhase::Moved, at(16)),
+            swipe.feed(point(0., 0.), TouchPhase::Ended, at(516)),
             Some(Command::PreviousSpace)
         );
-        assert_eq!(swipe.feed(point(0., 0.), TouchPhase::Ended, at(32)), None);
-        assert_eq!(swipe.feed(point(200., 0.), TouchPhase::Moved, at(48)), None);
-
-        // Without touch phases (Wayland) an idle gap starts the next gesture.
         assert_eq!(
-            swipe.feed(point(-90., 0.), TouchPhase::Moved, at(400)),
-            Some(Command::NextSpace)
+            swipe.feed(point(200., 0.), TouchPhase::Moved, at(532)),
+            None
         );
+        assert_eq!(swipe.release(), None);
+
+        // Without touch phases (Wayland), the owner releases after the idle gap.
+        assert_eq!(
+            swipe.feed(point(-90., 0.), TouchPhase::Moved, at(700)),
+            None
+        );
+        assert!(swipe.needs_idle_release());
+        assert_eq!(swipe.release(), Some(Command::NextSpace));
 
         // Vertical scrolling with sideways wobble never steps.
         assert_eq!(
-            swipe.feed(point(90., 300.), TouchPhase::Moved, at(800)),
+            swipe.feed(point(90., 300.), TouchPhase::Started, at(800)),
             None
         );
         assert_eq!(swipe.feed(point(90., 0.), TouchPhase::Moved, at(816)), None);
+        assert_eq!(swipe.release(), None);
 
         // Short travel is abandoned once the gesture goes idle.
         assert_eq!(
             swipe.feed(point(-60., 0.), TouchPhase::Moved, at(1200)),
             None
         );
+        assert_eq!(swipe.release(), None);
         assert_eq!(
             swipe.feed(point(-60., 0.), TouchPhase::Moved, at(1600)),
             None
         );
+        assert_eq!(swipe.release(), None);
     }
 
     #[test]
@@ -1346,11 +1470,11 @@ mod tests {
             let command = swipe.feed(point(x, 0.), phase, start + Duration::from_millis(ms));
             (command, swipe.progress())
         };
-        assert_eq!(feed(-40., TouchPhase::Started, 0), (None, Some(-0.5)));
-        assert_eq!(feed(20., TouchPhase::Moved, 16), (None, Some(-0.25)));
+        assert_eq!(feed(-100., TouchPhase::Started, 0), (None, Some(-100.)));
+        assert_eq!(feed(80., TouchPhase::Moved, 16), (None, Some(-20.)));
         assert_eq!(feed(0., TouchPhase::Ended, 32), (None, None));
         assert_eq!(feed(-100., TouchPhase::Moved, 48), (None, None));
-        assert_eq!(feed(20., TouchPhase::Started, 64), (None, Some(0.25)));
+        assert_eq!(feed(20., TouchPhase::Started, 64), (None, Some(20.)));
         swipe.finish();
         assert_eq!(swipe.progress(), None);
         assert_eq!(
