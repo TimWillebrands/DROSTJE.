@@ -7,7 +7,7 @@ edition = "2024"
 runtime-qa = ["gpui-kit/test-support"]
 
 [dependencies]
-gpui-kit = "=0.6.1"
+gpui-kit = "=0.6.6"
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,7 +32,3 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 name = "markdown_rendering"
 harness = false
 required-features = ["runtime-qa"]
-
-[patch.crates-io]
-# Keep gpui-kit pinned; fix double-wrapping in its existing inline renderer.
-gpui-base = { path = "crates/gpui-base" }

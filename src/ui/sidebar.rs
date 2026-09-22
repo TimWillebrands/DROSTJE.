@@ -106,9 +106,11 @@ pub enum Row {
     Project(ProjectId),
     Thread(ThreadId),
 }
-/// Visible sidebar rows in display order. A non-empty `query` keeps the threads
-/// whose title (or whose project's name) contains it, ignoring collapse so no
-/// match is hidden, and drops projects without a match.
+/// Visible sidebar rows in display order. Each project's threads are listed most
+/// recently touched first (`updated_at`); unreadable timestamps sort last and ties
+/// keep stored (creation) order. A non-empty `query` keeps the threads whose title
+/// (or whose project's name) contains it, ignoring collapse so no match is hidden,
+/// and drops projects without a match.
 pub fn rows(state: &AppState, query: &str) -> Vec<Row> {
     visible_rows(
         state
@@ -140,10 +142,13 @@ fn visible_rows<'a>(
         .into_iter()
         .filter(|p| show_archived || !p.archived)
     {
-        let threads = threads
+        let mut threads: Vec<&Thread> = threads
             .clone()
             .into_iter()
-            .filter(|t| t.project_id == project.id && (show_archived || !t.archived));
+            .filter(|t| t.project_id == project.id && (show_archived || !t.archived))
+            .collect();
+        threads.sort_by_key(|t| std::cmp::Reverse(unix_seconds(&t.updated_at)));
+        let threads = threads.into_iter();
         if query.is_empty() {
             rows.push(Row::Project(project.id));
             if !collapsed.contains(&project.id) {
@@ -403,15 +408,25 @@ fn row_menu(
     }
 }
 
-pub fn render(
+pub(super) struct SidebarPresentation {
+    pub cursor: Option<Row>,
+    pub hovered: Option<Row>,
+    pub slide: f32,
+}
+
+pub(super) fn render(
     state: &AppState,
     owner: &WeakEntity<Workspace>,
-    cursor: Option<Row>,
-    hovered_row: Option<Row>,
+    presentation: SidebarPresentation,
     search: &Entity<InputState>,
     scroll: &ScrollHandle,
     cx: &App,
 ) -> AnyElement {
+    let SidebarPresentation {
+        cursor,
+        hovered: hovered_row,
+        slide,
+    } = presentation;
     let theme = cx.theme();
     let query = search.read(cx).value();
     let now = std::time::SystemTime::now()
@@ -419,6 +434,7 @@ pub fn render(
         .map_or(0, |elapsed| elapsed.as_secs() as i64);
     let mut list = v_flex()
         .id("project-rows")
+        .test_support()
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
@@ -1032,7 +1048,15 @@ pub fn render(
                     .child("Inspecting working tree…"),
             )
         })
-        .child(list)
+        .child(
+            div().relative().flex_1().min_h_0().overflow_hidden().child(
+                v_flex()
+                    .relative()
+                    .size_full()
+                    .left(rems(slide * 3.))
+                    .child(list),
+            ),
+        )
         .child(
             h_flex()
                 .id("sidebar-toolbar")
@@ -1223,6 +1247,48 @@ mod tests {
             [Row::Project(lighting.id), Row::Thread(threads[3].id)]
         );
         assert!(visible_rows(&projects, &threads, &collapsed, false, "nothing").is_empty());
+    }
+
+    #[test]
+    fn threads_are_ordered_by_last_touched_within_each_project() {
+        let (dungeon, lighting) = (project("masters-of-the-dungeon"), project("lighting"));
+        let touched = |mut thread: Thread, at: &str| {
+            thread.updated_at = at.into();
+            thread
+        };
+        let threads = [
+            touched(thread(&dungeon, "Oldest", false), "2026-09-10T08:00:00Z"),
+            touched(thread(&dungeon, "Unreadable", false), ""),
+            touched(thread(&dungeon, "Newest", false), "2026-09-21T17:30:00Z"),
+            touched(thread(&lighting, "Lighting", false), "2026-09-22T09:00:00Z"),
+            touched(thread(&dungeon, "Middle", false), "2026-09-15T12:00:00Z"),
+        ];
+        let projects = [dungeon.clone(), lighting.clone()];
+        let collapsed = HashSet::new();
+
+        let expected = [
+            Row::Project(dungeon.id),
+            Row::Thread(threads[2].id),
+            Row::Thread(threads[4].id),
+            Row::Thread(threads[0].id),
+            Row::Thread(threads[1].id),
+            Row::Project(lighting.id),
+            Row::Thread(threads[3].id),
+        ];
+        assert_eq!(
+            visible_rows(&projects, &threads, &collapsed, false, ""),
+            expected
+        );
+        assert_eq!(
+            visible_rows(&projects, &threads, &collapsed, false, "e"),
+            [
+                Row::Project(dungeon.id),
+                Row::Thread(threads[2].id),
+                Row::Thread(threads[4].id),
+                Row::Thread(threads[0].id),
+                Row::Thread(threads[1].id),
+            ]
+        );
     }
 
     #[test]

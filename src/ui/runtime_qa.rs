@@ -2475,6 +2475,16 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
     })
     .await;
     let research = cx.read(|cx| fixture.state.read(cx).active_space);
+    assert!(cx.read(|cx| {
+        !fixture
+            .workspace
+            .read(cx)
+            .dock
+            .read(cx)
+            .is_dock_open(gpui_kit::component::dock::DockPlacement::Left)
+    }));
+    cx.dispatch_action(fixture.window.into(), commands::ToggleProjects);
+    cx.run_until_parked();
     assert_eq!(
         cx.read(|cx| fixture
             .state
@@ -2648,9 +2658,9 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
                 .dump(cx)
                 .left_dock
                 .as_ref()
-                .is_some_and(|dock| !dock.open())
+                .is_some_and(|dock| dock.open())
         }),
-        "returning to Default restores its hidden Projects pane"
+        "returning to Default keeps the shared Projects pane open"
     );
 
     // Moving from the native picker moves the project and every thread, not its data.
@@ -2670,6 +2680,15 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
         Duration::from_secs(5),
         |cx| !fixture.state.read(cx).project_in_active_space(project),
     )
+    .await;
+    until(cx, "moved draft detached", Duration::from_secs(5), |cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).active_key().is_none())
+    })
     .await;
     assert!(cx.read(|cx| {
         let state = fixture.state.read(cx);
@@ -3054,7 +3073,12 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             window.simulate_next_frame(cx);
             window.refresh();
             window.render_frame(cx);
-            window.find("space-switcher").bounds().origin.x.as_f32()
+            assert_eq!(
+                window.find("Projects").bounds().origin.x,
+                px(0.),
+                "Space motion must not translate the sidebar frame or workspace shell"
+            );
+            window.find("project-rows").bounds().origin.x.as_f32()
         })
         .unwrap()
     }
@@ -3150,4 +3174,118 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
     assert_eq!(position(cx, &fixture), rest);
     cx.update(|cx| cx.set_reduce_motion(false));
     quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable fixture; shared sidebar geometry across Spaces and reopening"]
+async fn spaces_share_sidebar_geometry_and_visibility(cx: &mut TestAppContext) {
+    use gpui_kit::component::dock::DockPlacement;
+
+    fn sidebar(cx: &mut TestAppContext, fixture: &Fixture) -> (f32, bool) {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.read(|cx| {
+            let dock = fixture
+                .workspace
+                .read(cx)
+                .dock
+                .read(cx)
+                .dump(cx)
+                .left_dock
+                .unwrap();
+            (dock.size().as_f32(), dock.open())
+        })
+    }
+
+    if let Some(data) = std::env::var_os("DROSTJE_SHARED_SIDEBAR_QA_DATA") {
+        let data = PathBuf::from(data);
+        let root = PathBuf::from(std::env::var_os("DROSTJE_RUNTIME_FIXTURE").unwrap());
+        assert!(
+            fs::canonicalize(&data)
+                .unwrap()
+                .starts_with(fs::canonicalize(root).unwrap())
+        );
+        let fixture = open_fixture(cx, Some(data)).await;
+        let width = cx
+            .update_window(fixture.window.into(), |_, window, _| {
+                (window.rem_size() * 18.).as_f32()
+            })
+            .unwrap();
+        let shared = (width, false);
+        assert_eq!(
+            sidebar(cx, &fixture),
+            shared,
+            "shared sidebar geometry survives reopening"
+        );
+        cx.dispatch_action(fixture.window.into(), commands::PreviousSpace);
+        assert_eq!(
+            sidebar(cx, &fixture),
+            shared,
+            "inactive Space geometry stays shared after reopening"
+        );
+        cx.dispatch_action(fixture.window.into(), commands::ToggleProjects);
+        assert_eq!(sidebar(cx, &fixture), (width, true));
+        quit(cx, &fixture).await;
+        return;
+    }
+
+    let fixture = open_fixture(cx, None).await;
+    let original = cx.read(|cx| fixture.state.read(cx).active_space);
+    let next = fixture.state.update(cx, |state, cx| {
+        let id = state.create_space("Shared sidebar").unwrap();
+        cx.notify();
+        id
+    });
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.dock.update(cx, |dock, cx| {
+                dock.set_dock_size(DockPlacement::Left, window.rem_size() * 20., window, cx);
+            });
+        },
+    );
+    let first = sidebar(cx, &fixture);
+    cx.dispatch_action(fixture.window.into(), commands::NextSpace);
+    assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+    assert_eq!(
+        sidebar(cx, &fixture),
+        first,
+        "a new Space must not reset the sidebar width"
+    );
+
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.dock.update(cx, |dock, cx| {
+                dock.set_dock_size(DockPlacement::Left, window.rem_size() * 18., window, cx);
+            });
+        },
+    );
+    cx.dispatch_action(fixture.window.into(), commands::ToggleProjects);
+    let shared = sidebar(cx, &fixture);
+    assert!(!shared.1);
+    cx.dispatch_action(fixture.window.into(), commands::PreviousSpace);
+    assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+    assert_eq!(
+        sidebar(cx, &fixture),
+        shared,
+        "an older Space must not restore stale sidebar geometry"
+    );
+    cx.dispatch_action(fixture.window.into(), commands::NextSpace);
+    assert_eq!(
+        sidebar(cx, &fixture),
+        shared,
+        "an empty Space must not reopen the shared sidebar"
+    );
+
+    quit(cx, &fixture).await;
+    println!("DROSTJE_SHARED_SIDEBAR_QA_DATA={}", fixture.data.display());
 }

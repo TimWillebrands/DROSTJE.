@@ -73,13 +73,13 @@ Gebruik **Control-Cmd-Q** om het scherm te vergrendelen en laat DROSTJE. open. *
 
 Een **Space** is een eigen werkcontext voor een groep projecten, geïnspireerd door [Zen](https://docs.zen-browser.app/user-manual/workspaces). De Space-kiezer in Projects wisselt de hele context; de `+` ernaast maakt een lege Space. Bestaande projecten en open threads komen bij de eerste start in **Default** terecht.
 
-Elke Space bewaart zijn eigen open tabs, geselecteerde project en thread, ingeklapte projecten, archiefweergave en paneelindeling. Projects, zoeken en de project- en threadresultaten in de command palette tonen alleen de actieve Space. Wisselen stopt geen lopende agent of Factory-run en bewaart concepten. Onvoltooide Neovim-opdrachten of tekstcompositie moeten eerst worden afgerond of geannuleerd.
+Elke Space bewaart zijn eigen open tabs, geselecteerde project en thread, ingeklapte projecten, archiefweergave en indeling van threadpanelen. Projects blijft één gedeelde zijbalk: breedte en open/dicht-toestand blijven gelijk bij het wisselen en na een herstart. Projects, zoeken en de project- en threadresultaten in de command palette tonen alleen de actieve Space. Wisselen stopt geen lopende agent of Factory-run en bewaart concepten. Onvoltooide Neovim-opdrachten of tekstcompositie moeten eerst worden afgerond of geannuleerd.
 
 Via het Space-menu of de command palette kun je een Space hernoemen, een project vanuit de actieve Space verplaatsen, of een Space verwijderen. Een project kan in meerdere Spaces staan: voeg dezelfde Git-werkboom in een andere Space opnieuw toe om hem daar ook te gebruiken. Elke Conversation- of Factory-thread hoort bij precies één combinatie van project en Space; een nieuwe thread blijft dus alleen zichtbaar in de Space waar je hem maakt. Verplaats één thread via **Move thread to space** in het contextmenu van die thread; het project wordt zo nodig automatisch aan de doel-Space toegevoegd. **Move project to space…** verplaatst het project en alleen zijn threads uit de actieve Space, zonder lidmaatschappen of threads in andere Spaces te wijzigen. Bij het verwijderen van een Space gaan de threads en projecten zonder andere plek naar Default. Historie, concepten en bestanden blijven behouden. Default zelf kan niet worden verwijderd.
 
 Gebruik **Switch space…** voor de toetsenbordkiezer: `j/k`, pijlen, `gg/G`, Return en Escape. **Next space** en **Previous space** wisselen direct buiten invoervelden en overlays. Spaces scheiden organisatie, niet accounts, credentials of bestandstoegang; tools en thema-instellingen blijven gedeeld.
 
-Een horizontale tweevingerveeg boven Projects verschuift de werkruimte mee met je vingers. Een korte veeg keert terug; een voldoende lange veeg wisselt één Space, zonder extra wissels door uitrollen. Wisselen via toetsenbord of kiezer krijgt dezelfde korte schuifanimatie. Bij verminderde beweging blijft de wissel direct, zonder animatie.
+Een horizontale tweevingerveeg boven Projects verschuift alleen de project- en threadlijst binnen de zijbalk mee met je vingers. De zijbalkrand, zoekbalk, Space-kiezer, werkbalk en centrale werkruimte blijven op hun plaats. Een korte veeg keert terug; een voldoende lange veeg wisselt één Space, zonder extra wissels door uitrollen. Wisselen via toetsenbord of kiezer krijgt dezelfde korte schuifanimatie. Bij verminderde beweging blijft de wissel direct, zonder animatie.
 
 ### Threads en werkruimte
 
@@ -146,9 +146,9 @@ Toegevoegde en gewijzigde bestanden worden opnieuw geladen. Ontbreekt het gekoze
 
 ### Vereisten en controle
 
-GPUI Kit is vastgezet op `0.6.1`. De prompteditor vereist een geïnstalleerde Neovim met de benodigde embedded-RPC- en UI-API's; getest met **Neovim 0.12.3** op macOS. Het pad wordt via PATH ontdekt of expliciet in Settings opgegeven. DROSTJE. start Neovim zonder gebruikers-init, plugins, ShaDa, swap- of undobestanden en gebruikt alleen eigen scratchbuffers. Dit is geen OS-sandbox: expliciete Neovim-opdrachten draaien met je lokale rechten.
+GPUI Kit is in zowel de app als de lokale terminaladapter vastgezet op `0.6.6`. De prompteditor vereist een geïnstalleerde Neovim met de benodigde embedded-RPC- en UI-API's; getest met **Neovim 0.12.3** op macOS. Het pad wordt via PATH ontdekt of expliciet in Settings opgegeven. DROSTJE. start Neovim zonder gebruikers-init, plugins, ShaDa, swap- of undobestanden en gebruikt alleen eigen scratchbuffers. Dit is geen OS-sandbox: expliciete Neovim-opdrachten draaien met je lokale rechten.
 
-`gpui-base 0.6.1` staat als lokale bronkopie in `crates/gpui-base`, met dezelfde Apache-licentie. De enige rendererwijziging voorkomt dat al afgebroken inline-tekstfragmenten tijdens het tekenen opnieuw afbreken; daardoor blijven de laatste tekens van inline-code op de juiste regel. GPUI Kit blijft op dezelfde versie vastgezet.
+Deze GPUI Kit-versie bevat de upstream-fix voor dubbel afbrekende inline-codefragmenten. Er is geen lokale kopie of Cargo-patch van `gpui-base` meer nodig; de pixel- en tekstselectieregressie blijft onderdeel van de desktop-QA.
 
 De OMP-integratie is getest met `18.2.0` (native RPC v2). Normale Pi gebruikt de standaard JSONL-RPC-interface; DROSTJE. hergebruikt daarvoor de gedeelde Pi/OMP-transcript-, tool-, model-, sessie- en extensie-UI-adapter zonder OMP's protocol-v2-negotiatie of gepagineerde geschiedenis te vereisen. Claude Code gebruikt de streaming JSON-interface en vraagt toestemming voor tools in DROSTJE. zelf. Authenticatie en modeltoegang moeten voor de gekozen Conversation-harness al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
 
@@ -181,6 +181,7 @@ cargo test --features runtime-qa --lib typing_saves_on_focus_loss_and_quit_not_i
 cargo test --features runtime-qa --lib factory_typing_stays_local_until_focus_loss_or_commit -- --ignored --nocapture
 cargo test --features runtime-qa --lib spaces_preserve_drafts_tabs_and_shared_projects -- --ignored --nocapture
 cargo test --features runtime-qa --lib space_swipes_track_reverse_cancel_and_settle -- --ignored --nocapture
+cargo test --features runtime-qa --lib spaces_share_sidebar_geometry_and_visibility -- --ignored --nocapture
 cargo test --features runtime-qa --lib thread_sidebar_hover_actions_rename_and_archive_immediately -- --ignored --nocapture
 cargo test --features runtime-qa --lib thread_archive_action_guards_and_palette_are_immediate -- --ignored --nocapture
 cargo test --features runtime-qa --lib terminal_tabs_keep_failure_local_and_do_not_persist_sessions -- --ignored --nocapture
@@ -197,6 +198,14 @@ Het Space-scenario controleert aanmaken, dubbele namen, hernoemen, wisselen, ver
 ```sh
 export DROSTJE_SPACES_QA_DATA="/pad/uit/het/space-scenario"
 cargo test --features runtime-qa --lib spaces_restore_active_context_and_inactive_tabs -- --ignored --nocapture
+```
+
+Het gedeelde-zijbalkscenario controleert breedte, zichtbaarheid en toetsenbordbediening over Space-wissels. Controleer de opslag in een nieuw proces met de afgedrukte map:
+
+```sh
+export DROSTJE_SHARED_SIDEBAR_QA_DATA="/pad/uit/het/gedeelde-zijbalkscenario"
+cargo test --features runtime-qa --lib spaces_share_sidebar_geometry_and_visibility -- --ignored --nocapture
+unset DROSTJE_SHARED_SIDEBAR_QA_DATA
 ```
 
 De vergelijkende prestatieworkload typt in de Neovim-composer, een Factory-invoer en Settings, en wisselt tussen tabs. Hij rapporteert mediaan en p95 van toetsafhandeling tot de GPUI-testdispatcher klaar is, niet de fysieke invoer-tot-schermlatentie. Er gelden geen tijdsdrempels in de gewone tests:

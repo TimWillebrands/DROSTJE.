@@ -1,6 +1,6 @@
 # AGENTS.md — DROSTJE.
 
-DROSTJE. is a macOS and Linux desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.1"`) that
+DROSTJE. is a macOS and Linux desktop app (Rust 2024, GPUI via `gpui-kit = "=0.6.6"`) that
 drives local coding agents (OMP over native RPC), edits prompts in embedded
 Neovim within a GPUI Kit-styled composer, and dispatches work to the Compliance Software Factory CLI. The README
 is Dutch and user-facing; code, comments, commits, docs and UI strings are
@@ -56,7 +56,7 @@ Design and cleanup rules for UI live in the project skill
 only what is specific to DROSTJE.
 
 - GPUI is reached only through the facade: `use gpui_kit::*;` for GPUI itself, `gpui_kit::component::<module>::<Type>` for components, `gpui_kit::actions!` for actions. Never add `gpui`, `gpui-component` or `gpui-base` as direct dependencies, and never import Zed's crates.
-- Exact signatures live in the pinned source under `~/.cargo/registry/src/*/gpui-component-0.6.1/src` and `gpui-base-0.6.1/src`; search there; never infer an API from Zed's crates or older gpui examples.
+- Exact signatures live in the pinned source under `~/.cargo/registry/src/*/gpui-component-0.6.6/src` and `gpui-base-0.6.6/src`; search there; never infer an API from Zed's crates or older gpui examples.
 - A missing theme role is added to the theme setup, never at the call site. `src/ui/theme.rs` owns theme loading and application.
 - Focus and selection styling must be restrained: prefer subtle, theme-derived neutral background or border changes over blue/accent outlines or saturated fills. Keep keyboard focus, the open selection, and inactive editors visibly distinct; never trade away focus clarity for aesthetics.
 - Monospace only for code, identifiers, shortcuts and aligned numbers, via `cx.theme().mono_font_family`.

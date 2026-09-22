@@ -158,17 +158,52 @@ impl SpaceSlide {
         }
     }
 
-    fn sample(&mut self, now: Instant) -> (f32, bool) {
+    fn sample(&self, now: Instant) -> (f32, bool) {
         let Some(started) = self.started else {
             return (self.offset, false);
         };
         let elapsed =
             now.saturating_duration_since(started).as_secs_f32() / Self::DURATION.as_secs_f32();
         if elapsed >= 1. {
-            *self = Self::default();
             return (0., false);
         }
         (self.offset * (1. - elapsed).powi(3), true)
+    }
+}
+
+/// Projects is one retained sidebar. Space layouts own threads, not its geometry.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct ProjectsSidebar {
+    size: Pixels,
+    open: bool,
+}
+
+impl ProjectsSidebar {
+    fn capture(layout: &DockAreaState) -> Option<Self> {
+        [&layout.left_dock, &layout.right_dock, &layout.bottom_dock]
+            .into_iter()
+            .flatten()
+            .find(|dock| contains_panel(dock.panel(), "Projects"))
+            .map(|dock| Self {
+                size: dock.size(),
+                open: dock.open(),
+            })
+    }
+
+    fn apply(self, layout: &mut DockAreaState) {
+        for dock in [
+            &mut layout.left_dock,
+            &mut layout.right_dock,
+            &mut layout.bottom_dock,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if contains_panel(dock.panel(), "Projects") {
+                *dock =
+                    DockState::new(dock.panel().clone(), dock.placement(), self.size, self.open);
+            }
+        }
     }
 }
 
@@ -291,6 +326,13 @@ impl Workspace {
         // A lone thread keeps its tab, like Zed, instead of a larger title.
         inner.set_panel_style(PanelStyle::TabBar, cx);
         let saved = state.read(cx).space_layout().cloned();
+        let shared_sidebar = state
+            .read(cx)
+            .snapshot
+            .settings
+            .get("projects_sidebar")
+            .and_then(|value| serde_json::from_value::<ProjectsSidebar>(value.clone()).ok())
+            .filter(|sidebar| f32::from(sidebar.size).is_finite() && sidebar.size > px(0.));
         let presented_space = state.read(cx).active_space;
         let thread_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads…"));
         let mut workspace = Self {
@@ -355,7 +397,10 @@ impl Workspace {
             },
         ));
         let restored = saved.map(|saved| {
-            let layout: DockAreaState = serde_json::from_value(saved)?;
+            let mut layout: DockAreaState = serde_json::from_value(saved)?;
+            if let Some(sidebar) = shared_sidebar {
+                sidebar.apply(&mut layout);
+            }
             validate_layout(&layout)?;
             // Nothing is leased during construction, so no callback can reach the
             // workspace here; `rebuilding` matters for later resets only.
@@ -367,10 +412,10 @@ impl Workspace {
             Some(Ok(())) => {}
             // A layout from another version is simply rebuilt; only a corrupt one is reported.
             Some(Err(error)) if error.to_string() == OUTDATED_LAYOUT => {
-                workspace.reset_layout(window, cx);
+                workspace.reset_layout_with_sidebar(shared_sidebar, window, cx);
             }
             other => {
-                workspace.reset_layout(window, cx);
+                workspace.reset_layout_with_sidebar(shared_sidebar, window, cx);
                 if let Some(Err(error)) = other {
                     workspace.state.update(cx, |state, cx| {
                         state.notice(
@@ -508,8 +553,17 @@ impl Workspace {
             workspace.show_notices(window, cx)
         });
         workspace.prepare_projects_cursor(cx);
-        let projects_focus = workspace.projects.read(cx).focus.clone();
-        projects_focus.focus(window, cx);
+        let initial_panel = if ProjectsSidebar::capture(&workspace.dock.read(cx).dump(cx))
+            .is_some_and(|sidebar| !sidebar.open)
+        {
+            workspace.thread_target(cx)
+        } else {
+            Some(workspace.projects.clone())
+        };
+        initial_panel
+            .map(|panel| panel.read(cx).focus.clone())
+            .unwrap_or_else(|| workspace.focus.clone())
+            .focus(window, cx);
         workspace.start_editor(window, cx);
         let quit_owner = cx.entity().downgrade();
         let quit_window = window.window_handle();
@@ -572,7 +626,7 @@ impl Workspace {
             self.space_swipe_idle.take();
             if self.space_slide.offset != 0. && self.space_slide.started.is_none() {
                 self.space_slide.settle(Instant::now());
-                cx.notify();
+                self.projects.update(cx, |_, cx| cx.notify());
             }
             return;
         }
@@ -584,24 +638,24 @@ impl Workspace {
             self.space_swipe_idle.take();
             self.space_slide.settle(now);
             self.execute(command, window, cx);
-            cx.notify();
+            self.projects.update(cx, |_, cx| cx.notify());
             return;
         } else if let Some(progress) = self.space_swipe.progress() {
             // Ordinary vertical scrolling must not redraw the workspace or start timers.
-            if progress == 0. && self.space_slide.offset == 0. {
+            if progress == 0. && self.space_slide.sample(now).0 == 0. {
                 return;
             }
             self.space_slide.drag(progress);
             if progress == 0. {
                 self.space_swipe_idle.take();
-                cx.notify();
+                self.projects.update(cx, |_, cx| cx.notify());
                 return;
             }
         } else {
             self.space_swipe_idle.take();
             if self.space_slide.offset != 0. && self.space_slide.started.is_none() {
                 self.space_slide.settle(now);
-                cx.notify();
+                self.projects.update(cx, |_, cx| cx.notify());
             }
             return;
         }
@@ -611,10 +665,10 @@ impl Workspace {
             let _ = workspace.update_in(window, |workspace, _, cx| {
                 workspace.space_swipe.finish();
                 workspace.space_slide.settle(Instant::now());
-                cx.notify();
+                workspace.projects.update(cx, |_, cx| cx.notify());
             });
         }));
-        cx.notify();
+        self.projects.update(cx, |_, cx| cx.notify());
     }
 
     pub(super) fn switch_space(
@@ -786,6 +840,8 @@ impl Workspace {
         if active == self.presented_space {
             return;
         }
+        let outgoing_layout = self.dock.read(cx).dump(cx);
+        let shared_sidebar = ProjectsSidebar::capture(&outgoing_layout);
         let direction = self.space_direction.take().unwrap_or_else(|| {
             let spaces = &self.state.read(cx).spaces;
             let old = spaces
@@ -802,7 +858,7 @@ impl Workspace {
         self.hide_terminals(cx);
         self.live_layouts.insert(
             self.presented_space,
-            filter_layout(self.dock.read(cx).dump(cx), &|panel| {
+            filter_layout(outgoing_layout, &|panel| {
                 terminal_of(panel).is_none_or(|id| {
                     self.terminals
                         .borrow()
@@ -834,7 +890,10 @@ impl Workspace {
                 .map(serde_json::from_value)
         });
         let restored = saved.map(|saved| -> anyhow::Result<()> {
-            let layout: DockAreaState = saved?;
+            let mut layout: DockAreaState = saved?;
+            if let Some(sidebar) = shared_sidebar {
+                sidebar.apply(&mut layout);
+            }
             validate_layout(&durable_layout(layout.clone()))?;
             self.dock
                 .update(cx, |dock, cx| dock.load(layout, window, cx))
@@ -851,7 +910,7 @@ impl Workspace {
                     )
                 });
             }
-            self.reset_layout(window, cx);
+            self.reset_layout_with_sidebar(shared_sidebar, window, cx);
         } else {
             self.sync_thread_panels(window, cx);
             self.invalidate_panel_bounds(cx);
@@ -865,6 +924,8 @@ impl Workspace {
             if workspace.presented_space == active {
                 let region = if workspace.state.read(cx).selected_thread.is_some()
                     || workspace.has_active_terminal(cx)
+                    || ProjectsSidebar::capture(&workspace.dock.read(cx).dump(cx))
+                        .is_some_and(|sidebar| !sidebar.open)
                 {
                     Region::Thread
                 } else {
@@ -1217,6 +1278,15 @@ impl Workspace {
     }
 
     pub fn reset_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset_layout_with_sidebar(None, window, cx);
+    }
+
+    fn reset_layout_with_sidebar(
+        &mut self,
+        sidebar: Option<ProjectsSidebar>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.reopening = None;
         let open = self.open_thread_ids(cx);
         let selected = self.state.read(cx).selected_thread;
@@ -1248,7 +1318,16 @@ impl Workspace {
             dock.remove_dock(DockPlacement::Bottom, window, cx);
             dock.set_center(center, window, cx);
             dock.set_dock(DockPlacement::Left, left, window, cx);
-            dock.set_dock_size(DockPlacement::Left, rem * 16., window, cx);
+            dock.set_dock_size(
+                DockPlacement::Left,
+                sidebar.map_or(rem * 16., |sidebar| sidebar.size),
+                window,
+                cx,
+            );
+            let open = sidebar.is_none_or(|sidebar| sidebar.open);
+            if dock.is_dock_open(DockPlacement::Left) != open {
+                dock.toggle_dock(DockPlacement::Left, window, cx);
+            }
             dock.set_dock_collapsible(DockPlacement::Left, true, window, cx);
         });
         self.rebuilding = false;
@@ -1619,10 +1698,14 @@ impl Workspace {
                 .is_some_and(|dock| contains_panel(dock.panel(), region.name()))
             {
                 let opening = !self.dock.read(cx).is_dock_open(placement);
+                let was_focused = self.focused_region(window, cx) == region;
                 self.dock
                     .update(cx, |dock, cx| dock.toggle_dock(placement, window, cx));
                 self.invalidate_panel_bounds(cx);
                 self.normalize_layout(opening.then_some(region), window, cx);
+                if !opening && was_focused {
+                    self.focus_region(Region::Thread, window, cx);
+                }
                 return;
             }
         }
@@ -1752,9 +1835,21 @@ impl Workspace {
         }
         let live = self.dock.read(cx).dump(cx);
         self.live_layouts.insert(self.presented_space, live.clone());
+        let sidebar = ProjectsSidebar::capture(&live).map(|sidebar| json!(sidebar));
+        let sidebar_changed = sidebar.as_ref().is_some_and(|sidebar| {
+            self.state
+                .read(cx)
+                .snapshot
+                .settings
+                .get("projects_sidebar")
+                != Some(sidebar)
+        });
         let layout = json!(durable_layout(live));
-        if self.state.read(cx).space_layout() != Some(&layout) {
+        if sidebar_changed || self.state.read(cx).space_layout() != Some(&layout) {
             self.state.update(cx, |state, cx| {
+                if let Some(sidebar) = sidebar {
+                    state.set_setting("projects_sidebar", sidebar);
+                }
                 state.set_space_layout(layout);
                 cx.notify();
             });
@@ -2695,15 +2790,6 @@ impl Render for WorkspaceRoot {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_terminal_visibility(window, cx);
-        let (slide, animating) = if cx.reduce_motion() {
-            self.space_slide = SpaceSlide::default();
-            (0., false)
-        } else {
-            self.space_slide.sample(Instant::now())
-        };
-        if animating {
-            window.request_animation_frame();
-        }
         let owner = cx.entity().downgrade();
         let state = self.state.read(cx);
         let dock_measurement = self.dock_measurement.clone();
@@ -2928,16 +3014,9 @@ impl Render for Workspace {
                         .min_h_0()
                         .overflow_hidden()
                         .child(
-                            div()
-                                .relative()
-                                .size_full()
-                                // Bounded travel avoids moving retained editors a whole viewport.
-                                .left(rems(slide * 3.))
-                                .child(
-                                    self.dock
-                                        .clone()
-                                        .cached(StyleRefinement::default().size_full()),
-                                ),
+                            self.dock
+                                .clone()
+                                .cached(StyleRefinement::default().size_full()),
                         )
                         .child(
                             canvas(
@@ -3428,15 +3507,28 @@ impl Render for WorkspacePanel {
             let state = self.state.read(cx);
             let scroll = &self.scroll;
             match self.kind {
-                PanelKind::Projects => sidebar::render(
-                    state,
-                    &self.workspace,
-                    workspace.cursor.filter(|_| list_focused),
-                    workspace.hovered_sidebar_row,
-                    &workspace.thread_search,
-                    scroll,
-                    cx,
-                ),
+                PanelKind::Projects => {
+                    let (slide, animating) = if cx.reduce_motion() {
+                        (0., false)
+                    } else {
+                        workspace.space_slide.sample(Instant::now())
+                    };
+                    if animating {
+                        window.request_animation_frame();
+                    }
+                    sidebar::render(
+                        state,
+                        &self.workspace,
+                        sidebar::SidebarPresentation {
+                            cursor: workspace.cursor.filter(|_| list_focused),
+                            hovered: workspace.hovered_sidebar_row,
+                            slide,
+                        },
+                        &workspace.thread_search,
+                        scroll,
+                        cx,
+                    )
+                }
                 PanelKind::Welcome => conversation::welcome(state, &self.workspace, cx),
                 PanelKind::Terminal(_) => self
                     .terminal
@@ -3613,12 +3705,6 @@ fn filter_layout(mut layout: DockAreaState, keep: &impl Fn(&PanelState) -> bool)
                         .collect();
                 }
             }
-            PanelInfo::Tiles { metas } => {
-                *metas = retained
-                    .iter()
-                    .filter_map(|(index, _)| metas.get(*index).copied())
-                    .collect();
-            }
             PanelInfo::Panel(_) => {}
         }
         panel.children = retained.into_iter().map(|(_, child)| child).collect();
@@ -3702,9 +3788,6 @@ fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
                             .all(|size| f32::from(*size).is_finite() && *size >= px(0.)),
                     "Invalid layout split"
                 );
-            }
-            PanelInfo::Tiles { .. } => {
-                anyhow::bail!("Floating tile layout is not supported by this workspace")
             }
         }
         for child in &panel.children {

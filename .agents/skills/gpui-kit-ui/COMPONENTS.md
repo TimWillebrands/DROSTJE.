@@ -1,11 +1,11 @@
-# gpui-kit 0.6.1 component map
+# gpui-kit component map
 
 Paths are `gpui_kit::component::<module>::<Type>` unless marked *root*
 (`gpui_kit::component::<Type>`). Builders listed are the ones that decide
 whether the component fits; verify the rest in the pinned source:
 
 ```sh
-K=~/.cargo/registry/src/*/gpui-component-0.6.1/src   # B=~/.cargo/registry/src/*/gpui-base-0.6.1/src
+K=~/.cargo/registry/src/*/gpui-component-0.6.6/src   # B=~/.cargo/registry/src/*/gpui-base-0.6.6/src
 grep -n "pub fn " $K/<module>.rs            # flat module
 grep -rn "pub fn " $K/<module>/             # directory module
 ```

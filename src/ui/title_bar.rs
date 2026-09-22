@@ -15,7 +15,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         dock::{
             DockAreaRenderer, DockContext, DockPlacement, DockSkin, NodeId, PanelState,
-            TabGroupContext, TabGroupRenderer, TilesRenderer,
+            TabGroupContext, TabGroupRenderer,
         },
         h_flex,
         menu::DropdownMenu,
@@ -363,10 +363,6 @@ impl DockAreaRenderer for WorkspaceDockSkin {
             inner: self.inner.tab_group_renderer(),
             title: self.title.clone(),
         })
-    }
-
-    fn tiles_renderer(&self) -> Rc<dyn TilesRenderer> {
-        self.inner.tiles_renderer()
     }
 }
 

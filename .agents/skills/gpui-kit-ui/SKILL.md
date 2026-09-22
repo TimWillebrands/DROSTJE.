@@ -25,7 +25,7 @@ Before writing a `div()` chain, name the behaviour, then find its owner:
 | key/value, caption, field | `DescriptionList`, `Label::new(a).secondary(b)`, `form::field()` |
 | rows, tabs, tree, palette | `list::List`+`ListItem`, `tab::TabBar`, `tree::Tree`, `command::Command` |
 
-Full map with verified 0.6.1 builders and module paths: [COMPONENTS.md](COMPONENTS.md).
+Component builders and module paths: [COMPONENTS.md](COMPONENTS.md).
 
 Reproducing a kit component from `div`s to match a picture is a defect, not
 a shortcut: it loses focus transfer, keyboard navigation, dismissal, disabled
@@ -36,7 +36,7 @@ state, geometry and accessibility.
 1. **State the task in one sentence**: object, primary action, next step. If a new user could not infer it from the screen, redesign before coding.
 2. **List the states** the surface has: empty, loading, error, disabled-with-reason, selected/focused. Each must render distinctly; none is "temporary".
 3. **Pick components from the map**, smallest surface that fits: tooltip → popover → menu → notification → dialog → alert dialog → sheet. Never stack overlays.
-4. **Verify each API in the pinned source** (`~/.cargo/registry/src/*/gpui-component-0.6.1/src`, `gpui-base-0.6.1/src`). Never infer from Zed crates, older gpui examples, or memory.
+4. **Verify each API in the pinned source** (`~/.cargo/registry/src/*/gpui-component-0.6.6/src`, `gpui-base-0.6.6/src`). Never infer from Zed crates, older gpui examples, or memory.
 5. **Assign ownership** before writing: state owner (view / `<X>State` / model), presentation owner, focus and keyboard contract (`key_context` and `on_action` on the same focused region, one `Action` per command), layout/overflow owner (one scroll owner per region, `min_w_0()` on the shrinking child, `items_stretch()` in `h_flex`), theme tokens used (`cx.theme().<role>`, rem helpers, `cx.theme().radius`; no `rgb`/hex/`px` for style).
 6. **Write it**: `ElementId`s are domain IDs, never indices or labels; controlled values in, intent out via callback; `render` reads and composes only.
 7. **Copy**: sentence case, verbs for commands, nouns for destinations, `…` on commands that need more input, errors say what happened and the next action.

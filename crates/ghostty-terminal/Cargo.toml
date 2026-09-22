@@ -6,7 +6,7 @@ license = "MIT"
 build = "build.rs"
 
 [dependencies]
-gpui-kit = "=0.6.1"
+gpui-kit = "=0.6.6"
 async-channel = "2.5"
 image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6"

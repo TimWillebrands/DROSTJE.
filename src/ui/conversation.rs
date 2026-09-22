@@ -2647,16 +2647,24 @@ fn frame(
     sidebar: AnyElement,
     composer: Option<AnyElement>,
 ) -> AnyElement {
+    // The composer shares the history column so both centre over the same width;
+    // the sidebar spans the full height beside them.
     root.child(
         h_flex()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .items_stretch()
-            .child(history)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .child(history)
+                    .when_some(composer, |column, composer| column.child(composer)),
+            )
             .child(sidebar),
     )
-    .when_some(composer, |root, composer| root.child(composer))
     .into_any_element()
 }
 
