@@ -41,7 +41,7 @@ const SPACE_SWIPE_DISTANCE: f32 = 80.;
 /// Scroll events further apart than this belong to different gestures. Touch phases
 /// cannot mark the boundary: Wayland never reports them and macOS keeps sending
 /// momentum after `Ended`.
-const SPACE_SWIPE_IDLE: Duration = Duration::from_millis(150);
+pub(super) const SPACE_SWIPE_IDLE: Duration = Duration::from_millis(150);
 
 /// Reduces precise scroll deltas over Projects to at most one Space step per gesture.
 /// Momentum keeps a finished gesture alive, so it cannot step a second time.
@@ -62,6 +62,10 @@ impl SpaceSwipe {
             *self = Self::default();
         }
         self.last_event = Some(now);
+        // A short gesture returns to rest on release; its momentum must not commit it.
+        if phase == TouchPhase::Ended {
+            self.stepped = true;
+        }
         if self.stepped {
             return None;
         }
@@ -77,6 +81,23 @@ impl SpaceSwipe {
         } else {
             Command::NextSpace
         })
+    }
+
+    /// Signed progress follows the fingers, not a timer. Vertical scrolling stays still.
+    pub(super) fn progress(&self) -> Option<f32> {
+        if self.stepped {
+            return None;
+        }
+        let (across, along) = (self.travelled.x.abs(), self.travelled.y.abs());
+        Some(if across >= 2. * along {
+            (self.travelled.x / SPACE_SWIPE_DISTANCE).clamp(-1., 1.)
+        } else {
+            0.
+        })
+    }
+
+    pub(super) fn finish(&mut self) {
+        self.stepped = true;
     }
 }
 
@@ -338,7 +359,7 @@ fn row_menu(
                 let state = workspace.read(cx).state.read(cx);
                 menu.item(command_item("Rename thread…", Command::RenameThread, state))
                     .item(command_item(
-                        "Archive thread…",
+                        Command::ArchiveThread.label(),
                         Command::ArchiveThread,
                         state,
                     ))
@@ -896,19 +917,9 @@ pub fn render(
             |_, window, cx| window.dispatch_action(Box::new(NextSpace), cx),
         )
         .on_scroll_wheel(move |event, window, cx| {
-            let ScrollDelta::Pixels(delta) = event.delta else {
-                return;
-            };
-            let command = swipe_owner.update(cx, |workspace, _| {
-                workspace.space_swipe.feed(
-                    delta.map(|axis| axis.as_f32()),
-                    event.touch_phase,
-                    Instant::now(),
-                )
+            let _ = swipe_owner.update(cx, |workspace, cx| {
+                workspace.swipe_space(event, window, cx);
             });
-            if let Ok(Some(command)) = command {
-                window.dispatch_action(command.action(), cx);
-            }
         })
         .child(
             h_flex()
@@ -1253,6 +1264,35 @@ mod tests {
         );
         assert_eq!(
             swipe.feed(point(-60., 0.), TouchPhase::Moved, at(1600)),
+            None
+        );
+    }
+
+    #[test]
+    fn swipe_preview_reverses_and_cancels_without_momentum_switching() {
+        use super::SpaceSwipe;
+        use gpui_kit::{TouchPhase, point};
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut swipe = SpaceSwipe::default();
+        let mut feed = |x, phase, ms| {
+            let command = swipe.feed(point(x, 0.), phase, start + Duration::from_millis(ms));
+            (command, swipe.progress())
+        };
+        assert_eq!(feed(-40., TouchPhase::Started, 0), (None, Some(-0.5)));
+        assert_eq!(feed(20., TouchPhase::Moved, 16), (None, Some(-0.25)));
+        assert_eq!(feed(0., TouchPhase::Ended, 32), (None, None));
+        assert_eq!(feed(-100., TouchPhase::Moved, 48), (None, None));
+        assert_eq!(feed(20., TouchPhase::Started, 64), (None, Some(0.25)));
+        swipe.finish();
+        assert_eq!(swipe.progress(), None);
+        assert_eq!(
+            swipe.feed(
+                point(100., 0.),
+                TouchPhase::Moved,
+                start + Duration::from_millis(80)
+            ),
             None
         );
     }

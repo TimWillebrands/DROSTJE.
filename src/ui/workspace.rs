@@ -37,6 +37,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 /// A list or scroll motion, shared by the Projects list, thread panels and the transcript.
@@ -136,6 +137,41 @@ enum SpaceChange {
     Delete(SpaceId),
 }
 
+/// Presentation only: never changes a Space or its retained editors/layout.
+#[derive(Default)]
+struct SpaceSlide {
+    offset: f32,
+    started: Option<Instant>,
+}
+
+impl SpaceSlide {
+    const DURATION: Duration = Duration::from_millis(160);
+
+    fn drag(&mut self, progress: f32) {
+        self.offset = progress;
+        self.started = None;
+    }
+
+    fn settle(&mut self, now: Instant) {
+        if self.started.is_none() && self.offset != 0. {
+            self.started = Some(now);
+        }
+    }
+
+    fn sample(&mut self, now: Instant) -> (f32, bool) {
+        let Some(started) = self.started else {
+            return (self.offset, false);
+        };
+        let elapsed =
+            now.saturating_duration_since(started).as_secs_f32() / Self::DURATION.as_secs_f32();
+        if elapsed >= 1. {
+            *self = Self::default();
+            return (0., false);
+        }
+        (self.offset * (1. - elapsed).powi(3), true)
+    }
+}
+
 pub struct Workspace {
     pub state: Entity<AppState>,
     pub(super) dock: Entity<DockArea>,
@@ -154,8 +190,11 @@ pub struct Workspace {
     focus: FocusHandle,
     pub cursor: Option<Row>,
     hovered_sidebar_row: Option<Row>,
-    /// Two-finger swipe over Projects, reduced to Space steps by the sidebar.
-    pub(super) space_swipe: super::sidebar::SpaceSwipe,
+    /// Gesture progress and settling are presentation-only; switching still saves drafts first.
+    space_swipe: super::sidebar::SpaceSwipe,
+    space_slide: SpaceSlide,
+    space_swipe_idle: Option<Task<()>>,
+    space_direction: Option<f32>,
     /// Filter text for the Projects list; empty shows every visible row.
     thread_search: Entity<InputState>,
     pub palette: Option<Entity<Palette>>,
@@ -279,6 +318,9 @@ impl Workspace {
             cursor: None,
             hovered_sidebar_row: None,
             space_swipe: Default::default(),
+            space_slide: SpaceSlide::default(),
+            space_swipe_idle: None,
+            space_direction: None,
             thread_search,
             model_picker: None,
             effort_picker: None,
@@ -510,6 +552,71 @@ impl Workspace {
         })
     }
 
+    pub(super) fn swipe_space(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ScrollDelta::Pixels(delta) = event.delta else {
+            return;
+        };
+        if self.dialog.is_some()
+            || self.palette.is_some()
+            || window.has_active_dialog(cx)
+            || window.has_active_sheet(cx)
+            || self.state.read(cx).spaces.len() < 2
+            || self.space_transition_reason(cx).is_some()
+        {
+            self.space_swipe.finish();
+            self.space_swipe_idle.take();
+            if self.space_slide.offset != 0. && self.space_slide.started.is_none() {
+                self.space_slide.settle(Instant::now());
+                cx.notify();
+            }
+            return;
+        }
+        let now = Instant::now();
+        let command =
+            self.space_swipe
+                .feed(delta.map(|axis| axis.as_f32()), event.touch_phase, now);
+        if let Some(command) = command {
+            self.space_swipe_idle.take();
+            self.space_slide.settle(now);
+            self.execute(command, window, cx);
+            cx.notify();
+            return;
+        } else if let Some(progress) = self.space_swipe.progress() {
+            // Ordinary vertical scrolling must not redraw the workspace or start timers.
+            if progress == 0. && self.space_slide.offset == 0. {
+                return;
+            }
+            self.space_slide.drag(progress);
+            if progress == 0. {
+                self.space_swipe_idle.take();
+                cx.notify();
+                return;
+            }
+        } else {
+            self.space_swipe_idle.take();
+            if self.space_slide.offset != 0. && self.space_slide.started.is_none() {
+                self.space_slide.settle(now);
+                cx.notify();
+            }
+            return;
+        }
+        // Also release on platforms without touch phases, or if the pointer leaves Projects.
+        self.space_swipe_idle = Some(cx.spawn_in(window, async move |workspace, window| {
+            smol::Timer::after(sidebar::SPACE_SWIPE_IDLE).await;
+            let _ = workspace.update_in(window, |workspace, _, cx| {
+                workspace.space_swipe.finish();
+                workspace.space_slide.settle(Instant::now());
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     pub(super) fn switch_space(
         &mut self,
         id: SpaceId,
@@ -519,7 +626,13 @@ impl Workspace {
         if id == self.state.read(cx).active_space {
             return Ok(());
         }
-        self.change_space(SpaceChange::Switch(id), window, cx)
+        let result = self.change_space(SpaceChange::Switch(id), window, cx);
+        if result.is_err() {
+            self.space_direction = None;
+            self.space_slide.settle(Instant::now());
+            cx.notify();
+        }
+        result
     }
 
     pub(super) fn move_project_to_space(
@@ -581,6 +694,8 @@ impl Workspace {
                     workspace.apply_space_change(change, window, cx)
                 });
                 if let Err(error) = result {
+                    workspace.space_direction = None;
+                    workspace.space_slide.settle(Instant::now());
                     workspace.space_error(error.context("Space was not changed; finish or cancel the editor command and try again"), cx);
                 }
                 cx.notify();
@@ -671,6 +786,18 @@ impl Workspace {
         if active == self.presented_space {
             return;
         }
+        let direction = self.space_direction.take().unwrap_or_else(|| {
+            let spaces = &self.state.read(cx).spaces;
+            let old = spaces
+                .iter()
+                .position(|space| space.id == self.presented_space);
+            let new = spaces.iter().position(|space| space.id == active);
+            if new > old { -1. } else { 1. }
+        });
+        self.space_swipe.finish();
+        self.space_swipe_idle.take();
+        self.space_slide.drag(-direction);
+        self.space_slide.settle(Instant::now());
         self.layout_save.take();
         self.hide_terminals(cx);
         self.live_layouts.insert(
@@ -2008,6 +2135,11 @@ impl Workspace {
                     (current + count - 1) % count
                 };
                 let target = state.spaces[index].id;
+                self.space_direction = Some(if command == Command::NextSpace {
+                    -1.
+                } else {
+                    1.
+                });
                 if let Err(error) = self.switch_space(target, window, cx) {
                     self.space_error(error, cx);
                 }
@@ -2105,11 +2237,31 @@ impl Workspace {
                 .read(cx)
                 .selected_thread
                 .map(DialogKind::RenameThread),
-            Command::ArchiveThread => self
-                .state
-                .read(cx)
-                .selected_thread
-                .map(DialogKind::ArchiveThread),
+            Command::ArchiveThread => {
+                if self.extension.is_some()
+                    || self
+                        .editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.read(cx).has_composition())
+                {
+                    return;
+                }
+                self.dismiss(window, cx);
+                if self.detail_surface.is_some() || self.dialog.is_some() || self.palette.is_some()
+                {
+                    return;
+                }
+                self.state.update(cx, |state, cx| {
+                    if let Some(mut thread) = state.thread().cloned() {
+                        thread.archived = true;
+                        thread.updated_at = crate::platform::now();
+                        state.save_thread(thread);
+                        state.set_show_archived(true);
+                        cx.notify();
+                    }
+                });
+                None
+            }
             Command::Settings => Some(DialogKind::Settings(self.state.read(cx).selected_project)),
             Command::NewConversation
             | Command::NewOmpConversation
@@ -2543,6 +2695,15 @@ impl Render for WorkspaceRoot {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_terminal_visibility(window, cx);
+        let (slide, animating) = if cx.reduce_motion() {
+            self.space_slide = SpaceSlide::default();
+            (0., false)
+        } else {
+            self.space_slide.sample(Instant::now())
+        };
+        if animating {
+            window.request_animation_frame();
+        }
         let owner = cx.entity().downgrade();
         let state = self.state.read(cx);
         let dock_measurement = self.dock_measurement.clone();
@@ -2765,10 +2926,18 @@ impl Render for Workspace {
                         .relative()
                         .flex_1()
                         .min_h_0()
+                        .overflow_hidden()
                         .child(
-                            self.dock
-                                .clone()
-                                .cached(StyleRefinement::default().size_full()),
+                            div()
+                                .relative()
+                                .size_full()
+                                // Bounded travel avoids moving retained editors a whole viewport.
+                                .left(rems(slide * 3.))
+                                .child(
+                                    self.dock
+                                        .clone()
+                                        .cached(StyleRefinement::default().size_full()),
+                                ),
                         )
                         .child(
                             canvas(
@@ -3212,7 +3381,7 @@ impl Panel for WorkspacePanel {
                         .on_click(owned(Command::RenameThread)),
                 )
                 .item(
-                    PopupMenuItem::new("Archive thread…")
+                    PopupMenuItem::new(Command::ArchiveThread.label())
                         .disabled(disabled(Command::ArchiveThread))
                         .on_click(owned(Command::ArchiveThread)),
                 )

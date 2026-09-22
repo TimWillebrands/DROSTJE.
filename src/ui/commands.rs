@@ -202,7 +202,7 @@ impl Command {
             Self::ArchiveProject => "Archive project…",
             Self::RenameThread => "Rename thread…",
             Self::RegenerateTitle => "Regenerate conversation title",
-            Self::ArchiveThread => "Archive thread…",
+            Self::ArchiveThread => "Archive thread",
             Self::CloseThread => "Close tab",
             Self::NextThread => "Next tab",
             Self::PreviousThread => "Previous tab",

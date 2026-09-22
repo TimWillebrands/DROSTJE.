@@ -392,9 +392,22 @@ async fn new_thread_tab_draws_its_title(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native sidebar hover actions"]
-async fn thread_sidebar_hover_actions_are_visible_and_rename(cx: &mut TestAppContext) {
+async fn thread_sidebar_hover_actions_rename_and_archive_immediately(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let id = new_conversation(cx, &fixture).await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.focus_composer(window, cx);
+        },
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "k e e p cmd-escape");
+    until(cx, "archive draft", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).thread().unwrap().draft == "keep"
+    })
+    .await;
     let row = format!("thread-{id}");
     let actions = format!("thread-actions-{id}");
     let rename = format!("rename-thread-{id}");
@@ -461,17 +474,91 @@ async fn thread_sidebar_hover_actions_are_visible_and_rename(cx: &mut TestAppCon
         window.click(archive.clone(), cx);
     })
     .unwrap();
+    cx.run_until_parked();
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
+    cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        let thread = state.thread().unwrap();
+        assert_eq!(state.selected_thread, Some(id));
+        assert!(thread.archived, "one click archives without confirmation");
+        assert_eq!(thread.title, "Manually renamed");
+        assert_eq!(thread.draft, "keep");
+        assert!(state.show_archived, "archived history remains accessible");
+    });
+    assert_eq!(
+        update_workspace(
+            cx,
+            fixture.window,
+            &fixture.workspace,
+            |workspace, window, cx| { workspace.focused_region(window, cx) }
+        ),
+        Region::Projects
+    );
+    wait_for_saved_thread(cx, &fixture, id, |thread| {
+        thread.archived && thread.title == "Manually renamed" && thread.draft == "keep"
+    })
+    .await;
+
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; immediate archive shares action guards and palette dispatch"]
+async fn thread_archive_action_guards_and_palette_are_immediate(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let id = new_conversation(cx, &fixture).await;
+    fixture.state.update(cx, |state, cx| {
+        state.active_threads.insert(id);
+        cx.notify();
+    });
+    cx.dispatch_action(fixture.window.into(), commands::ArchiveThread);
+    assert!(cx.read(|cx| !fixture.state.read(cx).thread().unwrap().archived));
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
+    fixture.state.update(cx, |state, cx| {
+        state.active_threads.remove(&id);
+        state.pending_factory.insert(id);
+        cx.notify();
+    });
+    cx.dispatch_action(fixture.window.into(), commands::ArchiveThread);
+    assert!(cx.read(|cx| !fixture.state.read(cx).thread().unwrap().archived));
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
+    fixture.state.update(cx, |state, cx| {
+        state.pending_factory.remove(&id);
+        cx.notify();
+    });
+
+    open_palette(cx, &fixture).await;
+    cx.simulate_keystrokes(
+        fixture.window.into(),
+        "a r c h i v e space t h r e a d enter",
+    );
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let workspace = fixture.workspace.read(cx);
+        assert!(workspace.palette.is_none());
+        assert!(workspace.dialog.is_none());
+        let state = fixture.state.read(cx);
+        assert_eq!(state.selected_thread, Some(id));
+        assert!(state.thread().unwrap().archived);
+    });
+    wait_for_saved_thread(cx, &fixture, id, |thread| thread.archived).await;
+
+    cx.dispatch_action(fixture.window.into(), commands::ArchiveProject);
+    assert!(cx.read(|cx| !fixture.state.read(cx).project().unwrap().archived));
     assert!(cx.read(|cx| {
         fixture
             .workspace
             .read(cx)
             .dialog
             .as_ref()
-            .is_some_and(|dialog| matches!(dialog.read(cx).kind, crate::ui::settings::DialogKind::ArchiveThread(target) if target == id))
+            .is_some_and(|dialog| {
+                matches!(
+                    dialog.read(cx).kind,
+                    crate::ui::settings::DialogKind::ArchiveProject(_)
+                )
+            })
     }));
     cx.dispatch_action(fixture.window.into(), commands::Dismiss);
-    cx.run_until_parked();
-
     quit(cx, &fixture).await;
 }
 
@@ -2954,5 +3041,113 @@ async fn terminal_tabs_keep_failure_local_and_do_not_persist_sessions(cx: &mut T
         },
     )
     .await;
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable fixture; exercises gesture-linked Space motion and reduced motion"]
+async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
+    use gpui_kit::{PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+
+    fn position(cx: &mut TestAppContext, fixture: &Fixture) -> f32 {
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.render_frame(cx);
+            window.find("space-switcher").bounds().origin.x.as_f32()
+        })
+        .unwrap()
+    }
+
+    fn scroll(cx: &mut TestAppContext, fixture: &Fixture, x: f32, y: f32, phase: TouchPhase) {
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            let position = window.find("space-switcher").bounds().center();
+            window.dispatch_event(
+                PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    position,
+                    delta: ScrollDelta::Pixels(point(px(x), px(y))),
+                    touch_phase: phase,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+    }
+
+    async fn settle(cx: &mut TestAppContext, fixture: &Fixture, rest: f32) {
+        smol::Timer::after(Duration::from_millis(200)).await;
+        cx.run_until_parked();
+        assert!((position(cx, fixture) - rest).abs() < 0.5);
+    }
+
+    let fixture = open_fixture(cx, None).await;
+    let original = cx.read(|cx| fixture.state.read(cx).active_space);
+    let next = fixture.state.update(cx, |state, cx| {
+        let id = state.create_space("Swipe destination").unwrap();
+        cx.notify();
+        id
+    });
+    cx.run_until_parked();
+    for (mode, width, height) in [("light", 1440., 900.), ("dark", 900., 600.)] {
+        fixture.state.update(cx, |state, cx| {
+            state.set_setting("theme_mode", json!(mode));
+            cx.notify();
+        });
+        cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
+        let rest = position(cx, &fixture);
+        // Vertical scroll does not move the Space; horizontal travel follows and reverses.
+        scroll(cx, &fixture, -10., 80., TouchPhase::Started);
+        assert_eq!(position(cx, &fixture), rest);
+        scroll(cx, &fixture, -40., 0., TouchPhase::Started);
+        let dragged = position(cx, &fixture);
+        assert!(
+            dragged < rest - 5.,
+            "Space must follow the fingers before committing"
+        );
+        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+        scroll(cx, &fixture, 20., 0., TouchPhase::Moved);
+        let reversed = position(cx, &fixture);
+        assert!(reversed > dragged && reversed < rest);
+        scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
+        scroll(cx, &fixture, -100., 0., TouchPhase::Moved);
+        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+        settle(cx, &fixture, rest).await;
+
+        // A platform without touch phases also releases a short abandoned drag.
+        scroll(cx, &fixture, -30., 0., TouchPhase::Moved);
+        assert!(position(cx, &fixture) < rest);
+        smol::Timer::after(Duration::from_millis(170)).await;
+        cx.run_until_parked();
+        settle(cx, &fixture, rest).await;
+        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+
+        scroll(cx, &fixture, -40., 0., TouchPhase::Started);
+        scroll(cx, &fixture, -45., 0., TouchPhase::Moved);
+        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+        assert!(
+            position(cx, &fixture) > rest,
+            "destination enters from the other side"
+        );
+        scroll(cx, &fixture, -200., 0., TouchPhase::Moved);
+        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+        settle(cx, &fixture, rest).await;
+
+        cx.dispatch_action(fixture.window.into(), commands::PreviousSpace);
+        assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
+        assert!(
+            position(cx, &fixture) < rest,
+            "keyboard switching also animates"
+        );
+        settle(cx, &fixture, rest).await;
+    }
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let rest = position(cx, &fixture);
+    scroll(cx, &fixture, -40., 0., TouchPhase::Started);
+    assert_eq!(position(cx, &fixture), rest);
+    scroll(cx, &fixture, -45., 0., TouchPhase::Moved);
+    assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), next);
+    assert_eq!(position(cx, &fixture), rest);
+    cx.update(|cx| cx.set_reduce_motion(false));
     quit(cx, &fixture).await;
 }

@@ -102,7 +102,6 @@ pub enum DialogKind {
     RenameProject(Uuid),
     RenameThread(Uuid),
     ArchiveProject(Uuid),
-    ArchiveThread(Uuid),
     Settings(Option<Uuid>),
 }
 pub enum SurfaceOutcome {
@@ -625,23 +624,6 @@ impl SurfaceContent {
                 state.save_project(project);
                 state.set_show_archived(true);
             }
-            DialogKind::ArchiveThread(id) => {
-                anyhow::ensure!(
-                    state.selected_thread == Some(id),
-                    "Thread selection changed; reopen Archive thread."
-                );
-                if let Some(reason) = state.archive_thread_reason() {
-                    anyhow::bail!(reason);
-                }
-                let mut thread = state
-                    .thread()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("Select a thread"))?;
-                thread.archived = true;
-                thread.updated_at = platform::now();
-                state.save_thread(thread);
-                state.set_show_archived(true);
-            }
 
             DialogKind::Settings(project_id) => {
                 let root = self.value("factory_data_root", cx);
@@ -777,7 +759,6 @@ impl SurfaceContent {
             DialogKind::RenameProject(_) => "Rename project",
             DialogKind::RenameThread(_) => "Rename thread",
             DialogKind::ArchiveProject(_) => "Archive project",
-            DialogKind::ArchiveThread(_) => "Archive thread",
             DialogKind::Settings(_) => "Settings",
         }
     }
@@ -1124,7 +1105,7 @@ impl SurfaceContent {
                             let _ = owner.update(cx, |surface, cx| surface.pick_folder(window, cx));
                         }));
             }
-            DialogKind::ArchiveProject(_) | DialogKind::ArchiveThread(_) => {
+            DialogKind::ArchiveProject(_) => {
                 body = body.child("Archive retains threads, drafts, sessions, and Factory history. It never deletes checkout, session, or Factory files. Archived history remains accessible from Projects.");
             }
             DialogKind::NewSpace
@@ -1268,10 +1249,7 @@ impl Render for SurfaceFooter {
 fn footer(dialog: &SurfaceContent) -> AnyElement {
     let readonly = dialog.presentation.readonly;
     let id = dialog.surface_id;
-    let archive = matches!(
-        dialog.kind,
-        DialogKind::ArchiveProject(_) | DialogKind::ArchiveThread(_)
-    );
+    let archive = matches!(dialog.kind, DialogKind::ArchiveProject(_));
     let cancel = dialog.owner.clone();
     let confirm = dialog.owner.clone();
     h_flex()
@@ -1380,9 +1358,7 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                         .on_close(move |_, _, cx| clear_surface(&close, id, cx))
                 });
             }
-            DialogKind::DeleteSpace(_)
-            | DialogKind::ArchiveProject(_)
-            | DialogKind::ArchiveThread(_) => {
+            DialogKind::DeleteSpace(_) | DialogKind::ArchiveProject(_) => {
                 window.open_alert_dialog(cx, move |alert, window, _| {
                     let close = host_owner.clone();
                     let confirm = host_owner.clone();

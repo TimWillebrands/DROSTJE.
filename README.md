@@ -79,12 +79,16 @@ Via het Space-menu of de command palette kun je een Space hernoemen, een project
 
 Gebruik **Switch space…** voor de toetsenbordkiezer: `j/k`, pijlen, `gg/G`, Return en Escape. **Next space** en **Previous space** wisselen direct buiten invoervelden en overlays. Spaces scheiden organisatie, niet accounts, credentials of bestandstoegang; tools en thema-instellingen blijven gedeeld.
 
+Een horizontale tweevingerveeg boven Projects verschuift de werkruimte mee met je vingers. Een korte veeg keert terug; een voldoende lange veeg wisselt één Space, zonder extra wissels door uitrollen. Wisselen via toetsenbord of kiezer krijgt dezelfde korte schuifanimatie. Bij verminderde beweging blijft de wissel direct, zonder animatie.
+
 ### Threads en werkruimte
 
 Projects bevat binnen de actieve Space een lijst met twee soorten threads:
 
 - **Conversation:** een interactieve OMP- of Claude Code-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Klik op de `+` naast een project en kies eerst **OMP** of **Claude Code**. Dezelfde keuzes staan onder **New thread** en in de command palette; `Cmd-N` gebruikt de gekozen projectstandaard. Rechts toont een inklapbare zijbalk de actuele Git-wijzigingen terwijl een turn loopt; `Toggle conversation changes` en `Refresh conversation changes` staan ook in de command palette. Het model kies je onderaan de composer.
 - **Factory:** parameters voor een bestaande Azure DevOps User Story of een bestaande PRD/issues-map. `Advanced` bevat de branch en het optionele thought level. `Start run` slaat de definitieve configuratie eerst op; een opslagfout start niets.
+
+**Archive thread** archiveert direct, zonder bevestigingsvenster. Geschiedenis en concept blijven bewaard en de archiefweergave wordt geopend. Een actieve turn, een lopende Factory-start of een eigen Factory-proces blijft archiveren blokkeren; projecten archiveren vraagt nog wel bevestiging.
 
 **Terminal** is een derde soort centraal paneel, geen opgeslagen thread. Kies **New terminal** in het projectmenu, het tabmenu of de command palette (`Cmd-Alt-T`). De standaard-shell start in de projectmap met je eigen gebruikersrechten. Op macOS is dit een login-shell, zodat systeem- en gebruikersprofielen (zoals `.zprofile` voor zsh) vóór de interactieve configuratie worden geladen, ook wanneer de app vanuit Finder start. Tabs, splitsingen, `Ctrl-Tab` en `Ctrl-W` + `h/j/k/l` werken ook voor terminals. `Cmd-Escape` verlaat de terminalinvoer zonder de shell te stoppen; `Ctrl-C` blijft een terminaltoets.
 
@@ -144,6 +148,8 @@ Toegevoegde en gewijzigde bestanden worden opnieuw geladen. Ontbreekt het gekoze
 
 GPUI Kit is vastgezet op `0.6.1`. De prompteditor vereist een geïnstalleerde Neovim met de benodigde embedded-RPC- en UI-API's; getest met **Neovim 0.12.3** op macOS. Het pad wordt via PATH ontdekt of expliciet in Settings opgegeven. DROSTJE. start Neovim zonder gebruikers-init, plugins, ShaDa, swap- of undobestanden en gebruikt alleen eigen scratchbuffers. Dit is geen OS-sandbox: expliciete Neovim-opdrachten draaien met je lokale rechten.
 
+`gpui-base 0.6.1` staat als lokale bronkopie in `crates/gpui-base`, met dezelfde Apache-licentie. De enige rendererwijziging voorkomt dat al afgebroken inline-tekstfragmenten tijdens het tekenen opnieuw afbreken; daardoor blijven de laatste tekens van inline-code op de juiste regel. GPUI Kit blijft op dezelfde versie vastgezet.
+
 De OMP-integratie is getest met `18.2.0` (native RPC v2). Normale Pi gebruikt de standaard JSONL-RPC-interface; DROSTJE. hergebruikt daarvoor de gedeelde Pi/OMP-transcript-, tool-, model-, sessie- en extensie-UI-adapter zonder OMP's protocol-v2-negotiatie of gepagineerde geschiedenis te vereisen. Claude Code gebruikt de streaming JSON-interface en vraagt toestemming voor tools in DROSTJE. zelf. Authenticatie en modeltoegang moeten voor de gekozen Conversation-harness al beschikbaar zijn. Factory vereist daarnaast een compatibele CLI, Docker, de agent-image en de authenticatie/broker van de gekozen harness.
 
 `Check readiness` toont echte `factory doctor --harness …`-uitvoer. Een Conversation gebruikt per project `omp` (standaard), normale `pi` of `claude-code`; een Factory-thread gebruikt `opencode` (standaard), `codex` of `claude-code`. Een ongeldige of niet-ondersteunde keuze blijft zichtbaar en moet vóór de volgende Conversation of Factory-run worden aangepast. DROSTJE. installeert of werkt vereisten alleen bij op jouw expliciete verzoek en voert geen authenticatie uit.
@@ -154,6 +160,8 @@ cargo test
 cargo test --test neovim_runtime -- --ignored --nocapture
 cargo test --features runtime-qa native_composition_is_recovery_only_until_committed -- --ignored --nocapture
 ```
+
+De macOS-regressie `cargo test --features runtime-qa --test markdown_rendering` gebruikt echte fonts en offscreen Metal-pixels, zonder vensterbediening, schermopnametoestemming of provider-turns. Ze controleert zichtbare code-suffixen, afbreking, Unicode en tekstselectie in beide thema's.
 
 ### Expliciete desktop-QA
 
@@ -172,6 +180,9 @@ cargo test --features runtime-qa --lib factory_start_requires_persisted_configur
 cargo test --features runtime-qa --lib typing_saves_on_focus_loss_and_quit_not_idle -- --ignored --nocapture
 cargo test --features runtime-qa --lib factory_typing_stays_local_until_focus_loss_or_commit -- --ignored --nocapture
 cargo test --features runtime-qa --lib spaces_preserve_drafts_tabs_and_shared_projects -- --ignored --nocapture
+cargo test --features runtime-qa --lib space_swipes_track_reverse_cancel_and_settle -- --ignored --nocapture
+cargo test --features runtime-qa --lib thread_sidebar_hover_actions_rename_and_archive_immediately -- --ignored --nocapture
+cargo test --features runtime-qa --lib thread_archive_action_guards_and_palette_are_immediate -- --ignored --nocapture
 cargo test --features runtime-qa --lib terminal_tabs_keep_failure_local_and_do_not_persist_sessions -- --ignored --nocapture
 ```
 

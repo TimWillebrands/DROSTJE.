@@ -27,3 +27,12 @@ ghostty-terminal = { version = "0.1.0", path = "crates/ghostty-terminal" }
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
+
+[[test]]
+name = "markdown_rendering"
+harness = false
+required-features = ["runtime-qa"]
+
+[patch.crates-io]
+# Keep gpui-kit pinned; fix double-wrapping in its existing inline renderer.
+gpui-base = { path = "crates/gpui-base" }
