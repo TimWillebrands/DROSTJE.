@@ -61,7 +61,7 @@ only what is specific to DROSTJE.
 - Focus and selection styling must be restrained: prefer subtle, theme-derived neutral background or border changes over blue/accent outlines or saturated fills. Keep keyboard focus, the open selection, and inactive editors visibly distinct; never trade away focus clarity for aesthetics.
 - Monospace only for code, identifiers, shortcuts and aligned numbers, via `cx.theme().mono_font_family`.
 - Workspace shell: Projects left, thread tabs centre (a lone thread still shows its tab); each thread's sidebar holds Changes and Output tabs; native TitleBar and dock headers; no permanent Factory sidebar or redundant footer. Save/error status lives in the title bar. Persist open thread identities and user-controlled layout; clamp restored values to preserve usable Thread space.
-- Terminology is stable across palette, menu, tooltip, dialog and docs: Project, Thread, Conversation, Factory thread, Draft, Turn, Launch, Run, Attempt, Task, Region.
+- Terminology is stable across palette, menu, tooltip, dialog and docs: Project, Thread, Conversation, Factory thread, Draft, Turn, Launch, Run, Attempt, Task, Region, Worktree.
 - Instant feedback; keep frames cheap: virtualise history and logs, deliver bounded event batches, never rebuild the whole conversation per token.
 
 ### Keyboard-driven, Vim-style navigation

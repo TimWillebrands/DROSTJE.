@@ -27,6 +27,13 @@ impl AppState {
         if (thread.archived || project.archived) && thread.session_ref.is_none() {
             return;
         }
+        // A removed worktree has no directory to run in; the composer explains why.
+        if self.thread_worktree(&thread).is_some_and(|w| !w.is_live()) {
+            return;
+        }
+        let Some((_, root)) = self.working_tree_of(&thread) else {
+            return;
+        };
         let mut session = ConversationSession::new(thread.model.clone());
         let (finished, drain) = async_channel::bounded(1);
         session.finished = Some(drain);
@@ -47,7 +54,7 @@ impl AppState {
                     .context("Persistence owner closed")?
                     .map_err(anyhow::Error::msg)?;
                 let config = smol::unblock(move || -> Result<_> {
-                    let repository = platform::inspect_repository(&project.root)?;
+                    let repository = platform::inspect_repository(&root)?;
                     let executable_name = harness::executable_name(&thread.harness)?;
                     let explicit = executables
                         .as_ref()
@@ -179,6 +186,9 @@ impl AppState {
         if !matches!(self.repositories.get(&thread.project_id), Some(Ok(_))) {
             return Some("Project root is unavailable".into());
         }
+        if self.thread_worktree(thread).is_some_and(|w| !w.is_live()) {
+            return Some("This conversation's worktree was removed".into());
+        }
         let Some(session) = self.conversations.get(&id) else {
             return Some("Open the conversation harness first".into());
         };
@@ -306,6 +316,24 @@ impl AppState {
         self.retry_conversation(id);
     }
     pub fn respond(&mut self, id: ThreadId, request_id: String, answer: UserAnswer) {
+        let switches_to_auto = matches!(&answer, UserAnswer::PermissionAuto)
+            && self
+                .conversations
+                .get(&id)
+                .and_then(|session| session.requests.get(&request_id))
+                .is_some_and(|request| request.kind == UserRequestKind::Permission);
+        if switches_to_auto
+            && let Some(mut thread) = self
+                .snapshot
+                .threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .cloned()
+            && thread.permission_mode.as_deref() != Some("auto")
+        {
+            thread.permission_mode = Some("auto".into());
+            self.save_thread(thread);
+        }
         self.send_command(id, ConversationCommand::Respond { request_id, answer });
     }
 
@@ -759,8 +787,11 @@ impl AppState {
         if self.storage_error.is_some() || thread.title == title {
             return;
         }
-        thread.title = title;
+        thread.title = title.clone();
         self.save_thread(thread);
+        if !replace {
+            self.rename_worktree_branch(id, &title);
+        }
         cx.emit(PresentationChange::Thread(id));
     }
 

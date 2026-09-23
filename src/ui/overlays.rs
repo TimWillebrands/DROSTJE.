@@ -115,6 +115,23 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn open_custom_answer(
+        &mut self,
+        thread: ThreadId,
+        mut request: UserRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if request.kind != UserRequestKind::Question {
+            return;
+        }
+        request.kind = UserRequestKind::Input;
+        request.title = "Custom answer".into();
+        request.text.clear();
+        request.placeholder = Some("Type an answer".into());
+        self.open_extension(thread, request, window, cx);
+    }
+
     pub fn close_extension(&mut self, cancel: bool, window: &mut Window, cx: &mut Context<Self>) {
         if cancel && self.extension_busy(cx) {
             return;

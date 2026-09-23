@@ -2,7 +2,7 @@ use anyhow::Result;
 use drostje::{
     model::{
         FactoryLaunch, FactorySourceKind, FactoryThreadConfig, ImageAttachment, ModelKey, Project,
-        ProjectDefaults, QueuedMessage, Thread, ThreadKind,
+        ProjectDefaults, QueuedMessage, Thread, ThreadKind, Worktree,
     },
     store::{Store, StoreError},
 };
@@ -55,6 +55,7 @@ fn conversation(project: &Project) -> Thread {
         model: None,
         effort: None,
         permission_mode: None,
+        worktree_id: None,
         draft: "Unsent draft\n日本語 é".into(),
         attachments: Vec::new(),
         submission: None,
@@ -80,6 +81,21 @@ fn factory_thread(project: &Project) -> Thread {
         harness: String::new(),
         draft: String::new(),
         ..conversation(project)
+    }
+}
+
+fn worktree(project: &Project, creator: &Thread, codename: &str) -> Worktree {
+    Worktree {
+        id: Uuid::new_v4(),
+        project_id: project.id,
+        path: project.root.join("..").join("worktrees").join(codename),
+        codename: codename.into(),
+        branch: format!("drostje/{codename}"),
+        base: "main".into(),
+        named: false,
+        created_by: creator.id,
+        created_at: "2026-09-22T12:00:00Z".into(),
+        removed_at: None,
     }
 }
 
@@ -263,7 +279,7 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     });
 }
@@ -355,7 +371,7 @@ fn version_2_database_upgrades_in_place_and_persists_effort() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     });
 }
@@ -422,7 +438,7 @@ fn version_3_database_upgrades_in_place_and_persists_permission_mode() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     });
 }
@@ -497,14 +513,104 @@ fn version_4_database_upgrades_in_place_and_persists_queued_messages() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
+        );
+    });
+}
+
+#[test]
+fn version_5_database_upgrades_in_place_and_persists_worktrees() {
+    smol::block_on(async {
+        let directory = TempDirectory::new();
+        let path = directory.0.join("drostje.sqlite3");
+        let project = project(directory.0.join("checkout"));
+        let thread = conversation(&project);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA_V2).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE threads ADD COLUMN effort TEXT;
+                 ALTER TABLE threads ADD COLUMN permission_mode TEXT;
+                 ALTER TABLE threads ADD COLUMN queued_json TEXT NOT NULL DEFAULT '[]'",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO projects(id, name, root, defaults_json) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    project.id.to_string(),
+                    project.name,
+                    project.root.to_string_lossy().into_owned(),
+                    serde_json::to_string(&project.defaults).unwrap(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads(id, project_id, title, harness, draft, created_at, updated_at, queued_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]')",
+                rusqlite::params![
+                    thread.id.to_string(),
+                    project.id.to_string(),
+                    thread.title,
+                    thread.harness,
+                    thread.draft,
+                    thread.created_at,
+                    thread.updated_at,
+                ],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+        drop(connection);
+
+        let store = reopen(&directory.0);
+        let snapshot = store.snapshot().await.unwrap();
+        assert!(snapshot.worktrees.is_empty());
+        assert_eq!(snapshot.threads[0].worktree_id, None);
+        let mut isolated = conversation(&project);
+        let mut worktree = worktree(&project, &isolated, "amber-heron");
+        isolated.worktree_id = Some(worktree.id);
+        store.save_worktree(worktree.clone()).await.unwrap();
+        store.save_thread(isolated.clone()).await.unwrap();
+        worktree.branch = "drostje/fix-login".into();
+        worktree.named = true;
+        store.save_worktree(worktree.clone()).await.unwrap();
+        store.flush().await.unwrap();
+        drop(store);
+
+        let reopened = reopen(&directory.0);
+        let snapshot = reopened.snapshot().await.unwrap();
+        assert_eq!(snapshot.worktrees, vec![worktree.clone()]);
+        let saved = snapshot
+            .threads
+            .iter()
+            .find(|saved| saved.id == isolated.id)
+            .unwrap();
+        assert_eq!(saved.worktree_id, Some(worktree.id));
+        assert_eq!(
+            snapshot
+                .threads
+                .iter()
+                .find(|saved| saved.id == thread.id)
+                .unwrap()
+                .worktree_id,
+            None
+        );
+        drop(reopened);
+        wait_for_release(&directory.0);
+        let database = Connection::open(&path).unwrap();
+        assert_eq!(
+            database
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            6
         );
     });
 }
 
 #[test]
 fn incompatible_schema_is_refused_without_changing_database_bytes() {
-    for version in [1, 6] {
+    for version in [1, 7] {
         let directory = TempDirectory::new();
         let path = directory.0.join("drostje.sqlite3");
         let connection = Connection::open(&path).unwrap();
@@ -701,6 +807,43 @@ fn invalid_associations_are_rejected_without_poisoning_healthy_storage() {
         correct_launch.process_exit = Some(7);
         correct_launch.launch_error = Some("Observed process failure".into());
         store.save_launch(correct_launch.clone()).await.unwrap();
+
+        // Worktrees belong to one project; threads never cross into another project's tree
+        // and never move between trees once created.
+        let mut orphan = worktree(&first, &thread, "orphan");
+        orphan.project_id = Uuid::new_v4();
+        assert!(store.save_worktree(orphan).await.is_err());
+        let foreign_tree = worktree(&second, &foreign_owner, "foreign-tree");
+        store.save_worktree(foreign_tree.clone()).await.unwrap();
+        let mut crossing = conversation(&first);
+        crossing.worktree_id = Some(foreign_tree.id);
+        assert!(store.save_thread(crossing).await.is_err());
+        let mut missing = conversation(&first);
+        missing.worktree_id = Some(Uuid::new_v4());
+        assert!(store.save_thread(missing).await.is_err());
+        let mut isolated = conversation(&first);
+        let tree = worktree(&first, &isolated, "amber-heron");
+        isolated.worktree_id = Some(tree.id);
+        store.save_worktree(tree.clone()).await.unwrap();
+        store.save_thread(isolated.clone()).await.unwrap();
+        let mut moved = isolated.clone();
+        moved.worktree_id = None;
+        assert!(store.save_thread(moved).await.is_err());
+        let mut rooted = thread.clone();
+        rooted.worktree_id = Some(tree.id);
+        assert!(store.save_thread(rooted).await.is_err());
+        let mut relocated = tree.clone();
+        relocated.path = first.root.join("elsewhere");
+        assert!(store.save_worktree(relocated).await.is_err());
+        let mut renamed_dir = tree.clone();
+        renamed_dir.codename = "other".into();
+        assert!(store.save_worktree(renamed_dir).await.is_err());
+        let mut duplicate_path = worktree(&first, &thread, "duplicate");
+        duplicate_path.path = tree.path.clone();
+        assert!(store.save_worktree(duplicate_path).await.is_err());
+        let mut relative = worktree(&first, &thread, "relative");
+        relative.path = PathBuf::from("relative/path");
+        assert!(store.save_worktree(relative).await.is_err());
         store.writable().await.unwrap();
         let snapshot = store.snapshot().await.unwrap();
         assert_eq!(
@@ -713,6 +856,18 @@ fn invalid_associations_are_rejected_without_poisoning_healthy_storage() {
             first.id
         );
         assert_eq!(snapshot.launches, vec![correct_launch]);
+        let mut worktrees = snapshot.worktrees.clone();
+        worktrees.sort_by(|a, b| a.codename.cmp(&b.codename));
+        assert_eq!(worktrees, vec![tree.clone(), foreign_tree]);
+        assert_eq!(
+            snapshot
+                .threads
+                .iter()
+                .find(|saved| saved.id == isolated.id)
+                .unwrap()
+                .worktree_id,
+            Some(tree.id)
+        );
     });
 }
 
@@ -791,6 +946,17 @@ fn malformed_v2_shapes_and_ownership_are_refused_without_repairing_data() {
             "UPDATE factory_launches SET project_id = (SELECT id FROM projects WHERE name = 'Other project')",
             "DROP INDEX factory_launches_factory_thread",
             "ALTER TABLE factory_launches RENAME COLUMN factory_thread_id TO thread_id",
+            "PRAGMA foreign_keys = OFF; UPDATE threads SET worktree_id = '00000000-0000-0000-0000-000000000009'",
+            "INSERT INTO worktrees(id, project_id, path, codename, branch, base, created_by, created_at)
+             SELECT '00000000-0000-0000-0000-000000000001', id, '/worktrees/amber-heron', 'amber-heron',
+             'drostje/amber-heron', 'main', '00000000-0000-0000-0000-000000000002', '2026-09-22T00:00:00Z'
+             FROM projects WHERE name = 'Other project';
+             UPDATE threads SET worktree_id = '00000000-0000-0000-0000-000000000001' WHERE kind = 'conversation'",
+            "INSERT INTO worktrees(id, project_id, path, codename, branch, base, created_by, created_at)
+             SELECT '00000000-0000-0000-0000-000000000001', id, 'relative/amber-heron', 'amber-heron',
+             'drostje/amber-heron', 'main', '00000000-0000-0000-0000-000000000002', '2026-09-22T00:00:00Z'
+             FROM projects WHERE name = 'Other project'",
+            "PRAGMA foreign_keys = OFF; DROP TABLE worktrees",
         ] {
             let directory = TempDirectory::new();
             let store = Store::open(directory.0.clone()).unwrap();

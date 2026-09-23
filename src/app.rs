@@ -4,10 +4,11 @@ mod persistence;
 mod project_diff;
 mod shutdown;
 mod spaces;
+mod worktrees;
 use crate::harness::{
     self, ContentBlock, ContextUsage, ConversationCommand, ConversationEvent, ConversationHandle,
     ConversationState, Message, ModelChoice, ToolActivity, TurnOutcome, UsageLimit, UserAnswer,
-    UserRequest,
+    UserRequest, UserRequestKind,
 };
 use crate::{model::*, platform, store::Store};
 use anyhow::{Context as _, Result};
@@ -20,6 +21,9 @@ use std::{
     path::PathBuf,
 };
 use uuid::Uuid;
+pub use worktrees::{
+    RemovalFailure, WorkingTree, WorktreeRequest, WorktreeRequestKind, WorktreeRequestStatus,
+};
 
 /// Content changes are separate from structural workspace invalidation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -27,7 +31,9 @@ pub enum PresentationChange {
     Draft(ThreadId),
     Thread(ThreadId),
     Transcript(ThreadId),
-    Diff(ProjectId),
+    Diff(WorkingTree),
+    /// A worktree request changed status; the dialog that opened it reads the new state.
+    WorktreeRequest(Uuid),
     Persistence,
     Selection,
     Projects,
@@ -293,6 +299,7 @@ enum Write {
         Option<async_channel::Sender<Result<(), String>>>,
     ),
     Setting(String, Value),
+    Worktree(Worktree),
     Flush(async_channel::Sender<Result<(), String>>),
 }
 
@@ -337,12 +344,23 @@ pub enum AppEvent {
     Diagnostics(BTreeMap<String, String>),
     PiInstalled(Result<PathBuf, String>),
     StorageFailed(String),
-    InteractiveActivity { thread_id: ThreadId, active: bool },
+    InteractiveActivity {
+        thread_id: ThreadId,
+        active: bool,
+    },
     FactorySnapshot(Box<crate::factory::FactorySnapshot>),
     HarnessOpened(ThreadId, Uuid, Result<ConversationHandle, String>),
     Harness(ThreadId, Uuid, ConversationEvent),
     Notice(WorkspaceNotice),
     HarnessDrained(async_channel::Sender<()>),
+    WorktreeCreated(Uuid, Result<Box<Worktree>, String>),
+    WorktreeRenamed(WorktreeId, Result<String, String>),
+    WorktreeInspected(WorktreeId, Result<platform::WorktreeStatus, String>),
+    /// `Ok(true)` when the branch was deleted along with the directory.
+    WorktreeRemoved(Option<Uuid>, WorktreeId, Result<bool, RemovalFailure>),
+    /// The live HEAD of a worktree; `Ok(None)` is detached.
+    WorktreeHeadRead(WorktreeId, Result<Option<String>, String>),
+    BranchSwitched(Uuid, WorkingTree, Result<String, String>),
 }
 
 pub struct AppState {
@@ -387,6 +405,13 @@ pub struct AppState {
     pub pending_factory: HashSet<ThreadId>,
     /// Conversations with a title request in flight; at most one each.
     titling: HashSet<ThreadId>,
+    /// The worktree creation or removal in flight, kept until the next one starts so the
+    /// dialog can show how it ended.
+    pub worktree_request: Option<WorktreeRequest>,
+    /// Live HEAD per worktree as last read from Git; absent means not read yet.
+    pub worktree_heads: HashMap<WorktreeId, Option<String>>,
+    renaming_worktrees: HashSet<WorktreeId>,
+    inspecting_worktrees: HashSet<WorktreeId>,
     writes: async_channel::Sender<Write>,
 }
 
@@ -600,12 +625,17 @@ impl AppState {
             factory_text_generation: Uuid::new_v4(),
             pending_factory: HashSet::new(),
             titling: HashSet::new(),
+            worktree_request: None,
+            worktree_heads: HashMap::new(),
+            renaming_worktrees: HashSet::new(),
+            inspecting_worktrees: HashSet::new(),
             active_threads: HashSet::new(),
             owned_launches: HashSet::new(),
             events,
             writes,
         };
         state.persist_space_session();
+        state.reconcile_worktrees();
         state
     }
 
@@ -793,6 +823,26 @@ impl AppState {
             AppEvent::HarnessDrained(reply) => {
                 let _ = reply.try_send(());
                 return;
+            }
+            AppEvent::WorktreeCreated(request, result) => {
+                self.worktree_created(request, result, cx)
+            }
+            AppEvent::WorktreeRenamed(id, result) => self.worktree_renamed(id, result, cx),
+            AppEvent::WorktreeInspected(id, result) => self.worktree_inspected(id, result, cx),
+            AppEvent::WorktreeRemoved(request, id, result) => {
+                self.worktree_removed(request, id, result, cx)
+            }
+            AppEvent::WorktreeHeadRead(id, result) => {
+                if let Ok(head) = result {
+                    self.record_head(WorkingTree::Worktree(id), head);
+                }
+                cx.emit(PresentationChange::Projects);
+                for thread in self.worktree_threads(id) {
+                    cx.emit(PresentationChange::Thread(thread));
+                }
+            }
+            AppEvent::BranchSwitched(request, tree, result) => {
+                self.branch_switched(request, tree, result, cx)
             }
         }
         cx.notify();
@@ -1258,60 +1308,109 @@ impl AppState {
         if let Some(reason) = self.mutable_project_reason() {
             anyhow::bail!(reason);
         }
-        let project = self.project().context("Select a project")?;
-        let timestamp = platform::now();
-        let (title, harness, model, factory) = match kind {
-            ThreadKind::Conversation => (
-                crate::titles::DEFAULT_CONVERSATION_TITLE,
-                conversation_harness.map(str::to_owned).unwrap_or_else(|| {
-                    if project.defaults.interactive_harness.trim().is_empty() {
-                        "omp".into()
-                    } else {
-                        project.defaults.interactive_harness.clone()
-                    }
-                }),
-                project.defaults.interactive_model.clone(),
-                None,
+        let project = self.project().context("Select a project")?.clone();
+        // A new thread follows the selected Conversation's checkout: its live worktree or the
+        // project root. Factory threads only borrow the branch as their default target.
+        let selected_worktree = self
+            .thread()
+            .filter(|thread| {
+                thread.kind == ThreadKind::Conversation && thread.project_id == project.id
+            })
+            .and_then(|thread| self.thread_worktree(thread))
+            .filter(|worktree| worktree.is_live())
+            .cloned();
+        let id = Uuid::new_v4();
+        let thread = match kind {
+            ThreadKind::Conversation => self.build_conversation(
+                &project,
+                conversation_harness,
+                id,
+                selected_worktree.map(|worktree| worktree.id),
             ),
-            ThreadKind::Factory => (
-                "New Factory thread",
-                String::new(),
-                None,
-                Some(FactoryThreadConfig {
-                    source_kind: FactorySourceKind::WorkItem,
-                    source: String::new(),
-                    harness: if project.defaults.factory_harness.trim().is_empty() {
-                        "opencode".into()
-                    } else {
-                        project.defaults.factory_harness.clone()
-                    },
-                    model: String::new(),
-                    thought_level: String::new(),
-                    target_branch: project
-                        .defaults
-                        .factory_target_branch
-                        .clone()
-                        .unwrap_or_else(|| {
-                            self.repositories
-                                .get(&project.id)
-                                .and_then(|repository| repository.as_ref().ok())
-                                .and_then(|repository| repository.branch.clone())
-                                .unwrap_or_default()
-                        }),
-                }),
-            ),
+            ThreadKind::Factory => {
+                let timestamp = platform::now();
+                Thread {
+                    id,
+                    project_id: project.id,
+                    kind,
+                    factory: Some(FactoryThreadConfig {
+                        source_kind: FactorySourceKind::WorkItem,
+                        source: String::new(),
+                        harness: if project.defaults.factory_harness.trim().is_empty() {
+                            "opencode".into()
+                        } else {
+                            project.defaults.factory_harness.clone()
+                        },
+                        model: String::new(),
+                        thought_level: String::new(),
+                        target_branch: project
+                            .defaults
+                            .factory_target_branch
+                            .clone()
+                            .or_else(|| {
+                                selected_worktree
+                                    .as_ref()
+                                    .map(|worktree| worktree.branch.clone())
+                            })
+                            .unwrap_or_else(|| {
+                                self.repositories
+                                    .get(&project.id)
+                                    .and_then(|repository| repository.as_ref().ok())
+                                    .and_then(|repository| repository.branch.clone())
+                                    .unwrap_or_default()
+                            }),
+                    }),
+                    title: "New Factory thread".into(),
+                    harness: String::new(),
+                    session_ref: None,
+                    model: None,
+                    effort: None,
+                    permission_mode: None,
+                    worktree_id: None,
+                    draft: String::new(),
+                    attachments: Vec::new(),
+                    submission: None,
+                    queued: Vec::new(),
+                    archived: false,
+                    created_at: timestamp.clone(),
+                    updated_at: timestamp,
+                }
+            }
         };
-        let thread = Thread {
-            id: Uuid::new_v4(),
+        let project_id = thread.project_id;
+        self.save_thread(thread);
+        self.register_thread_membership(id, project_id, self.active_space)?;
+        self.select_thread(id);
+        Ok(())
+    }
+    /// A fresh Conversation row in `project`, on `worktree_id` or the project root, with the
+    /// project's harness and model defaults.
+    pub(crate) fn build_conversation(
+        &self,
+        project: &Project,
+        harness: Option<&str>,
+        id: ThreadId,
+        worktree_id: Option<WorktreeId>,
+    ) -> Thread {
+        let timestamp = platform::now();
+        Thread {
+            id,
             project_id: project.id,
-            kind,
-            factory,
-            title: title.into(),
-            harness,
+            kind: ThreadKind::Conversation,
+            factory: None,
+            title: crate::titles::DEFAULT_CONVERSATION_TITLE.into(),
+            harness: harness.map(str::to_owned).unwrap_or_else(|| {
+                if project.defaults.interactive_harness.trim().is_empty() {
+                    "omp".into()
+                } else {
+                    project.defaults.interactive_harness.clone()
+                }
+            }),
             session_ref: None,
-            model,
+            model: project.defaults.interactive_model.clone(),
             effort: None,
             permission_mode: None,
+            worktree_id,
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,
@@ -1319,13 +1418,7 @@ impl AppState {
             archived: false,
             created_at: timestamp.clone(),
             updated_at: timestamp,
-        };
-        let id = thread.id;
-        let project = thread.project_id;
-        self.save_thread(thread);
-        self.register_thread_membership(id, project, self.active_space)?;
-        self.select_thread(id);
-        Ok(())
+        }
     }
     pub fn register_project(&mut self, path: PathBuf) {
         if self.space_mutation_reason().is_some() || self.registering {

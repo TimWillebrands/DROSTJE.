@@ -2274,20 +2274,48 @@ fn request_card(
         .rounded(cx.theme().radius)
         .child(
             div()
+                .id(SharedString::from(format!("request-{}-title", request.id)))
+                .max_h(rems(4.))
+                .overflow_y_scroll()
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(request.title.clone()),
         );
     if !request.text.is_empty() {
-        card = card.child(div().text_sm().child(request.text.clone()));
+        card = card.child(
+            div()
+                .id(SharedString::from(format!("request-{}-body", request.id)))
+                .test_support()
+                .max_h(rems(8.))
+                .overflow_y_scroll()
+                .text_sm()
+                .child(request.text.clone()),
+        );
     }
-    let mut choices = v_flex().w_full().gap_1();
+    let mut choices = v_flex()
+        .id(SharedString::from(format!(
+            "request-{}-choices",
+            request.id
+        )))
+        .test_support()
+        .w_full()
+        .min_h_0()
+        .max_h(rems(14.))
+        .overflow_y_scroll()
+        .gap_1();
     let mut answers: Vec<(String, Option<String>, UserAnswer)> = Vec::new();
+    if request.kind == UserRequestKind::Permission {
+        answers.push((
+            "Yes and switch to auto".into(),
+            Some("Approve all permission asks already open".into()),
+            UserAnswer::PermissionAuto,
+        ));
+    }
     match request.kind {
         UserRequestKind::Confirm => {
             answers.push(("Confirm".into(), None, UserAnswer::Confirmed(true)));
             answers.push(("Decline".into(), None, UserAnswer::Confirmed(false)));
         }
-        UserRequestKind::Select => {
+        UserRequestKind::Select | UserRequestKind::Permission | UserRequestKind::Question => {
             for option in &request.options {
                 answers.push((
                     option.value.clone(),
@@ -2341,30 +2369,46 @@ fn request_card(
             }),
         );
     }
+    card = card.child(choices);
+    if request.kind == UserRequestKind::Question {
+        let custom = owner.clone();
+        let request = request.clone();
+        card = card.child(
+            Button::new(SharedString::from(format!("request-{}-custom", request.id)))
+                .small()
+                .outline()
+                .w_full()
+                .label("Custom answer…")
+                .on_click(move |_, window, cx| {
+                    let _ = custom.update(cx, |workspace, cx| {
+                        workspace.open_custom_answer(id, request.clone(), window, cx)
+                    });
+                }),
+        );
+    }
     let cancel = owner.clone();
     let request_id = request.id.clone();
-    card.child(choices)
-        .child(
-            h_flex().justify_end().child(
-                Button::new(SharedString::from(format!("request-{}-cancel", request.id)))
-                    .small()
-                    .ghost()
-                    .label("Cancel")
-                    .on_click(move |_, _, cx| {
-                        let _ = cancel.update(cx, |workspace, cx| {
-                            workspace.state.update(cx, |state, cx| {
-                                state.respond(
-                                    id,
-                                    request_id.clone(),
-                                    UserAnswer::Cancelled { timed_out: false },
-                                );
-                                cx.notify();
-                            })
-                        });
-                    }),
-            ),
-        )
-        .into_any_element()
+    card.child(
+        h_flex().justify_end().child(
+            Button::new(SharedString::from(format!("request-{}-cancel", request.id)))
+                .small()
+                .ghost()
+                .label("Cancel")
+                .on_click(move |_, _, cx| {
+                    let _ = cancel.update(cx, |workspace, cx| {
+                        workspace.state.update(cx, |state, cx| {
+                            state.respond(
+                                id,
+                                request_id.clone(),
+                                UserAnswer::Cancelled { timed_out: false },
+                            );
+                            cx.notify();
+                        })
+                    });
+                }),
+        ),
+    )
+    .into_any_element()
 }
 
 /// The centre pane while no thread is open: name the next step and offer it.
@@ -3035,6 +3079,36 @@ fn render_content(
                     )
                 }),
         );
+    // A Conversation in a worktree names it quietly: codename and branch in the mono font,
+    // the directory in the tooltip.
+    if let Some(worktree) = state.thread_worktree(thread) {
+        let tooltip = if worktree.is_live() {
+            format!("Worktree at {}", worktree.path.display())
+        } else {
+            format!("Worktree at {} was removed", worktree.path.display())
+        };
+        let label = format!(
+            "{} · {}",
+            worktree.codename,
+            state.worktree_branch_label(worktree)
+        );
+        leading = leading.child(
+            div()
+                .id("worktree-label")
+                .flex_shrink_0()
+                .max_w(rems(20.))
+                .truncate()
+                .text_xs()
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_color(cx.theme().muted_foreground)
+                .child(if worktree.is_live() {
+                    label
+                } else {
+                    format!("{label} (removed)")
+                })
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
+        );
+    }
     // The harness status line trails the context actions, muted and truncated.
     leading = leading.child(
         div()
@@ -3505,6 +3579,7 @@ mod tests {
                 model: None,
                 effort: None,
                 permission_mode: None,
+                worktree_id: None,
                 draft: String::new(),
                 attachments: Vec::new(),
                 submission: None,
@@ -3577,7 +3652,9 @@ mod tests {
 
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
-    fn request_choices_wrap_long_labels_inside_the_card(cx: &mut gpui_kit::TestAppContext) {
+    fn request_cards_bound_large_content_and_offer_extra_actions(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
         use super::{UserRequest, UserRequestKind, Workspace, request_card, v_flex};
         use crate::harness::UserOption;
         use gpui_kit::{
@@ -3592,15 +3669,15 @@ mod tests {
                 let owner = WeakEntity::<Workspace>::new_invalid();
                 let request = UserRequest {
                     id: "kpi".into(),
-                    kind: UserRequestKind::Select,
+                    kind: UserRequestKind::Question,
                     title: "KPI cards".into(),
                     options: vec![
                         UserOption {
                             value: "Possible".into(),
                             description: Some(
                                 "Open services have status OPEN, filled services have status FILLED, \
-                                 conflict or sick means BLOCKED plus CANCELLED, and proposals remain zero."
-                                    .into(),
+                                 conflict or sick means BLOCKED plus CANCELLED, and proposals remain zero. "
+                                    .repeat(40),
                             ),
                         },
                         UserOption {
@@ -3608,7 +3685,19 @@ mod tests {
                             description: None,
                         },
                     ],
-                    text: "What should the four top KPI cards show?".into(),
+                    text: "Review this plan before choosing.\n".repeat(200),
+                    placeholder: None,
+                    deadline: None,
+                };
+                let permission = UserRequest {
+                    id: "permission".into(),
+                    kind: UserRequestKind::Permission,
+                    title: "Allow Bash?".into(),
+                    options: vec![UserOption {
+                        value: "Allow".into(),
+                        description: Some("This time".into()),
+                    }],
+                    text: "Bash: cargo check".into(),
                     placeholder: None,
                     deadline: None,
                 };
@@ -3617,6 +3706,7 @@ mod tests {
                     .test_support()
                     .w(px(420.))
                     .child(request_card(Uuid::from_u128(1), &request, &owner, cx))
+                    .child(request_card(Uuid::from_u128(1), &permission, &owner, cx))
             }
         }
 
@@ -3639,9 +3729,30 @@ mod tests {
                 let card = window.find("request-harness").bounds();
                 let long_choice = window.find("request-kpi-0").bounds();
                 let short_choice = window.find("request-kpi-1").bounds();
+                let custom = window.find("request-kpi-custom").bounds();
+                let body = window.find("request-kpi-body").bounds();
+                let choices = window.find("request-kpi-choices").bounds();
+                let auto = window.find("request-permission-0").bounds();
+                let rem = window.rem_size();
+                assert!(
+                    body.size.height <= rem * 8.,
+                    "{mode} request context must scroll instead of growing beyond eight rem"
+                );
+                assert!(
+                    choices.size.height <= rem * 14.,
+                    "{mode} choices must scroll instead of filling the conversation"
+                );
+                assert!(
+                    custom.top() >= card.top() && custom.bottom() <= card.bottom(),
+                    "{mode} custom answer must remain inside the bounded request card"
+                );
                 assert!(
                     long_choice.size.height > short_choice.size.height,
                     "{mode} theme must wrap long option text instead of clipping it to the short button height"
+                );
+                assert!(
+                    auto.size.height > px(0.),
+                    "{mode} permission card must expose auto approval"
                 );
                 assert!(
                     long_choice.left() >= card.left() && long_choice.right() <= card.right(),

@@ -8,6 +8,7 @@ pub mod platform;
 pub mod store;
 pub mod titles;
 pub mod ui;
+pub mod worktrees;
 
 use gpui_kit::{
     assets::AllAssets,
@@ -19,6 +20,10 @@ use gpui_kit::{
 const APP_ASSETS: AllAssets = AllAssets;
 
 pub fn run() {
+    // First, while the process is single-threaded: agents must see the user's terminal PATH.
+    if let Err(error) = platform::import_login_shell_environment() {
+        eprintln!("Could not import the login shell environment: {error:#}");
+    }
     let bootstrap = app::Bootstrap::load();
     if let Err(error) = &bootstrap {
         if matches!(

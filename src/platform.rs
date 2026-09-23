@@ -6,6 +6,9 @@ use std::{
     process::Command,
 };
 
+mod shell_env;
+pub use shell_env::import_login_shell_environment;
+
 #[cfg_attr(
     not(any(target_os = "macos", test)),
     expect(
@@ -274,6 +277,8 @@ pub struct RepositoryInfo {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryDiff {
+    /// The branch checked out when the diff was read; `None` when HEAD is detached.
+    pub head_branch: Option<String>,
     pub patch: String,
     pub changed_files: usize,
     pub additions: usize,
@@ -352,7 +357,9 @@ pub fn working_tree_diff(root: &Path) -> Result<RepositoryDiff> {
         .lines()
         .filter(|line| line.starts_with('-') && !line.starts_with("---"))
         .count();
+    let head_branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
     Ok(RepositoryDiff {
+        head_branch,
         patch,
         changed_files: entries.len(),
         additions,
@@ -473,6 +480,182 @@ pub fn validate_branch(root: &Path, branch: &str) -> Result<()> {
     )?;
     Ok(())
 }
+/// Exit code of a Git command whose non-zero exit carries meaning (`merge-base --is-ancestor`,
+/// `show-ref --verify`, `config --get`); the caller decides which codes are answers.
+fn git_exit(root: &Path, args: &[&str]) -> Result<i32> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .context("Run Git")?;
+    output
+        .status
+        .code()
+        .with_context(|| format!("Git {} was terminated by a signal", args.join(" ")))
+}
+
+/// What Git reports about a linked worktree, read at one moment; nothing here is inferred.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub exists: bool,
+    /// `git status --porcelain` is empty: no modified, staged or untracked files.
+    pub clean: bool,
+    /// The branch checked out, `None` when detached.
+    pub head_branch: Option<String>,
+    /// The worktree's own branch is an ancestor of the base branch.
+    pub merged: bool,
+}
+
+/// Creates a linked worktree of `project_root` at `path` on new local `branch` from `base`.
+pub fn create_worktree(
+    project_root: &Path,
+    path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<PathBuf> {
+    validate_branch(project_root, base)?;
+    git(project_root, &["check-ref-format", "--branch", branch])?;
+    ensure!(!path.exists(), "{} already exists", path.display());
+    let parent = path
+        .parent()
+        .context("Worktree path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("Create {}", parent.display()))?;
+    let path_arg = path.to_str().context("Worktree path is not valid UTF-8")?;
+    // Stale registrations for directories deleted by hand would otherwise block the add.
+    git(project_root, &["worktree", "prune"])?;
+    git(
+        project_root,
+        &["worktree", "add", "-b", branch, path_arg, base],
+    )?;
+    fs::canonicalize(path).with_context(|| format!("Read worktree {}", path.display()))
+}
+
+/// The branch checked out in a worktree root; `None` when HEAD is detached.
+pub fn worktree_head_branch(path: &Path) -> Result<Option<String>> {
+    let toplevel = fs::canonicalize(git(path, &["rev-parse", "--show-toplevel"])?)?;
+    ensure!(
+        toplevel == fs::canonicalize(path)?,
+        "{} is not a working-tree root",
+        path.display()
+    );
+    Ok(git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok())
+}
+
+pub fn branch_exists(root: &Path, branch: &str) -> Result<bool> {
+    match git_exit(
+        root,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )? {
+        0 => Ok(true),
+        1 => Ok(false),
+        code => bail!("Git show-ref exited with {code}"),
+    }
+}
+
+pub fn branch_has_upstream(root: &Path, branch: &str) -> Result<bool> {
+    match git_exit(
+        root,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )? {
+        0 => Ok(true),
+        1 => Ok(false),
+        code => bail!("Git config exited with {code}"),
+    }
+}
+
+/// Whether every commit of `branch` is already in `base`; both must be local branches.
+pub fn branch_is_merged(root: &Path, branch: &str, base: &str) -> Result<bool> {
+    validate_branch(root, base)?;
+    validate_branch(root, branch)?;
+    match git_exit(root, &["merge-base", "--is-ancestor", branch, base])? {
+        0 => Ok(true),
+        1 => Ok(false),
+        code => bail!("Git merge-base exited with {code}"),
+    }
+}
+
+/// Checks out `branch` in a clean working tree, creating it from HEAD when `create`. Git itself
+/// refuses a branch that is checked out in another worktree.
+pub fn switch_branch(root: &Path, branch: &str, create: bool) -> Result<()> {
+    ensure!(
+        git(root, &["status", "--porcelain"])?.is_empty(),
+        "The working tree has uncommitted changes; commit or stash them first"
+    );
+    git(root, &["check-ref-format", "--branch", branch])?;
+    if create {
+        git(root, &["switch", "-c", branch])?;
+    } else {
+        git(root, &["switch", branch])?;
+    }
+    Ok(())
+}
+
+/// Renames the branch checked out in `worktree`, only while it is still on `old` and `old`
+/// was never pushed; Git updates the worktree's HEAD with the rename.
+pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<()> {
+    ensure!(
+        worktree_head_branch(worktree)?.as_deref() == Some(old),
+        "The worktree is no longer on {old}"
+    );
+    ensure!(
+        !branch_has_upstream(worktree, old)?,
+        "Branch {old} already has an upstream"
+    );
+    git(worktree, &["check-ref-format", "--branch", new])?;
+    git(worktree, &["branch", "-m", old, new])?;
+    Ok(())
+}
+
+pub fn inspect_worktree(
+    project_root: &Path,
+    path: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<WorktreeStatus> {
+    if !path.is_dir() {
+        return Ok(WorktreeStatus::default());
+    }
+    let head_branch = worktree_head_branch(path)?;
+    let clean = git(path, &["status", "--porcelain"])?.is_empty();
+    let merged = branch_is_merged(project_root, branch, base)?;
+    Ok(WorktreeStatus {
+        exists: true,
+        clean,
+        head_branch,
+        merged,
+    })
+}
+
+/// Removes a linked worktree directory; Git refuses a dirty one unless `force`.
+pub fn remove_worktree(project_root: &Path, path: &Path, force: bool) -> Result<()> {
+    let path_arg = path.to_str().context("Worktree path is not valid UTF-8")?;
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path_arg);
+    git(project_root, &args)?;
+    Ok(())
+}
+
+/// Drops Git's registration of worktrees whose directories are already gone.
+pub fn prune_worktrees(project_root: &Path) -> Result<()> {
+    git(project_root, &["worktree", "prune"])?;
+    Ok(())
+}
+
+/// Safe delete only: Git refuses a branch that is not merged into HEAD or its upstream.
+pub fn delete_branch(project_root: &Path, branch: &str) -> Result<()> {
+    git(project_root, &["branch", "-d", branch])?;
+    Ok(())
+}
+
 pub fn now() -> String {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -576,5 +759,116 @@ mod tests {
         assert!(diff.patch.contains("diff --git a/new.txt b/new.txt"));
         assert!(diff.patch.contains("+new line"));
         assert!(!diff.truncated);
+    }
+    #[test]
+    fn worktrees_are_created_renamed_inspected_and_removed() {
+        use super::{
+            branch_exists, branch_is_merged, create_worktree, delete_branch, inspect_worktree,
+            prune_worktrees, remove_worktree, rename_branch, worktree_head_branch,
+        };
+        let repository = TempRepository::new();
+        let data = std::env::temp_dir().join(format!("drostje-wt-{}", uuid::Uuid::new_v4()));
+        let path = data.join("worktrees").join("repo").join("amber-heron");
+        let created = create_worktree(&repository.0, &path, "drostje/amber-heron", "main").unwrap();
+        assert_eq!(created, fs::canonicalize(&path).unwrap());
+        assert!(path.join("tracked.txt").is_file());
+        assert_eq!(
+            worktree_head_branch(&created).unwrap().as_deref(),
+            Some("drostje/amber-heron")
+        );
+        assert!(branch_exists(&repository.0, "drostje/amber-heron").unwrap());
+        assert!(!branch_exists(&repository.0, "drostje/other").unwrap());
+        assert!(branch_is_merged(&repository.0, "drostje/amber-heron", "main").unwrap());
+        assert!(create_worktree(&repository.0, &path, "drostje/again", "main").is_err());
+        assert!(
+            create_worktree(
+                &repository.0,
+                &data.join("x"),
+                "drostje/amber-heron",
+                "main"
+            )
+            .is_err()
+        );
+
+        // Switching creates or checks out branches only in a clean tree.
+        use super::switch_branch;
+        switch_branch(&created, "drostje/side", true).unwrap();
+        assert_eq!(
+            worktree_head_branch(&created).unwrap().as_deref(),
+            Some("drostje/side")
+        );
+        assert!(
+            switch_branch(&created, "main", false).is_err(),
+            "main is checked out in the root"
+        );
+        switch_branch(&created, "drostje/amber-heron", false).unwrap();
+        fs::write(created.join("dirty.txt"), "x\n").unwrap();
+        assert!(switch_branch(&created, "drostje/side", false).is_err());
+        fs::remove_file(created.join("dirty.txt")).unwrap();
+        delete_branch(&repository.0, "drostje/side").unwrap();
+
+        // A commit on the branch leaves it unmerged and undeletable by the safe delete.
+        fs::write(created.join("tracked.txt"), "worktree change\n").unwrap();
+        git(&created, &["add", "tracked.txt"]);
+        git(
+            &created,
+            &[
+                "-c",
+                "user.name=DROSTJE.",
+                "-c",
+                "user.email=drostje@example.invalid",
+                "commit",
+                "-m",
+                "wip",
+            ],
+        );
+        let status =
+            inspect_worktree(&repository.0, &created, "drostje/amber-heron", "main").unwrap();
+        assert!(status.exists && status.clean && !status.merged);
+        assert_eq!(status.head_branch.as_deref(), Some("drostje/amber-heron"));
+        assert!(delete_branch(&repository.0, "drostje/amber-heron").is_err());
+
+        // The one-time rename follows the worktree's HEAD.
+        rename_branch(&created, "drostje/amber-heron", "drostje/fix-login").unwrap();
+        assert_eq!(
+            worktree_head_branch(&created).unwrap().as_deref(),
+            Some("drostje/fix-login")
+        );
+        assert!(!branch_exists(&repository.0, "drostje/amber-heron").unwrap());
+        assert!(rename_branch(&created, "drostje/amber-heron", "drostje/x").is_err());
+        assert!(worktree_head_branch(&repository.0.join("..")).is_err());
+
+        // Dirty trees are refused without force; detached HEAD reads as no branch.
+        fs::write(created.join("scratch.txt"), "untracked\n").unwrap();
+        let dirty = inspect_worktree(&repository.0, &created, "drostje/fix-login", "main").unwrap();
+        assert!(!dirty.clean);
+        assert!(remove_worktree(&repository.0, &created, false).is_err());
+        git(&created, &["checkout", "--detach"]);
+        assert_eq!(worktree_head_branch(&created).unwrap(), None);
+        remove_worktree(&repository.0, &created, true).unwrap();
+        assert!(!created.exists());
+        let gone = inspect_worktree(&repository.0, &created, "drostje/fix-login", "main").unwrap();
+        assert!(!gone.exists);
+
+        // A directory deleted by hand leaves a stale registration that prune drops.
+        let second = data.join("worktrees").join("repo").join("bold-otter");
+        create_worktree(&repository.0, &second, "drostje/bold-otter", "main").unwrap();
+        fs::remove_dir_all(&second).unwrap();
+        prune_worktrees(&repository.0).unwrap();
+        assert!(!git_output(&repository.0, &["worktree", "list"]).contains("bold-otter"));
+        assert!(branch_is_merged(&repository.0, "drostje/bold-otter", "main").unwrap());
+        delete_branch(&repository.0, "drostje/bold-otter").unwrap();
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    fn git_output(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
     }
 }

@@ -84,7 +84,12 @@ pub enum ConversationCommand {
 pub enum UserAnswer {
     Value(String),
     Confirmed(bool),
-    Cancelled { timed_out: bool },
+    /// Approve this Claude Code permission, switch the session to auto, and approve other
+    /// permission requests that are already pending.
+    PermissionAuto,
+    Cancelled {
+        timed_out: bool,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationState {
@@ -174,6 +179,10 @@ pub struct ToolActivity {
 pub enum UserRequestKind {
     Confirm,
     Select,
+    /// A Claude Code permission request. Kept distinct so only permissions expose auto approval.
+    Permission,
+    /// A Claude Code AskUserQuestion selection which also accepts a free-form answer.
+    Question,
     Input,
     Editor,
 }

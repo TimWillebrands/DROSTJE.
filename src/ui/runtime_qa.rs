@@ -633,6 +633,125 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; creates and removes a real Git worktree, no provider turn"]
+async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let root = cx.read(|cx| fixture.state.read(cx).project().unwrap().root.clone());
+    cx.dispatch_action(fixture.window.into(), commands::NewConversationInWorktree);
+    cx.run_until_parked();
+    assert!(cx.read(|cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| {
+                matches!(
+                    dialog.read(cx).kind,
+                    crate::ui::settings::DialogKind::NewWorktreeConversation(_)
+                )
+            })
+    }));
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(cx, "worktree conversation", Duration::from_secs(20), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .conversation_thread()
+            .is_some_and(|thread| thread.worktree_id.is_some())
+    })
+    .await;
+    let (thread, worktree) = cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        let thread = state.conversation_thread().unwrap().clone();
+        let worktree = state.thread_worktree(&thread).unwrap().clone();
+        (thread, worktree)
+    });
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
+    assert!(
+        worktree
+            .path
+            .starts_with(fs::canonicalize(&fixture.data).unwrap().join("worktrees"))
+    );
+    assert!(worktree.path.is_dir());
+    assert!(worktree.branch.starts_with(crate::worktrees::BRANCH_PREFIX));
+    assert_eq!(worktree.created_by, thread.id);
+    assert_eq!(
+        platform::worktree_head_branch(&worktree.path)
+            .unwrap()
+            .as_deref(),
+        Some(worktree.branch.as_str())
+    );
+
+    // Cmd-N from a Conversation in a worktree shares that worktree.
+    cx.dispatch_action(fixture.window.into(), commands::NewConversation);
+    cx.run_until_parked();
+    let sibling = cx.read(|cx| {
+        fixture
+            .state
+            .read(cx)
+            .conversation_thread()
+            .unwrap()
+            .clone()
+    });
+    assert_ne!(sibling.id, thread.id);
+    assert_eq!(sibling.worktree_id, Some(worktree.id));
+
+    // Switching to a new branch from HEAD settles the title rename and updates the label.
+    cx.dispatch_action(fixture.window.into(), commands::SwitchBranch);
+    cx.run_until_parked();
+    set_dialog(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        "new_branch",
+        "feature-x",
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(cx, "branch switch", Duration::from_secs(20), |cx| {
+        let state = fixture.state.read(cx);
+        state
+            .worktree(worktree.id)
+            .is_some_and(|w| w.branch == "feature-x" && w.named)
+            && state.worktree_heads.get(&worktree.id) == Some(&Some("feature-x".into()))
+    })
+    .await;
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
+    assert_eq!(
+        platform::worktree_head_branch(&worktree.path)
+            .unwrap()
+            .as_deref(),
+        Some("feature-x")
+    );
+
+    // Archiving the last live thread removes a clean, merged worktree and its branch.
+    for id in [sibling.id, thread.id] {
+        fixture.state.update(cx, |state, cx| {
+            state.select_thread(id);
+            cx.notify();
+        });
+        cx.dispatch_action(fixture.window.into(), commands::ArchiveThread);
+        cx.run_until_parked();
+    }
+    until(
+        cx,
+        "automatic worktree removal",
+        Duration::from_secs(20),
+        |cx| {
+            fixture
+                .state
+                .read(cx)
+                .worktree(worktree.id)
+                .is_some_and(|worktree| !worktree.is_live())
+        },
+    )
+    .await;
+    assert!(!worktree.path.exists());
+    assert!(!platform::branch_exists(&root, "feature-x").unwrap());
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native live diff sidebar, no provider turn"]
 async fn conversation_diff_sidebar_tracks_working_tree(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;

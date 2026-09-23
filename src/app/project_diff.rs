@@ -1,13 +1,14 @@
 use super::*;
 
+/// Changes are cached per working tree (project root or linked worktree), never per thread.
 #[derive(Default)]
 pub struct ProjectDiffs {
-    projects: HashMap<ProjectId, ProjectDiffState>,
+    trees: HashMap<WorkingTree, ProjectDiffState>,
 }
 
-/// A project has one cached result and at most one working-tree read, even when
-/// several conversations show it. Hiding invalidates the result of an existing
-/// read without releasing its slot: reopening cannot overlap that read.
+/// A working tree has one cached result and at most one Git read, even when several
+/// conversations show it. Hiding invalidates the result of an existing read without
+/// releasing its slot: reopening cannot overlap that read.
 pub struct ProjectDiffState {
     pub result: Option<Result<platform::RepositoryDiff, String>>,
     pub loading: bool,
@@ -118,8 +119,8 @@ impl ProjectDiffState {
 }
 
 impl AppState {
-    pub fn project_diff(&self, id: ProjectId) -> Option<&ProjectDiffState> {
-        self.project_diffs.projects.get(&id)
+    pub fn working_tree_diff(&self, key: WorkingTree) -> Option<&ProjectDiffState> {
+        self.project_diffs.trees.get(&key)
     }
 
     pub fn conversation_diff(&self, id: ThreadId) -> Option<&ProjectDiffState> {
@@ -128,7 +129,17 @@ impl AppState {
             .threads
             .iter()
             .find(|thread| thread.id == id)?;
-        self.project_diff(thread.project_id)
+        let (key, _) = self.working_tree_of(thread)?;
+        self.working_tree_diff(key)
+    }
+
+    fn conversation_tree(&self, id: ThreadId) -> Option<WorkingTree> {
+        let thread = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id && thread.kind == ThreadKind::Conversation)?;
+        self.working_tree_of(thread).map(|(key, _)| key)
     }
 
     /// Supply the actual visible conversation panes, not every retained tab.
@@ -138,7 +149,7 @@ impl AppState {
         ids: impl IntoIterator<Item = ThreadId>,
         cx: &mut Context<Self>,
     ) {
-        let mut interests: HashMap<ProjectId, (PathBuf, HashSet<ThreadId>)> = HashMap::new();
+        let mut interests: HashMap<WorkingTree, (PathBuf, HashSet<ThreadId>)> = HashMap::new();
         if !self.shutting_down {
             for id in ids {
                 if !self.thread_sidebar_open(id)
@@ -154,72 +165,64 @@ impl AppState {
                 else {
                     continue;
                 };
-                let Some(project) = self
-                    .snapshot
-                    .projects
-                    .iter()
-                    .find(|project| project.id == thread.project_id)
-                else {
+                let Some((key, root)) = self.working_tree_of(thread) else {
                     continue;
                 };
                 interests
-                    .entry(project.id)
-                    .or_insert_with(|| (project.root.clone(), HashSet::new()))
+                    .entry(key)
+                    .or_insert_with(|| (root, HashSet::new()))
                     .1
                     .insert(id);
             }
         }
         let mut refresh = Vec::new();
-        for (id, diff) in &mut self.project_diffs.projects {
-            let (root, interested) = match interests.remove(id) {
+        for (key, diff) in &mut self.project_diffs.trees {
+            let (root, interested) = match interests.remove(key) {
                 Some((root, interested)) => (Some(root), interested),
                 None => (None, HashSet::new()),
             };
             if diff.set_interest(root, interested) {
-                refresh.push(*id);
+                refresh.push(*key);
             }
         }
-        for (id, (root, interested)) in interests {
+        for (key, (root, interested)) in interests {
             let mut diff = ProjectDiffState::new(root);
             diff.set_interest(None, interested);
-            self.project_diffs.projects.insert(id, diff);
-            refresh.push(id);
+            self.project_diffs.trees.insert(key, diff);
+            refresh.push(key);
         }
-        for id in refresh {
-            self.refresh_project_diff(id, true, cx);
+        for key in refresh {
+            self.refresh_project_diff(key, true, cx);
         }
     }
 
     pub fn refresh_conversation_diff(&mut self, id: ThreadId, cx: &mut Context<Self>) {
-        let Some(project_id) = self.snapshot.threads.iter().find_map(|thread| {
-            (thread.id == id && thread.kind == ThreadKind::Conversation)
-                .then_some(thread.project_id)
-        }) else {
+        let Some(key) = self.conversation_tree(id) else {
             return;
         };
-        self.refresh_project_diff(project_id, true, cx);
+        self.refresh_project_diff(key, true, cx);
     }
 
     pub(super) fn queue_conversation_diff(&mut self, id: ThreadId, cx: &mut Context<Self>) {
-        let Some(project_id) = self
-            .snapshot
-            .threads
-            .iter()
-            .find_map(|thread| (thread.id == id).then_some(thread.project_id))
-        else {
+        let Some(key) = self.conversation_tree(id) else {
             return;
         };
-        if let Some(diff) = self.project_diffs.projects.get_mut(&project_id) {
+        if let Some(diff) = self.project_diffs.trees.get_mut(&key) {
             diff.dirty = true;
         }
-        self.schedule_project_diff(project_id, cx);
+        self.schedule_project_diff(key, cx);
     }
 
-    fn refresh_project_diff(&mut self, id: ProjectId, explicit: bool, cx: &mut Context<Self>) {
+    pub(super) fn refresh_project_diff(
+        &mut self,
+        id: WorkingTree,
+        explicit: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.shutting_down {
             return;
         }
-        let Some(diff) = self.project_diffs.projects.get_mut(&id) else {
+        let Some(diff) = self.project_diffs.trees.get_mut(&id) else {
             return;
         };
         let (request, changed) = diff.begin_refresh(explicit);
@@ -235,7 +238,11 @@ impl AppState {
             })
             .await;
             let _ = this.update(cx, |state, cx| {
-                let Some(diff) = state.project_diffs.projects.get_mut(&id) else {
+                let head = result.as_ref().ok().map(|diff| diff.head_branch.clone());
+                if let Some(head) = head {
+                    state.record_head(id, head);
+                }
+                let Some(diff) = state.project_diffs.trees.get_mut(&id) else {
                     return;
                 };
                 let Some(completion) = diff.complete(generation, result) else {
@@ -255,20 +262,20 @@ impl AppState {
         .detach();
     }
 
-    fn project_has_active_conversation(&self, id: ProjectId) -> bool {
-        self.snapshot
-            .threads
-            .iter()
-            .any(|thread| thread.project_id == id && self.active_threads.contains(&thread.id))
+    fn project_has_active_conversation(&self, id: WorkingTree) -> bool {
+        self.snapshot.threads.iter().any(|thread| {
+            self.active_threads.contains(&thread.id)
+                && self.working_tree_of(thread).map(|(key, _)| key) == Some(id)
+        })
     }
 
-    fn schedule_project_diff(&mut self, id: ProjectId, cx: &mut Context<Self>) {
+    fn schedule_project_diff(&mut self, id: WorkingTree, cx: &mut Context<Self>) {
         if self.shutting_down {
             return;
         }
         let Some(token) = self
             .project_diffs
-            .projects
+            .trees
             .get_mut(&id)
             .and_then(|diff| diff.schedule())
         else {
@@ -279,7 +286,7 @@ impl AppState {
             let _ = this.update(cx, |state, cx| {
                 if state
                     .project_diffs
-                    .projects
+                    .trees
                     .get_mut(&id)
                     .is_some_and(|diff| diff.take_scheduled(token))
                 {

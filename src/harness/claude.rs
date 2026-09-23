@@ -651,15 +651,19 @@ impl Actor {
                 }
             }
             ConversationCommand::Respond { request_id, answer } => {
-                if let Some(permission) = self.permissions.remove(&request_id) {
-                    let Some(response) = permission_response(&permission, &answer) else {
-                        self.permissions.insert(request_id, permission);
-                        self.emit(ConversationEvent::Notice {
-                            level: "error".into(),
-                            text: "Claude Code requests take one of the offered answers".into(),
-                        });
-                        return Ok(());
-                    };
+                if !self.permissions.contains_key(&request_id) {
+                    return Ok(());
+                }
+                let Some(responses) =
+                    permission_responses(&mut self.permissions, &request_id, &answer)
+                else {
+                    self.emit(ConversationEvent::Notice {
+                        level: "error".into(),
+                        text: "Claude Code request does not accept that answer".into(),
+                    });
+                    return Ok(());
+                };
+                for (request_id, response) in responses {
                     self.queue(
                         json!({"type":"control_response","response":{
                             "subtype":"success","request_id":request_id,"response":response
@@ -667,8 +671,12 @@ impl Actor {
                         None,
                     )?;
                     self.emit(ConversationEvent::UserRequestDismissed { request_id });
-                    self.state(ConversationState::Running);
                 }
+                self.state(if self.permissions.is_empty() {
+                    ConversationState::Running
+                } else {
+                    ConversationState::WaitingForInput
+                });
             }
             ConversationCommand::Submit {
                 request_id,
@@ -1210,7 +1218,7 @@ fn permission_request(
     Ok((
         UserRequest {
             id: request_id,
-            kind: UserRequestKind::Select,
+            kind: UserRequestKind::Permission,
             title: format!("Allow {display_name}?"),
             options,
             text,
@@ -1272,7 +1280,7 @@ fn question_request(
     Ok((
         UserRequest {
             id: request_id,
-            kind: UserRequestKind::Select,
+            kind: UserRequestKind::Question,
             title,
             options,
             text: text.clone(),
@@ -1303,15 +1311,15 @@ fn permission_response(permission: &Permission, answer: &UserAnswer) -> Option<V
         (UserAnswer::Confirmed(true), None) => Some(allow(None)),
         (UserAnswer::Confirmed(_), Some(_)) => None,
         (UserAnswer::Value(value), Some(question)) => {
-            let offered = permission.input["questions"][0]["options"]
-                .as_array()?
-                .iter()
-                .any(|option| option["label"] == *value);
-            offered.then(|| {
-                let mut input = permission.input.clone();
-                input["answers"] = json!({ question.as_str(): value });
-                json!({"behavior":"allow","updatedInput":input})
-            })
+            let mut input = permission.input.clone();
+            input["answers"] = json!({ question.as_str(): value });
+            Some(json!({"behavior":"allow","updatedInput":input}))
+        }
+        (UserAnswer::PermissionAuto, None) => {
+            let mut response = allow(None);
+            response["updatedPermissions"] =
+                json!([{"type":"setMode","mode":"auto","destination":"session"}]);
+            Some(response)
         }
         (UserAnswer::Value(value), None) if value == ALLOW => Some(allow(None)),
         (UserAnswer::Value(value), None) if value == DENY => Some(deny(DENIED)),
@@ -1320,7 +1328,40 @@ fn permission_response(permission: &Permission, answer: &UserAnswer) -> Option<V
             .iter()
             .find(|(label, _)| label == value)
             .map(|(_, suggestion)| allow(Some(suggestion))),
+        (UserAnswer::PermissionAuto, Some(_)) => None,
     }
+}
+
+/// Removes and answers one request. Auto approval also clears every other pending permission,
+/// while AskUserQuestion entries remain for the user.
+fn permission_responses(
+    permissions: &mut HashMap<String, Permission>,
+    request_id: &str,
+    answer: &UserAnswer,
+) -> Option<Vec<(String, Value)>> {
+    let permission = permissions.remove(request_id)?;
+    let Some(response) = permission_response(&permission, answer) else {
+        permissions.insert(request_id.to_owned(), permission);
+        return None;
+    };
+    let mut responses = vec![(request_id.to_owned(), response)];
+    if matches!(answer, UserAnswer::PermissionAuto) {
+        let mut pending: Vec<String> = permissions
+            .iter()
+            .filter(|(_, permission)| permission.question.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        pending.sort();
+        for id in pending {
+            if let Some(permission) = permissions.remove(&id)
+                && let Some(response) =
+                    permission_response(&permission, &UserAnswer::Confirmed(true))
+            {
+                responses.push((id, response));
+            }
+        }
+    }
+    Some(responses)
 }
 
 /// Label for one `permission_suggestions` item, or `None` for kinds DROSTJE will not offer
@@ -1575,7 +1616,7 @@ mod tests {
             "tool_use_id":"tool-1"});
         let (shown, permission) =
             permission_request("permission-1".into(), &request).expect("presentable");
-        assert_eq!(shown.kind, UserRequestKind::Select);
+        assert_eq!(shown.kind, UserRequestKind::Permission);
         assert_eq!(shown.title, "Allow Bash?");
         assert_eq!(shown.text, "Create sub directory\nBash: mkdir -p sub");
         let labels: Vec<&str> = shown.options.iter().map(|o| o.value.as_str()).collect();
@@ -1616,10 +1657,62 @@ mod tests {
             "allow"
         );
         assert!(permission_response(&permission, &UserAnswer::Value("Maybe".into())).is_none());
+        let auto = permission_response(&permission, &UserAnswer::PermissionAuto).unwrap();
+        assert_eq!(auto["behavior"], "allow");
+        assert_eq!(
+            auto["updatedPermissions"],
+            json!([{"type":"setMode","mode":"auto","destination":"session"}])
+        );
     }
 
     #[test]
-    fn single_choice_questions_become_selections_and_others_are_declined() {
+    fn auto_permission_approves_pending_permissions_but_leaves_questions_open() {
+        let mut permissions = HashMap::from([
+            (
+                "current".into(),
+                Permission {
+                    input: json!({"command":"cargo check"}),
+                    choices: Vec::new(),
+                    question: None,
+                },
+            ),
+            (
+                "other".into(),
+                Permission {
+                    input: json!({"command":"cargo test"}),
+                    choices: Vec::new(),
+                    question: None,
+                },
+            ),
+            (
+                "question".into(),
+                Permission {
+                    input: json!({"questions":[]}),
+                    choices: Vec::new(),
+                    question: Some("Which option?".into()),
+                },
+            ),
+        ]);
+
+        let responses =
+            permission_responses(&mut permissions, "current", &UserAnswer::PermissionAuto).unwrap();
+
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].0, "current");
+        assert_eq!(
+            responses[0].1["updatedPermissions"],
+            json!([{"type":"setMode","mode":"auto","destination":"session"}])
+        );
+        assert_eq!(responses[1].0, "other");
+        assert!(responses[1].1.get("updatedPermissions").is_none());
+        assert_eq!(
+            permissions.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["question"]
+        );
+    }
+
+    #[test]
+    fn single_choice_questions_accept_offered_and_custom_answers() {
         let question = |questions: Value| {
             json!({"subtype":"can_use_tool","tool_name":"AskUserQuestion",
                 "input":{"questions":questions},"tool_use_id":"tool-1"})
@@ -1632,7 +1725,7 @@ mod tests {
             ),
         )
         .expect("presentable");
-        assert_eq!(shown.kind, UserRequestKind::Select);
+        assert_eq!(shown.kind, UserRequestKind::Question);
         assert_eq!(shown.title, "Colour");
         assert_eq!(shown.text, "Which colour?");
         assert_eq!(shown.options.len(), 2);
@@ -1647,7 +1740,13 @@ mod tests {
             answer["updatedInput"]["questions"].as_array().map(Vec::len),
             Some(1)
         );
-        assert!(permission_response(&permission, &UserAnswer::Value("Green".into())).is_none());
+        assert!(permission_response(&permission, &UserAnswer::PermissionAuto).is_none());
+        let custom =
+            permission_response(&permission, &UserAnswer::Value("Something else".into())).unwrap();
+        assert_eq!(
+            custom["updatedInput"]["answers"],
+            json!({"Which colour?":"Something else"})
+        );
         assert!(permission_response(&permission, &UserAnswer::Confirmed(true)).is_none());
         assert_eq!(
             permission_response(&permission, &UserAnswer::Cancelled { timed_out: true }).unwrap()["behavior"],
@@ -2012,7 +2111,7 @@ done
                 }
                 ConversationEvent::UserRequest(request) => {
                     assert_eq!(request.id, "permission-1");
-                    assert_eq!(request.kind, UserRequestKind::Select);
+                    assert_eq!(request.kind, UserRequestKind::Permission);
                     permission = Some(request);
                 }
                 _ => {}

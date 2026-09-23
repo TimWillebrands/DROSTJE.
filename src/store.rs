@@ -1,5 +1,6 @@
 use crate::model::{
-    FactoryLaunch, FactoryThreadConfig, Project, Thread, ThreadKind, WorkspaceSnapshot,
+    FactoryLaunch, FactoryThreadConfig, Project, Thread, ThreadKind, WorkspaceSnapshot, Worktree,
+    WorktreeId,
 };
 use anyhow::{Context, Result, bail};
 use async_channel::{Receiver, Sender};
@@ -19,17 +20,35 @@ use std::{
 };
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 /// Version 2 lacks `threads.effort`, version 3 lacks `threads.permission_mode`, version 4
-/// lacks `threads.queued_json`; opening any of them adds the missing trailing columns in
+/// lacks `threads.queued_json`, version 5 lacks the `worktrees` table and
+/// `threads.worktree_id`; opening any of them adds the missing trailing columns and table in
 /// one transaction.
-const UPGRADABLE_VERSIONS: [i64; 3] = [2, 3, 4];
-const SCHEMA: &str = "
+const UPGRADABLE_VERSIONS: [i64; 4] = [2, 3, 4, 5];
+/// Shared by the initial schema and the v5 upgrade. `created_by` names the thread whose title
+/// may rename the branch; it is deliberately not a foreign key because the worktree row is
+/// written before its first thread.
+macro_rules! worktrees_table {
+    () => {
+        "CREATE TABLE worktrees(
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
+    path TEXT UNIQUE NOT NULL, codename TEXT NOT NULL, branch TEXT NOT NULL, base TEXT NOT NULL,
+    named INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL, removed_at TEXT
+);"
+    };
+}
+const SCHEMA: &str = concat!(
+    "
 CREATE TABLE settings(key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
 CREATE TABLE projects(
     id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT UNIQUE NOT NULL,
     archived INTEGER NOT NULL DEFAULT 0, defaults_json TEXT NOT NULL
 );
+",
+    worktrees_table!(),
+    "
 CREATE TABLE threads(
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
     title TEXT NOT NULL, harness TEXT NOT NULL, session_ref TEXT, model_json TEXT,
@@ -37,7 +56,8 @@ CREATE TABLE threads(
     submission_json TEXT, archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'conversation', factory_config_json TEXT, effort TEXT,
-    permission_mode TEXT, queued_json TEXT NOT NULL DEFAULT '[]'
+    permission_mode TEXT, queued_json TEXT NOT NULL DEFAULT '[]',
+    worktree_id TEXT REFERENCES worktrees(id)
 );
 CREATE TABLE factory_launches(
     id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id),
@@ -45,7 +65,8 @@ CREATE TABLE factory_launches(
     event_path TEXT UNIQUE, work_item_id INTEGER, attempt_id TEXT,
     process_exit INTEGER, launch_error TEXT, created_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX factory_launches_factory_thread ON factory_launches(factory_thread_id);";
+CREATE UNIQUE INDEX factory_launches_factory_thread ON factory_launches(factory_thread_id);"
+);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -73,6 +94,7 @@ enum Command {
     Snapshot(Reply<WorkspaceSnapshot>),
     SaveProject(Project, Reply<()>),
     SaveThread(Thread, Reply<()>),
+    SaveWorktree(Worktree, Reply<()>),
     SaveLaunch(FactoryLaunch, Reply<()>),
     SetSetting(String, Value, Reply<()>),
     Writable(Reply<()>),
@@ -135,6 +157,11 @@ impl Store {
 
     pub async fn save_thread(&self, thread: Thread) -> Result<()> {
         self.request(|reply| Command::SaveThread(thread, reply))
+            .await
+    }
+
+    pub async fn save_worktree(&self, worktree: Worktree) -> Result<()> {
+        self.request(|reply| Command::SaveWorktree(worktree, reply))
             .await
     }
 
@@ -255,8 +282,14 @@ fn open_database(path: &Path) -> Result<Connection> {
             if version < 4 {
                 transaction.execute_batch("ALTER TABLE threads ADD COLUMN permission_mode TEXT")?;
             }
+            if version < 5 {
+                transaction.execute_batch(
+                    "ALTER TABLE threads ADD COLUMN queued_json TEXT NOT NULL DEFAULT '[]'",
+                )?;
+            }
+            transaction.execute_batch(worktrees_table!())?;
             transaction.execute_batch(
-                "ALTER TABLE threads ADD COLUMN queued_json TEXT NOT NULL DEFAULT '[]'",
+                "ALTER TABLE threads ADD COLUMN worktree_id TEXT REFERENCES worktrees(id)",
             )?;
             validate_schema(&transaction, SCHEMA_VERSION)?;
             read_snapshot(&transaction)?;
@@ -329,7 +362,7 @@ fn ensure_empty(connection: &Connection) -> Result<()> {
 // whitespace and index names do not matter; incompatible schemas are never upgraded.
 fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
     type Column<'a> = (&'a str, &'a str, bool, Option<&'a str>, bool);
-    let tables: &[(&str, &[Column<'_>])] = &[
+    let all_tables: &[(&str, &[Column<'_>])] = &[
         (
             "settings",
             &[
@@ -367,6 +400,22 @@ fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
                 ("effort", "TEXT", false, None, false),
                 ("permission_mode", "TEXT", false, None, false),
                 ("queued_json", "TEXT", true, Some("'[]'"), false),
+                ("worktree_id", "TEXT", false, None, false),
+            ],
+        ),
+        (
+            "worktrees",
+            &[
+                ("id", "TEXT", false, None, true),
+                ("project_id", "TEXT", true, None, false),
+                ("path", "TEXT", true, None, false),
+                ("codename", "TEXT", true, None, false),
+                ("branch", "TEXT", true, None, false),
+                ("base", "TEXT", true, None, false),
+                ("named", "INTEGER", true, Some("0"), false),
+                ("created_by", "TEXT", true, None, false),
+                ("created_at", "TEXT", true, None, false),
+                ("removed_at", "TEXT", false, None, false),
             ],
         ),
         (
@@ -385,6 +434,11 @@ fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
             ],
         ),
     ];
+    // Versions before 6 have no `worktrees` table.
+    let tables: Vec<_> = all_tables
+        .iter()
+        .filter(|(table, _)| version >= 6 || *table != "worktrees")
+        .collect();
     let mut statement = connection.prepare(
         "SELECT type, name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' AND type != 'index'",
     )?;
@@ -401,12 +455,13 @@ fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
         bail!("Database objects do not match workspace schema v{version}");
     }
     for (table, expected) in tables {
-        // Versions 2 to 4 predate the trailing `effort`, `permission_mode` and
-        // `queued_json` columns.
+        // Versions 2 to 5 predate the trailing `effort`, `permission_mode`, `queued_json`
+        // and `worktree_id` columns.
         let missing = match (*table, version) {
-            ("threads", 2) => 3,
-            ("threads", 3) => 2,
-            ("threads", 4) => 1,
+            ("threads", 2) => 4,
+            ("threads", 3) => 3,
+            ("threads", 4) => 2,
+            ("threads", 5) => 1,
             _ => 0,
         };
         let expected: &[_] = &expected[..expected.len() - missing];
@@ -439,15 +494,26 @@ fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
     require_unique(connection, "projects", "root")?;
     require_unique(connection, "factory_launches", "event_path")?;
     require_unique(connection, "factory_launches", "factory_thread_id")?;
-    for (table, expected) in [
+    if version >= 6 {
+        require_unique(connection, "worktrees", "path")?;
+    }
+    let mut thread_keys = vec![("project_id", "projects")];
+    if version >= 6 {
+        thread_keys.push(("worktree_id", "worktrees"));
+    }
+    let mut foreign_keys = vec![
         ("settings", Vec::new()),
         ("projects", Vec::new()),
-        ("threads", vec![("project_id", "projects")]),
+        ("threads", thread_keys),
         (
             "factory_launches",
             vec![("project_id", "projects"), ("factory_thread_id", "threads")],
         ),
-    ] {
+    ];
+    if version >= 6 {
+        foreign_keys.push(("worktrees", vec![("project_id", "projects")]));
+    }
+    for (table, expected) in foreign_keys {
         let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list({table})"))?;
         let keys = statement
             .query_map([], |row| {
@@ -546,6 +612,15 @@ fn serve(mut connection: Connection, commands: Receiver<Command>, failures: Send
                     &failures,
                     reply,
                     |connection| save_thread(connection, thread),
+                );
+            }
+            Command::SaveWorktree(worktree, reply) => {
+                complete_write(
+                    &mut connection,
+                    &mut failure,
+                    &failures,
+                    reply,
+                    |connection| save_worktree(connection, worktree),
                 );
             }
             Command::SaveLaunch(launch, reply) => {
@@ -674,6 +749,89 @@ fn require_project(connection: &Connection, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+fn require_worktree(connection: &Connection, id: WorktreeId, project: Uuid) -> Result<()> {
+    let owner: Option<Uuid> = connection
+        .query_row(
+            "SELECT project_id FROM worktrees WHERE id = ?1",
+            [id.to_string()],
+            |row| uuid(row, 0),
+        )
+        .optional()?;
+    if owner != Some(project) {
+        return Err(invalid(format!(
+            "Worktree {id} does not belong to project {project}"
+        )));
+    }
+    Ok(())
+}
+
+fn save_worktree(connection: &mut Connection, worktree: Worktree) -> Result<()> {
+    if !worktree.path.is_absolute() {
+        return Err(invalid("Worktree path must be an absolute directory"));
+    }
+    let path = path_text(&worktree.path)?;
+    let id = worktree.id.to_string();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    require_project(&transaction, worktree.project_id)?;
+    let previous = transaction
+        .query_row(
+            "SELECT project_id, path, codename, base, created_by FROM worktrees WHERE id = ?1",
+            [&id],
+            |row| {
+                Ok((
+                    uuid(row, 0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    uuid(row, 4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if previous
+        .as_ref()
+        .is_some_and(|(project, previous_path, codename, base, creator)| {
+            *project != worktree.project_id
+                || previous_path != path
+                || *codename != worktree.codename
+                || *base != worktree.base
+                || *creator != worktree.created_by
+        })
+    {
+        return Err(invalid(
+            "A worktree's project, directory, codename, base and creator cannot be reassigned",
+        ));
+    }
+    let duplicate: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM worktrees WHERE path = ?1 AND id != ?2)",
+        params![path, id],
+        |row| row.get(0),
+    )?;
+    if duplicate {
+        return Err(invalid(format!("A worktree already owns directory {path}")));
+    }
+    transaction.execute(
+        "INSERT INTO worktrees(id, project_id, path, codename, branch, base, named, created_by,
+         created_at, removed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET branch = excluded.branch, named = excluded.named,
+         removed_at = excluded.removed_at",
+        params![
+            id,
+            worktree.project_id.to_string(),
+            path,
+            worktree.codename,
+            worktree.branch,
+            worktree.base,
+            worktree.named,
+            worktree.created_by.to_string(),
+            worktree.created_at,
+            worktree.removed_at
+        ],
+    )?;
+    transaction.commit().context("Persist worktree")
+}
+
 fn save_project(connection: &mut Connection, project: Project) -> Result<()> {
     if !project.root.is_absolute() {
         return Err(invalid(
@@ -708,24 +866,32 @@ fn save_thread(connection: &mut Connection, thread: Thread) -> Result<()> {
     let id = thread.id.to_string();
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     require_project(&transaction, thread.project_id)?;
+    if let Some(worktree) = thread.worktree_id {
+        require_worktree(&transaction, worktree, thread.project_id)?;
+    }
     let previous = transaction
         .query_row(
-            "SELECT project_id, kind, factory_config_json FROM threads WHERE id = ?1",
+            "SELECT project_id, kind, factory_config_json, worktree_id FROM threads WHERE id = ?1",
             [&id],
             |row| {
                 Ok((
                     uuid(row, 0)?,
                     thread_kind(row, 1)?,
                     decode_optional::<FactoryThreadConfig>(row, 2)?,
+                    uuid_optional(row, 3)?,
                 ))
             },
         )
         .optional()?;
     if previous
         .as_ref()
-        .is_some_and(|(project, kind, _)| *project != thread.project_id || kind != &thread.kind)
+        .is_some_and(|(project, kind, _, worktree)| {
+            *project != thread.project_id || kind != &thread.kind || *worktree != thread.worktree_id
+        })
     {
-        return Err(invalid("A thread's project and kind cannot be reassigned"));
+        return Err(invalid(
+            "A thread's project, kind and worktree cannot be reassigned",
+        ));
     }
     let owns_launch: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM factory_launches WHERE factory_thread_id = ?1)",
@@ -735,7 +901,7 @@ fn save_thread(connection: &mut Connection, thread: Thread) -> Result<()> {
     if owns_launch
         && previous
             .as_ref()
-            .is_some_and(|(_, _, config)| config != &thread.factory)
+            .is_some_and(|(_, _, config, _)| config != &thread.factory)
     {
         return Err(invalid(
             "A launched Factory thread's configuration is read-only",
@@ -748,8 +914,8 @@ fn save_thread(connection: &mut Connection, thread: Thread) -> Result<()> {
     let queued = encode(&thread.queued)?;
     transaction.execute("INSERT INTO threads(id, project_id, title, harness, session_ref, model_json, draft,
         attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json, effort,
-        permission_mode, queued_json)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+        permission_mode, queued_json, worktree_id)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
         ON CONFLICT(id) DO UPDATE SET title = excluded.title, harness = excluded.harness,
         session_ref = excluded.session_ref, model_json = excluded.model_json, draft = excluded.draft,
         attachments_json = excluded.attachments_json, submission_json = excluded.submission_json,
@@ -759,7 +925,7 @@ fn save_thread(connection: &mut Connection, thread: Thread) -> Result<()> {
         params![id, thread.project_id.to_string(), thread.title, thread.harness, thread.session_ref,
             model, thread.draft, attachments, submission, thread.archived, thread.created_at,
             thread.updated_at, kind_text(&thread.kind), factory, thread.effort, thread.permission_mode,
-            queued])?;
+            queued, thread.worktree_id.map(|id| id.to_string())])?;
     transaction.commit().context("Persist thread and draft")
 }
 
@@ -883,6 +1049,16 @@ fn uuid(row: &Row<'_>, column: usize) -> rusqlite::Result<Uuid> {
     })
 }
 
+fn uuid_optional(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<Uuid>> {
+    let text: Option<String> = row.get(column)?;
+    text.map(|text| {
+        Uuid::parse_str(&text).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+        })
+    })
+    .transpose()
+}
+
 fn archived(row: &Row<'_>, column: usize) -> rusqlite::Result<bool> {
     match row.get::<_, i64>(column)? {
         0 => Ok(false),
@@ -924,6 +1100,36 @@ fn read_projects(connection: &Connection) -> Result<Vec<Project>> {
         bail!("Stored projects contain duplicate UUID identities");
     }
     Ok(projects)
+}
+
+fn read_worktrees(connection: &Connection) -> Result<Vec<Worktree>> {
+    let worktrees = connection
+        .prepare(
+            "SELECT id, project_id, path, codename, branch, base, named, created_by, created_at,
+             removed_at FROM worktrees ORDER BY created_at, id",
+        )?
+        .query_map([], |row| {
+            Ok(Worktree {
+                id: uuid(row, 0)?,
+                project_id: uuid(row, 1)?,
+                path: PathBuf::from(row.get::<_, String>(2)?),
+                codename: row.get(3)?,
+                branch: row.get(4)?,
+                base: row.get(5)?,
+                named: archived(row, 6)?,
+                created_by: uuid(row, 7)?,
+                created_at: row.get(8)?,
+                removed_at: row.get(9)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if worktrees
+        .iter()
+        .any(|worktree| !worktree.path.is_absolute())
+    {
+        bail!("Stored worktree directory is not absolute");
+    }
+    Ok(worktrees)
 }
 
 fn read_settings(connection: &Connection) -> Result<std::collections::BTreeMap<String, Value>> {
@@ -991,15 +1197,16 @@ fn read_snapshot(connection: &Connection) -> Result<WorkspaceSnapshot> {
     let projects = read_projects(connection)?;
     let threads = connection.prepare("SELECT id, project_id, title, harness, session_ref, model_json, draft,
         attachments_json, submission_json, archived, created_at, updated_at, kind, factory_config_json, effort,
-        permission_mode, queued_json FROM threads ORDER BY created_at, id")?
+        permission_mode, queued_json, worktree_id FROM threads ORDER BY created_at, id")?
         .query_map([], |row| Ok(Thread {
             id: uuid(row, 0)?, project_id: uuid(row, 1)?, title: row.get(2)?, harness: row.get(3)?,
             session_ref: row.get(4)?, model: decode_optional(row, 5)?, draft: row.get(6)?,
             attachments: decode(row, 7)?, submission: decode_optional(row, 8)?, archived: archived(row, 9)?,
             created_at: row.get(10)?, updated_at: row.get(11)?,
             kind: thread_kind(row, 12)?, factory: decode_optional(row, 13)?, effort: row.get(14)?,
-            permission_mode: row.get(15)?, queued: decode(row, 16)?,
+            permission_mode: row.get(15)?, queued: decode(row, 16)?, worktree_id: uuid_optional(row, 17)?,
         }))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let worktrees = read_worktrees(connection)?;
     let launches = connection
         .prepare(
             "SELECT id, project_id, factory_thread_id, descriptor_json, event_path,
@@ -1048,15 +1255,36 @@ fn read_snapshot(connection: &Connection) -> Result<WorkspaceSnapshot> {
             bail!("A stored Factory thread owns more than one launch");
         }
     }
+    let worktree_by_id: HashMap<_, _> = worktrees
+        .iter()
+        .map(|worktree| (worktree.id, worktree))
+        .collect();
+    if worktree_by_id.len() != worktrees.len() {
+        bail!("Stored worktrees contain duplicate UUID identities");
+    }
+    if worktrees
+        .iter()
+        .any(|worktree| !project_ids.contains(&worktree.project_id))
+    {
+        bail!("Stored worktree belongs to a missing project");
+    }
     for thread in &threads {
         if !project_ids.contains(&thread.project_id) {
             bail!("Stored thread belongs to a missing project");
+        }
+        if let Some(id) = thread.worktree_id
+            && !worktree_by_id
+                .get(&id)
+                .is_some_and(|worktree| worktree.project_id == thread.project_id)
+        {
+            bail!("Stored thread references a worktree outside its project");
         }
         validate_thread_shape(thread)?;
     }
     Ok(WorkspaceSnapshot {
         projects,
         threads,
+        worktrees,
         launches,
         settings,
     })

@@ -139,6 +139,7 @@ esac
                 model: None,
                 effort: None,
                 permission_mode: None,
+                worktree_id: None,
                 draft: String::new(),
                 attachments: Vec::new(),
                 submission: None,

@@ -7,6 +7,7 @@ pub type ProjectId = Uuid;
 pub type ThreadId = Uuid;
 pub type LaunchId = Uuid;
 pub type SpaceId = Uuid;
+pub type WorktreeId = Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Space {
@@ -152,6 +153,35 @@ pub struct FactoryThreadConfig {
     pub target_branch: String,
 }
 
+/// A linked Git worktree that Conversations run in. Several threads may share one; the
+/// directory keeps its codename for life while the branch is renamed once from the first
+/// generated title. A removed worktree keeps its row so archived threads still explain
+/// themselves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Worktree {
+    pub id: WorktreeId,
+    pub project_id: ProjectId,
+    /// Absolute directory under the data directory.
+    pub path: PathBuf,
+    /// Stable two-word directory name.
+    pub codename: String,
+    /// The branch DROSTJE. created; the agent may have moved on, Git is the truth.
+    pub branch: String,
+    /// Local branch the worktree started from.
+    pub base: String,
+    /// Whether the one-time rename from the generated title has been settled.
+    pub named: bool,
+    /// The Conversation whose generated title may rename the branch.
+    pub created_by: ThreadId,
+    pub created_at: String,
+    pub removed_at: Option<String>,
+}
+impl Worktree {
+    pub fn is_live(&self) -> bool {
+        self.removed_at.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Thread {
     pub id: ThreadId,
@@ -168,6 +198,10 @@ pub struct Thread {
     /// Harness permission mode (Claude Code `--permission-mode`); `None` means the harness default.
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// The Conversation's worktree; `None` means the project root. Fixed at creation because
+    /// harness sessions are pinned to the directory they started in.
+    #[serde(default)]
+    pub worktree_id: Option<WorktreeId>,
     pub draft: String,
     pub attachments: Vec<ImageAttachment>,
     pub submission: Option<Value>,
@@ -195,6 +229,7 @@ pub struct FactoryLaunch {
 pub struct WorkspaceSnapshot {
     pub projects: Vec<Project>,
     pub threads: Vec<Thread>,
+    pub worktrees: Vec<Worktree>,
     pub launches: Vec<FactoryLaunch>,
     pub settings: BTreeMap<String, Value>,
 }

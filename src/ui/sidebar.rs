@@ -325,6 +325,11 @@ fn row_menu(
                 state,
             ))
             .item(command_item(
+                Command::NewConversationInWorktree.label(),
+                Command::NewConversationInWorktree,
+                state,
+            ))
+            .item(command_item(
                 "New Factory thread",
                 Command::NewFactoryThread,
                 state,
@@ -369,12 +374,29 @@ fn row_menu(
             };
             let mut menu = {
                 let state = workspace.read(cx).state.read(cx);
+                let row_thread = state.snapshot.threads.iter().find(|c| c.id == thread);
+                let in_worktree = row_thread.is_some_and(|c| c.worktree_id.is_some());
+                let conversation = row_thread.is_some_and(|c| c.kind == ThreadKind::Conversation);
                 menu.item(command_item("Rename thread…", Command::RenameThread, state))
                     .item(command_item(
                         Command::ArchiveThread.label(),
                         Command::ArchiveThread,
                         state,
                     ))
+                    .when(conversation, |menu| {
+                        menu.item(command_item(
+                            Command::SwitchBranch.label(),
+                            Command::SwitchBranch,
+                            state,
+                        ))
+                    })
+                    .when(in_worktree, |menu| {
+                        menu.item(command_item(
+                            Command::RemoveWorktree.label(),
+                            Command::RemoveWorktree,
+                            state,
+                        ))
+                    })
             };
             if let Some(reason) = reason {
                 menu =
@@ -691,17 +713,31 @@ fn render_list(
                     ThreadKind::Conversation => ("OMP conversation", Icon::new(IconName::Bot)),
                     ThreadKind::Factory => ("Factory thread", Icon::new(IconName::Cpu)),
                 };
+                let worktree = state.thread_worktree(thread);
                 let tooltip = format!(
-                    "{kind}: {}{}",
+                    "{kind}: {}{}{}",
                     thread.title,
-                    if thread.archived { " · Archived" } else { "" }
+                    if thread.archived { " · Archived" } else { "" },
+                    match worktree {
+                        Some(worktree) if worktree.is_live() => format!(
+                            " · Worktree {} at {}",
+                            worktree.codename,
+                            worktree.path.display()
+                        ),
+                        Some(worktree) => format!(" · Worktree {} (removed)", worktree.codename),
+                        None => String::new(),
+                    }
                 );
                 let status = exceptional_state(state, thread);
+                // Factory rows name their target branch; Conversations in a worktree name
+                // the worktree's branch the same way.
                 let branch = thread
                     .factory
                     .as_ref()
                     .map(|config| config.target_branch.trim())
-                    .filter(|branch| !branch.is_empty());
+                    .filter(|branch| !branch.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| worktree.map(|worktree| state.worktree_branch_label(worktree)));
                 let separator = || div().flex_shrink_0().child("•");
                 let mut details = h_flex()
                     .pl_6()
@@ -1311,6 +1347,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            worktree_id: None,
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,

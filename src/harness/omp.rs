@@ -867,7 +867,9 @@ impl Actor {
                             .request
                             .options
                             .iter()
-                            .any(|option| &option.value == value),
+                            .any(|option| option.value == *value),
+                        (UserRequestKind::Permission | UserRequestKind::Question, _)
+                        | (_, UserAnswer::PermissionAuto) => false,
                         _ => false,
                     };
                     if valid {
@@ -1838,6 +1840,10 @@ fn answer_frame(id: &str, answer: UserAnswer) -> Value {
         UserAnswer::Value(value) => json!({"type":"extension_ui_response","id":id,"value":value}),
         UserAnswer::Confirmed(confirmed) => {
             json!({"type":"extension_ui_response","id":id,"confirmed":confirmed})
+        }
+        // Claude-only permission semantics must never approve an OMP dialog.
+        UserAnswer::PermissionAuto => {
+            json!({"type":"extension_ui_response","id":id,"cancelled":true})
         }
         UserAnswer::Cancelled { timed_out: false } => {
             json!({"type":"extension_ui_response","id":id,"cancelled":true})

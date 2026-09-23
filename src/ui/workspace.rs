@@ -500,6 +500,10 @@ impl Workspace {
                         workspace.sync_detail_surface(window, cx);
                         workspace.show_notices(window, cx);
                     }
+                    PresentationChange::WorktreeRequest(request) => {
+                        workspace.settle_worktree_dialog(request, window, cx);
+                        workspace.show_notices(window, cx);
+                    }
                     _ => return,
                 }
                 cx.notify();
@@ -1124,6 +1128,17 @@ impl Workspace {
         else {
             return;
         };
+        // A terminal opened from a Conversation starts where that Conversation works.
+        let (root, worktree) = {
+            let state = self.state.read(cx);
+            state
+                .conversation_thread()
+                .filter(|thread| thread.project_id == project.id)
+                .and_then(|thread| state.thread_worktree(thread))
+                .filter(|worktree| worktree.is_live())
+                .map(|worktree| (worktree.path.clone(), Some(worktree.id)))
+                .unwrap_or((project.root.clone(), None))
+        };
         let id = TerminalId::new();
         let owner = cx.entity().downgrade();
         let state = self.state.clone();
@@ -1133,7 +1148,7 @@ impl Workspace {
             .and_then(|panel| panel.read(cx).group.clone())
             .and_then(|group| group.upgrade())
             .map(|group| group.read(cx).node());
-        let pane = cx.new(|cx| TerminalPane::new(project.id, space, project.root, window, cx));
+        let pane = cx.new(|cx| TerminalPane::new(project.id, worktree, space, root, window, cx));
         let panel = cx.new(|cx| {
             let mut panel = WorkspacePanel::new(PanelKind::Terminal(id), state, owner, window, cx);
             panel.terminal = Some(pane);
@@ -2226,6 +2241,7 @@ impl Workspace {
                 | Command::NewOmpConversation
                 | Command::NewPiConversation
                 | Command::NewClaudeCodeConversation
+                | Command::NewConversationInWorktree
                 | Command::NewFactoryThread
                 | Command::NewTerminal
                 | Command::RestartTerminal
@@ -2375,6 +2391,22 @@ impl Workspace {
                 .read(cx)
                 .selected_thread
                 .map(DialogKind::RenameThread),
+            Command::NewConversationInWorktree => self
+                .state
+                .read(cx)
+                .selected_project
+                .map(DialogKind::NewWorktreeConversation),
+            Command::RemoveWorktree => self
+                .state
+                .read(cx)
+                .conversation_thread()
+                .and_then(|thread| thread.worktree_id)
+                .map(DialogKind::RemoveWorktree),
+            Command::SwitchBranch => self
+                .state
+                .read(cx)
+                .conversation_thread()
+                .map(|thread| DialogKind::SwitchBranch(thread.id)),
             Command::ArchiveThread => {
                 if self.extension.is_some()
                     || self
@@ -2390,13 +2422,12 @@ impl Workspace {
                     return;
                 }
                 self.state.update(cx, |state, cx| {
-                    if let Some(mut thread) = state.thread().cloned() {
-                        thread.archived = true;
-                        thread.updated_at = crate::platform::now();
-                        state.save_thread(thread);
-                        state.set_show_archived(true);
-                        cx.notify();
+                    if let Some(id) = state.thread().map(|thread| thread.id)
+                        && let Err(error) = state.archive_thread(id)
+                    {
+                        state.notice(crate::app::NoticeLevel::Warning, format!("{error:#}"));
                     }
+                    cx.notify();
                 });
                 None
             }
@@ -2549,6 +2580,11 @@ impl Workspace {
         let Some(dialog) = self.dialog.take() else {
             return;
         };
+        // A request already running owns the dialog until it settles.
+        if dialog.read(cx).request.is_some() {
+            self.dialog = Some(dialog);
+            return;
+        }
         if matches!(
             dialog.read(cx).kind,
             DialogKind::NewSpace | DialogKind::DeleteSpace(_)
@@ -2574,20 +2610,56 @@ impl Workspace {
                 SurfaceOutcome::DeleteSpace(id) => {
                     self.change_space(SpaceChange::Delete(id), window, cx)?
                 }
+                SurfaceOutcome::Pending(request) => return Ok(Some(request)),
             }
-            Ok(())
+            Ok(None)
         });
         match result {
-            Ok(()) => {
+            Ok(None) => {
                 let kind = dialog.read(cx).kind.clone();
                 super::settings::close_surface(&kind, window, cx);
                 cx.notify();
+            }
+            Ok(Some(request)) => {
+                dialog.update(cx, |dialog, cx| dialog.begin_request(request, cx));
+                self.dialog = Some(dialog);
             }
             Err(error) => {
                 dialog.update(cx, |dialog, cx| dialog.set_error(&error, cx));
                 self.dialog = Some(dialog);
             }
         }
+    }
+    /// Closes the dialog that started `request` once the App layer reports it done; failures
+    /// stay in the dialog, which shows them next to the form.
+    fn settle_worktree_dialog(
+        &mut self,
+        request: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let done = self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).request == Some(request))
+            && self
+                .state
+                .read(cx)
+                .worktree_request
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.id == request
+                        && matches!(pending.status, crate::app::WorktreeRequestStatus::Done(_))
+                });
+        if !done {
+            return;
+        }
+        if let Some(dialog) = self.dialog.take() {
+            let kind = dialog.read(cx).kind.clone();
+            super::settings::close_surface(&kind, window, cx);
+        }
+        self.focus_region(Region::Thread, window, cx);
+        cx.notify();
     }
     pub(super) fn set_sidebar_row_hovered(
         &mut self,
@@ -2890,6 +2962,15 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &NewClaudeCodeConversation, w, cx| {
                     this.execute(Command::NewClaudeCodeConversation, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &NewConversationInWorktree, w, cx| {
+                    this.execute(Command::NewConversationInWorktree, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| {
+                    this.execute(Command::RemoveWorktree, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SwitchBranch, w, cx| {
+                    this.execute(Command::SwitchBranch, w, cx)
+                }))
                 .on_action(
                     cx.listener(|this, _: &InstallPi, w, cx| {
                         this.execute(Command::InstallPi, w, cx)
@@ -3187,13 +3268,16 @@ impl WorkspacePanel {
                         PresentationChange::Draft(id) | PresentationChange::Thread(id),
                         PanelKind::Thread(thread),
                     ) => id == thread,
-                    (PresentationChange::Diff(project), PanelKind::Thread(thread)) => panel
-                        .state
-                        .read(cx)
-                        .snapshot
-                        .threads
-                        .iter()
-                        .any(|candidate| candidate.id == thread && candidate.project_id == project),
+                    (PresentationChange::Diff(key), PanelKind::Thread(thread)) => {
+                        let state = panel.state.read(cx);
+                        state
+                            .snapshot
+                            .threads
+                            .iter()
+                            .find(|candidate| candidate.id == thread)
+                            .and_then(|candidate| state.working_tree_of(candidate))
+                            .is_some_and(|(tree, _)| tree == key)
+                    }
                     (
                         PresentationChange::Projects | PresentationChange::Selection,
                         PanelKind::Projects,
@@ -3266,17 +3350,26 @@ impl WorkspacePanel {
             PanelKind::Projects => "Projects".into(),
             PanelKind::Welcome => "Threads".into(),
             PanelKind::Terminal(_) => {
-                let project = self.terminal.as_ref().map(|pane| pane.read(cx).project_id);
-                let name = self
-                    .state
-                    .read(cx)
+                let (project, worktree) = self
+                    .terminal
+                    .as_ref()
+                    .map(|pane| {
+                        let pane = pane.read(cx);
+                        (Some(pane.project_id), pane.worktree)
+                    })
+                    .unwrap_or((None, None));
+                let state = self.state.read(cx);
+                let name = state
                     .snapshot
                     .projects
                     .iter()
                     .find(|candidate| Some(candidate.id) == project)
                     .map(|project| project.name.as_str())
                     .unwrap_or("Project");
-                format!("Terminal — {name}")
+                match worktree.and_then(|id| state.worktree(id)) {
+                    Some(worktree) => format!("Terminal — {name} · {}", worktree.codename),
+                    None => format!("Terminal — {name}"),
+                }
             }
             PanelKind::Thread(id) => self
                 .state
@@ -3523,11 +3616,21 @@ impl Panel for WorkspacePanel {
                     }),
                 )
                 .separator()
+                .menu(Command::SwitchBranch.label(), Box::new(SwitchBranch))
+                .separator()
                 .menu("New conversation", Box::new(NewConversation))
+                .menu(
+                    Command::NewConversationInWorktree.label(),
+                    Box::new(NewConversationInWorktree),
+                )
                 .menu("New Factory thread", Box::new(NewFactoryThread))
             }
             PanelKind::Welcome => menu
                 .menu("New conversation", Box::new(NewConversation))
+                .menu(
+                    Command::NewConversationInWorktree.label(),
+                    Box::new(NewConversationInWorktree),
+                )
                 .menu("New Factory thread", Box::new(NewFactoryThread)),
             PanelKind::Projects => menu
                 .menu("Add project…", Box::new(AddProject))

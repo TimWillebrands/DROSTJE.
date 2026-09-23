@@ -27,6 +27,7 @@ gpui_kit::actions!(
         NewOmpConversation,
         NewPiConversation,
         NewClaudeCodeConversation,
+        NewConversationInWorktree,
         NewFactoryThread,
         NewTerminal,
         RestartTerminal,
@@ -35,6 +36,8 @@ gpui_kit::actions!(
         RenameThread,
         RegenerateTitle,
         ArchiveThread,
+        RemoveWorktree,
+        SwitchBranch,
         CloseThread,
         NextThread,
         PreviousThread,
@@ -98,6 +101,7 @@ pub enum Command {
     NewOmpConversation,
     NewPiConversation,
     NewClaudeCodeConversation,
+    NewConversationInWorktree,
     NewFactoryThread,
     NewTerminal,
     RestartTerminal,
@@ -106,6 +110,8 @@ pub enum Command {
     RenameThread,
     RegenerateTitle,
     ArchiveThread,
+    RemoveWorktree,
+    SwitchBranch,
     CloseThread,
     NextThread,
     PreviousThread,
@@ -133,7 +139,7 @@ pub enum Command {
     EditQueuedMessage,
 }
 impl Command {
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 48] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -146,6 +152,7 @@ impl Command {
         Self::NewOmpConversation,
         Self::NewPiConversation,
         Self::NewClaudeCodeConversation,
+        Self::NewConversationInWorktree,
         Self::NewFactoryThread,
         Self::NewTerminal,
         Self::RestartTerminal,
@@ -154,6 +161,8 @@ impl Command {
         Self::RenameThread,
         Self::RegenerateTitle,
         Self::ArchiveThread,
+        Self::RemoveWorktree,
+        Self::SwitchBranch,
         Self::CloseThread,
         Self::NextThread,
         Self::PreviousThread,
@@ -195,6 +204,7 @@ impl Command {
             Self::NewOmpConversation => "New OMP conversation",
             Self::NewPiConversation => "New Pi conversation",
             Self::NewClaudeCodeConversation => "New Claude Code conversation",
+            Self::NewConversationInWorktree => "New conversation in new worktree…",
             Self::NewFactoryThread => "New Factory thread",
             Self::NewTerminal => "New terminal",
             Self::RestartTerminal => "Restart terminal",
@@ -203,6 +213,8 @@ impl Command {
             Self::RenameThread => "Rename thread…",
             Self::RegenerateTitle => "Regenerate conversation title",
             Self::ArchiveThread => "Archive thread",
+            Self::RemoveWorktree => "Remove worktree…",
+            Self::SwitchBranch => "Switch branch…",
             Self::CloseThread => "Close tab",
             Self::NextThread => "Next tab",
             Self::PreviousThread => "Previous tab",
@@ -245,6 +257,7 @@ impl Command {
             Self::NewOmpConversation => Box::new(NewOmpConversation),
             Self::NewPiConversation => Box::new(NewPiConversation),
             Self::NewClaudeCodeConversation => Box::new(NewClaudeCodeConversation),
+            Self::NewConversationInWorktree => Box::new(NewConversationInWorktree),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::NewTerminal => Box::new(NewTerminal),
             Self::RestartTerminal => Box::new(RestartTerminal),
@@ -253,6 +266,8 @@ impl Command {
             Self::RenameThread => Box::new(RenameThread),
             Self::RegenerateTitle => Box::new(RegenerateTitle),
             Self::ArchiveThread => Box::new(ArchiveThread),
+            Self::RemoveWorktree => Box::new(RemoveWorktree),
+            Self::SwitchBranch => Box::new(SwitchBranch),
             Self::CloseThread => Box::new(CloseThread),
             Self::NextThread => Box::new(NextThread),
             Self::PreviousThread => Box::new(PreviousThread),
@@ -337,6 +352,9 @@ impl Command {
             Self::RenameThread => state.rename_thread_reason(),
             Self::RegenerateTitle => state.regenerate_title_reason(),
             Self::ArchiveThread => state.archive_thread_reason(),
+            Self::NewConversationInWorktree => state.create_worktree_reason(),
+            Self::RemoveWorktree => state.remove_worktree_reason(),
+            Self::SwitchBranch => state.switch_branch_reason(),
             Self::CloseThread | Self::FocusOutput | Self::ToggleOutput
                 if state.thread().is_none() =>
             {
@@ -485,6 +503,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-b", ToggleProjects, workspace),
         KeyBinding::new("secondary-j", ToggleOutput, workspace),
         KeyBinding::new("secondary-n", NewConversation, workspace),
+        KeyBinding::new("secondary-alt-n", NewConversationInWorktree, workspace),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
         KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
         KeyBinding::new("secondary-,", Settings, workspace),
@@ -496,6 +515,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-b", ToggleProjects, command),
         KeyBinding::new("secondary-j", ToggleOutput, command),
         KeyBinding::new("secondary-n", NewConversation, command),
+        KeyBinding::new("secondary-alt-n", NewConversationInWorktree, command),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, command),
         KeyBinding::new("secondary-alt-t", NewTerminal, command),
         KeyBinding::new("secondary-,", Settings, command),
@@ -1073,6 +1093,19 @@ impl Render for Palette {
                     w,
                     cx,
                 )
+            }))
+            .on_action(cx.listener(|this, _: &NewConversationInWorktree, w, cx| {
+                this.run(
+                    PaletteTarget::Command(Command::NewConversationInWorktree),
+                    w,
+                    cx,
+                )
+            }))
+            .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| {
+                this.run(PaletteTarget::Command(Command::RemoveWorktree), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SwitchBranch, w, cx| {
+                this.run(PaletteTarget::Command(Command::SwitchBranch), w, cx)
             }))
             .on_action(cx.listener(|this, _: &InstallPi, w, cx| {
                 this.run(PaletteTarget::Command(Command::InstallPi), w, cx)

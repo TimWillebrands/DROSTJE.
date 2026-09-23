@@ -849,6 +849,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            worktree_id: None,
             draft: "Keep this unsent draft".into(),
             attachments: Vec::new(),
             submission: Some(json!({"recovery": "never replay"})),
@@ -858,6 +859,7 @@ mod tests {
             updated_at: "2026-09-17T00:00:00Z".into(),
         };
         WorkspaceSnapshot {
+            worktrees: Vec::new(),
             settings: BTreeMap::from([
                 ("selected_project".into(), json!(project.id)),
                 ("selected_thread".into(), json!(thread.id)),

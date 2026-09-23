@@ -1,5 +1,5 @@
 use super::{commands::RestartTerminal, theme};
-use crate::model::{ProjectId, SpaceId};
+use crate::model::{ProjectId, SpaceId, WorktreeId};
 use ghostty_terminal::{Terminal, TerminalOptions};
 use gpui_kit::{
     component::{ActiveTheme, alert::Alert, button::Button, h_flex, v_flex},
@@ -27,6 +27,8 @@ impl std::fmt::Display for TerminalId {
 
 pub struct TerminalPane {
     pub project_id: ProjectId,
+    /// The worktree the shell started in, when it was opened from a Conversation in one.
+    pub worktree: Option<WorktreeId>,
     pub space_id: SpaceId,
     pub root: PathBuf,
     native: Option<Entity<Terminal>>,
@@ -40,6 +42,7 @@ pub struct TerminalPane {
 impl TerminalPane {
     pub fn new(
         project_id: ProjectId,
+        worktree: Option<WorktreeId>,
         space_id: SpaceId,
         root: PathBuf,
         window: &mut Window,
@@ -55,6 +58,7 @@ impl TerminalPane {
         cx.defer_in(window, |pane, window, cx| pane.start(window, cx));
         Self {
             project_id,
+            worktree,
             space_id,
             root,
             native: None,

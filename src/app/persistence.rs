@@ -19,6 +19,7 @@ pub(super) async fn run(store: Store, requests: Receiver<Write>, completed: Send
                 result.map_err(anyhow::Error::msg)
             }
             Write::Setting(key, value) => store.set_setting(key, value).await,
+            Write::Worktree(worktree) => store.save_worktree(worktree).await,
             Write::Flush(reply) => {
                 let result = store.flush().await.map_err(|error| format!("{error:#}"));
                 let _ = reply.send(result).await;

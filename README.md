@@ -85,7 +85,7 @@ Een horizontale tweevingerveeg boven Projects schuift de project- en threadlijst
 
 Projects bevat binnen de actieve Space een lijst met twee soorten threads:
 
-- **Conversation:** een interactieve OMP- of Claude Code-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Klik op de `+` naast een project en kies eerst **OMP** of **Claude Code**. Dezelfde keuzes staan onder **New thread** en in de command palette; `Cmd-N` gebruikt de gekozen projectstandaard. Rechts toont een inklapbare zijbalk de actuele Git-wijzigingen terwijl een turn loopt; `Toggle conversation changes` en `Refresh conversation changes` staan ook in de command palette. Het model kies je onderaan de composer.
+- **Conversation:** een interactieve OMP- of Claude Code-sessie met geschiedenis, berichtballonnen, bijlagen met previews en een ingebedde Neovim-prompteditor met GPUI Kit-styling. Klik op de `+` naast een project en kies eerst **OMP** of **Claude Code**. Dezelfde keuzes staan onder **New thread** en in de command palette; `Cmd-N` gebruikt de gekozen projectstandaard. Rechts toont een inklapbare zijbalk de actuele Git-wijzigingen terwijl een turn loopt; `Toggle conversation changes` en `Refresh conversation changes` staan ook in de command palette. Het model kies je onderaan de composer. Met **New conversation in new worktree…** (`Cmd-Alt-N`) start een Conversation in een eigen Git-worktree onder de app-datamap, op een nieuwe branch `drostje/<naam>` vanaf een gekozen lokale basisbranch; na de eerste gegenereerde titel krijgt die branch zijn definitieve naam. `Cmd-N` vanuit zo'n Conversation deelt dezelfde worktree; de composer en de threadlijst tonen codenaam en branch. Is de laatste thread van een worktree gearchiveerd en is de worktree schoon en in zijn basisbranch gemerged, dan wordt hij automatisch verwijderd; anders blijft hij staan tot **Remove worktree…**. **Switch branch…** wisselt de branch van de werkboom van de geselecteerde Conversation, of maakt een nieuwe branch vanaf HEAD; dat kan niet tijdens een turn en niet met niet-gecommitte wijzigingen. De labels volgen de echte Git-HEAD, ook na een `git switch` in een terminal.
 - **Factory:** parameters voor een bestaande Azure DevOps User Story of een bestaande PRD/issues-map. `Advanced` bevat de branch en het optionele thought level. `Start run` slaat de definitieve configuratie eerst op; een opslagfout start niets.
 
 **Archive thread** archiveert direct, zonder bevestigingsvenster. Geschiedenis en concept blijven bewaard en de archiefweergave wordt geopend. Een actieve turn, een lopende Factory-start of een eigen Factory-proces blijft archiveren blokkeren; projecten archiveren vraagt nog wel bevestiging.
@@ -112,6 +112,7 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |---|---|
 |`Cmd-Shift-P`|Command palette: opdrachten, projecten en beide threadsoorten|
 |`Cmd-N` / `Cmd-Shift-N`|Nieuwe Conversation / Factory-thread|
+|`Cmd-Alt-N`|Nieuwe Conversation in een nieuwe Git-worktree|
 |`Cmd-Alt-T`|Nieuwe Terminal in het geselecteerde project|
 |`Cmd-1` / `Cmd-2` / `Cmd-3`|Focus Projects / Thread / Output; opent zo nodig het dock|
 |`Cmd-B` / `Cmd-J`|Projects / Output tonen of verbergen|

@@ -1,6 +1,6 @@
 use super::{theme, workspace::Workspace};
 use crate::{
-    app::{AppState, PresentationChange},
+    app::{AppState, PresentationChange, WorktreeRequestStatus},
     harness,
     model::ModelKey,
     platform,
@@ -16,6 +16,7 @@ use gpui_kit::{
         searchable_list::SearchableListItem,
         select::{Select, SelectEvent, SelectState},
         setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
+        spinner::Spinner,
         v_flex,
     },
     prelude::FluentBuilder,
@@ -102,12 +103,19 @@ pub enum DialogKind {
     RenameProject(Uuid),
     RenameThread(Uuid),
     ArchiveProject(Uuid),
+    /// A Conversation in a fresh worktree of this project, from a chosen base branch.
+    NewWorktreeConversation(Uuid),
+    RemoveWorktree(Uuid),
+    /// Check out another local branch, or a new one, in a Conversation's working tree.
+    SwitchBranch(Uuid),
     Settings(Option<Uuid>),
 }
 pub enum SurfaceOutcome {
     Applied,
     SpaceCreated(Uuid),
     DeleteSpace(Uuid),
+    /// Git is working in the background; the dialog stays open until the request settles.
+    Pending(Uuid),
 }
 pub struct Field {
     pub key: &'static str,
@@ -120,6 +128,10 @@ pub struct SurfaceContent {
     pub fields: Vec<Field>,
     pub error: Option<String>,
     error_field: Option<&'static str>,
+    /// The worktree request this dialog started and is waiting for.
+    pub request: Option<Uuid>,
+    /// Removal was refused for uncommitted changes; the next confirm discards them.
+    force: bool,
     selects: Vec<SelectField>,
     surface_id: Uuid,
     settings_id: SharedString,
@@ -189,6 +201,104 @@ impl SurfaceContent {
                         .map(|t| t.title.clone())
                         .unwrap_or_default(),
                 ),
+                DialogKind::NewWorktreeConversation(project) => {
+                    let repository = state
+                        .repositories
+                        .get(project)
+                        .and_then(|repository| repository.as_ref().ok());
+                    let branches: Vec<String> = repository
+                        .map(|repository| repository.branches.clone())
+                        .unwrap_or_default();
+                    // Default to where the selected Conversation already works.
+                    let selected = state
+                        .conversation_thread()
+                        .filter(|thread| thread.project_id == *project)
+                        .and_then(|thread| state.thread_worktree(thread))
+                        .filter(|worktree| worktree.is_live())
+                        .map(|worktree| worktree.branch.clone())
+                        .or_else(|| repository.and_then(|repository| repository.branch.clone()))
+                        .filter(|branch| branches.contains(branch))
+                        .or_else(|| branches.first().cloned())
+                        .unwrap_or_default();
+                    if !branches.is_empty() {
+                        selects.push(select_field(
+                            "base",
+                            "Base branch",
+                            branches
+                                .iter()
+                                .map(|branch| Choice::new(branch.clone(), branch.clone()))
+                                .collect(),
+                            &selected,
+                            window,
+                            cx,
+                        ));
+                    }
+                }
+                DialogKind::RemoveWorktree(_) => {}
+                DialogKind::SwitchBranch(thread) => {
+                    field(
+                        "new_branch",
+                        "New branch from HEAD (optional)",
+                        String::new(),
+                    );
+                    let thread = state.snapshot.threads.iter().find(|t| t.id == *thread);
+                    let repository = thread.and_then(|thread| {
+                        state
+                            .repositories
+                            .get(&thread.project_id)
+                            .and_then(|repository| repository.as_ref().ok())
+                    });
+                    let own = thread.and_then(|thread| thread.worktree_id);
+                    // Git allows a branch in one worktree only: hide the ones checked out
+                    // elsewhere, as far as the app has seen them.
+                    let elsewhere: Vec<String> = thread
+                        .map(|thread| {
+                            let mut taken: Vec<String> = state
+                                .snapshot
+                                .worktrees
+                                .iter()
+                                .filter(|w| {
+                                    w.is_live()
+                                        && w.project_id == thread.project_id
+                                        && Some(w.id) != own
+                                })
+                                .map(|w| state.worktree_branch_label(w))
+                                .collect();
+                            if own.is_some()
+                                && let Some(branch) = repository.and_then(|r| r.branch.clone())
+                            {
+                                taken.push(branch);
+                            }
+                            taken
+                        })
+                        .unwrap_or_default();
+                    let current = thread.and_then(|thread| match state.thread_worktree(thread) {
+                        Some(worktree) => Some(state.worktree_branch_label(worktree)),
+                        None => repository.and_then(|r| r.branch.clone()),
+                    });
+                    let branches: Vec<String> = repository
+                        .map(|repository| repository.branches.clone())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|branch| !elsewhere.contains(branch))
+                        .collect();
+                    if !branches.is_empty() {
+                        selects.push(select_field(
+                            "branch",
+                            "Branch",
+                            branches
+                                .iter()
+                                .map(|branch| Choice::new(branch.clone(), branch.clone()))
+                                .collect(),
+                            current
+                                .as_deref()
+                                .filter(|current| branches.iter().any(|b| b == current))
+                                .unwrap_or(&branches[0]),
+                            window,
+                            cx,
+                        ));
+                    }
+                }
                 DialogKind::Settings(project) => {
                     for (key, label) in [
                         ("nvim", "Neovim executable (blank: discover on PATH)"),
@@ -410,13 +520,24 @@ impl SurfaceContent {
             (fields, selects)
         });
         let presentation = SurfacePresentation::new(&kind, state.read(cx));
+        let error = match &kind {
+            DialogKind::NewWorktreeConversation(_) if selects.is_empty() => {
+                Some("This repository has no local branches yet. Commit first.".to_owned())
+            }
+            _ => None,
+        };
         let mut subscriptions = vec![
             cx.observe(&state, |surface, _, cx| surface.refresh_presentation(cx)),
-            cx.subscribe(&state, |surface, _, change: &PresentationChange, cx| {
-                if matches!(change, PresentationChange::Persistence) {
-                    surface.refresh_presentation(cx);
-                }
-            }),
+            cx.subscribe(
+                &state,
+                |surface, _, change: &PresentationChange, cx| match change {
+                    PresentationChange::Persistence => surface.refresh_presentation(cx),
+                    PresentationChange::WorktreeRequest(request) => {
+                        surface.worktree_request_changed(*request, cx)
+                    }
+                    _ => {}
+                },
+            ),
             cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()),
             cx.observe_global_in::<ThemeRegistry>(window, |surface, window, cx| {
                 surface.refresh_theme_choices(window, cx);
@@ -448,8 +569,10 @@ impl SurfaceContent {
         Self {
             kind,
             fields,
-            error: None,
+            error,
             error_field: None,
+            request: None,
+            force: false,
             selects,
             surface_id,
             settings_id: format!("drostje-settings-{surface_id}").into(),
@@ -459,6 +582,44 @@ impl SurfaceContent {
             presentation,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Marks the request this dialog is waiting for; the confirm control is disabled until
+    /// the App layer reports how it ended.
+    pub fn begin_request(&mut self, request: Uuid, cx: &mut Context<Self>) {
+        self.request = Some(request);
+        self.error = None;
+        self.error_field = None;
+        cx.notify();
+    }
+
+    fn worktree_request_changed(&mut self, request: Uuid, cx: &mut Context<Self>) {
+        if self.request != Some(request) {
+            return;
+        }
+        let status = self
+            .state
+            .read(cx)
+            .worktree_request
+            .as_ref()
+            .filter(|pending| pending.id == request)
+            .map(|pending| pending.status.clone());
+        match status {
+            Some(WorktreeRequestStatus::Failed(error)) => {
+                self.request = None;
+                self.error = Some(error);
+                self.error_field = None;
+            }
+            Some(WorktreeRequestStatus::Refused(error)) => {
+                self.request = None;
+                self.force = true;
+                self.error = Some(error);
+                self.error_field = None;
+            }
+            // Done: the Workspace closes the dialog. Pending or gone: nothing to show yet.
+            _ => {}
+        }
+        cx.notify();
     }
 
     fn refresh_presentation(&mut self, cx: &mut Context<Self>) {
@@ -607,6 +768,41 @@ impl SurfaceContent {
                 thread.title = title;
                 thread.updated_at = platform::now();
                 state.save_thread(thread);
+            }
+            DialogKind::NewWorktreeConversation(project) => {
+                let base = self.value("base", cx);
+                if base.is_empty() {
+                    return Err(field_error("base", "Choose a base branch."));
+                }
+                return state
+                    .create_worktree_conversation(project, &base)
+                    .map(SurfaceOutcome::Pending);
+            }
+            DialogKind::RemoveWorktree(id) => {
+                return state
+                    .remove_worktree(id, self.force)
+                    .map(SurfaceOutcome::Pending);
+            }
+            DialogKind::SwitchBranch(thread) => {
+                anyhow::ensure!(
+                    state.conversation_thread().is_some_and(|t| t.id == thread),
+                    "Thread selection changed; reopen Switch branch."
+                );
+                let new = self.value("new_branch", cx);
+                let (branch, create) = if new.is_empty() {
+                    (self.value("branch", cx), false)
+                } else {
+                    (new, true)
+                };
+                if branch.is_empty() {
+                    return Err(field_error(
+                        "new_branch",
+                        "Choose a branch or name a new one.",
+                    ));
+                }
+                return state
+                    .switch_branch(&branch, create)
+                    .map(SurfaceOutcome::Pending);
             }
             DialogKind::ArchiveProject(id) => {
                 anyhow::ensure!(
@@ -759,6 +955,9 @@ impl SurfaceContent {
             DialogKind::RenameProject(_) => "Rename project",
             DialogKind::RenameThread(_) => "Rename thread",
             DialogKind::ArchiveProject(_) => "Archive project",
+            DialogKind::NewWorktreeConversation(_) => "New conversation in new worktree",
+            DialogKind::RemoveWorktree(_) => "Remove worktree",
+            DialogKind::SwitchBranch(_) => "Switch branch",
             DialogKind::Settings(_) => "Settings",
         }
     }
@@ -1108,6 +1307,126 @@ impl SurfaceContent {
             DialogKind::ArchiveProject(_) => {
                 body = body.child("Archive retains threads, drafts, sessions, and Factory history. It never deletes checkout, session, or Factory files. Archived history remains accessible from Projects.");
             }
+            DialogKind::NewWorktreeConversation(project) => {
+                let pending = self.request.is_some();
+                let location = state
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|candidate| candidate.id == project)
+                    .map(|project| {
+                        crate::worktrees::worktree_dir(&state.data_dir, &project.root, "…")
+                    });
+                body = body
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(match location {
+                                Some(location) => format!(
+                                    "Creates a linked worktree at {} on a new branch under {}; the branch is renamed after the first generated title. The conversation runs there instead of the project root.",
+                                    location.display(),
+                                    crate::worktrees::BRANCH_PREFIX
+                                ),
+                                None => "Creates a linked worktree on a new branch; the conversation runs there instead of the project root.".into(),
+                            }),
+                    )
+                    .when(self.select("base").is_some(), |view| {
+                        view.child(Form::new().child(self.form_field("base", readonly || pending, cx)))
+                    })
+                    .when(pending, |view| {
+                        view.child(
+                            h_flex()
+                                .id("worktree-pending")
+                                .gap_2()
+                                .items_center()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(Spinner::new().xsmall())
+                                .child("Creating worktree…"),
+                        )
+                    });
+            }
+            DialogKind::SwitchBranch(thread) => {
+                let pending = self.request.is_some();
+                let tree = state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|t| t.id == thread)
+                    .map(|thread| match state.thread_worktree(thread) {
+                        Some(worktree) => format!("worktree {}", worktree.codename),
+                        None => "the project root".to_owned(),
+                    })
+                    .unwrap_or_else(|| "this working tree".to_owned());
+                body = body
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!(
+                                "Checks out a branch in {tree}. Uncommitted changes block the switch; commit or stash them first. Branches checked out in another worktree are not listed."
+                            )),
+                    )
+                    .child(
+                        Form::new()
+                            .when(self.select("branch").is_some(), |form| {
+                                form.child(self.form_field("branch", readonly || pending, cx))
+                            })
+                            .child(self.form_field("new_branch", readonly || pending, cx)),
+                    )
+                    .when(pending, |view| {
+                        view.child(
+                            h_flex()
+                                .id("worktree-pending")
+                                .gap_2()
+                                .items_center()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(Spinner::new().xsmall())
+                                .child("Switching branch…"),
+                        )
+                    });
+            }
+            DialogKind::RemoveWorktree(id) => {
+                let pending = self.request.is_some();
+                match state.worktree(id) {
+                    Some(worktree) => {
+                        body = body
+                            .child(format!(
+                                "Remove worktree {} at {}? Its branch {} is deleted only when it is merged into {}. Conversations in it stay in history but cannot continue; terminals opened in it keep running.",
+                                worktree.codename,
+                                worktree.path.display(),
+                                worktree.branch,
+                                worktree.base
+                            ))
+                            .when(self.force, |view| {
+                                view.child(
+                                    Alert::warning(
+                                        "worktree-force",
+                                        "Uncommitted changes in this worktree will be discarded.",
+                                    )
+                                    .small(),
+                                )
+                            });
+                    }
+                    None => {
+                        body = body.child("This worktree is no longer available.");
+                    }
+                }
+                body = body.when(pending, |view| {
+                    view.child(
+                        h_flex()
+                            .id("worktree-pending")
+                            .gap_2()
+                            .items_center()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(Spinner::new().xsmall())
+                            .child("Removing worktree…"),
+                    )
+                });
+            }
             DialogKind::NewSpace
             | DialogKind::RenameSpace(_)
             | DialogKind::RenameProject(_)
@@ -1248,6 +1567,7 @@ impl Render for SurfaceFooter {
 
 fn footer(dialog: &SurfaceContent) -> AnyElement {
     let readonly = dialog.presentation.readonly;
+    let pending = dialog.request.is_some();
     let id = dialog.surface_id;
     let archive = matches!(dialog.kind, DialogKind::ArchiveProject(_));
     let cancel = dialog.owner.clone();
@@ -1275,7 +1595,8 @@ fn footer(dialog: &SurfaceContent) -> AnyElement {
         .child(
             Button::new("dialog-confirm")
                 .primary()
-                .disabled(readonly)
+                .disabled(readonly || pending)
+                .loading(pending)
                 .label(if matches!(dialog.kind, DialogKind::DeleteSpace(_)) {
                     "Delete space"
                 } else if matches!(dialog.kind, DialogKind::NewSpace) {
@@ -1284,6 +1605,16 @@ fn footer(dialog: &SurfaceContent) -> AnyElement {
                     "Archive"
                 } else if matches!(dialog.kind, DialogKind::AddProject) {
                     "Add project"
+                } else if matches!(dialog.kind, DialogKind::NewWorktreeConversation(_)) {
+                    "Create conversation"
+                } else if matches!(dialog.kind, DialogKind::SwitchBranch(_)) {
+                    "Switch"
+                } else if matches!(dialog.kind, DialogKind::RemoveWorktree(_)) {
+                    if dialog.force {
+                        "Discard changes and remove"
+                    } else {
+                        "Remove worktree"
+                    }
                 } else {
                     "Save"
                 })
@@ -1358,7 +1689,9 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                         .on_close(move |_, _, cx| clear_surface(&close, id, cx))
                 });
             }
-            DialogKind::DeleteSpace(_) | DialogKind::ArchiveProject(_) => {
+            DialogKind::DeleteSpace(_)
+            | DialogKind::ArchiveProject(_)
+            | DialogKind::RemoveWorktree(_) => {
                 window.open_alert_dialog(cx, move |alert, window, _| {
                     let close = host_owner.clone();
                     let confirm = host_owner.clone();
@@ -1402,13 +1735,22 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                 return;
             };
             let dialog = dialog.read(cx);
-            let focus = if let Some(select) = dialog.select("theme_mode") {
+            let focus = if let Some(select) = dialog
+                .select("theme_mode")
+                .or_else(|| dialog.select("branch"))
+            {
                 Some(select.focus_handle(cx))
             } else {
                 dialog
                     .fields
                     .first()
                     .map(|field| field.input.focus_handle(cx))
+                    .or_else(|| {
+                        dialog
+                            .selects
+                            .first()
+                            .map(|select| select.state.focus_handle(cx))
+                    })
             };
             if let Some(focus) = focus {
                 focus.focus(window, cx);
