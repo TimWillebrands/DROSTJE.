@@ -8,7 +8,8 @@ use gpui_kit::{
 };
 use std::{path::PathBuf, sync::Arc};
 
-/// Runtime-only identity. It never names a Thread or a persisted shell session.
+/// Tab identity. Saved layouts keep it so the tab reopens after a restart, always
+/// with a new shell; it never names a Thread or a persisted shell session.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]

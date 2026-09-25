@@ -3083,10 +3083,31 @@ async fn projects_selection_displays_the_threads_tab(cx: &mut TestAppContext) {
     quit(cx, &fixture).await;
 }
 
+/// Terminal tab leaves in a layout as `(tab id, project)`.
+fn terminal_tabs(value: &serde_json::Value) -> Vec<(String, String)> {
+    let mut tabs = Vec::new();
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("panel_name") == Some(&json!("Terminal")) {
+                let panel = &map["info"]["panel"];
+                tabs.push((panel["terminal"].to_string(), panel["project"].to_string()));
+            }
+            map.values()
+                .for_each(|child| tabs.extend(terminal_tabs(child)));
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .for_each(|child| tabs.extend(terminal_tabs(child))),
+        _ => {}
+    }
+    tabs
+}
+
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; tests real unsupported-native-host error, mixed tabs and persistence without a provider turn"]
-async fn terminal_tabs_keep_failure_local_and_do_not_persist_sessions(cx: &mut TestAppContext) {
+async fn terminal_tabs_keep_failure_local_and_save_tabs(cx: &mut TestAppContext) {
     let fixture = open_fixture_with_editor(cx, None, Some("/nonexistent/drostje-qa-neovim")).await;
+    let project = cx.read(|cx| fixture.state.read(cx).snapshot.projects[0].id);
     cx.dispatch_action(fixture.window.into(), commands::NewFactoryThread);
     let factory = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
     cx.dispatch_action(fixture.window.into(), commands::NewTerminal);
@@ -3159,13 +3180,58 @@ async fn terminal_tabs_keep_failure_local_and_do_not_persist_sessions(cx: &mut T
     );
     fixture.store.flush().await.unwrap();
     let snapshot = fixture.store.snapshot().await.unwrap();
-    let saved = serde_json::to_string(&snapshot.settings).unwrap();
-    assert!(
-        !saved.contains("\"Terminal\""),
-        "ephemeral terminal leaf leaked into saved layout"
-    );
+    let saved = terminal_tabs(&json!(snapshot.settings));
+    assert_eq!(saved.len(), 1, "terminal tab is saved with the layout");
+    assert_eq!(saved[0].1, json!(project).to_string());
     assert_eq!(snapshot.threads.len(), 1);
     assert_eq!(snapshot.threads[0].id, factory);
+
+    // Quit with the tab open; the second phase restarts on this data directory.
+    quit(cx, &fixture).await;
+    println!("DROSTJE_TERMINAL_QA_DATA={}", fixture.data.display());
+}
+
+#[gpui_kit::test]
+#[ignore = "requires DROSTJE_TERMINAL_QA_DATA from terminal_tabs_keep_failure_local_and_save_tabs; reopens the tab after process restart"]
+async fn terminal_tabs_reopen_after_restart(cx: &mut TestAppContext) {
+    let data = PathBuf::from(std::env::var_os("DROSTJE_TERMINAL_QA_DATA").unwrap());
+    let root = PathBuf::from(std::env::var_os("DROSTJE_RUNTIME_FIXTURE").unwrap());
+    assert!(
+        fs::canonicalize(&data)
+            .unwrap()
+            .starts_with(fs::canonicalize(root).unwrap())
+    );
+    let fixture =
+        open_fixture_with_editor(cx, Some(data), Some("/nonexistent/drostje-qa-neovim")).await;
+    let factory = cx.read(|cx| fixture.state.read(cx).open_threads.clone());
+    assert_eq!(factory.len(), 1, "the Factory thread tab is restored too");
+    let saved = terminal_tabs(
+        cx.read(|cx| fixture.state.read(cx).space_layout().cloned())
+            .as_ref()
+            .unwrap(),
+    );
+    assert_eq!(saved.len(), 1, "first phase saved one terminal tab");
+    until(cx, "terminal tab reopened", Duration::from_secs(10), |cx| {
+        fixture.workspace.read(cx).terminal_count(cx) == 1
+    })
+    .await;
+    let press = |cx: &mut TestAppContext, key: &str| {
+        cx.update_window(fixture.window.into(), |_, window, cx| window.press(key, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    let live = cx.read(|cx| json!(fixture.workspace.read(cx).dock.read(cx).dump(cx)));
+    assert_eq!(terminal_tabs(&live), saved, "the same tab reopened");
+    let factory = factory[0];
+    // The restored active tab is the Thread region's target.
+    press(cx, "secondary-2");
+    until(
+        cx,
+        "focus reopened terminal",
+        Duration::from_secs(5),
+        |cx| fixture.workspace.read(cx).has_active_terminal(cx),
+    )
+    .await;
 
     press(cx, commands::CLOSE_THREAD_KEY);
     until(

@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     app::{AppState, NoticeLevel, PresentationChange, SidebarTab},
-    model::{PaneDirection, ProjectId, SpaceId, ThreadId, ThreadKind},
+    model::{PaneDirection, ProjectId, SpaceId, ThreadId, ThreadKind, WorktreeId},
 };
 use gpui_kit::{
     component::{
@@ -62,7 +62,7 @@ impl Region {
         commands::region_action(self)
     }
 }
-/// What one dock panel shows. Threads and ephemeral terminals can be tabbed,
+/// What one dock panel shows. Threads and terminals can be tabbed,
 /// split and dragged. Welcome holds the center only while no content is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelKind {
@@ -120,6 +120,23 @@ fn thread_of(state: &PanelState) -> Option<ThreadId> {
 fn terminal_of(state: &PanelState) -> Option<TerminalId> {
     match &state.info {
         PanelInfo::Panel(value) => serde_json::from_value(value.get("terminal")?.clone()).ok(),
+        _ => None,
+    }
+}
+/// What a saved `Terminal` leaf reopens with: a new shell where the tab worked.
+/// Neither the old process nor its scrollback is ever restored.
+#[derive(serde::Deserialize)]
+struct TerminalTab {
+    terminal: TerminalId,
+    project: ProjectId,
+    #[serde(default)]
+    worktree: Option<WorktreeId>,
+}
+fn terminal_tab(state: &PanelState) -> Option<TerminalTab> {
+    match &state.info {
+        PanelInfo::Panel(value) if state.panel_name == "Terminal" => {
+            serde_json::from_value(value.clone()).ok()
+        }
         _ => None,
     }
 }
@@ -217,7 +234,7 @@ pub struct Workspace {
     /// Shared with the panel registry so a restored layout rebuilds into the same map.
     threads: ThreadPanels,
     terminals: TerminalPanels,
-    /// Live layouts may refer to retained terminals; durable layouts never do.
+    /// Live layouts reattach retained terminals; durable layouts reopen them with a new shell.
     live_layouts: BTreeMap<SpaceId, DockAreaState>,
     active_terminal: Option<TerminalId>,
     space_terminals: BTreeMap<SpaceId, TerminalId>,
@@ -310,9 +327,13 @@ impl Workspace {
                 owner.clone(),
             );
             register_panel(cx, "Terminal", move |ctx, window, cx| {
-                // Only in-memory IDs resolve. A stale reference never spawns a shell.
+                // A live ID reattaches its shell; a saved tab reopens a new one.
+                // Layouts are filtered by `restorable_layout` first, so Welcome is a backstop.
                 let panel = terminal_of(ctx.state())
                     .and_then(|id| terminals.borrow().get(&id).cloned())
+                    .or_else(|| {
+                        reopen_terminal(ctx.state(), &terminals, &state, &owner, window, cx)
+                    })
                     .unwrap_or_else(|| welcome_panel(&welcome, &state, &owner, window, cx));
                 panel_handle(panel)
             });
@@ -404,6 +425,7 @@ impl Workspace {
             if let Some(sidebar) = shared_sidebar {
                 sidebar.apply(&mut layout);
             }
+            let layout = workspace.restorable_layout(durable_layout(layout), cx);
             validate_layout(&layout)?;
             // Nothing is leased during construction, so no callback can reach the
             // workspace here; `rebuilding` matters for later resets only.
@@ -941,6 +963,7 @@ impl Workspace {
             if let Some(sidebar) = shared_sidebar {
                 sidebar.apply(&mut layout);
             }
+            let layout = self.restorable_layout(layout, cx);
             validate_layout(&durable_layout(layout.clone()))?;
             self.dock
                 .update(cx, |dock, cx| dock.load(layout, window, cx))
@@ -1007,6 +1030,19 @@ impl Workspace {
             window,
             cx,
         ));
+    }
+    /// Drop Terminal leaves the Terminal registry could not resolve for the active Space:
+    /// neither a live terminal nor a saved tab whose project is still in this Space.
+    fn restorable_layout(&self, layout: DockAreaState, cx: &App) -> DockAreaState {
+        let state = self.state.read(cx);
+        filter_layout(layout, &|panel| {
+            panel.panel_name != "Terminal"
+                || terminal_of(panel).is_some_and(|id| self.terminals.borrow().contains_key(&id))
+                || terminal_tab(panel).is_some_and(|tab| {
+                    state.project_in_space(tab.project, state.active_space)
+                        && state.snapshot.projects.iter().any(|p| p.id == tab.project)
+                })
+        })
     }
     pub(super) fn has_active_terminal(&self, cx: &App) -> bool {
         self.active_terminal(cx).is_some()
@@ -3228,6 +3264,49 @@ fn welcome_panel(
     *welcome.borrow_mut() = Some(panel.clone());
     panel
 }
+/// Reopen a saved terminal tab with a new shell in its project, or in its worktree
+/// while that is still live. None when the tab's project left the active Space.
+fn reopen_terminal(
+    saved: &PanelState,
+    terminals: &TerminalPanels,
+    state: &Entity<AppState>,
+    owner: &WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Entity<WorkspacePanel>> {
+    let tab = terminal_tab(saved)?;
+    let (space, root, worktree) = {
+        let state = state.read(cx);
+        let space = state.active_space;
+        if !state.project_in_space(tab.project, space) {
+            return None;
+        }
+        let project = state
+            .snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == tab.project)?;
+        tab.worktree
+            .and_then(|id| state.worktree(id))
+            .filter(|worktree| worktree.is_live() && worktree.project_id == tab.project)
+            .map(|worktree| (space, worktree.path.clone(), Some(worktree.id)))
+            .unwrap_or((space, project.root.clone(), None))
+    };
+    let pane = cx.new(|cx| TerminalPane::new(tab.project, worktree, space, root, window, cx));
+    let panel = cx.new(|cx| {
+        let mut panel = WorkspacePanel::new(
+            PanelKind::Terminal(tab.terminal),
+            state.clone(),
+            owner.clone(),
+            window,
+            cx,
+        );
+        panel.terminal = Some(pane);
+        panel
+    });
+    terminals.borrow_mut().insert(tab.terminal, panel.clone());
+    Some(panel)
+}
 
 pub struct WorkspacePanel {
     kind: PanelKind,
@@ -3431,13 +3510,19 @@ impl BasePanel for WorkspacePanel {
             });
         }
     }
-    fn dump(&self, _: &App) -> PanelState {
+    fn dump(&self, cx: &App) -> PanelState {
         let mut state = PanelState::new(self.kind.name());
         if let PanelKind::Thread(id) = self.kind {
             state.info = PanelInfo::panel(json!({ "thread": id }));
         }
         if let PanelKind::Terminal(id) = self.kind {
-            state.info = PanelInfo::panel(json!({ "terminal": id }));
+            // Enough to reopen the tab after a restart; see `TerminalTab`.
+            let pane = self.terminal.as_ref().map(|pane| pane.read(cx));
+            state.info = PanelInfo::panel(json!({
+                "terminal": id,
+                "project": pane.map(|pane| pane.project_id),
+                "worktree": pane.and_then(|pane| pane.worktree),
+            }));
         }
         state
     }
@@ -3822,8 +3907,8 @@ fn panel_visible(
             .is_some_and(|active| active.panel_id(cx) == PanelId::from(entity.entity_id()))
 }
 
-/// Preserve all durable leaves and repair their containers after removing live
-/// terminals. Active tabs follow the nearest surviving tab; split sizes keep the
+/// Preserve the kept leaves and repair their containers after removing the
+/// others (terminals of another Space, unrestorable tabs). Active tabs follow the nearest surviving tab; split sizes keep the
 /// same association with their surviving children.
 fn filter_layout(mut layout: DockAreaState, keep: &impl Fn(&PanelState) -> bool) -> DockAreaState {
     fn filter(mut panel: PanelState, keep: &impl Fn(&PanelState) -> bool) -> Option<PanelState> {
@@ -3876,8 +3961,12 @@ fn filter_layout(mut layout: DockAreaState, keep: &impl Fn(&PanelState) -> bool)
     }
     layout
 }
+/// Terminal tabs persist with their project so they reopen after a restart; a leaf
+/// that cannot name its project (an older layout) is dropped.
 fn durable_layout(layout: DockAreaState) -> DockAreaState {
-    filter_layout(layout, &|panel| panel.panel_name != "Terminal")
+    filter_layout(layout, &|panel| {
+        panel.panel_name != "Terminal" || terminal_tab(panel).is_some()
+    })
 }
 
 fn contains_panel(panel: &PanelState, name: &str) -> bool {
@@ -3909,6 +3998,10 @@ fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
                 anyhow::ensure!(
                     panel.panel_name != "Thread" || thread_of(panel).is_some(),
                     "Thread panel names no thread"
+                );
+                anyhow::ensure!(
+                    panel.panel_name != "Terminal" || terminal_tab(panel).is_some(),
+                    "Terminal panel names no project"
                 );
                 names.push(&panel.panel_name);
             }
@@ -3966,7 +4059,7 @@ fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
     anyhow::ensure!(
         names
             .iter()
-            .all(|name| matches!(*name, "Projects" | "Welcome" | "Thread")),
+            .all(|name| matches!(*name, "Projects" | "Welcome" | "Thread" | "Terminal")),
         "Layout contains an unknown panel"
     );
     Ok(())
@@ -4011,6 +4104,7 @@ mod terminal_layout_tests {
                 "panel_name": "Thread", "children": [], "info": {"panel": {"thread": id}}
             })
         };
+        // A leaf from before terminal tabs were saved names no project.
         let terminal = json!({
             "panel_name": "Terminal", "children": [], "info": {"panel": {"terminal": "ephemeral"}}
         });
@@ -4050,5 +4144,63 @@ mod terminal_layout_tests {
             saved["center"]["children"][1],
             tabs(json!([thread(first)]), 0)
         );
+    }
+
+    #[test]
+    fn saving_keeps_terminal_tabs_with_their_project() {
+        let thread = crate::model::ThreadId::new_v4();
+        let project = crate::model::ProjectId::new_v4();
+        let worktree = crate::model::WorktreeId::new_v4();
+        let terminal = json!({
+            "panel_name": "Terminal", "children": [],
+            "info": {"panel": {
+                "terminal": uuid::Uuid::new_v4(), "project": project, "worktree": worktree
+            }}
+        });
+        let layout: DockAreaState = serde_json::from_value(json!({
+            "version": LAYOUT_VERSION,
+            "center": {
+                "panel_name": "TabPanel",
+                "children": [
+                    {"panel_name": "Thread", "children": [], "info": {"panel": {"thread": thread}}},
+                    terminal
+                ],
+                "info": {"tabs": {"active_index": 1}}
+            },
+            "left_dock": {
+                "panel": {"panel_name": "TabPanel", "children": [
+                    {"panel_name": "Projects", "children": [], "info": {"panel": null}}
+                ], "info": {"tabs": {"active_index": 0}}},
+                "placement": "left", "size": 240., "open": true
+            }
+        }))
+        .unwrap();
+        let saved = durable_layout(layout);
+        validate_layout(&saved).unwrap();
+        let tab = super::terminal_tab(&saved.center.children[1]).unwrap();
+        assert_eq!((tab.project, tab.worktree), (project, Some(worktree)));
+        let saved = serde_json::to_value(saved).unwrap();
+        assert_eq!(saved["center"]["children"][1], terminal);
+        assert_eq!(saved["center"]["info"]["tabs"]["active_index"], json!(1));
+    }
+
+    #[test]
+    fn terminal_leaf_without_project_is_invalid() {
+        let layout: DockAreaState = serde_json::from_value(json!({
+            "version": LAYOUT_VERSION,
+            "center": {"panel_name": "TabPanel", "children": [
+                {"panel_name": "Terminal", "children": [],
+                 "info": {"panel": {"terminal": uuid::Uuid::new_v4()}}}
+            ], "info": {"tabs": {"active_index": 0}}},
+            "left_dock": {
+                "panel": {"panel_name": "TabPanel", "children": [
+                    {"panel_name": "Projects", "children": [], "info": {"panel": null}}
+                ], "info": {"tabs": {"active_index": 0}}},
+                "placement": "left", "size": 240., "open": true
+            }
+        }))
+        .unwrap();
+        assert!(validate_layout(&layout).is_err());
+        validate_layout(&durable_layout(layout)).unwrap();
     }
 }

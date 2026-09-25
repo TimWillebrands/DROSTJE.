@@ -1209,7 +1209,7 @@ impl Workspace {
             "Saved drafts and session references are retained. Active interactive turns stop. Factory jobs already started continue; a pending dispatch may require outcome review after reopening.".to_owned()
         };
         if self.has_running_terminals(cx) {
-            message.push_str(" All terminal shells and their foreground jobs will be stopped. Terminal sessions cannot be restored.");
+            message.push_str(" All terminal shells and their foreground jobs will be stopped. Terminal tabs reopen with a new shell; running jobs and scrollback are not restored.");
         }
         let owner = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, window, _| {
