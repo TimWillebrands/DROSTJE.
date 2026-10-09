@@ -41,7 +41,7 @@ mod macos {
                         .child(drostje::ui::conversation::markdown_text(
                             "markdown",
                             self.text.clone(),
-                            cx,
+                            drostje::ui::conversation::Markdown::Element,
                         )),
                 )
         }

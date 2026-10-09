@@ -6,9 +6,9 @@ mod shutdown;
 mod spaces;
 mod worktrees;
 use crate::harness::{
-    self, ContentBlock, ContextUsage, ConversationCommand, ConversationEvent, ConversationHandle,
-    ConversationState, Message, ModelChoice, ToolActivity, TurnOutcome, UsageLimit, UserAnswer,
-    UserRequest, UserRequestKind,
+    self, CommandCatalog, ContentBlock, ContextUsage, ConversationCommand, ConversationEvent,
+    ConversationHandle, ConversationState, Message, ModelChoice, ToolActivity, TurnOutcome,
+    UsageLimit, UserAnswer, UserRequest, UserRequestKind,
 };
 use crate::{model::*, platform, store::Store};
 use anyhow::{Context as _, Result};
@@ -49,6 +49,8 @@ pub struct ConversationSession {
     pub persisted: bool,
     pub models: Vec<ModelChoice>,
     pub model: Option<ModelKey>,
+    /// Slash commands the harness offers for prompt text.
+    pub slash_commands: CommandCatalog,
     pub messages: Vec<Arc<Message>>,
     pub tools: BTreeMap<String, Arc<ToolActivity>>,
     pub requests: BTreeMap<String, UserRequest>,
@@ -90,6 +92,7 @@ impl ConversationSession {
             persisted: false,
             models: Vec::new(),
             model,
+            slash_commands: CommandCatalog::Loading,
             generation: Uuid::new_v4(),
             finished: None,
             messages: Vec::new(),

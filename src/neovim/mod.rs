@@ -112,6 +112,14 @@ pub enum NvimCommand {
         text: String,
         reply: Sender<Result<bool>>,
     },
+    /// Writes `/name ` over the leading command the active draft starts with (or before
+    /// its text) and leaves the cursor after it in insert mode. The edit is computed from
+    /// the buffer as it is when the command runs, after every earlier keystroke.
+    InsertSlashCommand {
+        key: DraftKey,
+        name: String,
+        reply: Sender<Result<()>>,
+    },
     PersistenceBarrier {
         reply: Sender<Result<Vec<DraftSnapshot>>>,
     },
@@ -179,6 +187,13 @@ impl NvimEditor {
                 text,
                 reply,
             })
+            .await?;
+        result.recv().await?
+    }
+    pub async fn insert_slash_command(&self, key: DraftKey, name: String) -> Result<()> {
+        let (reply, result) = async_channel::bounded(1);
+        self.commands
+            .send(NvimCommand::InsertSlashCommand { key, name, reply })
             .await?;
         result.recv().await?
     }

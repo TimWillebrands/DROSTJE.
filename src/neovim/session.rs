@@ -986,6 +986,38 @@ impl Session {
         }
         Ok(replaced)
     }
+    async fn insert_slash_command(&mut self, key: DraftKey, name: String) -> Result<()> {
+        ensure!(
+            !self.composition,
+            "Complete or cancel native composition before inserting a command"
+        );
+        ensure!(
+            self.active.as_ref() == Some(&key),
+            "Open the conversation draft before inserting a command"
+        );
+        ensure!(
+            !name.is_empty() && !name.contains(char::is_whitespace),
+            "Command names cannot contain spaces"
+        );
+        let mode = self.drain().await?;
+        ensure!(
+            !mode.starts_with("no") && !mode.starts_with('c') && !mode.starts_with('r'),
+            "Complete or cancel the current Neovim operator or command before inserting a command"
+        );
+        let current = self.refresh_draft(&key).await?;
+        let (end, text) = crate::model::slash_command_insertion(&current.text, &name);
+        let handle = self.drafts[&key].handle.clone();
+        // Check, write and cursor placement happen in one Lua call so no keystroke lands
+        // between them. `startinsert!` appends when the line ends with the inserted text,
+        // where a normal-mode cursor could not sit past the last byte.
+        let result = self.lua("local b,tick,e,text=...; if vim.api.nvim_get_current_buf()~=b or vim.api.nvim_buf_get_changedtick(b)~=tick then return false end; local line=vim.api.nvim_buf_get_lines(b,0,1,true)[1]; vim.api.nvim_buf_set_text(b,0,0,0,e,{text}); if #line==e then vim.cmd('startinsert!') else vim.api.nvim_win_set_cursor(0,{1,#text}); vim.cmd('startinsert') end; return true", vec![handle, current.changedtick.into(), (end as u64).into(), text.into()]).await?;
+        ensure!(
+            result.as_bool() == Some(true),
+            "The draft changed while the command was inserted; insert it again"
+        );
+        self.refresh_draft(&key).await?;
+        Ok(())
+    }
     async fn persist_barrier(&mut self) -> Result<Vec<DraftSnapshot>> {
         if self.active.is_some() {
             self.snapshot_active().await?;
@@ -1209,6 +1241,14 @@ impl Session {
                 let result = async {
                     self.available()?;
                     self.replace_if_revision(key, revision, text).await
+                }
+                .await;
+                let _ = reply.try_send(result);
+            }
+            NvimCommand::InsertSlashCommand { key, name, reply } => {
+                let result = async {
+                    self.available()?;
+                    self.insert_slash_command(key, name).await
                 }
                 .await;
                 let _ = reply.try_send(result);

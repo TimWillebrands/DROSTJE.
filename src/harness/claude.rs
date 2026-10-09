@@ -332,6 +332,10 @@ struct Actor {
     models_reported: bool,
     /// Usage control requests awaiting an answer, so refresh triggers never pile up.
     usage_requests: Vec<&'static str>,
+    /// The last command list, kept raw so `init` can mark terminal-only commands later.
+    slash_commands: Option<Value>,
+    /// `terminal_slash_commands` from `init`: commands bound to the Claude Code terminal.
+    terminal_commands: Vec<String>,
 }
 
 impl Actor {
@@ -373,6 +377,8 @@ impl Actor {
             idle_sleep_assertion: None,
             permissions: HashMap::new(),
             tools: HashMap::new(),
+            slash_commands: None,
+            terminal_commands: Vec::new(),
             model_requests: HashMap::new(),
             models_reported: false,
             usage_requests: Vec::new(),
@@ -778,6 +784,19 @@ impl Actor {
                     "Claude Code initialized a different session"
                 );
                 self.initialized = true;
+                let terminal: Vec<String> = frame["terminal_slash_commands"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                if terminal != self.terminal_commands {
+                    self.terminal_commands = terminal;
+                    if let Some(commands) = self.slash_commands.clone() {
+                        self.commands(commands);
+                    }
+                }
                 if !self.models_reported {
                     let models = frame["model"]
                         .as_str()
@@ -906,6 +925,10 @@ impl Actor {
                 self.state(ConversationState::Ready);
                 self.refresh_usage(&[CONTEXT_USAGE_REQUEST, USAGE_REQUEST])?;
             }
+            // Claude Code pushes the whole list again whenever it changes.
+            "system" if frame["subtype"] == "commands_changed" => {
+                self.commands(frame["commands"].clone())
+            }
             "control_response" => self.control_response(&frame)?,
             "rate_limit_event" => self.refresh_usage(&[USAGE_REQUEST])?,
             "keep_alive" => {}
@@ -945,11 +968,15 @@ impl Actor {
         });
         if request_id == INITIALIZE_REQUEST {
             match error {
-                Some(error) => self.emit(ConversationEvent::Notice {
-                    level: "error".into(),
-                    text: format!("Claude Code model discovery failed: {error}"),
-                }),
+                Some(error) => {
+                    self.emit(ConversationEvent::Notice {
+                        level: "error".into(),
+                        text: format!("Claude Code model discovery failed: {error}"),
+                    });
+                    self.emit(ConversationEvent::CommandsUnavailable(error));
+                }
                 None => {
+                    self.commands(response["response"]["commands"].clone());
                     let models = parse_models(&response["response"]["models"]);
                     if !models.is_empty() {
                         self.models_reported = true;
@@ -974,6 +1001,17 @@ impl Actor {
             }
         }
         Ok(())
+    }
+
+    fn commands(&mut self, raw: Value) {
+        let event = match parse_commands(&raw, &self.terminal_commands) {
+            Some(commands) => ConversationEvent::CommandsUpdated(commands),
+            None => ConversationEvent::CommandsUnavailable(
+                "Claude Code did not list its commands".into(),
+            ),
+        };
+        self.slash_commands = Some(raw);
+        self.emit(event);
     }
 
     fn settle(&mut self, outcome: TurnOutcome) {
@@ -1029,6 +1067,55 @@ fn parse_models(models: &Value) -> Vec<ModelChoice> {
             })
         })
         .collect()
+}
+
+/// Command entries are `{name, description, argumentHint, aliases?, builtin?}`. Plugin
+/// commands are namespaced `plugin:name`; everything else is a skill or command file, which
+/// Claude Code does not tell apart.
+fn parse_commands(raw: &Value, terminal: &[String]) -> Option<Vec<SlashCommand>> {
+    let commands = raw
+        .as_array()?
+        .iter()
+        .filter_map(|entry| {
+            let name = entry["name"].as_str().filter(|name| !name.is_empty())?;
+            let aliases: Vec<String> = entry["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            let builtin = entry["builtin"] == true;
+            let source = if builtin {
+                CommandSource::Builtin
+            } else if name.contains(':') {
+                CommandSource::Plugin
+            } else {
+                CommandSource::Custom
+            };
+            let blocked = if builtin && matches!(name, "clear" | "reset" | "new") {
+                Some(super::commands::NEW_CONVERSATION)
+            } else if builtin && name == "model" {
+                Some(super::commands::MODEL_PICKER)
+            } else if terminal.iter().any(|command| command == name) {
+                Some("it only runs in the Claude Code terminal")
+            } else {
+                None
+            };
+            Some(SlashCommand {
+                name: name.to_owned(),
+                aliases,
+                description: entry["description"].as_str().unwrap_or("").to_owned(),
+                argument_hint: entry["argumentHint"]
+                    .as_str()
+                    .filter(|hint| !hint.is_empty())
+                    .map(str::to_owned),
+                source,
+                blocked,
+            })
+        })
+        .collect();
+    Some(commands)
 }
 
 /// Error results carry their reason in `result`, `error` or (for execution errors) `errors`.
@@ -1491,7 +1578,14 @@ fn normalize_assistant(frame: &Value, sequence: usize) -> Result<Message> {
             .filter(|id| !id.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("claude-assistant-{sequence}")),
-        role: "assistant".into(),
+        // A local slash command (`/context`, `/reload-skills`) answers with a synthetic
+        // assistant frame; like OMP's command output it is not a model reply.
+        role: if frame.get("local_command_run").is_some() {
+            "system"
+        } else {
+            "assistant"
+        }
+        .into(),
         content,
         raw: Some(frame.clone()),
         tool_call_id: None,
@@ -2158,5 +2252,49 @@ done
         assert!(history.iter().any(|frame| frame["type"] == "assistant"));
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn command_list_marks_commands_that_would_replace_drostje_state() {
+        let raw = json!([
+            {"name":"compact","description":"Free up context","argumentHint":"<optional custom summarization instructions>","builtin":true},
+            {"name":"clear","description":"Start a new session","argumentHint":"[name]","aliases":["reset","new"],"builtin":true},
+            {"name":"model","description":"Set the AI model","argumentHint":"[model]","builtin":true},
+            {"name":"doctor","description":"Diagnose","argumentHint":"","builtin":true},
+            {"name":"caveman:caveman-commit","description":"(caveman) Commit messages","argumentHint":"","aliases":["caveman-commit"]},
+            {"name":"probecmd","description":"Probe command (project)","argumentHint":"foo"},
+            {"description":"nameless"}
+        ]);
+        let commands = parse_commands(&raw, &["doctor".to_owned()]).unwrap();
+        assert_eq!(commands.len(), 6);
+        assert_eq!(
+            commands[0].argument_hint.as_deref(),
+            Some("<optional custom summarization instructions>")
+        );
+        assert_eq!(commands[0].blocked, None);
+        assert_eq!(commands[1].aliases, ["reset", "new"]);
+        assert!(commands[1].blocked.is_some());
+        assert!(commands[2].blocked.is_some());
+        assert!(commands[3].blocked.is_some(), "terminal-only");
+        assert_eq!(commands[4].source, CommandSource::Plugin);
+        assert_eq!(commands[4].argument_hint, None);
+        assert_eq!(commands[5].source, CommandSource::Custom);
+        assert_eq!(commands[5].blocked, None);
+        assert!(parse_commands(&json!(null), &[]).is_none());
+    }
+
+    #[test]
+    fn local_command_output_is_not_a_model_reply() {
+        let local = json!({"type":"assistant","uuid":"u1",
+            "message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Reloaded skills: 220 skills available (no changes)"}]},
+            "local_command_run":{"command":"reload-skills","args":""}});
+        let message = normalize_assistant(&local, 0).unwrap();
+        assert_eq!(message.role, "system");
+        assert!(
+            matches!(&message.content[..], [ContentBlock::Text(text)] if text.starts_with("Reloaded skills"))
+        );
+        let reply = json!({"type":"assistant","uuid":"u2",
+            "message":{"role":"assistant","content":[{"type":"text","text":"Done"}]}});
+        assert_eq!(normalize_assistant(&reply, 1).unwrap().role, "assistant");
     }
 }

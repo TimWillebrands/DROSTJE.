@@ -1753,7 +1753,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn navigation_blocked(&self, window: &mut Window, cx: &mut App) -> bool {
+    pub(super) fn navigation_blocked(&self, window: &mut Window, cx: &mut App) -> bool {
         self.quit_requested
             || self.preparing_space_change
             || self.terminal_confirmation
@@ -2356,6 +2356,10 @@ impl Workspace {
             }
             Command::PasteImage => {
                 self.paste_image(window, cx);
+                None
+            }
+            Command::InsertSlashCommand => {
+                self.open_slash_command_picker(window, cx);
                 None
             }
             Command::ClearQueuedMessages => {
@@ -3062,6 +3066,9 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &PasteImage, w, cx| {
                     this.execute(Command::PasteImage, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &InsertSlashCommand, w, cx| {
+                    this.execute(Command::InsertSlashCommand, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &ClearQueuedMessages, w, cx| {
                     this.execute(Command::ClearQueuedMessages, w, cx)

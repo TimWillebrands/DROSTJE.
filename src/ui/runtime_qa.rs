@@ -1532,6 +1532,284 @@ async fn editor_startup_failure_and_restart_preserve_draft(cx: &mut TestAppConte
     );
 }
 
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE and OMP; slash commands reach the real draft, never a provider turn"]
+async fn slash_command_picker_writes_into_the_draft_and_refuses_blocked_commands(
+    cx: &mut TestAppContext,
+) {
+    let fixture = open_fixture(cx, None).await;
+    cx.update_window(fixture.window.into(), |_, window, _| {
+        window.activate_window()
+    })
+    .unwrap();
+    let id = new_conversation(cx, &fixture).await;
+    until(
+        cx,
+        "OMP lists its commands",
+        Duration::from_secs(30),
+        |cx| {
+            fixture
+                .state
+                .read(cx)
+                .conversations
+                .get(&id)
+                .is_some_and(|session| {
+                    session.state == crate::harness::ConversationState::Ready
+                        && session
+                            .slash_commands
+                            .commands()
+                            .iter()
+                            .any(|command| command.name == "compact")
+                })
+        },
+    )
+    .await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.focus_composer(window, cx),
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "k e e p space t e s t s");
+    until(cx, "typed arguments", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).drafts[&DraftKey::Thread(id)].text == "keep tests"
+    })
+    .await;
+
+    cx.dispatch_action(fixture.window.into(), commands::InsertSlashCommand);
+    until(cx, "command picker opened", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).palette.is_some()
+    })
+    .await;
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    cx.simulate_keystrokes(fixture.window.into(), "c o m p a c t enter");
+    until(
+        cx,
+        "command inserted before the arguments",
+        Duration::from_secs(5),
+        |cx| {
+            fixture.workspace.read(cx).palette.is_none()
+                && fixture.state.read(cx).drafts[&DraftKey::Thread(id)].text
+                    == "/compact keep tests"
+        },
+    )
+    .await;
+    // The cursor sits after the command, still in insert mode, so typing continues there.
+    cx.simulate_keystrokes(fixture.window.into(), "s o f t space");
+    until(
+        cx,
+        "typing continues after the command",
+        Duration::from_secs(5),
+        |cx| {
+            fixture.state.read(cx).drafts[&DraftKey::Thread(id)].text == "/compact soft keep tests"
+        },
+    )
+    .await;
+    assert!(
+        cx.read(|cx| fixture
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .unwrap()
+            .submission
+            .is_none()),
+        "inserting a command never sends it"
+    );
+
+    // A blocked command typed by hand is refused before it reaches OMP.
+    cx.simulate_keystrokes(fixture.window.into(), "escape g g d G i / m o d e l");
+    until(cx, "blocked command typed", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).drafts[&DraftKey::Thread(id)].text == "/model"
+    })
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(
+        cx,
+        "blocked command refused",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .state
+                .read(cx)
+                .conversations
+                .get(&id)
+                .and_then(|session| session.error.as_deref())
+                .is_some_and(|error| error.starts_with("/model is not available"))
+        },
+    )
+    .await;
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).drafts[&DraftKey::Thread(id)]
+            .text
+            .clone()),
+        "/model",
+        "a refused command stays in the draft"
+    );
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE and OMP; caret popup completes against the real draft"]
+async fn slash_command_popup_completes_at_the_caret(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    cx.update_window(fixture.window.into(), |_, window, _| {
+        window.activate_window()
+    })
+    .unwrap();
+    let id = new_conversation(cx, &fixture).await;
+    until(
+        cx,
+        "OMP lists its commands",
+        Duration::from_secs(30),
+        |cx| {
+            fixture
+                .state
+                .read(cx)
+                .conversations
+                .get(&id)
+                .is_some_and(|session| {
+                    session
+                        .slash_commands
+                        .commands()
+                        .iter()
+                        .any(|command| command.name == "compact")
+                })
+        },
+    )
+    .await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.focus_composer(window, cx),
+    );
+    let draft = |cx: &App| {
+        fixture.state.read(cx).drafts[&DraftKey::Thread(id)]
+            .text
+            .clone()
+    };
+    let popup_shown = |cx: &mut TestAppContext| {
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.refresh();
+            window.render_frame(cx);
+            window.try_find("slash-completion").is_some()
+        })
+        .unwrap()
+    };
+    let selection = |cx: &App| {
+        fixture
+            .workspace
+            .read(cx)
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.read(cx).completion_selection(cx))
+    };
+
+    cx.simulate_keystrokes(fixture.window.into(), "/ c o m p a c");
+    until(cx, "partial command typed", Duration::from_secs(5), |cx| {
+        draft(cx) == "/compac" && selection(cx).as_deref() == Some("compact")
+    })
+    .await;
+    assert!(popup_shown(cx), "a partial command opens the popup");
+
+    cx.simulate_keystrokes(fixture.window.into(), "tab");
+    until(cx, "command completed", Duration::from_secs(5), |cx| {
+        draft(cx) == "/compact "
+    })
+    .await;
+    assert!(
+        !popup_shown(cx),
+        "the popup closes once the cursor leaves the command"
+    );
+    let note = |cx: &App| {
+        fixture
+            .workspace
+            .read(cx)
+            .editor
+            .as_ref()
+            .and_then(|editor| editor.read(cx).command_note_text().map(str::to_owned))
+    };
+    until(cx, "argument syntax shown", Duration::from_secs(5), |cx| {
+        note(cx).is_some_and(|note| note.starts_with("/compact ["))
+    })
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "s o f t");
+    until(
+        cx,
+        "arguments typed in insert mode",
+        Duration::from_secs(5),
+        |cx| draft(cx) == "/compact soft",
+    )
+    .await;
+    until(
+        cx,
+        "argument syntax hidden once typed",
+        Duration::from_secs(5),
+        |cx| note(cx).is_none(),
+    )
+    .await;
+
+    // Escape closes the popup without leaving insert mode; typing on reopens it.
+    cx.simulate_keystrokes(fixture.window.into(), "escape g g d G i / c o");
+    until(cx, "second partial command", Duration::from_secs(5), |cx| {
+        draft(cx) == "/co"
+    })
+    .await;
+    assert!(popup_shown(cx));
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    cx.run_until_parked();
+    assert!(!popup_shown(cx), "Escape closes the popup first");
+    cx.simulate_keystrokes(fixture.window.into(), "m");
+    until(cx, "still in insert mode", Duration::from_secs(5), |cx| {
+        draft(cx) == "/com"
+    })
+    .await;
+    assert!(popup_shown(cx), "a changed query reopens the popup");
+
+    // Down and Ctrl-P move the selection; Return inserts it.
+    let first = cx.read(selection).unwrap();
+    cx.simulate_keystrokes(fixture.window.into(), "down");
+    cx.run_until_parked();
+    let second = cx.read(selection).unwrap();
+    assert_ne!(first, second);
+    cx.simulate_keystrokes(fixture.window.into(), "ctrl-p");
+    cx.run_until_parked();
+    assert_eq!(cx.read(selection).unwrap(), first);
+    cx.simulate_keystrokes(fixture.window.into(), "enter");
+    let expected = format!("/{first} ");
+    until(
+        cx,
+        "Return inserts the selection",
+        Duration::from_secs(5),
+        |cx| draft(cx) == expected,
+    )
+    .await;
+    assert!(
+        cx.read(|cx| fixture
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == id)
+            .unwrap()
+            .submission
+            .is_none()),
+        "completion never sends"
+    );
+    quit(cx, &fixture).await;
+}
+
 async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
     cx.simulate_keystrokes(fixture.window.into(), "secondary-shift-p");
     until(cx, "palette opened", Duration::from_secs(5), |cx| {

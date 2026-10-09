@@ -63,6 +63,11 @@ gpui_kit::actions!(
         ClearQueuedMessages,
         SendQueuedNow,
         EditQueuedMessage,
+        InsertSlashCommand,
+        NextCompletion,
+        PreviousCompletion,
+        AcceptCompletion,
+        DismissCompletion,
         OpenPalette,
         FocusLeft,
         FocusDown,
@@ -137,9 +142,10 @@ pub enum Command {
     ClearQueuedMessages,
     SendQueuedNow,
     EditQueuedMessage,
+    InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 48] = [
+    pub const ALL: [Self; 49] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -185,6 +191,7 @@ impl Command {
         Self::CancelEditorCommand,
         Self::CopyDraftRecovery,
         Self::PasteImage,
+        Self::InsertSlashCommand,
         Self::SendQueuedNow,
         Self::EditQueuedMessage,
         Self::ClearQueuedMessages,
@@ -240,6 +247,7 @@ impl Command {
             Self::ClearQueuedMessages => "Clear queued messages",
             Self::SendQueuedNow => "Send next queued message now",
             Self::EditQueuedMessage => "Edit last queued message",
+            Self::InsertSlashCommand => "Insert slash command…",
         }
     }
 
@@ -293,6 +301,7 @@ impl Command {
             Self::ClearQueuedMessages => Box::new(ClearQueuedMessages),
             Self::SendQueuedNow => Box::new(SendQueuedNow),
             Self::EditQueuedMessage => Box::new(EditQueuedMessage),
+            Self::InsertSlashCommand => Box::new(InsertSlashCommand),
         }
     }
 
@@ -412,6 +421,13 @@ impl Command {
                     }
                     _ => None,
                 }),
+            Self::InsertSlashCommand => match state.conversation_thread() {
+                None => Some("Select a conversation first.".into()),
+                Some(thread) if thread.archived => Some("Archived threads are read-only.".into()),
+                Some(thread) => state
+                    .slash_command_reason(thread.id)
+                    .map(|reason| format!("{reason}.")),
+            },
             Self::SendQueuedNow => match state.conversation_thread() {
                 None => Some("Select a conversation first.".into()),
                 // During a turn, Send now stops that turn first; the row button agrees.
@@ -484,6 +500,7 @@ pub fn bind_keys(cx: &mut App) {
     let submit = Some(
         "(Thread || PromptEditor || FactoryThreadForm) && !Command && !PopupMenu && !Sheet && !Dialog",
     );
+    let caret_popup = Some("PromptEditor && CaretPopup && !Command && !Sheet && !Dialog");
     cx.bind_keys(vec![
         KeyBinding::new("secondary-shift-p", OpenPalette, workspace),
         KeyBinding::new("secondary-alt-]", NextSpace, navigation),
@@ -586,6 +603,16 @@ pub fn bind_keys(cx: &mut App) {
             Some("(PromptEditor || Terminal) && !Dialog && !Sheet"),
         ),
         KeyBinding::new("secondary-enter", Submit, submit),
+        // The composer's caret popup follows Vim's insert-mode completion menu. Its context
+        // is deeper than Root's Tab focus navigation and the workspace's Escape.
+        KeyBinding::new("ctrl-n", NextCompletion, caret_popup),
+        KeyBinding::new("down", NextCompletion, caret_popup),
+        KeyBinding::new("ctrl-p", PreviousCompletion, caret_popup),
+        KeyBinding::new("up", PreviousCompletion, caret_popup),
+        KeyBinding::new("tab", AcceptCompletion, caret_popup),
+        KeyBinding::new("enter", AcceptCompletion, caret_popup),
+        KeyBinding::new("ctrl-e", DismissCompletion, caret_popup),
+        KeyBinding::new("escape", DismissCompletion, caret_popup),
         KeyBinding::new(
             "secondary-enter",
             Submit,
@@ -666,6 +693,8 @@ pub struct Palette {
     state: Entity<AppState>,
     closed: bool,
     spaces: Option<SpacePicker>,
+    /// The Conversation whose harness commands this palette lists instead of the app's.
+    slash_commands: Option<Uuid>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -676,7 +705,17 @@ impl Palette {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        Self::open_with_spaces(owner, state, None, window, cx)
+        Self::open_with_spaces(owner, state, None, None, window, cx)
+    }
+
+    pub fn open_slash_commands(
+        owner: WeakEntity<Workspace>,
+        state: Entity<AppState>,
+        thread: Uuid,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::open_with_spaces(owner, state, None, Some(thread), window, cx)
     }
 
     pub fn open_spaces(
@@ -696,13 +735,14 @@ impl Palette {
                 .cloned()
                 .collect(),
         };
-        Self::open_with_spaces(owner, state, Some(picker), window, cx)
+        Self::open_with_spaces(owner, state, Some(picker), None, window, cx)
     }
 
     fn open_with_spaces(
         owner: WeakEntity<Workspace>,
         state: Entity<AppState>,
         spaces: Option<SpacePicker>,
+        slash_commands: Option<Uuid>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -731,6 +771,7 @@ impl Palette {
                 state,
                 closed: false,
                 spaces,
+                slash_commands,
                 _subscriptions: subscriptions,
             }
         });
@@ -890,6 +931,100 @@ impl Palette {
         });
     }
 
+    fn run_slash_command(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.slash_commands else {
+            return;
+        };
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let id = cx.entity().entity_id();
+        let _ = self.owner.update(cx, |workspace, cx| {
+            if !workspace
+                .palette
+                .as_ref()
+                .is_some_and(|palette| palette.entity_id() == id)
+            {
+                return;
+            }
+            workspace.palette = None;
+            window.close_dialog(cx);
+            workspace.insert_slash_command(thread, &name, window, cx);
+            cx.notify();
+        });
+    }
+
+    fn render_slash_commands(&self, thread: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.state.read(cx);
+        let catalog = state
+            .conversations
+            .get(&thread)
+            .map(|session| &session.slash_commands);
+        let harness = state
+            .snapshot
+            .threads
+            .iter()
+            .find(|candidate| candidate.id == thread)
+            .map(|thread| crate::harness::display_name(&thread.harness).to_owned())
+            .unwrap_or_default();
+        let reason = catalog.map_or_else(
+            || Some("Open the conversation harness first".to_owned()),
+            |catalog| catalog.unavailable_reason(),
+        );
+        let commands: Vec<_> = catalog
+            .map(|catalog| super::slash_commands::matches(catalog, ""))
+            .unwrap_or_default()
+            .into_iter()
+            .cloned()
+            .collect();
+        let mut group = CommandGroup::new().label(format!("{harness} commands"));
+        for command in &commands {
+            let shown = command.clone();
+            group = group.item(
+                CommandItem::new()
+                    .label(format!("/{}", command.name))
+                    // The native filter does not rank, so descriptions would bury the
+                    // command whose name was typed.
+                    .keywords(command.aliases.iter().map(|alias| format!("/{alias}")))
+                    .child(move |_, cx| super::slash_commands::row(&shown, cx)),
+            );
+        }
+        let names: Rc<Vec<String>> =
+            Rc::new(commands.into_iter().map(|command| command.name).collect());
+        let confirm = cx.entity().downgrade();
+        let cancel = cx.entity().downgrade();
+        div()
+            .id("slash-command-picker")
+            .key_context("SlashCommandPicker")
+            .w_full()
+            .child(
+                NativeCommand::new(&self.command)
+                    .bordered(false)
+                    .placeholder("Search commands and skills…")
+                    .max_h(rems(26.))
+                    .group(group)
+                    .empty(move |_, _, cx| {
+                        div()
+                            .p_3()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(reason.clone().unwrap_or_else(|| "No commands match".into()))
+                    })
+                    .on_confirm(move |index, window, cx| {
+                        let Some(name) = names.get(index.row).cloned() else {
+                            return;
+                        };
+                        let _ = confirm.update(cx, |palette, cx| {
+                            palette.run_slash_command(name, window, cx)
+                        });
+                    })
+                    .on_cancel(move |_, cx| {
+                        let _ = cancel.update(cx, |palette, cx| palette.cleanup(cx));
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_spaces(&self, picker: &SpacePicker, cx: &mut Context<Self>) -> AnyElement {
         let confirm = cx.entity().downgrade();
         let cancel = cx.entity().downgrade();
@@ -943,6 +1078,9 @@ impl Render for Palette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(picker) = &self.spaces {
             return self.render_spaces(picker, cx);
+        }
+        if let Some(thread) = self.slash_commands {
+            return self.render_slash_commands(thread, cx);
         }
         let state = self.state.read(cx);
         let mut targets = [Vec::new(), Vec::new(), Vec::new()];
@@ -1065,6 +1203,9 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &SwitchSpace, w, cx| {
                 this.run(PaletteTarget::Command(Command::SwitchSpace), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &InsertSlashCommand, w, cx| {
+                this.run(PaletteTarget::Command(Command::InsertSlashCommand), w, cx)
             }))
             .on_action(cx.listener(|this, _: &NextSpace, w, cx| {
                 this.run(PaletteTarget::Command(Command::NextSpace), w, cx)

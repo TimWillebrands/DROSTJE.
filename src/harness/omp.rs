@@ -390,6 +390,7 @@ enum RequestKind {
     },
     Prompt(Uuid),
     Abort,
+    Commands,
 }
 struct Pending {
     kind: RequestKind,
@@ -581,8 +582,40 @@ impl Actor {
         if self.dialect == Dialect::Pi {
             self.request(json!({"type":"get_state"}), RequestKind::State)?;
             self.request(json!({"type":"get_available_models"}), RequestKind::Models)?;
+            self.request_commands()?;
         }
         Ok(())
+    }
+    /// OMP also pushes `available_commands_update` whenever its list changes; Pi has no such
+    /// event, so its list is fetched again after every turn.
+    fn request_commands(&mut self) -> Result<()> {
+        if self
+            .requests
+            .pending
+            .values()
+            .any(|pending| matches!(pending.kind, RequestKind::Commands))
+        {
+            return Ok(());
+        }
+        let command = match self.dialect {
+            Dialect::Omp => "get_available_commands",
+            Dialect::Pi => "get_commands",
+        };
+        self.request(json!({ "type": command }), RequestKind::Commands)
+    }
+    fn commands(&mut self, raw: &Value) {
+        match parse_commands(self.dialect, raw) {
+            Ok((commands, rejected)) => {
+                if !rejected.is_empty() {
+                    self.emit(ConversationEvent::Diagnostic {
+                        label: "Commands without a name".into(),
+                        raw: Value::Array(rejected),
+                    });
+                }
+                self.emit(ConversationEvent::CommandsUpdated(commands));
+            }
+            Err(error) => self.emit(ConversationEvent::CommandsUnavailable(format!("{error:#}"))),
+        }
     }
     fn emit(&mut self, event: ConversationEvent) {
         self.events.push_back(event);
@@ -1038,6 +1071,9 @@ impl Actor {
         {
             self.request(json!({"type":"get_state"}), RequestKind::State)?;
         }
+        if self.dialect == Dialect::Pi {
+            self.request_commands()?;
+        }
         self.history(None)
     }
     fn close(&mut self) -> Result<()> {
@@ -1116,6 +1152,9 @@ impl Actor {
                     });
                     self.maybe_ready()?;
                 }
+                RequestKind::Commands => self.emit(ConversationEvent::CommandsUnavailable(
+                    format!("{} did not list its commands in time", self.dialect.name()),
+                )),
                 _ => {
                     self.emit(ConversationEvent::Failed {
                         request_id: None,
@@ -1298,6 +1337,9 @@ impl Actor {
                     });
                 }
             }
+            "available_commands_update" if self.dialect == Dialect::Omp => {
+                self.commands(&value["commands"])
+            }
             "session_info_update" => {
                 self.request(json!({"type":"get_state"}), RequestKind::State)?;
             }
@@ -1406,6 +1448,9 @@ impl Actor {
                 RequestKind::Negotiate => {
                     bail!("OMP refused protocol v2: {}", string(&value, "error"))
                 }
+                RequestKind::Commands => self.emit(ConversationEvent::CommandsUnavailable(string(
+                    &value, "error",
+                ))),
                 RequestKind::State if !self.initialized => {
                     bail!("OMP initialization failed: {}", string(&value, "error"))
                 }
@@ -1443,6 +1488,7 @@ impl Actor {
                 }
                 self.request(json!({"type":"get_state"}), RequestKind::State)?;
                 self.request(json!({"type":"get_available_models"}), RequestKind::Models)?;
+                self.request_commands()?;
             }
             RequestKind::State => {
                 let session_id = data["sessionId"]
@@ -1566,6 +1612,7 @@ impl Actor {
                     self.finish(TurnOutcome::Completed)?;
                 }
             }
+            RequestKind::Commands => self.commands(&data["commands"]),
             RequestKind::Abort => {
                 // Abort acknowledgement alone does not prove that the agent stopped.
                 self.next_poll = Instant::now();
@@ -1859,6 +1906,68 @@ fn safe_web_url(url: &str) -> bool {
         && url
             .split_once("://")
             .is_some_and(|(_, rest)| !rest.is_empty() && !rest.starts_with('/'))
+}
+/// OMP entries are `{name, aliases?, description, input?: {hint}, source}`; Pi entries are
+/// `{name, description?, source}` plus location details DROSTJE. does not need. Entries
+/// without a name are returned separately so they can be shown as a diagnostic.
+fn parse_commands(dialect: Dialect, raw: &Value) -> Result<(Vec<SlashCommand>, Vec<Value>)> {
+    let entries = raw
+        .as_array()
+        .with_context(|| format!("{} returned no command list", dialect.name()))?;
+    let mut commands = Vec::new();
+    let mut rejected = Vec::new();
+    for entry in entries {
+        let Some(name) = entry["name"]
+            .as_str()
+            .map(|name| name.trim_start_matches('/'))
+            .filter(|name| !name.is_empty())
+        else {
+            rejected.push(entry.clone());
+            continue;
+        };
+        let source = match entry["source"].as_str().unwrap_or("") {
+            "builtin" => CommandSource::Builtin,
+            "skill" => CommandSource::Skill,
+            "extension" => CommandSource::Extension,
+            "custom" => CommandSource::Custom,
+            "prompt" => CommandSource::Template,
+            "file" => CommandSource::File,
+            "mcp_prompt" => CommandSource::McpPrompt,
+            other => CommandSource::Other(other.to_owned()),
+        };
+        let blocked = (dialect == Dialect::Omp && source == CommandSource::Builtin)
+            .then(|| omp_blocked(name))
+            .flatten();
+        commands.push(SlashCommand {
+            name: name.to_owned(),
+            aliases: entry["aliases"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            description: string(entry, "description"),
+            argument_hint: entry["input"]["hint"]
+                .as_str()
+                .filter(|hint| !hint.is_empty())
+                .map(str::to_owned),
+            source,
+            blocked,
+        });
+    }
+    Ok((commands, rejected))
+}
+/// OMP builtins that replace the model, session or directory DROSTJE. tracks.
+fn omp_blocked(name: &str) -> Option<&'static str> {
+    match name {
+        "model" | "switch" => Some(super::commands::MODEL_PICKER),
+        "session" => Some("session management belongs to the Conversation"),
+        "move" | "wt" | "add-dir" | "remove-dir" => {
+            Some("DROSTJE. owns the Conversation's directory and worktree")
+        }
+        _ => None,
+    }
 }
 fn string(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or("").to_owned()
@@ -2643,5 +2752,152 @@ done
             submission_size_for_lengths(id, &format!("{text}x"), &[]).unwrap(),
             FRAME as u64 + 1
         );
+    }
+
+    fn test_actor(dialect: Dialect) -> Result<(Actor, std::path::PathBuf)> {
+        let root = std::env::temp_dir().join(format!("drostje-omp-commands-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        let mut config = ConversationConfig {
+            harness: match dialect {
+                Dialect::Omp => "omp",
+                Dialect::Pi => "pi",
+            }
+            .into(),
+            executable: "/usr/bin/true".into(),
+            cwd: root.clone(),
+            session_dir: root.join("session"),
+            session_ref: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            allow_empty_session: true,
+        };
+        let child = prepare(&mut config, dialect)?;
+        let (_commands, input) = async_channel::bounded(64);
+        let (output, _events) = async_channel::bounded(128);
+        let mut actor = Actor::new(config, child, input, output, dialect);
+        actor.initialized = true;
+        actor.negotiated = true;
+        actor.events.clear();
+        Ok((actor, root))
+    }
+
+    fn written(actor: &Actor) -> Vec<Value> {
+        actor
+            .writes
+            .iter()
+            .map(|bytes| serde_json::from_slice(bytes).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn omp_and_pi_command_lists_parse_into_one_shape() -> Result<()> {
+        let (commands, rejected) = parse_commands(
+            Dialect::Omp,
+            &json!([
+                {"name":"model","aliases":["models"],"description":"Show current model selection","source":"builtin"},
+                {"name":"compact","description":"Compact the conversation","input":{"hint":"[soft|remote|snapcompact] [focus]"},"subcommands":[{"name":"soft","description":"Summarize locally"}],"source":"builtin"},
+                {"name":"skill:tdd","description":"Test-driven development.","input":{"hint":"arguments"},"source":"skill"},
+                {"name":"green","description":"Iterate on CI","source":"custom"},
+                {"name":"later","description":"From a newer OMP","source":"workflow"},
+                {"description":"No name"}
+            ]),
+        )?;
+        assert_eq!(rejected, vec![json!({"description":"No name"})]);
+        assert_eq!(commands.len(), 5);
+        assert_eq!(commands[0].aliases, ["models"]);
+        assert_eq!(
+            commands[0].blocked,
+            Some(super::super::commands::MODEL_PICKER)
+        );
+        assert_eq!(
+            commands[1].argument_hint.as_deref(),
+            Some("[soft|remote|snapcompact] [focus]")
+        );
+        assert_eq!(commands[1].blocked, None);
+        assert_eq!(commands[2].source, CommandSource::Skill);
+        assert_eq!(commands[3].source, CommandSource::Custom);
+        assert_eq!(commands[4].source, CommandSource::Other("workflow".into()));
+
+        // Pi's documented and shipped shapes differ only in location fields.
+        let (commands, rejected) = parse_commands(
+            Dialect::Pi,
+            &json!([
+                {"name":"skill:review","description":"Review code","source":"skill","location":"user","path":"/home/u/.pi/agent/skills/review/SKILL.md"},
+                {"name":"fix","source":"prompt","sourceInfo":{"path":"/p/.pi/prompts/fix.md","source":"local","scope":"project","origin":"top-level"}},
+                {"name":"model","description":"An extension's own model command","source":"extension"}
+            ]),
+        )?;
+        assert!(rejected.is_empty());
+        assert_eq!(commands[0].source, CommandSource::Skill);
+        assert_eq!(commands[1].source, CommandSource::Template);
+        assert_eq!(commands[1].description, "");
+        assert_eq!(
+            commands[2].blocked, None,
+            "only OMP's own builtins are blocked"
+        );
+        assert!(parse_commands(Dialect::Pi, &json!({"commands":[]})).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn omp_requests_commands_after_negotiation_and_applies_pushed_updates() -> Result<()> {
+        let (mut actor, root) = test_actor(Dialect::Omp)?;
+        actor.negotiated = false;
+        actor.request(
+            json!({"id":"negotiate","type":"negotiate_protocol","protocolVersion":2}),
+            RequestKind::Negotiate,
+        )?;
+        actor.frame(json!({"id":"negotiate","type":"response","command":"negotiate_protocol","success":true,"data":{"protocolVersion":2}}))?;
+        let request = written(&actor)
+            .into_iter()
+            .find(|frame| frame["type"] == "get_available_commands")
+            .context("OMP command list was not requested")?;
+
+        actor.frame(json!({"id":request["id"],"type":"response","command":"get_available_commands","success":true,
+            "data":{"commands":[{"name":"compact","description":"Compact the conversation","source":"builtin"}]}}))?;
+        assert!(actor.events.iter().any(|event| matches!(event,
+            ConversationEvent::CommandsUpdated(commands) if commands.len() == 1 && commands[0].name == "compact")));
+
+        actor.events.clear();
+        actor.frame(json!({"type":"available_commands_update","commands":[
+            {"name":"skill:tdd","description":"TDD","source":"skill"},
+            {"name":"reload-plugins","description":"Reload all plugins","source":"builtin"}]}))?;
+        assert!(matches!(actor.events.back(),
+            Some(ConversationEvent::CommandsUpdated(commands)) if commands.len() == 2));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_command_list_is_not_a_conversation_failure() -> Result<()> {
+        let (mut actor, root) = test_actor(Dialect::Pi)?;
+        actor.request_commands()?;
+        actor.request_commands()?;
+        let requests: Vec<_> = written(&actor)
+            .into_iter()
+            .filter(|frame| frame["type"] == "get_commands")
+            .collect();
+        assert_eq!(requests.len(), 1, "one list request at a time");
+        actor.frame(json!({"id":requests[0]["id"],"type":"response","command":"get_commands","success":false,"error":"Unknown command: get_commands"}))?;
+        assert!(matches!(actor.events.back(),
+            Some(ConversationEvent::CommandsUnavailable(reason)) if reason == "Unknown command: get_commands"));
+        assert!(
+            !actor
+                .events
+                .iter()
+                .any(|event| matches!(event, ConversationEvent::Failed { .. }))
+        );
+
+        // Pi has no change event, so every settled turn asks again.
+        actor.writes.clear();
+        actor.finish(TurnOutcome::Completed)?;
+        assert!(
+            written(&actor)
+                .iter()
+                .any(|frame| frame["type"] == "get_commands")
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

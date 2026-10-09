@@ -1,8 +1,10 @@
 //! Native conversation boundary. Provider wire objects stay in their harness module.
 mod claude;
+mod commands;
 mod omp;
 mod pi;
 use crate::model::{ImageAttachment, ModelKey};
+pub use commands::{CommandCatalog, CommandSource, SlashCommand, invocation};
 use serde_json::Value;
 use std::{path::PathBuf, time::SystemTime};
 pub const CONVERSATION_HARNESSES: [&str; 3] = ["omp", "pi", "claude-code"];
@@ -227,6 +229,10 @@ pub enum ConversationEvent {
         outcome: TurnOutcome,
     },
     ModelSelected(ModelKey),
+    /// The complete command list; replaces any earlier one.
+    CommandsUpdated(Vec<SlashCommand>),
+    /// The harness could not list its commands. Prompts still send typed commands.
+    CommandsUnavailable(String),
     TitleChanged(String),
     EditorTextRequested(String),
     StatusUpdated {

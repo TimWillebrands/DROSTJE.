@@ -366,6 +366,20 @@ impl AppState {
         }
     }
 
+    /// Why the Conversation cannot offer slash commands right now.
+    pub fn slash_command_reason(&self, id: ThreadId) -> Option<String> {
+        let Some(session) = self.conversations.get(&id) else {
+            return Some("Open the conversation harness first".into());
+        };
+        session.slash_commands.unavailable_reason()
+    }
+
+    /// Why `text` must not reach the harness: it invokes a slash command that would replace
+    /// state DROSTJE. owns for the Conversation.
+    pub fn command_refusal(&self, id: ThreadId, text: &str) -> Option<String> {
+        self.conversations.get(&id)?.slash_commands.refusal(text)
+    }
+
     pub fn submit_snapshot(&mut self, id: ThreadId, draft: DraftSnapshot, cx: &mut Context<Self>) {
         let Some(thread) = self.snapshot.threads.iter().find(|t| t.id == id) else {
             return;
@@ -383,6 +397,10 @@ impl AppState {
         }
         if draft.text.trim().is_empty() && thread.attachments.is_empty() {
             self.submission_failed(id, "Enter a prompt or attach an image".into());
+            return;
+        }
+        if let Some(reason) = self.command_refusal(id, &draft.text) {
+            self.submission_failed(id, reason);
             return;
         }
         let images = thread.attachments.clone();
@@ -473,6 +491,10 @@ impl AppState {
         }
         if draft.text.trim().is_empty() && thread.attachments.is_empty() {
             self.notice(NoticeLevel::Warning, "Enter a prompt or attach an image");
+            return;
+        }
+        if let Some(reason) = self.command_refusal(id, &draft.text) {
+            self.notice(NoticeLevel::Warning, reason);
             return;
         }
         let Some(editor) = self.editor.clone() else {
@@ -848,6 +870,8 @@ impl AppState {
             | ConversationEvent::SubmissionAccepted { .. }
             | ConversationEvent::TurnSettled { .. }
             | ConversationEvent::ModelSelected(_)
+            | ConversationEvent::CommandsUpdated(_)
+            | ConversationEvent::CommandsUnavailable(_)
             | ConversationEvent::TitleChanged(_)
             | ConversationEvent::EditorTextRequested(_)
             | ConversationEvent::StatusUpdated { .. }
@@ -1119,6 +1143,12 @@ impl AppState {
                 } else {
                     session.widgets.insert(key, lines);
                 }
+            }
+            ConversationEvent::CommandsUpdated(commands) => {
+                session.slash_commands = CommandCatalog::Ready(commands);
+            }
+            ConversationEvent::CommandsUnavailable(reason) => {
+                session.slash_commands = CommandCatalog::Unavailable(reason);
             }
             ConversationEvent::ContextUsageUpdated(usage) => {
                 session.context_usage = Some(usage);

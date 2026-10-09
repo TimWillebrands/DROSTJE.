@@ -1,4 +1,6 @@
-use super::commands::PasteImage;
+use super::commands::{
+    AcceptCompletion, DismissCompletion, NextCompletion, PasteImage, PreviousCompletion,
+};
 use crate::model::{DraftKey, DraftRevision, DraftSnapshot};
 use crate::neovim::grid::{Cell, GridSnapshot, Highlight, HighlightedChunk};
 use crate::neovim::{ClipboardContent, NvimCommand, NvimEditor, NvimEvent};
@@ -22,6 +24,20 @@ pub enum NvimViewEvent {
     Failed(String),
     InputRejected(String),
     CompositionChanged(bool),
+    /// Neovim's mode changed; `NvimView::mode` has the new one.
+    ModeChanged,
+    /// A key the caret popup claimed instead of Neovim.
+    CaretPopupKey(CaretPopupKey),
+}
+
+/// What the caret popup's Actions ask of its owner. Bindings live in `commands::bind_keys`
+/// and follow Vim's insert-mode completion menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaretPopupKey {
+    Next,
+    Previous,
+    Accept,
+    Dismiss,
 }
 
 #[derive(Clone)]
@@ -185,6 +201,9 @@ pub struct NvimView {
     bell: u64,
     dragging: Option<MouseButton>,
     scroll_remainder: Point<f32>,
+    /// Shown below the caret while the owner has something to offer there; while shown the
+    /// surface adds the `CaretPopup` key context, whose Actions become `CaretPopupKey`s.
+    caret_popup: Option<AnyView>,
 }
 
 impl EventEmitter<NvimViewEvent> for NvimView {}
@@ -281,6 +300,21 @@ impl NvimView {
             dragging: None,
             blink_timer: None,
             scroll_remainder: point(0., 0.),
+            caret_popup: None,
+        }
+    }
+
+    /// Neovim's current mode name, such as `insert` or `normal`.
+    pub fn mode(&self) -> &str {
+        &self.grid.mode
+    }
+
+    pub fn set_caret_popup(&mut self, popup: Option<AnyView>, cx: &mut Context<Self>) {
+        if self.caret_popup.as_ref().map(AnyView::entity_id)
+            != popup.as_ref().map(AnyView::entity_id)
+        {
+            self.caret_popup = popup;
+            cx.notify();
         }
     }
 
@@ -404,8 +438,12 @@ impl NvimView {
                 {
                     self.blink_epoch = Instant::now();
                 }
+                let mode_changed = self.grid.mode != grid.mode;
                 self.grid = grid;
                 self.frame = None;
+                if mode_changed {
+                    cx.emit(NvimViewEvent::ModeChanged);
+                }
             }
             NvimEvent::DraftChanged(draft) => {
                 if self.draft.as_ref().is_some_and(|active| {
@@ -1501,14 +1539,37 @@ impl Render for NvimView {
         self.arm_blink(window, cx);
         let prepare = cx.entity();
         let paint = prepare.clone();
+        let popup_shown = self.caret_popup.is_some()
+            && self.bounds.is_some()
+            && self.enabled()
+            && self.focus_handle.is_focused(window);
         let mut surface = div()
             .size_full()
             .min_h_0()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .key_context("NativeInput PromptEditor")
+            .key_context(if popup_shown {
+                "NativeInput PromptEditor CaretPopup"
+            } else {
+                "NativeInput PromptEditor"
+            })
             .track_focus(&self.focus_handle)
+            .when(popup_shown, |surface| {
+                surface
+                    .on_action(cx.listener(|_, _: &NextCompletion, _, cx| {
+                        cx.emit(NvimViewEvent::CaretPopupKey(CaretPopupKey::Next))
+                    }))
+                    .on_action(cx.listener(|_, _: &PreviousCompletion, _, cx| {
+                        cx.emit(NvimViewEvent::CaretPopupKey(CaretPopupKey::Previous))
+                    }))
+                    .on_action(cx.listener(|_, _: &AcceptCompletion, _, cx| {
+                        cx.emit(NvimViewEvent::CaretPopupKey(CaretPopupKey::Accept))
+                    }))
+                    .on_action(cx.listener(|_, _: &DismissCompletion, _, cx| {
+                        cx.emit(NvimViewEvent::CaretPopupKey(CaretPopupKey::Dismiss))
+                    }))
+            })
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(cx.theme().mono_font_size)
             .text_color(cx.theme().foreground)
@@ -1545,6 +1606,20 @@ impl Render for NvimView {
                 .flex_1()
                 .min_h_0(),
             );
+        if let (Some(popup), Some(bounds)) = (self.caret_popup.clone(), self.bounds)
+            && popup_shown
+        {
+            let caret = bounds.origin + self.cursor_origin();
+            surface = surface.child(
+                deferred(
+                    anchored()
+                        .position(point(caret.x, caret.y + self.cell.height))
+                        .snap_to_window_with_margin(px(8.))
+                        .child(popup),
+                )
+                .with_priority(1),
+            );
+        }
         if let Some(error) = self.error.as_ref() {
             surface = surface.child(Alert::error("nvim-error", error.clone()).banner());
         } else if !self.writable {

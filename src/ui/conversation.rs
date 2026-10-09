@@ -33,8 +33,8 @@ use gpui_kit::{
         spinner::Spinner,
         tag::Tag,
         text::{
-            MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, TextViewStyle,
-            markdown_ast,
+            MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, TextViewState,
+            TextViewStyle, markdown_ast,
         },
         tooltip::Tooltip,
         v_flex,
@@ -44,6 +44,9 @@ use gpui_kit::{
 };
 use serde_json::Value;
 use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -61,6 +64,10 @@ pub(super) struct TranscriptView {
     revision: u64,
     count: usize,
     invalidate_rows: bool,
+    /// List width at which unmeasured rows last got an estimated height; `None` once rows
+    /// without one were added.
+    estimated_width: Rc<Cell<Option<Pixels>>>,
+    markdown: MarkdownStates,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -117,11 +124,13 @@ impl TranscriptView {
             id,
             state,
             owner,
+            markdown: MarkdownStates::new(list.clone(), cx.entity_id()),
             list,
             generation: None,
             revision: 0,
             count: 0,
             invalidate_rows: false,
+            estimated_width: Rc::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -130,33 +139,32 @@ impl TranscriptView {
         let Some(session) = self.state.read(cx).conversations.get(&self.id) else {
             if self.count != 0 {
                 self.list.reset(0);
+                self.markdown.clear();
                 self.count = 0;
             }
             self.generation = None;
             return;
         };
         let count = session.messages.len();
-        if self.generation != Some(session.generation) {
-            self.list.reset(count);
-        } else if self.invalidate_rows {
-            self.list.splice(0..self.count, count);
-        } else if let Some(changes) = session.transcript_changes_since(self.revision) {
-            let mut changed: Vec<_> = changes
-                .filter(|index| *index < self.count && *index < count)
-                .collect();
-            changed.sort_unstable();
-            changed.dedup();
-            for index in changed {
-                self.list.splice(index..index + 1, 1);
-            }
-            if count > self.count {
-                self.list.splice(self.count..self.count, count - self.count);
-            } else if count < self.count {
-                self.list.splice(count..self.count, 0);
-            }
+        let changes = if self.generation != Some(session.generation) {
+            RowChanges::Reset
         } else {
-            self.list.reset(count);
+            match session.transcript_changes_since(self.revision) {
+                None => RowChanges::Reset,
+                Some(_) if self.invalidate_rows => RowChanges::All,
+                Some(changes) => RowChanges::Rows(changes.collect()),
+            }
+        };
+        if matches!(changes, RowChanges::Reset) {
+            self.markdown.clear();
         }
+        update_rows(
+            &self.list,
+            &self.estimated_width,
+            self.count,
+            count,
+            changes,
+        );
         self.generation = Some(session.generation);
         self.revision = session.transcript_revision;
         self.count = count;
@@ -168,6 +176,76 @@ impl TranscriptView {
         scroll_list(&self.list, motion, window.rem_size() * 2.25);
         cx.notify();
     }
+}
+
+/// What changed in a transcript since its list last rendered.
+enum RowChanges {
+    /// A new session, or a gap in the change journal: nothing known about the old rows holds.
+    Reset,
+    /// Any row may have changed height: thread state, a disclosure or the theme changed.
+    All,
+    /// These rows changed in place.
+    Rows(Vec<usize>),
+}
+
+/// Brings `list` from `old` rows to `count`. Changed rows are remeasured in place: a splice
+/// would move a reader inside a replaced row to its top and forget the row's height, so the
+/// reader would jump and the scrollbar would shrink to the rows in view.
+fn update_rows(
+    list: &ListState,
+    estimated_width: &Cell<Option<Pixels>>,
+    old: usize,
+    count: usize,
+    changes: RowChanges,
+) {
+    let kept = old.min(count);
+    if count > old || matches!(changes, RowChanges::Reset) {
+        // New rows have no height until `estimate_unmeasured_rows` runs again.
+        estimated_width.set(None);
+    }
+    match changes {
+        RowChanges::Reset => return list.reset(count),
+        RowChanges::All => list.remeasure_items(0..kept),
+        RowChanges::Rows(mut rows) => {
+            rows.retain(|row| *row < kept);
+            rows.sort_unstable();
+            rows.dedup();
+            for row in rows {
+                list.remeasure_items(row..row + 1);
+            }
+        }
+    }
+    if count != old {
+        list.splice(kept..old, count - kept);
+    }
+}
+
+/// Rows the list has not laid out count as a short message until they are measured.
+const ROW_ESTIMATE: f32 = 3.;
+
+/// Gives rows the list has not laid out an estimated height, so the scrollbar spans the whole
+/// transcript and a drag lands proportionally instead of skipping rows that count as zero.
+/// The list forgets every row height when its width changes; this runs after the list's
+/// prepaint and before the scrollbar's, so the thumb is right in the same frame.
+fn estimate_unmeasured_rows(
+    list: &ListState,
+    estimated_width: &Rc<Cell<Option<Pixels>>>,
+    row: Pixels,
+) -> impl IntoElement {
+    let list = list.clone();
+    let estimated_width = estimated_width.clone();
+    canvas(
+        move |_, _, _| {
+            let width = list.viewport_bounds().size.width;
+            if estimated_width.replace(Some(width)) != Some(width) {
+                // Measured rows keep their height; only unknown ones take the estimate.
+                list.with_uniform_item_height(row);
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .size_0()
 }
 
 fn scroll_list(list: &ListState, motion: Motion, line: Pixels) {
@@ -199,10 +277,11 @@ fn scrolled_up(list: &ListState) -> bool {
 }
 
 impl Render for TranscriptView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync(cx);
         let state = self.state.clone();
         let owner = self.owner.clone();
+        let markdown = self.markdown.clone();
         let id = self.id;
         let scrolled_up = scrolled_up(&self.list);
         let rows = list(self.list.clone(), move |index, _, cx| {
@@ -221,6 +300,7 @@ impl Render for TranscriptView {
                         session,
                         state.active_threads.contains(&id),
                         &owner,
+                        Markdown::Row(&markdown, index),
                         cx,
                     )
                 })
@@ -232,6 +312,11 @@ impl Render for TranscriptView {
             .relative()
             .size_full()
             .child(rows)
+            .child(estimate_unmeasured_rows(
+                &self.list,
+                &self.estimated_width,
+                window.rem_size() * ROW_ESTIMATE,
+            ))
             .vertical_scrollbar(&self.list)
             .when(scrolled_up, |this| {
                 this.child(
@@ -767,8 +852,144 @@ fn transcript_text_style(cx: &App) -> TextViewStyle {
             }
         })
 }
-pub fn markdown_text(id: impl Into<ElementId>, text: String, cx: &App) -> impl IntoElement {
-    TextView::markdown(id, text)
+/// Where a Markdown block keeps its parsed state.
+#[derive(Clone, Copy)]
+pub enum Markdown<'a> {
+    /// With its element, for as long as the element renders in consecutive frames.
+    Element,
+    /// With the transcript, for the list row it renders in.
+    Row(&'a MarkdownStates, usize),
+}
+
+/// `TextView` parses longer documents on a background executor.
+const SYNC_PARSE_LIMIT: usize = 4 * 1024;
+
+/// Parsed transcript Markdown, kept for as long as the transcript.
+///
+/// Element state lasts only while its element renders in consecutive frames, and a long
+/// document lays out empty until its background parse lands. A row that left the list's
+/// render window and came back would be measured at zero height, and scrolling across it
+/// would skip it. Here each text parses once, and a landing parse remeasures its row.
+#[derive(Clone)]
+pub struct MarkdownStates {
+    list: ListState,
+    view: EntityId,
+    entries: Rc<RefCell<HashMap<ElementId, MarkdownEntry>>>,
+}
+
+struct MarkdownEntry {
+    state: Entity<TextViewState>,
+    text: SharedString,
+    row: Rc<Cell<usize>>,
+    /// Set until a background parse lands and the row can be measured at its real height.
+    parsing: Rc<Cell<bool>>,
+    _parsed: Subscription,
+}
+
+impl MarkdownStates {
+    fn new(list: ListState, view: EntityId) -> Self {
+        Self {
+            list,
+            view,
+            entries: Rc::default(),
+        }
+    }
+
+    fn state(
+        &self,
+        id: ElementId,
+        text: SharedString,
+        row: usize,
+        cx: &mut App,
+    ) -> Entity<TextViewState> {
+        let existing = self.entries.borrow_mut().get_mut(&id).map(|entry| {
+            entry.row.set(row);
+            let changed = entry.text != text;
+            if changed {
+                entry.parsing.set(text.len() > SYNC_PARSE_LIMIT);
+                entry.text = text.clone();
+            }
+            (entry.state.clone(), changed)
+        });
+        match existing {
+            Some((state, true)) => {
+                state.update(cx, |state, cx| state.set_text(&text, cx));
+                state
+            }
+            Some((state, false)) => state,
+            None => self.insert(id, text, row, cx),
+        }
+    }
+
+    fn insert(
+        &self,
+        id: ElementId,
+        text: SharedString,
+        row: usize,
+        cx: &mut App,
+    ) -> Entity<TextViewState> {
+        let state = cx.new(|cx| TextViewState::markdown(&text, cx));
+        let row = Rc::new(Cell::new(row));
+        let parsing = Rc::new(Cell::new(text.len() > SYNC_PARSE_LIMIT));
+        let parsed = cx.observe(&state, {
+            let (list, view, row, parsing) =
+                (self.list.clone(), self.view, row.clone(), parsing.clone());
+            move |_, cx| {
+                if parsing.replace(false) {
+                    let row = row.get();
+                    if row < list.item_count() {
+                        list.remeasure_items(row..row + 1);
+                    }
+                }
+                cx.notify(view);
+            }
+        });
+        self.entries.borrow_mut().insert(
+            id,
+            MarkdownEntry {
+                state: state.clone(),
+                text,
+                row,
+                parsing,
+                _parsed: parsed,
+            },
+        );
+        state
+    }
+
+    fn clear(&self) {
+        self.entries.borrow_mut().clear();
+    }
+}
+
+pub fn markdown_text(
+    id: impl Into<ElementId>,
+    text: String,
+    markdown: Markdown,
+) -> impl IntoElement {
+    TranscriptMarkdown {
+        id: id.into(),
+        text: text.into(),
+        states: match markdown {
+            Markdown::Element => None,
+            Markdown::Row(states, row) => Some((states.clone(), row)),
+        },
+    }
+}
+
+#[derive(IntoElement)]
+struct TranscriptMarkdown {
+    id: ElementId,
+    text: SharedString,
+    states: Option<(MarkdownStates, usize)>,
+}
+
+impl RenderOnce for TranscriptMarkdown {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        match self.states {
+            Some((states, row)) => TextView::new(&states.state(self.id, self.text, row, cx)),
+            None => TextView::markdown(self.id, self.text),
+        }
         .style(transcript_text_style(cx))
         .plugin(InertResources)
         .selectable(true)
@@ -779,6 +1000,7 @@ pub fn markdown_text(id: impl Into<ElementId>, text: String, cx: &App) -> impl I
                 cx.open_url(url);
             }
         })
+    }
 }
 pub fn image_thumbnail(
     image: &ImageAttachment,
@@ -947,6 +1169,7 @@ fn thinking_block(
     identity: String,
     display: String,
     owner: &WeakEntity<Workspace>,
+    markdown: Markdown,
     cx: &App,
 ) -> AnyElement {
     let key = format!("{identity}:thinking");
@@ -991,7 +1214,7 @@ fn thinking_block(
             owner,
             cx,
             "thinking",
-            || markdown_text(markdown_id, rendered, cx).into_any_element(),
+            || markdown_text(markdown_id, rendered, markdown).into_any_element(),
         ))
     } else {
         let titles = thinking_titles(&display);
@@ -1045,13 +1268,14 @@ pub(super) fn block(
     content: &ContentBlock,
     identity: String,
     owner: &WeakEntity<Workspace>,
+    markdown: Markdown,
     cx: &App,
 ) -> AnyElement {
     match content {
         ContentBlock::Text(text) => {
             let markdown_id = format!("{identity}:markdown");
             guarded_text(identity, text, owner, cx, || {
-                markdown_text(markdown_id, text.clone(), cx).into_any_element()
+                markdown_text(markdown_id, text.clone(), markdown).into_any_element()
             })
         }
         ContentBlock::Thinking(text) => {
@@ -1059,7 +1283,7 @@ pub(super) fn block(
             if display.is_empty() {
                 return div().into_any_element();
             }
-            thinking_block(identity, display, owner, cx)
+            thinking_block(identity, display, owner, markdown, cx)
         }
         ContentBlock::Image(image) => image_thumbnail(image, owner, cx),
         ContentBlock::ImageError(error) => Alert::error(
@@ -1087,6 +1311,7 @@ pub(super) fn block(
                 exit_code: None,
             },
             owner,
+            markdown,
             cx,
         ),
     }
@@ -1140,9 +1365,9 @@ fn code_block(
     identity: impl Into<ElementId>,
     text: &str,
     language: &str,
-    cx: &App,
+    markdown: Markdown,
 ) -> impl IntoElement {
-    markdown_text(identity, code_fence(text, language), cx)
+    markdown_text(identity, code_fence(text, language), markdown)
 }
 /// Wrap `text` in a fence longer than any backtick run it contains, so the
 /// block always closes where intended.
@@ -1326,6 +1551,7 @@ fn tool_card(
     call: ToolCall<'_>,
     result: ToolResult<'_>,
     owner: &WeakEntity<Workspace>,
+    markdown: Markdown,
     cx: &App,
 ) -> AnyElement {
     let ToolCall {
@@ -1458,10 +1684,10 @@ fn tool_card(
                 (ContentBlock::Text(text), Some(language)) => {
                     let markdown_id = format!("{identity}:markdown");
                     guarded_text(identity, text, owner, cx, || {
-                        code_block(markdown_id, text, language, cx).into_any_element()
+                        code_block(markdown_id, text, language, markdown).into_any_element()
                     })
                 }
-                _ => self::block(block, identity, owner, cx),
+                _ => self::block(block, identity, owner, markdown, cx),
             });
         }
         detail = detail.child(output);
@@ -1633,6 +1859,10 @@ fn todo_checklist(list: &TodoList, cx: &App) -> Div {
     column
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a row helper takes the row context message() renders with"
+)]
 fn tool_call_row(
     thread: ThreadId,
     call_id: &str,
@@ -1640,6 +1870,7 @@ fn tool_call_row(
     session: &ConversationSession,
     active: bool,
     owner: &WeakEntity<Workspace>,
+    markdown: Markdown,
     cx: &App,
 ) -> AnyElement {
     let key = format!("tool:{thread}:{call_id}");
@@ -1668,6 +1899,7 @@ fn tool_call_row(
                 exit_code: tool.exit_code,
             },
             owner,
+            markdown,
             cx,
         );
     }
@@ -1683,7 +1915,7 @@ fn tool_call_row(
             exit_code: None,
         },
     };
-    tool_card(key, call, result, owner, cx)
+    tool_card(key, call, result, owner, markdown, cx)
 }
 
 /// OMP injects `<system-reminder>` nudges, `<irc>` relays and `<critical>`
@@ -1714,6 +1946,7 @@ fn message(
     session: &ConversationSession,
     active: bool,
     owner: &WeakEntity<Workspace>,
+    markdown: Markdown,
     cx: &App,
 ) -> AnyElement {
     // A tool result answers a call rendered earlier; that card shows its content.
@@ -1738,6 +1971,7 @@ fn message(
                 exit_code: message.exit_code,
             },
             owner,
+            markdown,
             cx,
         ));
     }
@@ -1825,12 +2059,13 @@ fn message(
                     session,
                     active,
                     owner,
+                    markdown,
                     cx,
                 ));
             }
             ContentBlock::Image(_) if user_message => {
                 has_images = true;
-                images = images.child(block(item, identity, owner, cx));
+                images = images.child(block(item, identity, owner, markdown, cx));
             }
             ContentBlock::Text(text) if message.role == "custom" => match JobNotice::parse(text) {
                 Some(notice) => {
@@ -1839,13 +2074,14 @@ fn message(
                             format!("job:{id}:{}:{}", message.id, job.id),
                             job,
                             owner,
+                            markdown,
                             cx,
                         ));
                     }
                 }
-                None => body = body.child(block(item, identity, owner, cx)),
+                None => body = body.child(block(item, identity, owner, markdown, cx)),
             },
-            _ => body = body.child(block(item, identity, owner, cx)),
+            _ => body = body.child(block(item, identity, owner, markdown, cx)),
         }
     }
     if has_images {
@@ -2062,7 +2298,13 @@ fn sticky_dock(
 /// One finished background job from a `<system-notice>`: a task agent's report
 /// or a shell command's output. A structured report opens by default; raw
 /// output folds behind the disclosure like any tool result.
-fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &App) -> AnyElement {
+fn job_card(
+    key: String,
+    job: &JobResult,
+    owner: &WeakEntity<Workspace>,
+    markdown: Markdown,
+    cx: &App,
+) -> AnyElement {
     let structured = matches!(job.output, JobOutput::Structured(_));
     let has_output = !matches!(job.output, JobOutput::Empty);
     let open = has_output && (structured != is_expanded(owner, &key, cx));
@@ -2143,9 +2385,13 @@ fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &Ap
             );
         }
         output = match &job.output {
-            JobOutput::Structured(value) => {
-                output.child(structured_view(format!("{key}:structured"), value, 0, cx))
-            }
+            JobOutput::Structured(value) => output.child(structured_view(
+                format!("{key}:structured"),
+                value,
+                0,
+                markdown,
+                cx,
+            )),
             JobOutput::Text(text) => {
                 let language = if text.trim_start().starts_with(['{', '[']) {
                     "json"
@@ -2155,7 +2401,7 @@ fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &Ap
                 let identity = format!("{key}:output");
                 let markdown_id = format!("{identity}:markdown");
                 output.child(guarded_text(identity, text, owner, cx, || {
-                    code_block(markdown_id, text, language, cx).into_any_element()
+                    code_block(markdown_id, text, language, markdown).into_any_element()
                 }))
             }
             JobOutput::Empty => output,
@@ -2167,7 +2413,13 @@ fn job_card(key: String, job: &JobResult, owner: &WeakEntity<Workspace>, cx: &Ap
 /// Generic reading view for a job's JSON report: keys become captions, strings
 /// render as Markdown, string lists as bullets, nested objects indent. Beyond a
 /// few levels the raw JSON is shown so nothing is hidden.
-fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> AnyElement {
+fn structured_view(
+    identity: String,
+    value: &Value,
+    depth: usize,
+    markdown: Markdown,
+    cx: &App,
+) -> AnyElement {
     const MAX_DEPTH: usize = 3;
     match value {
         Value::Object(fields) if depth < MAX_DEPTH && !fields.is_empty() => {
@@ -2188,6 +2440,7 @@ fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> A
                             format!("{identity}:field:{key}"),
                             value,
                             depth + 1,
+                            markdown,
                             cx,
                         )),
                 );
@@ -2205,7 +2458,7 @@ fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> A
                 .map(|item| format!("- {}", item.replace('\n', "\n  ")))
                 .collect::<Vec<_>>()
                 .join("\n");
-            markdown_text(identity, list, cx).into_any_element()
+            markdown_text(identity, list, markdown).into_any_element()
         }
         Value::Array(items)
             if depth < MAX_DEPTH
@@ -2223,13 +2476,14 @@ fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> A
                             format!("{identity}:item:{index}"),
                             item,
                             depth + 1,
+                            markdown,
                             cx,
                         )),
                 );
             }
             column.into_any_element()
         }
-        Value::String(text) => markdown_text(identity, text.clone(), cx).into_any_element(),
+        Value::String(text) => markdown_text(identity, text.clone(), markdown).into_any_element(),
         Value::Null => div()
             .text_color(cx.theme().muted_foreground)
             .child("None")
@@ -2239,7 +2493,7 @@ fn structured_view(identity: String, value: &Value, depth: usize, cx: &App) -> A
             identity,
             &serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
             "json",
-            cx,
+            markdown,
         )
         .into_any_element(),
     }
@@ -3473,8 +3727,205 @@ mod tests {
 
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
+    fn transcript_updates_keep_the_reader_and_the_scrollbar(cx: &mut gpui_kit::TestAppContext) {
+        use super::{RowChanges, estimate_unmeasured_rows, update_rows};
+        use gpui_kit::{
+            AppContext, Context, FollowMode, IntoElement, ListAlignment, ListOffset, ListState,
+            ParentElement, Pixels, Render, Styled, Window, component::Root, div, list, px, size,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        const ROW: Pixels = px(40.);
+        struct Rows(ListState, Rc<Cell<Option<Pixels>>>);
+        impl Render for Rows {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .relative()
+                    .size_full()
+                    .child(
+                        list(self.0.clone(), |_, _, _| {
+                            div().h(ROW).w_full().into_any_element()
+                        })
+                        .size_full(),
+                    )
+                    // The estimate matches every row, so the scrollbar must span all of them.
+                    .child(estimate_unmeasured_rows(&self.0, &self.1, ROW))
+            }
+        }
+
+        cx.update(gpui_kit::init);
+        let rows = ListState::new(0, ListAlignment::Bottom, px(500.));
+        rows.set_follow_mode(FollowMode::Tail);
+        let estimated = Rc::new(Cell::new(None));
+        update_rows(&rows, &estimated, 0, 200, RowChanges::Reset);
+        let window = cx.add_window({
+            let rows = rows.clone();
+            let estimated = estimated.clone();
+            |window, cx| Root::new(cx.new(|_| Rows(rows, estimated)), window, cx)
+        });
+        let draw = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+        let spans_all_rows = |rows: &ListState| {
+            rows.max_offset_for_scrollbar().y
+                == ROW * rows.item_count() as f32 - rows.viewport_bounds().size.height
+        };
+        let at_reader = |rows: &ListState| {
+            let top = rows.logical_scroll_top();
+            (top.item_ix, top.offset_in_item) == (100, px(15.))
+        };
+
+        draw(cx);
+        assert!(
+            spans_all_rows(&rows),
+            "rows never laid out still count toward the scrollbar"
+        );
+
+        rows.scroll_to(ListOffset {
+            item_ix: 100,
+            offset_in_item: px(15.),
+        });
+        draw(cx);
+        assert!(at_reader(&rows));
+
+        for changes in [RowChanges::All, RowChanges::Rows(vec![101, 100, 101])] {
+            update_rows(&rows, &estimated, 200, 200, changes);
+            draw(cx);
+            assert!(at_reader(&rows), "a changed row must not move the reader");
+            assert!(
+                spans_all_rows(&rows),
+                "a changed row must keep known heights"
+            );
+        }
+
+        update_rows(&rows, &estimated, 200, 203, RowChanges::Rows(vec![199]));
+        draw(cx);
+        assert!(at_reader(&rows), "new output must not move the reader");
+        assert!(spans_all_rows(&rows), "new rows count toward the scrollbar");
+
+        // The list forgets every measured height when its width changes.
+        cx.simulate_window_resize(window.into(), size(px(640.), px(480.)));
+        draw(cx);
+        assert!(at_reader(&rows), "a resize must not move the reader");
+        assert!(
+            spans_all_rows(&rows),
+            "a resize must not shrink the scrollbar to the rows in view"
+        );
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn scrolling_across_long_markdown_lands_inside_it(cx: &mut gpui_kit::TestAppContext) {
+        use super::{Markdown, MarkdownStates, SYNC_PARSE_LIMIT, markdown_text};
+        use gpui_kit::{
+            AppContext, Context, FollowMode, IntoElement, ListAlignment, ListOffset, ListState,
+            ParentElement, Render, Styled, Window, component::Root, div, list, px,
+        };
+
+        const LONG: usize = 10;
+        struct Rows {
+            list: ListState,
+            markdown: MarkdownStates,
+            text: String,
+        }
+        impl Render for Rows {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let (markdown, text) = (self.markdown.clone(), self.text.clone());
+                list(self.list.clone(), move |index, _, _| {
+                    if index == LONG {
+                        let markdown = Markdown::Row(&markdown, index);
+                        div()
+                            .w_full()
+                            .child(markdown_text("long", text.clone(), markdown))
+                            .into_any_element()
+                    } else {
+                        div().h(px(40.)).w_full().into_any_element()
+                    }
+                })
+                .size_full()
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, None, cx);
+        });
+        let text = (0..200)
+            .map(|line| format!("Paragraph {line} of a long reply."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert!(text.len() > SYNC_PARSE_LIMIT, "parses in the background");
+        let rows = ListState::new(200, ListAlignment::Bottom, px(500.));
+        rows.set_follow_mode(FollowMode::Tail);
+        let window = cx.add_window({
+            let rows = rows.clone();
+            |window, cx| {
+                let view = cx.new(|cx| Rows {
+                    markdown: MarkdownStates::new(rows.clone(), cx.entity_id()),
+                    list: rows,
+                    text,
+                });
+                Root::new(view, window, cx)
+            }
+        });
+        let draw = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+        // The reader sits 10px into the row below, so 30px up is 20px into the long row.
+        let scroll_up_into_long_row = |cx: &mut gpui_kit::TestAppContext| {
+            rows.scroll_to(ListOffset {
+                item_ix: LONG + 1,
+                offset_in_item: px(10.),
+            });
+            draw(cx);
+            rows.scroll_by(px(-30.));
+            draw(cx);
+            rows.logical_scroll_top().item_ix
+        };
+        draw(cx);
+
+        // First seen above the viewport, so it lays out empty until its parse lands.
+        rows.scroll_to(ListOffset {
+            item_ix: LONG + 1,
+            offset_in_item: px(10.),
+        });
+        draw(cx);
+        cx.run_until_parked();
+        assert_eq!(
+            scroll_up_into_long_row(cx),
+            LONG,
+            "a landed parse must remeasure its row"
+        );
+
+        // Away long enough for element state to lapse, and every row invalidated.
+        rows.scroll_to(ListOffset {
+            item_ix: 150,
+            offset_in_item: px(0.),
+        });
+        draw(cx);
+        draw(cx);
+        rows.remeasure_items(0..200);
+        assert_eq!(
+            scroll_up_into_long_row(cx),
+            LONG,
+            "a row coming back must not wait for a second parse"
+        );
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
     fn compact_timeline_states_render_on_the_native_surface(cx: &mut gpui_kit::TestAppContext) {
-        use super::{ToolCall, ToolOutcome, ToolResult, Workspace, block, tool_card, v_flex};
+        use super::{
+            Markdown, ToolCall, ToolOutcome, ToolResult, Workspace, block, tool_card, v_flex,
+        };
         use gpui_kit::{
             AppContext, Context, IntoElement, ParentElement, Render, Styled, VisualTestContext,
             WeakEntity, Window, component::Root, test::TestWindowExt,
@@ -3492,7 +3943,13 @@ mod tests {
                 let failure = [ContentBlock::Text("permission denied".into())];
                 v_flex()
                     .gap_2()
-                    .child(block(&reasoning, "reasoning".into(), &owner, cx))
+                    .child(block(
+                        &reasoning,
+                        "reasoning".into(),
+                        &owner,
+                        Markdown::Element,
+                        cx,
+                    ))
                     .child(tool_card(
                         "preview".into(),
                         ToolCall {
@@ -3506,6 +3963,7 @@ mod tests {
                             exit_code: Some(0),
                         },
                         &owner,
+                        Markdown::Element,
                         cx,
                     ))
                     .child(tool_card(
@@ -3521,6 +3979,7 @@ mod tests {
                             exit_code: Some(1),
                         },
                         &owner,
+                        Markdown::Element,
                         cx,
                     ))
             }
@@ -3766,7 +4225,7 @@ mod tests {
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
     fn separate_message_text_blocks_select_their_own_text(cx: &mut gpui_kit::TestAppContext) {
-        use super::{ContentBlock, Workspace, block, v_flex};
+        use super::{ContentBlock, Markdown, Workspace, block, v_flex};
         use gpui_kit::{
             AppContext, Context, InteractiveElement, IntoElement, Modifiers, MouseButton,
             MouseDownEvent, MouseUpEvent, ParentElement, Render, Styled, TestSupportExt,
@@ -3789,8 +4248,20 @@ mod tests {
                     .w(gpui_kit::px(420.))
                     .p_3()
                     .gap_3()
-                    .child(block(&first, "message:0".into(), &owner, cx))
-                    .child(block(&second, "message:1".into(), &owner, cx))
+                    .child(block(
+                        &first,
+                        "message:0".into(),
+                        &owner,
+                        Markdown::Element,
+                        cx,
+                    ))
+                    .child(block(
+                        &second,
+                        "message:1".into(),
+                        &owner,
+                        Markdown::Element,
+                        cx,
+                    ))
             }
         }
 

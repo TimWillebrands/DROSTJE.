@@ -45,6 +45,22 @@ impl DraftSnapshot {
     }
 }
 
+/// How to write `/name` into `draft`: replace the first `end` bytes of its first line with
+/// the returned text. A leading `/word` is the command being completed and is replaced
+/// together with one following blank; any other text is kept as the command's arguments.
+pub fn slash_command_insertion(draft: &str, name: &str) -> (usize, String) {
+    let line = draft.split('\n').next().unwrap_or("");
+    let end = line
+        .strip_prefix('/')
+        .map(|rest| rest.find(char::is_whitespace).unwrap_or(rest.len()))
+        .filter(|&len| !line[1..1 + len].contains('/'))
+        .map_or(0, |len| {
+            let after = 1 + len;
+            after + usize::from(line[after..].starts_with([' ', '\t']))
+        });
+    (end, format!("/{name} "))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneDirection {
@@ -236,7 +252,7 @@ pub struct WorkspaceSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageAttachment, QueuedMessage};
+    use super::{ImageAttachment, QueuedMessage, slash_command_insertion};
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -249,6 +265,38 @@ mod tests {
             height: 1,
             original: None,
         }
+    }
+
+    #[test]
+    fn insertion_replaces_the_typed_command_and_keeps_arguments() {
+        assert_eq!(
+            slash_command_insertion("", "compact"),
+            (0, "/compact ".into())
+        );
+        assert_eq!(
+            slash_command_insertion("/", "compact"),
+            (1, "/compact ".into())
+        );
+        assert_eq!(
+            slash_command_insertion("/comp", "compact"),
+            (5, "/compact ".into())
+        );
+        assert_eq!(
+            slash_command_insertion("/comp keep tests", "compact"),
+            (6, "/compact ".into())
+        );
+        assert_eq!(
+            slash_command_insertion("/comp\nsecond line", "compact"),
+            (5, "/compact ".into())
+        );
+        assert_eq!(
+            slash_command_insertion("fix the bug", "skill:tdd"),
+            (0, "/skill:tdd ".into())
+        );
+        assert_eq!(
+            slash_command_insertion("/usr/bin is missing", "review"),
+            (0, "/review ".into())
+        );
     }
 
     #[test]

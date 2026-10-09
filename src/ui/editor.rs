@@ -1,5 +1,6 @@
 use super::{
-    nvim::{NvimView, NvimViewEvent},
+    nvim::{CaretPopupKey, NvimView, NvimViewEvent},
+    slash_commands::{SlashCompletion, SlashCompletionEvent, completion_query},
     workspace::{Region, Workspace},
 };
 use crate::{
@@ -9,7 +10,7 @@ use crate::{
     platform,
 };
 use gpui_kit::component::{
-    ActiveTheme, WindowExt, alert::Alert, dialog::DialogButtonProps, label::Label,
+    ActiveTheme, WindowExt, alert::Alert, dialog::DialogButtonProps, h_flex, label::Label,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -32,6 +33,12 @@ pub(super) struct PromptEditor {
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     switch_task: Option<Task<()>>,
+    /// Slash-command completion for the active Conversation draft, created on first use.
+    completion: Option<Entity<SlashCompletion>>,
+    /// The query the user closed the popup for; it stays closed until the query changes.
+    dismissed_query: Option<String>,
+    /// See `command_note`; kept so the header redraws only when the note changes.
+    command_note: Option<(String, bool)>,
 }
 
 pub(super) struct PromptEditorChanged;
@@ -40,7 +47,7 @@ impl EventEmitter<PromptEditorChanged> for PromptEditor {}
 impl PromptEditor {
     fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         Self {
-            state,
+            state: state.clone(),
             view: None,
             desired: None,
             active: None,
@@ -49,9 +56,174 @@ impl PromptEditor {
             composition: false,
             window_inactive: false,
             focus: cx.focus_handle(),
-            _subscriptions: Vec::new(),
+            _subscriptions: vec![cx.subscribe(
+                &state,
+                |this, _, change: &crate::app::PresentationChange, cx| {
+                    // Command lists arrive with conversation events.
+                    if matches!(change, crate::app::PresentationChange::Thread(_)) {
+                        this.sync_completion(cx);
+                    }
+                },
+            )],
             switch_task: None,
+            completion: None,
+            dismissed_query: None,
+            command_note: None,
         }
+    }
+
+    /// The note beside the draft label, for native QA.
+    #[cfg(all(test, feature = "runtime-qa"))]
+    pub fn command_note_text(&self) -> Option<&str> {
+        self.command_note.as_ref().map(|(note, _)| note.as_str())
+    }
+
+    /// The command the popup would insert, for native QA.
+    #[cfg(all(test, feature = "runtime-qa"))]
+    pub fn completion_selection(&self, cx: &App) -> Option<String> {
+        self.completion
+            .as_ref()
+            .and_then(|completion| completion.read(cx).selected())
+            .map(|command| command.name.clone())
+    }
+
+    /// What the draft's leading slash command needs, shown beside the draft label: why
+    /// DROSTJE. will refuse it, or its argument syntax until arguments are typed. The flag
+    /// says whether the note is command syntax.
+    fn command_note(&self, state: &AppState) -> Option<(String, bool)> {
+        let Some(DraftKey::Thread(id)) = &self.active else {
+            return None;
+        };
+        let draft = state.drafts.get(&DraftKey::Thread(*id))?;
+        let catalog = &state.conversations.get(id)?.slash_commands;
+        if let Some(refusal) = catalog.refusal(&draft.text) {
+            return Some((refusal, false));
+        }
+        let command = catalog.invoked(&draft.text)?;
+        let (_, arguments) = crate::harness::invocation(&draft.text)?;
+        let hint = command
+            .argument_hint
+            .as_ref()
+            .filter(|_| arguments.is_empty())?;
+        Some((format!("/{} {hint}", command.name), true))
+    }
+
+    /// Shows the command popup while the active Conversation draft starts with a partly
+    /// typed `/command` in insert mode, and hides it otherwise.
+    fn sync_completion(&mut self, cx: &mut Context<Self>) {
+        let note = self.command_note(self.state.read(cx));
+        if note != self.command_note {
+            self.command_note = note;
+            cx.notify();
+        }
+        let Some(view) = self.view.clone() else {
+            return;
+        };
+        let offer = match &self.active {
+            Some(DraftKey::Thread(id)) if !self.switching && !self.composition => {
+                let state = self.state.read(cx);
+                (view.read(cx).mode() == "insert")
+                    .then(|| state.drafts.get(&DraftKey::Thread(*id)))
+                    .flatten()
+                    .and_then(|draft| completion_query(&draft.text, draft.cursor))
+                    .and_then(|query| {
+                        let session = state.conversations.get(id)?;
+                        Some((*id, query.to_owned(), session.slash_commands.clone()))
+                    })
+            }
+            _ => None,
+        };
+        let Some((id, query, catalog)) = offer else {
+            self.dismissed_query = None;
+            view.update(cx, |view, cx| view.set_caret_popup(None, cx));
+            return;
+        };
+        if self.dismissed_query.as_ref() == Some(&query) {
+            view.update(cx, |view, cx| view.set_caret_popup(None, cx));
+            return;
+        }
+        self.dismissed_query = None;
+        let completion = match &self.completion {
+            Some(completion) => completion.clone(),
+            None => {
+                let completion = cx.new(|_| SlashCompletion::new(id));
+                self._subscriptions.push(cx.subscribe(
+                    &completion,
+                    |this, _, event: &SlashCompletionEvent, cx| match event {
+                        SlashCompletionEvent::Accept(name) => {
+                            this.accept_completion(name.clone(), cx)
+                        }
+                    },
+                ));
+                self.completion = Some(completion.clone());
+                completion
+            }
+        };
+        completion.update(cx, |completion, cx| {
+            completion.set(id, &query, &catalog, cx)
+        });
+        view.update(cx, |view, cx| {
+            view.set_caret_popup(Some(completion.clone().into()), cx)
+        });
+    }
+
+    fn completion_key(&mut self, key: CaretPopupKey, cx: &mut Context<Self>) {
+        let Some(completion) = self.completion.clone() else {
+            return;
+        };
+        match key {
+            CaretPopupKey::Next => completion.update(cx, |completion, cx| completion.select(1, cx)),
+            CaretPopupKey::Previous => {
+                completion.update(cx, |completion, cx| completion.select(-1, cx))
+            }
+            CaretPopupKey::Accept => {
+                if let Some(name) = completion
+                    .read(cx)
+                    .selected()
+                    .map(|command| command.name.clone())
+                {
+                    self.accept_completion(name, cx);
+                }
+            }
+            CaretPopupKey::Dismiss => {
+                self.dismissed_query = Some(completion.read(cx).query().to_owned());
+                self.sync_completion(cx);
+            }
+        }
+    }
+
+    /// Replaces the typed `/partial` with the chosen command. The draft change that follows
+    /// moves the cursor past the command, which closes the popup.
+    fn accept_completion(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(DraftKey::Thread(id)) = self.active.clone() else {
+            return;
+        };
+        if self
+            .completion
+            .as_ref()
+            .is_none_or(|completion| completion.read(cx).thread() != id)
+        {
+            return;
+        }
+        let Some(editor) = self.state.read(cx).editor.clone() else {
+            return;
+        };
+        let state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = editor
+                .insert_slash_command(DraftKey::Thread(id), name)
+                .await
+            {
+                state.update(cx, |state, cx| {
+                    state.notice(
+                        NoticeLevel::Warning,
+                        format!("The command was not inserted: {error:#}"),
+                    );
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     pub fn active_key(&self) -> Option<&DraftKey> {
@@ -127,6 +299,7 @@ impl PromptEditor {
                                         }
                                         cx.emit(crate::app::PresentationChange::Draft(id));
                                     });
+                                    this.sync_completion(cx);
                                     return;
                                 }
                                 NvimViewEvent::CompositionChanged(composing) => {
@@ -141,6 +314,14 @@ impl PromptEditor {
                                 NvimViewEvent::InputRejected(error) => this.state.update(cx, |state, cx| {
                                     state.notice(NoticeLevel::Warning, format!("Editor input: {error}")); cx.notify();
                                 }),
+                                NvimViewEvent::ModeChanged => {
+                                    this.sync_completion(cx);
+                                    return;
+                                }
+                                NvimViewEvent::CaretPopupKey(key) => {
+                                    this.completion_key(*key, cx);
+                                    return;
+                                }
                             }
                             cx.emit(PromptEditorChanged);
                             cx.notify();
@@ -316,6 +497,7 @@ impl Render for PromptEditor {
                         })
                 });
         let error = state.editor_error.clone();
+        let command_note = self.command_note.clone();
         if let Some(view) = &self.view {
             view.update(cx, |view, cx| view.set_writable(writable, cx));
         }
@@ -341,24 +523,42 @@ impl Render for PromptEditor {
                 cx.theme().transparent
             })
             .child(
-                Label::new(if focused {
-                    "Draft · Editing"
-                } else {
-                    "Draft · Not focused"
-                })
-                .text_xs()
-                .bg(if focused {
-                    cx.theme().muted
-                } else {
-                    cx.theme().transparent
-                })
-                .text_color(if focused {
-                    cx.theme().foreground
-                } else {
-                    cx.theme().muted_foreground
-                })
-                .px_2()
-                .py_0p5(),
+                h_flex()
+                    .gap_2()
+                    .min_w_0()
+                    .px_2()
+                    .py_0p5()
+                    .text_xs()
+                    .bg(if focused {
+                        cx.theme().muted
+                    } else {
+                        cx.theme().transparent
+                    })
+                    .child(
+                        Label::new(if focused {
+                            "Draft · Editing"
+                        } else {
+                            "Draft · Not focused"
+                        })
+                        .flex_none()
+                        .text_color(if focused {
+                            cx.theme().foreground
+                        } else {
+                            cx.theme().muted_foreground
+                        }),
+                    )
+                    .when_some(command_note, |header, (note, code)| {
+                        header.child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(cx.theme().muted_foreground)
+                                .when(code, |note| {
+                                    note.font_family(cx.theme().mono_font_family.clone())
+                                })
+                                .child(note),
+                        )
+                    }),
             )
             .when_some(self.view.clone(), |surface, view| {
                 surface.child(
@@ -499,6 +699,81 @@ impl Workspace {
             self.start_editor(window, cx);
         }
     }
+    /// Opens the picker over the composer. An inactive draft is activated first so the
+    /// chosen command can land in it; Root returns focus to the composer on dismiss.
+    pub fn open_slash_command_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id)
+        else {
+            return;
+        };
+        self.dismiss(window, cx);
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        if self.editor_selection != Some(DraftKey::Thread(id)) {
+            self.focus_composer(window, cx);
+        }
+        self.palette = Some(super::commands::Palette::open_slash_commands(
+            cx.entity().downgrade(),
+            self.state.clone(),
+            id,
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
+    /// Writes `/name ` at the start of the Conversation's draft, replacing a partly typed
+    /// command, and leaves the cursor after it in insert mode. Nothing is sent.
+    pub fn insert_slash_command(
+        &mut self,
+        id: ThreadId,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = DraftKey::Thread(id);
+        let warn = |workspace: &mut Self, text: String, cx: &mut Context<Self>| {
+            workspace.state.update(cx, |state, cx| {
+                state.notice(NoticeLevel::Warning, text);
+                cx.notify();
+            });
+        };
+        if self.editor_selection.as_ref() != Some(&key) || self.editor_override.is_some() {
+            warn(
+                self,
+                "Wait for the conversation draft to activate, then insert the command again".into(),
+                cx,
+            );
+            return;
+        }
+        let Some(editor) = self.state.read(cx).editor.clone() else {
+            warn(
+                self,
+                "Neovim is not available; restart the editor".into(),
+                cx,
+            );
+            return;
+        };
+        let name = name.to_owned();
+        cx.spawn_in(window, async move |workspace, window| {
+            let result = editor.insert_slash_command(key, name).await;
+            let _ = workspace.update_in(window, |workspace, window, cx| match result {
+                Ok(()) => workspace.focus_composer(window, cx),
+                Err(error) => warn(
+                    workspace,
+                    format!("The command was not inserted: {error:#}"),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
     pub fn submit_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.extension.is_some() {
             self.confirm_extension(window, cx);

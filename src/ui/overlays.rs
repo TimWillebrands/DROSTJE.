@@ -600,6 +600,7 @@ impl DetailContent {
                     block,
                     format!("tool:{thread_id}:{tool_id}:{index}"),
                     &self.owner,
+                    super::conversation::Markdown::Element,
                     cx,
                 ));
             }
