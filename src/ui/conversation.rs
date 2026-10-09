@@ -1,11 +1,13 @@
 use super::{
+    activity,
     commands::{ClearQueuedMessages, Command, SelectLast, button},
     job_notice::{self, JobKind, JobNotice, JobOutput, JobResult, JobStart},
+    theme,
     todo_list::{self, TodoList, TodoStatus},
     workspace::{Motion, PAGE_SHARE, Workspace},
 };
 use crate::{
-    app::{AppState, ConversationSession},
+    app::{AppState, ConversationSession, ThreadActivity},
     harness::{
         ContentBlock, ContextUsage, LimitWindow, Message, UsageLimit, UserAnswer, UserRequest,
         UserRequestKind,
@@ -675,6 +677,23 @@ fn content_column() -> Div {
     div().w_full().max_w(rems(60.)).px_3()
 }
 
+/// Agent prose in the theme's prose type, as wide as the tool cards beside it; code
+/// inside keeps the mono font.
+fn prose(content: AnyElement, cx: &App) -> AnyElement {
+    let prose = theme::prose(cx);
+    div()
+        .debug_selector(|| "transcript-prose".into())
+        .w_full()
+        .min_w_0()
+        .when_some(prose.family, |prose, family| prose.font_family(family))
+        .when_some(prose.size, |prose, size| prose.text_size(size))
+        .when_some(prose.line_height, |prose, height| {
+            prose.line_height(relative(height))
+        })
+        .child(content)
+        .into_any_element()
+}
+
 /// Utilisation at or above this share of a window or context reads as a warning.
 const USAGE_WARNING_PERCENT: f32 = 80.;
 
@@ -839,8 +858,8 @@ impl MarkdownPlugin for InertResources {
 }
 /// Transcript prose stays close to body size: headings step up modestly and
 /// paragraphs sit half a line apart, so a reply reads as a message, not a page.
-fn transcript_text_style(cx: &App) -> TextViewStyle {
-    let body = cx.theme().font_size;
+/// `body` is the size the text inherits, so prose type scales its headings too.
+fn transcript_text_style(body: Pixels) -> TextViewStyle {
     TextViewStyle::default()
         .paragraph_gap(rems(0.5))
         .heading_font_size(move |level, _| {
@@ -985,12 +1004,13 @@ struct TranscriptMarkdown {
 }
 
 impl RenderOnce for TranscriptMarkdown {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let body = window.text_style().font_size.to_pixels(window.rem_size());
         match self.states {
             Some((states, row)) => TextView::new(&states.state(self.id, self.text, row, cx)),
             None => TextView::markdown(self.id, self.text),
         }
-        .style(transcript_text_style(cx))
+        .style(transcript_text_style(body))
         .plugin(InertResources)
         .selectable(true)
         .on_link_click(|url, event, _, cx| {
@@ -2081,6 +2101,9 @@ fn message(
                 }
                 None => body = body.child(block(item, identity, owner, markdown, cx)),
             },
+            ContentBlock::Text(_) if message.role == "assistant" => {
+                body = body.child(prose(block(item, identity, owner, markdown, cx), cx));
+            }
             _ => body = body.child(block(item, identity, owner, markdown, cx)),
         }
     }
@@ -2666,6 +2689,26 @@ fn request_card(
 }
 
 /// The centre pane while no thread is open: name the next step and offer it.
+const WORDMARK: &str = "DROSTJE.";
+
+/// The brand in its display face, the full stop in the theme's accent.
+fn wordmark(cx: &App) -> impl IntoElement {
+    let stop = WORDMARK.len() - 1;
+    div()
+        .debug_selector(|| "wordmark".into())
+        .font_family(theme::DISPLAY_FONT)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(rems(2.25))
+        .line_height(relative(1.))
+        .child(StyledText::new(WORDMARK).with_highlights([(
+            stop..WORDMARK.len(),
+            HighlightStyle {
+                color: Some(cx.theme().primary),
+                ..Default::default()
+            },
+        )]))
+}
+
 pub fn welcome(state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> AnyElement {
     let has_project = state.project().is_some();
     let actions = h_flex()
@@ -2712,6 +2755,7 @@ pub fn welcome(state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> Any
                 .items_center()
                 .gap_3()
                 .text_center()
+                .child(wordmark(cx))
                 .child(div().text_lg().child(if has_project {
                     "No thread selected"
                 } else {
@@ -3381,8 +3425,13 @@ fn render_content(
             cx,
         ));
     }
+    // The wordmark's full stop, breathing beside the composer while a turn runs.
     if active {
-        trailing = trailing.child(Spinner::new().xsmall());
+        trailing = trailing.children(activity::mark(
+            "turn-running".into(),
+            ThreadActivity::Running,
+            cx,
+        ));
     }
     if let Some(workspace) = owner.upgrade() {
         if let Some(picker) = workspace
@@ -3554,10 +3603,23 @@ fn render_content(
                 .h(rems(preferred_height))
                 .max_h(relative(0.5))
                 .min_h_0()
+                .relative()
                 .border_t_1()
                 .border_color(cx.theme().border)
                 .pt_2()
                 .pb_2()
+                // Sweeps along the top border while a turn runs.
+                .when(active, |row| {
+                    row.child(
+                        div()
+                            .debug_selector(|| "composer-sweep".into())
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .top(rems(-0.0625))
+                            .child(activity::sweep(cx)),
+                    )
+                })
                 .child(
                     content_column()
                         .h_full()
@@ -3918,6 +3980,60 @@ mod tests {
             LONG,
             "a row coming back must not wait for a second parse"
         );
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn agent_prose_fills_its_column_in_every_theme(cx: &mut gpui_kit::TestAppContext) {
+        use super::prose;
+        use gpui_kit::{
+            AppContext, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+            VisualTestContext, Window, component::Root, div, px,
+        };
+        use serde_json::json;
+        use std::collections::BTreeMap;
+
+        struct Reply;
+        impl Render for Reply {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .debug_selector(|| "reply-pane".into())
+                    .size_full()
+                    .child(prose(div().w_full().h(px(10.)).into_any_element(), cx))
+            }
+        }
+
+        let theme = |cx: &mut gpui_kit::TestAppContext, light: &str| {
+            let settings = BTreeMap::from([
+                ("theme_mode".to_owned(), json!("light")),
+                ("theme_light".to_owned(), json!(light)),
+            ]);
+            cx.update(|cx| crate::ui::theme::initialize(Some(&settings), None, cx));
+        };
+        cx.update(gpui_kit::init);
+        theme(cx, "Ink Light");
+        let window = cx.add_window(|window, cx| Root::new(cx.new(|_| Reply), window, cx));
+        let width = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            let mut visual = VisualTestContext::from_window(window.into(), cx);
+            let prose = visual
+                .debug_bounds("transcript-prose")
+                .expect("prose renders");
+            let pane = visual.debug_bounds("reply-pane").unwrap().size.width;
+            (prose.size.width, pane)
+        };
+
+        // Prose lines up with the tool cards beside it, whatever its type.
+        let (ink, pane) = width(cx);
+        assert_eq!(ink, pane, "Ink prose fills its column");
+
+        theme(cx, "Delft Light");
+        let (delft, pane) = width(cx);
+        assert_eq!(delft, pane, "Delft prose fills its column");
     }
 
     #[cfg(feature = "runtime-qa")]

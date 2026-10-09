@@ -141,7 +141,13 @@ Ontbreekt Neovim of valt het proces weg, dan verschijnt een fout zonder terugval
 
 Settings groepeert de bestaande instellingen en kan zoeken op naam, beschrijving en groep. Het biedt **System**, **Light** en **Dark**, met een afzonderlijke themakeuze per modus. Save past de keuze toe; Cancel verandert het uiterlijk niet. De Neovim-prompteditor volgt dezelfde achtergrond-, tekst-, selectie- en cursorkleuren en het monospace-lettertype.
 
-Eigen thema's staan in `<DROSTJE_DATA_DIR>/themes` (standaard `~/Library/Application Support/Drostje/themes`). Settings toont de map en kan die openen. Gebruik GPUI Kit `ThemeSet`-JSON: een object met een `themes`-array; iedere entry heeft een unieke `name` en `mode` (`light` of `dark`). Dit is niet het losse Zed-themaformaat. Ingebouwd zijn DROSTJE. Light en DROSTJE. Dark (naar Zed's One Light en One Dark, met gedempte tekst) als standaard, plus GPUI Kit's Default Light en Default Dark.
+Eigen thema's staan in `<DROSTJE_DATA_DIR>/themes` (standaard `~/Library/Application Support/Drostje/themes`). Settings toont de map en kan die openen. Gebruik GPUI Kit `ThemeSet`-JSON: een object met een `themes`-array; iedere entry heeft een unieke `name` en `mode` (`light` of `dark`). Dit is niet het losse Zed-themaformaat. Ingebouwd zijn:
+
+- **Delft Light** en **Delft Dark**, de standaard: IBM Plex Sans en IBM Plex Mono, met Delfts blauw als enige accentkleur.
+- **Ink Light** en **Ink Dark**, een leesmodus naar e-readers: antwoorden van agents staan in Libron, code in Monaspace Xenon, met gedempte kleuren.
+- GPUI Kit's Default Light en Default Dark.
+
+Een eerder opgeslagen keuze voor DROSTJE. Light of DROSTJE. Dark betekent nu Delft. Het woordmerk op het startscherm staat in Dosis; zolang een turn loopt, ademt de punt van DROSTJE. naast de composer. De lettertypes zitten in de app zelf en vallen onder de SIL Open Font License; herkomst en licenties staan in `assets/fonts`.
 
 Toegevoegde en gewijzigde bestanden worden opnieuw geladen. Ontbreekt het gekozen thema, dan gebruikt DROSTJE. een standaardthema met een waarschuwing; de opgeslagen naam blijft behouden zodat herstel van het bestand de keuze kan herstellen. Gebruik unieke namen om dubbele registry-entries te vermijden.
 

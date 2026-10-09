@@ -456,7 +456,7 @@ impl SurfaceContent {
                             .settings
                             .get(key)
                             .and_then(|value| value.as_str())
-                            .unwrap_or("");
+                            .map_or("", theme::saved_theme_name);
                         selects.push(select_field(
                             key,
                             label,

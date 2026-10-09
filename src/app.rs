@@ -1,3 +1,4 @@
+mod activity;
 mod conversation;
 mod factory;
 mod persistence;
@@ -11,6 +12,7 @@ use crate::harness::{
     UsageLimit, UserAnswer, UserRequest, UserRequestKind,
 };
 use crate::{model::*, platform, store::Store};
+pub use activity::ThreadActivity;
 use anyhow::{Context as _, Result};
 use gpui_kit::*;
 pub use project_diff::{ProjectDiffState, ProjectDiffs};
@@ -390,6 +392,7 @@ pub struct AppState {
     pub installing_pi: bool,
     pub registering: bool,
     pub active_threads: HashSet<ThreadId>,
+    unseen_turns: activity::UnseenTurns,
     pub owned_launches: HashSet<LaunchId>,
     pub events: async_channel::Sender<AppEvent>,
     pub shutting_down: bool,
@@ -633,6 +636,7 @@ impl AppState {
             renaming_worktrees: HashSet::new(),
             inspecting_worktrees: HashSet::new(),
             active_threads: HashSet::new(),
+            unseen_turns: activity::UnseenTurns::default(),
             owned_launches: HashSet::new(),
             events,
             writes,
@@ -816,7 +820,11 @@ impl AppState {
                             | ConversationEvent::TurnSettled { .. }
                             | ConversationEvent::Failed { .. }
                     );
+                    let was_running = self.active_threads.contains(&id);
                     self.receive_conversation(id, event, cx);
+                    if was_running && !self.active_threads.contains(&id) {
+                        self.turn_ended(id);
+                    }
                     if project_rows_changed {
                         cx.emit(PresentationChange::Projects);
                     }
@@ -1081,6 +1089,26 @@ impl AppState {
             self.set_setting("thread_sidebar_tab", Value::Object(tabs));
         }
     }
+    pub fn thread_activity(&self, id: ThreadId) -> ThreadActivity {
+        self.unseen_turns
+            .activity(id, self.active_threads.contains(&id))
+    }
+
+    /// A turn that did not complete or stop on request ended badly: shown as failed.
+    fn turn_ended(&mut self, id: ThreadId) {
+        let failed = self.conversations.get(&id).is_none_or(|session| {
+            matches!(
+                session.state,
+                ConversationState::Failed | ConversationState::Disconnected
+            ) || !matches!(
+                session.outcome,
+                Some(TurnOutcome::Completed | TurnOutcome::Interrupted)
+            )
+        });
+        self.unseen_turns
+            .turn_ended(id, self.selected_thread, failed);
+    }
+
     fn is_conversation(&self, id: ThreadId) -> bool {
         self.snapshot
             .threads
@@ -1249,6 +1277,7 @@ impl AppState {
             })
             .flatten();
         self.selected_project = Some(thread.project_id);
+        self.unseen_turns.seen(id);
         if self.selected_thread != Some(id)
             && let Some(previous) = self.selected_thread
         {

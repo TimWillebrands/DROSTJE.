@@ -391,6 +391,82 @@ async fn new_thread_tab_draws_its_title(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; running turns mark their tab, row, composer and title bar"]
+async fn running_turn_marks_its_thread(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let id = new_conversation(cx, &fixture).await;
+    let leak = |name: String| -> &'static str { Box::leak(name.into_boxed_str()) };
+    let (tab, tab_mark, tab_sweep, row_mark) = (
+        leak(format!("thread-tab-{id}")),
+        leak(format!("thread-tab-activity-{id}")),
+        leak(format!("thread-tab-sweep-{id}")),
+        leak(format!("thread-activity-rows-{id}")),
+    );
+    let set_running = |cx: &mut TestAppContext, running: bool| {
+        fixture.state.update(cx, |state, cx| {
+            match running {
+                true => state.active_threads.insert(id),
+                false => state.active_threads.remove(&id),
+            };
+            cx.emit(crate::app::PresentationChange::Thread(id));
+            cx.emit(crate::app::PresentationChange::Projects);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    };
+
+    set_running(cx, true);
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    let title = visual.debug_bounds(tab).expect("thread tab");
+    assert!(
+        visual.debug_bounds(tab_mark).is_some(),
+        "tab carries the mark"
+    );
+    let sweep = visual.debug_bounds(tab_sweep).expect("tab underline");
+    assert_eq!((sweep.left(), sweep.right()), (title.left(), title.right()));
+    assert!(
+        sweep.top() >= title.bottom(),
+        "the underline sits below the label"
+    );
+    eprintln!("tab title {title:?}, underline {sweep:?}");
+    assert!(
+        visual.debug_bounds(row_mark).is_some(),
+        "Projects row carries the mark"
+    );
+    let composer = visual.debug_bounds("composer-row").expect("composer");
+    let edge = visual
+        .debug_bounds("composer-sweep")
+        .expect("composer sweep");
+    assert_eq!(edge.size.width, composer.size.width);
+    assert!(
+        edge.top() <= composer.top() + px(1.),
+        "the sweep rides the top border"
+    );
+    assert!(
+        visual.debug_bounds("running-turns").is_some(),
+        "title bar counts it"
+    );
+
+    set_running(cx, false);
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    for selector in [
+        tab_mark,
+        tab_sweep,
+        row_mark,
+        "composer-sweep",
+        "running-turns",
+    ] {
+        assert!(visual.debug_bounds(selector).is_none(), "{selector} clears");
+    }
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; native sidebar hover actions"]
 async fn thread_sidebar_hover_actions_rename_and_archive_immediately(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::Path, rc::Rc};
+use std::{borrow::Cow, collections::BTreeMap, path::Path, rc::Rc};
 
 use anyhow::{Result, bail};
 use gpui_kit::{
@@ -11,12 +11,39 @@ use serde_json::Value;
 
 use crate::app::{AppState, NoticeLevel};
 
-/// Themes shipped with DROSTJE., modelled on Zed's One Light and One Dark so
-/// text stays muted instead of near-black. They are the fallback for every
-/// mode and are listed before registry themes. Kit's registry is not told
-/// about them: `ThemeRegistry::load_themes_from_str` entries are dropped on
-/// every directory reload, so bundled themes live here instead.
+/// Themes shipped with DROSTJE.: Delft, the default, and Ink, a reading mode. The
+/// default of each mode is the fallback, and bundled themes are listed before registry
+/// themes. Kit's registry is not told about them: `ThemeRegistry::load_themes_from_str`
+/// entries are dropped on every directory reload, so bundled themes live here instead.
 const BUNDLED_THEMES: &str = include_str!("../../assets/themes/drostje.json");
+/// Names the bundled defaults had before Delft; a saved choice of them means the default.
+const RENAMED_THEMES: [(&str, &str); 2] = [
+    ("DROSTJE. Light", "Delft Light"),
+    ("DROSTJE. Dark", "Delft Dark"),
+];
+/// The faces bundled themes name, embedded so every platform renders the same type.
+/// Each family's licence sits beside its files in `assets/fonts`.
+const FONTS: [&[u8]; 17] = [
+    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
+    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"),
+    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Medium.ttf"),
+    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"),
+    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Bold.ttf"),
+    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-BoldItalic.ttf"),
+    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"),
+    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Italic.ttf"),
+    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Bold.ttf"),
+    include_bytes!("../../assets/fonts/libron/Libron-Regular.ttf"),
+    include_bytes!("../../assets/fonts/libron/Libron-Italic.ttf"),
+    include_bytes!("../../assets/fonts/libron/Libron-Bold.ttf"),
+    include_bytes!("../../assets/fonts/libron/Libron-BoldItalic.ttf"),
+    include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Regular.otf"),
+    include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Italic.otf"),
+    include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Bold.otf"),
+    include_bytes!("../../assets/fonts/dosis/Dosis-SemiBold.ttf"),
+];
+/// The brand face: the wordmark and the Welcome screen, in every theme.
+pub const DISPLAY_FONT: &str = "Dosis";
 /// Base UI size when a theme sets no `font.size`. Kit uses it as the window's
 /// rem, so it scales spacing and every `text_*` step along with the prose.
 const UI_FONT_SIZE: Pixels = px(15.);
@@ -64,21 +91,78 @@ pub(super) fn terminal_theme(cx: &App) -> ghostty_terminal::TerminalTheme {
     )
 }
 
-fn parse_bundled() -> BTreeMap<ThemeMode, Rc<ThemeConfig>> {
+/// How a theme sets agent prose in the transcript. Kit's theme format has no field for
+/// it, so bundled themes carry `prose.*` keys beside Kit's own; other themes set prose
+/// in their UI font.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Prose {
+    pub family: Option<SharedString>,
+    pub size: Option<Pixels>,
+    /// Line height as a multiple of the size.
+    pub line_height: Option<f32>,
+}
+
+impl Prose {
+    fn from_theme(theme: &Value) -> Self {
+        let number = |key: &str| {
+            theme.get(key).map(|value| {
+                value
+                    .as_f64()
+                    .filter(|value| *value > 0.)
+                    .unwrap_or_else(|| panic!("bundled {key} is a positive number"))
+                    as f32
+            })
+        };
+        Self {
+            family: theme
+                .get("prose.font.family")
+                .and_then(Value::as_str)
+                .map(|family| SharedString::from(family.to_owned())),
+            size: number("prose.font.size").map(px),
+            line_height: number("prose.line_height"),
+        }
+    }
+}
+
+struct Bundled {
+    config: Rc<ThemeConfig>,
+    prose: Prose,
+}
+
+/// Bundled themes in file order; each mode has exactly one default.
+fn parse_bundled() -> Vec<Bundled> {
     let set: ThemeSet =
         serde_json::from_str(BUNDLED_THEMES).expect("assets/themes/drostje.json is valid Kit JSON");
-    let mut bundled = BTreeMap::new();
-    for theme in set.themes {
-        bundled.insert(theme.mode, Rc::new(theme));
-    }
+    let raw: Value = serde_json::from_str(BUNDLED_THEMES).expect("bundled themes are JSON");
+    let bundled: Vec<_> = set
+        .themes
+        .into_iter()
+        .zip(raw["themes"].as_array().expect("bundled themes are a list"))
+        .map(|(config, raw)| Bundled {
+            config: Rc::new(config),
+            prose: Prose::from_theme(raw),
+        })
+        .collect();
     for mode in [ThemeMode::Light, ThemeMode::Dark] {
-        assert!(
-            bundled.contains_key(&mode),
-            "assets/themes/drostje.json bundles one {} theme",
+        assert_eq!(
+            bundled
+                .iter()
+                .filter(|theme| theme.config.mode == mode && theme.config.is_default)
+                .count(),
+            1,
+            "assets/themes/drostje.json bundles one default {} theme",
             mode.name()
         );
     }
     bundled
+}
+
+/// A saved theme name under its current name.
+pub fn saved_theme_name(name: &str) -> &str {
+    RENAMED_THEMES
+        .iter()
+        .find(|(old, _)| *old == name)
+        .map_or(name, |(_, new)| new)
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -118,6 +202,7 @@ fn saved_name(value: Option<&Value>) -> Option<&str> {
     value
         .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
+        .map(saved_theme_name)
 }
 
 impl Preferences {
@@ -148,34 +233,55 @@ struct AppliedTheme {
 
 struct Coordinator {
     preferences: Preferences,
-    bundled: BTreeMap<ThemeMode, Rc<ThemeConfig>>,
+    bundled: Vec<Bundled>,
     native_appearance: Option<Appearance>,
     applied: Option<AppliedTheme>,
+    /// Prose of the theme in effect for the current mode.
+    prose: Prose,
+    fonts_error: Option<String>,
     warnings: Vec<String>,
 }
 
 impl Coordinator {
-    fn new(preferences: Preferences) -> Self {
+    fn new(preferences: Preferences, fonts_error: Option<String>) -> Self {
         Self {
             preferences,
             bundled: parse_bundled(),
             native_appearance: None,
             applied: None,
+            prose: Prose::default(),
+            fonts_error,
             warnings: Vec::new(),
         }
     }
 
+    /// The default bundled theme of `mode`.
     fn bundled(&self, mode: ThemeMode) -> &Rc<ThemeConfig> {
-        &self.bundled[&mode]
+        &self
+            .bundled
+            .iter()
+            .find(|theme| theme.config.mode == mode && theme.config.is_default)
+            .expect("parse_bundled checked one default per mode")
+            .config
+    }
+
+    fn prose(&self, theme: &Rc<ThemeConfig>) -> Prose {
+        self.bundled
+            .iter()
+            .find(|bundled| Rc::ptr_eq(&bundled.config, theme))
+            .map(|bundled| bundled.prose.clone())
+            .unwrap_or_default()
     }
 }
 
 /// A bundled theme wins over a registry theme of the same name so a stray
 /// file cannot replace the defaults; other registry themes are found by name.
 fn find_theme<'a>(name: &str, cx: &'a App) -> Option<&'a Rc<ThemeConfig>> {
+    let name = saved_theme_name(name);
     cx.global::<Coordinator>()
         .bundled
-        .values()
+        .iter()
+        .map(|theme| &theme.config)
         .find(|theme| theme.name.as_ref() == name)
         .or_else(|| ThemeRegistry::global(cx).themes().get(name))
 }
@@ -196,8 +302,20 @@ pub fn initialize(
     data_dir: Option<&Path>,
     cx: &mut App,
 ) {
+    // Register once per app; a second initialization reuses the faces.
+    let fonts_error = match cx.try_global::<Coordinator>() {
+        Some(coordinator) => coordinator.fonts_error.clone(),
+        None => cx
+            .text_system()
+            .add_fonts(FONTS.iter().map(|font| Cow::Borrowed(*font)).collect())
+            .err()
+            .map(|error| {
+                format!("Could not load the bundled fonts: {error:#}. Text uses system fonts.")
+            }),
+    };
     cx.set_global(Coordinator::new(
         settings.map(Preferences::from_settings).unwrap_or_default(),
+        fonts_error,
     ));
     cx.set_global(InitialLoad {
         finished: data_dir.is_none(),
@@ -225,17 +343,29 @@ pub fn initial_load_finished(cx: &App) -> bool {
         .is_none_or(|load| load.finished)
 }
 
-/// Bundled theme first, then registry themes in Kit's order, without repeats.
+/// Bundled themes first, then registry themes in Kit's order, without repeats.
 pub fn theme_names(mode: ThemeMode, cx: &App) -> Vec<String> {
-    let bundled = cx.global::<Coordinator>().bundled(mode).name.clone();
+    let bundled: Vec<_> = cx
+        .global::<Coordinator>()
+        .bundled
+        .iter()
+        .filter(|theme| theme.config.mode == mode)
+        .map(|theme| theme.config.name.to_string())
+        .collect();
     let registry = ThemeRegistry::global(cx)
         .sorted_themes()
         .into_iter()
-        .filter(|theme| theme.mode == mode && theme.name != bundled)
-        .map(|theme| theme.name.to_string());
-    std::iter::once(bundled.to_string())
-        .chain(registry)
-        .collect()
+        .filter(|theme| theme.mode == mode && !bundled.iter().any(|name| *name == theme.name))
+        .map(|theme| theme.name.to_string())
+        .collect::<Vec<_>>();
+    bundled.into_iter().chain(registry).collect()
+}
+
+/// Agent prose in the theme in effect; empty fields fall back to the UI font.
+pub fn prose(cx: &App) -> Prose {
+    cx.try_global::<Coordinator>()
+        .map(|coordinator| coordinator.prose.clone())
+        .unwrap_or_default()
 }
 
 /// Validate new choices while allowing an unavailable saved choice to survive
@@ -333,6 +463,9 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
     if let Some(error) = &cx.global::<InitialLoad>().error {
         warnings.push(error.clone());
     }
+    if let Some(error) = &cx.global::<Coordinator>().fonts_error {
+        warnings.push(error.clone());
+    }
     let light = resolve(
         preferences.light.as_deref(),
         ThemeMode::Light,
@@ -373,7 +506,12 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
                 || previous.light != applied.light
                 || previous.dark != applied.dark
         });
-    cx.global_mut::<Coordinator>().applied = Some(applied);
+    let prose = cx
+        .global::<Coordinator>()
+        .prose(if mode.is_dark() { &dark } else { &light });
+    let coordinator = cx.global_mut::<Coordinator>();
+    coordinator.applied = Some(applied);
+    coordinator.prose = prose;
     if changed {
         // Kit only replaces optional typography/radius/highlight fields when
         // present. Reset those fields to Kit defaults so switching away from a
@@ -483,43 +621,142 @@ pub fn attach_recovery(window: &mut Window, cx: &mut App) -> Subscription {
 mod tests {
     // Not `use super::*`: the Kit facade exports a `test` macro that would
     // shadow `#[test]`.
-    use super::parse_bundled;
-    use gpui_kit::component::ThemeMode;
+    use super::{DISPLAY_FONT, FONTS, Prose, parse_bundled, saved_theme_name};
+    use gpui_kit::{FontStyle, FontWeight, component::ThemeMode, font, px};
+    use std::borrow::Cow;
 
     #[test]
-    fn bundled_themes_parse_with_muted_text() {
+    fn bundled_themes_are_delft_by_default_and_ink_for_reading() {
         let bundled = parse_bundled();
-        let light = &bundled[&ThemeMode::Light];
-        let dark = &bundled[&ThemeMode::Dark];
-        assert_eq!(light.name.as_ref(), "DROSTJE. Light");
-        assert_eq!(dark.name.as_ref(), "DROSTJE. Dark");
-        // Zed One Light / One Dark text, not Kit's neutral-950 / neutral-50.
-        assert_eq!(light.colors.foreground.as_deref(), Some("#242529"));
-        assert_eq!(light.colors.background.as_deref(), Some("#fafafa"));
-        assert_eq!(light.colors.muted_foreground.as_deref(), Some("#58585a"));
-        assert_eq!(dark.colors.foreground.as_deref(), Some("#dce0e5"));
-        assert_eq!(dark.colors.background.as_deref(), Some("#282c33"));
-        assert_eq!(dark.colors.muted_foreground.as_deref(), Some("#a9afbc"));
-        for theme in [light, dark] {
-            assert!(theme.is_default, "{} marks itself default", theme.name);
+        let names: Vec<_> = bundled
+            .iter()
+            .map(|theme| {
+                (
+                    theme.config.name.as_ref(),
+                    theme.config.mode,
+                    theme.config.is_default,
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Delft Light", ThemeMode::Light, true),
+                ("Delft Dark", ThemeMode::Dark, true),
+                ("Ink Light", ThemeMode::Light, false),
+                ("Ink Dark", ThemeMode::Dark, false),
+            ]
+        );
+        let theme = |name: &str| {
+            bundled
+                .iter()
+                .find(|theme| theme.config.name.as_ref() == name)
+                .unwrap()
+        };
+        let delft = theme("Delft Light");
+        assert_eq!(delft.config.colors.background.as_deref(), Some("#f7f9fc"));
+        assert_eq!(delft.config.colors.foreground.as_deref(), Some("#1b2740"));
+        assert_eq!(delft.config.colors.primary.as_deref(), Some("#2453a6"));
+        assert_eq!(delft.config.font_family.as_deref(), Some("IBM Plex Sans"));
+        assert_eq!(
+            delft.config.mono_font_family.as_deref(),
+            Some("IBM Plex Mono")
+        );
+        assert_eq!(delft.prose, Prose::default(), "Delft prose is its UI font");
+        for name in ["Ink Light", "Ink Dark"] {
+            let ink = theme(name);
+            assert_eq!(
+                ink.config.mono_font_family.as_deref(),
+                Some("Monaspace Xenon")
+            );
+            assert_eq!(
+                ink.prose,
+                Prose {
+                    family: Some("Libron".into()),
+                    size: Some(px(17.)),
+                    line_height: Some(1.55),
+                }
+            );
+        }
+        for theme in &bundled {
             // Kit 0.6.1 drops the flattened `editor.*` / status colors of a
             // highlight block while parsing (its own default does too), so
             // only the syntax table is asserted here.
-            let highlight = theme.highlight.as_ref().expect("bundled syntax colors");
-            assert!(highlight.syntax.keyword.is_some());
-            assert!(highlight.syntax.string.is_some());
+            let highlight = theme
+                .config
+                .highlight
+                .as_ref()
+                .expect("bundled syntax colors");
+            assert!(highlight.syntax.keyword.is_some(), "{}", theme.config.name);
+            assert!(highlight.syntax.string.is_some(), "{}", theme.config.name);
+        }
+    }
+
+    #[test]
+    fn saved_defaults_from_before_delft_mean_delft() {
+        assert_eq!(saved_theme_name("DROSTJE. Light"), "Delft Light");
+        assert_eq!(saved_theme_name("DROSTJE. Dark"), "Delft Dark");
+        assert_eq!(saved_theme_name("Ink Dark"), "Ink Dark");
+        assert_eq!(saved_theme_name("Runtime dark"), "Runtime dark");
+    }
+
+    /// The test platform's text system is a stub, so this asks the real one.
+    #[test]
+    fn every_family_a_bundled_theme_names_is_embedded() {
+        let text_system = gpui_kit::platform::current_platform(true).text_system();
+        text_system
+            .add_fonts(FONTS.iter().map(|font| Cow::Borrowed(*font)).collect())
+            .expect("bundled fonts load");
+        let installed = text_system.all_font_names();
+        let mut families = vec![DISPLAY_FONT.to_owned()];
+        for theme in parse_bundled() {
+            families.extend(
+                [
+                    theme.config.font_family.clone(),
+                    theme.config.mono_font_family.clone(),
+                    theme.prose.family.clone(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|family| family.to_string()),
+            );
+        }
+        for family in families {
+            assert!(installed.contains(&family), "{family} is embedded");
+        }
+        // Bold and italic text uses real faces, not the regular one.
+        for family in ["IBM Plex Sans", "Libron"] {
+            let face = |weight, style| {
+                let mut face = font(family);
+                face.weight = weight;
+                face.style = style;
+                text_system.font_id(&face).unwrap()
+            };
+            let regular = face(FontWeight::NORMAL, FontStyle::Normal);
+            assert_ne!(
+                regular,
+                face(FontWeight::BOLD, FontStyle::Normal),
+                "{family} bold"
+            );
+            assert_ne!(
+                regular,
+                face(FontWeight::NORMAL, FontStyle::Italic),
+                "{family} italic"
+            );
         }
     }
 }
 
 #[cfg(all(test, feature = "runtime-qa"))]
 mod runtime_tests {
-    use super::{initialize, resolve, theme_names, validate_preferences};
+    use super::{initialize, prose, resolve, theme_names, validate_preferences};
     use gpui_kit::{
         Hsla, TestAppContext,
         component::{Theme, ThemeMode},
         rgb,
     };
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
     #[gpui_kit::test]
     fn bundled_themes_are_the_fallback_and_listed_first(cx: &mut TestAppContext) {
@@ -527,31 +764,64 @@ mod runtime_tests {
             gpui_kit::init(cx);
             initialize(None, None, cx);
 
-            assert_eq!(theme_names(ThemeMode::Light, cx)[0], "DROSTJE. Light");
-            assert_eq!(theme_names(ThemeMode::Dark, cx)[0], "DROSTJE. Dark");
-            assert!(theme_names(ThemeMode::Light, cx).contains(&"Default Light".to_owned()));
+            let light = theme_names(ThemeMode::Light, cx);
+            assert_eq!(light[..2], ["Delft Light", "Ink Light"]);
+            assert_eq!(
+                theme_names(ThemeMode::Dark, cx)[..2],
+                ["Delft Dark", "Ink Dark"]
+            );
+            assert!(light.contains(&"Default Light".to_owned()));
 
             let theme = Theme::global(cx);
-            assert_eq!(theme.light_theme.name.as_ref(), "DROSTJE. Light");
-            assert_eq!(theme.dark_theme.name.as_ref(), "DROSTJE. Dark");
+            assert_eq!(theme.light_theme.name.as_ref(), "Delft Light");
+            assert_eq!(theme.dark_theme.name.as_ref(), "Delft Dark");
             let expected: Hsla = if theme.mode.is_dark() {
-                rgb(0xdce0e5).into()
+                rgb(0xdce3f0).into()
             } else {
-                rgb(0x242529).into()
+                rgb(0x1b2740).into()
             };
             assert_eq!(theme.foreground, expected);
+            assert_eq!(theme.font_family.as_ref(), "IBM Plex Sans");
+            assert_eq!(prose(cx).family, None, "Delft prose is its UI font");
 
-            validate_preferences("light", Some("DROSTJE. Light"), Some("DROSTJE. Dark"), cx)
+            validate_preferences("light", Some("Delft Light"), Some("Ink Dark"), cx)
                 .expect("bundled names validate");
+            validate_preferences("light", Some("DROSTJE. Light"), None, cx)
+                .expect("names from before Delft still validate");
             validate_preferences("light", Some("Default Light"), None, cx)
                 .expect("Kit defaults stay selectable");
             assert!(validate_preferences("light", Some("Missing"), None, cx).is_err());
-            assert!(validate_preferences("light", Some("DROSTJE. Dark"), None, cx).is_err());
+            assert!(validate_preferences("light", Some("Ink Dark"), None, cx).is_err());
 
             let mut warnings = Vec::new();
             let resolved = resolve(Some("Missing"), ThemeMode::Light, cx, &mut warnings);
-            assert_eq!(resolved.name.as_ref(), "DROSTJE. Light");
+            assert_eq!(resolved.name.as_ref(), "Delft Light");
             assert_eq!(warnings.len(), 1, "{warnings:?}");
+            let mut warnings = Vec::new();
+            let resolved = resolve(Some("DROSTJE. Dark"), ThemeMode::Dark, cx, &mut warnings);
+            assert_eq!(resolved.name.as_ref(), "Delft Dark");
+            assert!(warnings.is_empty(), "{warnings:?}");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn ink_sets_agent_prose_in_libron_and_switching_away_restores_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let settings = |light: &str| {
+                BTreeMap::from([
+                    ("theme_mode".to_owned(), json!("light")),
+                    ("theme_light".to_owned(), json!(light)),
+                ])
+            };
+            initialize(Some(&settings("Ink Light")), None, cx);
+            let theme = Theme::global(cx);
+            assert_eq!(theme.mono_font_family.as_ref(), "Monaspace Xenon");
+            assert_eq!(prose(cx).family.as_deref(), Some("Libron"));
+
+            initialize(Some(&settings("Delft Light")), None, cx);
+            assert_eq!(Theme::global(cx).mono_font_family.as_ref(), "IBM Plex Mono");
+            assert_eq!(prose(cx).family, None);
         });
     }
 }

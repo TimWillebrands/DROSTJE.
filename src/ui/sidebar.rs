@@ -1,4 +1,5 @@
 use super::{
+    activity,
     commands::{
         AddProject, ArchiveThread, CollapseProject, Command, Dismiss, ExpandProject, NextSpace,
         PreviousSpace, RenameThread, SearchThreads, SelectNext, ShowArchived, ToggleProjects,
@@ -823,13 +824,24 @@ fn render_list(
                                         }))
                                         // Pointer shortcuts only: the context menu and palette
                                         // carry the same commands. The lane keeps its width so
-                                        // long titles do not jump when the pointer enters.
+                                        // long titles do not jump when the pointer enters; the
+                                        // activity mark holds it otherwise.
                                         .when(!thread.archived, |view| {
                                             view.child(
                                                 h_flex()
                                                     .w(rems(2.75))
                                                     .flex_shrink_0()
                                                     .justify_end()
+                                                    .when(!pointer_hovered, |lane| {
+                                                        lane.pr_1().children(activity::mark(
+                                                            SharedString::from(format!(
+                                                                "thread-activity-{}-{id}",
+                                                                if active { "rows" } else { "preview" }
+                                                            )),
+                                                            state.thread_activity(id),
+                                                            cx,
+                                                        ))
+                                                    })
                                                     .when(pointer_hovered, |lane| {
                                                         lane.child(
                                                             h_flex()

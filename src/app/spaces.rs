@@ -673,6 +673,9 @@ impl AppState {
         let session = self.space_state.active_session();
         self.selected_project = session.selected_project;
         self.selected_thread = session.selected_thread;
+        if let Some(id) = self.selected_thread {
+            self.unseen_turns.seen(id);
+        }
         self.open_threads = session.open_threads;
         self.show_archived = session.show_archived;
         self.collapsed = session.collapsed;

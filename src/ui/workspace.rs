@@ -1,4 +1,5 @@
 use super::{
+    activity,
     commands::{self, *},
     conversation, factory,
     settings::{DialogKind, SurfaceContent, SurfaceOutcome},
@@ -8,7 +9,7 @@ use super::{
     title_bar::{WorkspaceDockSkin, WorkspaceTitle},
 };
 use crate::{
-    app::{AppState, NoticeLevel, PresentationChange, SidebarTab},
+    app::{AppState, NoticeLevel, PresentationChange, SidebarTab, ThreadActivity},
     model::{PaneDirection, ProjectId, SpaceId, ThreadId, ThreadKind, WorktreeId},
 };
 use gpui_kit::{
@@ -26,7 +27,6 @@ use gpui_kit::{
         menu::{PopupMenu, PopupMenuItem},
         notification::Notification,
         shimmer::ShimmerText,
-        spinner::Spinner,
         v_flex,
     },
     prelude::FluentBuilder,
@@ -3535,8 +3535,9 @@ impl BasePanel for WorkspacePanel {
     }
 }
 impl Panel for WorkspacePanel {
-    /// A thread tab shows a spinner while its agent works and a close control on
-    /// hover; a middle click closes it too. Closing only closes the tab.
+    /// A thread tab shows its activity mark, with a sweeping underline while its agent
+    /// works, and a close control on hover; a middle click closes it too. Closing only
+    /// closes the tab.
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.panel_title(cx);
         if let PanelKind::Terminal(id) = self.kind {
@@ -3575,7 +3576,7 @@ impl Panel for WorkspacePanel {
             return title.into_any_element();
         };
         let state = self.state.read(cx);
-        let working = state.active_threads.contains(&id);
+        let activity = state.thread_activity(id);
         let titling = state.is_titling(id);
         let group = SharedString::from(format!("thread-tab-{id}"));
         let (middle, close) = (self.workspace.clone(), self.workspace.clone());
@@ -3584,6 +3585,7 @@ impl Panel for WorkspacePanel {
             .id(group.clone())
             .debug_selector(move || selector.to_string())
             .group(group.clone())
+            .relative()
             .items_center()
             .gap_1()
             .min_w_0()
@@ -3595,7 +3597,11 @@ impl Panel for WorkspacePanel {
                     });
                 }
             })
-            .when(working, |tab| tab.child(Spinner::new().xsmall()))
+            .children(activity::mark(
+                SharedString::from(format!("thread-tab-activity-{id}")),
+                activity,
+                cx,
+            ))
             .map(|tab| match titling {
                 true => tab.child(ShimmerText::new(title)),
                 false => tab.child(title),
@@ -3618,10 +3624,23 @@ impl Panel for WorkspacePanel {
                             }),
                     ),
             )
+            // Inside the tab's clipped inner box, just below the label.
+            .when(activity == ThreadActivity::Running, |tab| {
+                let selector = format!("thread-tab-sweep-{id}");
+                tab.child(
+                    div()
+                        .debug_selector(move || selector)
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(rems(-0.25))
+                        .child(activity::sweep(cx)),
+                )
+            })
             .into_any_element()
     }
     fn tab_name(&self, cx: &App) -> Option<SharedString> {
-        // Threads draw their own tab (spinner, close control); the rest use the name.
+        // Threads draw their own tab (activity mark, close control); the rest use the name.
         match self.kind {
             PanelKind::Thread(_) | PanelKind::Terminal(_) => None,
             _ => Some(self.panel_title(cx).into()),

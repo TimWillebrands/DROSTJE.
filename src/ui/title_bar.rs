@@ -27,10 +27,11 @@ use gpui_kit::{
 };
 use std::{rc::Rc, sync::Arc};
 
-/// Save acknowledgements repaint only their status, never the title bar or the shell.
+/// Save acknowledgements and the running-turn count repaint only their status, never the
+/// title bar or the shell.
 pub(super) struct SaveStatus {
     state: Entity<AppState>,
-    presentation: (bool, bool),
+    presentation: (usize, bool, bool),
     _subscriptions: Vec<Subscription>,
 }
 
@@ -51,8 +52,9 @@ impl SaveStatus {
         }
     }
 
-    fn presentation(state: &AppState) -> (bool, bool) {
+    fn presentation(state: &AppState) -> (usize, bool, bool) {
         (
+            state.active_threads.len(),
             state.pending_writes > 0,
             state.storage_error.is_some() || state.shutdown_error.is_some(),
         )
@@ -69,9 +71,24 @@ impl SaveStatus {
 
 impl Render for SaveStatus {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (running, saving, unsaved) = self.presentation;
         h_flex()
             .gap_2()
-            .when(self.presentation.0, |view| {
+            .when(running > 0, |view| {
+                view.child(
+                    div()
+                        .id("running-turns")
+                        .debug_selector(|| "running-turns".into())
+                        .test_support()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(match running {
+                            1 => "1 turn running".to_owned(),
+                            n => format!("{n} turns running"),
+                        }),
+                )
+            })
+            .when(saving, |view| {
                 view.child(
                     div()
                         .id("save-indicator")
@@ -81,7 +98,7 @@ impl Render for SaveStatus {
                         .child("Saving changes…"),
                 )
             })
-            .when(self.presentation.1, |view| {
+            .when(unsaved, |view| {
                 view.child(Tag::danger().child("Unsaved changes"))
             })
     }
