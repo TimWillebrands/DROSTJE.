@@ -298,6 +298,58 @@ pub fn submission_size_for_lengths(
     )
 }
 
+/// A bounded exact-byte cache avoids rewriting the same image on every canonical
+/// message snapshot. Files outlive cache eviction because messages own references.
+#[derive(Default)]
+struct ImageCache {
+    entries: std::collections::VecDeque<(String, String, ImageAttachment)>,
+    bytes: usize,
+}
+impl ImageCache {
+    /// Stores a provider's base64 image under `directory/native-images`.
+    fn import(
+        &mut self,
+        mime: &str,
+        encoded: &str,
+        directory: &std::path::Path,
+    ) -> anyhow::Result<ImageAttachment> {
+        use anyhow::{Context, ensure};
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        ensure!(
+            matches!(mime, "image/png" | "image/jpeg" | "image/webp"),
+            "Unsupported provider image MIME: {mime}"
+        );
+        ensure!(
+            encoded.len() as u64 <= crate::attachments::FILE_LIMIT.div_ceil(3) * 4,
+            "Provider image exceeds 20 MiB"
+        );
+        if let Some((_, _, image)) = self
+            .entries
+            .iter()
+            .find(|(data, kind, _)| data == encoded && kind == mime)
+        {
+            return Ok(image.clone());
+        }
+        let bytes = STANDARD
+            .decode(encoded)
+            .context("Corrupt provider image base64")?;
+        let image =
+            crate::attachments::import_bytes(&bytes, mime, &directory.join("native-images"))?;
+        const CACHE_BYTES: usize = 32 * 1024 * 1024;
+        while self.entries.len() >= 16 || self.bytes + encoded.len() > CACHE_BYTES {
+            if let Some((data, _, _)) = self.entries.pop_front() {
+                self.bytes -= data.len();
+            } else {
+                break;
+            }
+        }
+        self.bytes += encoded.len();
+        self.entries
+            .push_back((encoded.into(), mime.into(), image.clone()));
+        Ok(image)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::permission_modes;
