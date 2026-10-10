@@ -10,14 +10,17 @@ licence sits beside its files as `OFL.txt`.
 | IBM Plex Mono | Regular, Italic, Bold | [IBM/plex](https://github.com/IBM/plex) `@ibm/plex-mono@2.5.0`, `fonts/complete/ttf` | 2.5.0 |
 | Libron | Regular, Italic, Bold, Bold Italic | [nicoverbruggen/libron](https://github.com/nicoverbruggen/libron) `Libron.zip` | v0.31 |
 | Monaspace Xenon | Regular, Italic, Bold | [githubnext/monaspace](https://github.com/githubnext/monaspace) `monaspace-static-v1.400.zip` | 1.400 |
-| Dosis | SemiBold | [google/fonts](https://github.com/google/fonts/tree/main/ofl/dosis) `Dosis[wght].ttf` | see below |
+| Dosis | Medium, SemiBold, Bold | [google/fonts](https://github.com/google/fonts/tree/main/ofl/dosis) `Dosis[wght].ttf` | see below |
+| Maple Mono NL | Regular, Italic, Bold | [subframe7536/maple-font](https://github.com/subframe7536/maple-font) `MapleMonoNL-TTF-AutoHint.zip` (no ligatures, hinted; SHA-256 checked) | v7.9 |
 
-Dosis ships only as a variable font. `Dosis-SemiBold.ttf` is its static instance
-at weight 600, made with fontTools 4.60.1:
+Dosis ships only as a variable font. Its files here are static instances at
+weights 500, 600 and 700, made with fontTools 4.60.1:
 
 ```sh
 fonttools varLib.instancer 'Dosis[wght].ttf' wght=600 --update-name-table -o Dosis-SemiBold.ttf
 ```
 
-Its licence reserves no font name, so the instance keeps the name Dosis.
+There is deliberately no Regular: normal-weight text falls to Medium, which keeps
+the narrow Dosis from going thin. Its licence reserves no font name, so the
+instances keep the name Dosis.
 GPUI's support for variable-font weights is not relied on; every face here is static.

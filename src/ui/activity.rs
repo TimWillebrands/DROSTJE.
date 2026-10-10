@@ -1,8 +1,10 @@
 //! How a thread shows its agent's activity: a dot that breathes while a turn runs and
 //! stays lit after one ends out of sight, and a hairline sweeping along the running
 //! thread's edges. Every copy shares one clock, so tab, row and composer move together;
-//! reduced motion keeps them still.
+//! reduced motion keeps them still. Both use the theme's signature color, the wordmark's
+//! full stop; a failed turn uses danger.
 
+use super::theme;
 use crate::app::ThreadActivity;
 use gpui_kit::{
     component::{ActiveTheme, tooltip::Tooltip},
@@ -20,8 +22,8 @@ const SEGMENT: f32 = 0.3;
 pub fn mark(id: SharedString, activity: ThreadActivity, cx: &App) -> Option<AnyElement> {
     let (color, tooltip) = match activity {
         ThreadActivity::Idle => return None,
-        ThreadActivity::Running => (cx.theme().primary, "Turn running"),
-        ThreadActivity::Unseen { failed: false } => (cx.theme().primary, "Turn finished"),
+        ThreadActivity::Running => (theme::signature(cx), "Turn running"),
+        ThreadActivity::Unseen { failed: false } => (theme::signature(cx), "Turn finished"),
         ThreadActivity::Unseen { failed: true } => (cx.theme().danger, "Turn did not complete"),
     };
     let selector = id.clone();
@@ -52,7 +54,7 @@ pub fn mark(id: SharedString, activity: ThreadActivity, cx: &App) -> Option<AnyE
 /// A full-width hairline whose bright segment sweeps back and forth while a turn runs;
 /// the caller places it on an edge. Reduced motion shows the whole line, still.
 pub fn sweep(cx: &App) -> AnyElement {
-    let color = cx.theme().primary;
+    let color = theme::signature(cx);
     let track = div()
         .debug_selector(|| "activity-sweep".into())
         .w_full()

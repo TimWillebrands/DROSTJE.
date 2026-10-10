@@ -145,6 +145,7 @@ Eigen thema's staan in `<DROSTJE_DATA_DIR>/themes` (standaard `~/Library/Applica
 
 - **Delft Light** en **Delft Dark**, de standaard: IBM Plex Sans en IBM Plex Mono, met Delfts blauw als enige accentkleur.
 - **Ink Light** en **Ink Dark**, een leesmodus naar e-readers: antwoorden van agents staan in Libron, code in Monaspace Xenon, met gedempte kleuren.
+- **Cootje Light** en **Cootje Dark**, de speelse: alles in Dosis, code in Maple Mono, rondere hoeken, Cootje-blauw en saffraan voor de punt die laat zien dat een agent bezig is.
 - GPUI Kit's Default Light en Default Dark.
 
 Een eerder opgeslagen keuze voor DROSTJE. Light of DROSTJE. Dark betekent nu Delft. Het woordmerk op het startscherm staat in Dosis; zolang een turn loopt, ademt de punt van DROSTJE. naast de composer. De lettertypes zitten in de app zelf en vallen onder de SIL Open Font License; herkomst en licenties staan in `assets/fonts`.

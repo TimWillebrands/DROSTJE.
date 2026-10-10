@@ -23,7 +23,7 @@ const RENAMED_THEMES: [(&str, &str); 2] = [
 ];
 /// The faces bundled themes name, embedded so every platform renders the same type.
 /// Each family's licence sits beside its files in `assets/fonts`.
-const FONTS: [&[u8]; 17] = [
+const FONTS: [&[u8]; 22] = [
     include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
     include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"),
     include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Medium.ttf"),
@@ -40,7 +40,13 @@ const FONTS: [&[u8]; 17] = [
     include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Regular.otf"),
     include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Italic.otf"),
     include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Bold.otf"),
+    // No Regular: normal text falls to Medium, which keeps the narrow Dosis from going thin.
+    include_bytes!("../../assets/fonts/dosis/Dosis-Medium.ttf"),
     include_bytes!("../../assets/fonts/dosis/Dosis-SemiBold.ttf"),
+    include_bytes!("../../assets/fonts/dosis/Dosis-Bold.ttf"),
+    include_bytes!("../../assets/fonts/maple-mono-nl/MapleMonoNL-Regular.ttf"),
+    include_bytes!("../../assets/fonts/maple-mono-nl/MapleMonoNL-Italic.ttf"),
+    include_bytes!("../../assets/fonts/maple-mono-nl/MapleMonoNL-Bold.ttf"),
 ];
 /// The brand face: the wordmark and the Welcome screen, in every theme.
 pub const DISPLAY_FONT: &str = "Dosis";
@@ -91,9 +97,31 @@ pub(super) fn terminal_theme(cx: &App) -> ghostty_terminal::TerminalTheme {
     )
 }
 
-/// How a theme sets agent prose in the transcript. Kit's theme format has no field for
-/// it, so bundled themes carry `prose.*` keys beside Kit's own; other themes set prose
-/// in their UI font.
+/// What bundled themes set beyond Kit's format, as `prose.*` and `signature` keys beside
+/// Kit's own. Other themes get the defaults.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Extensions {
+    prose: Prose,
+    /// The wordmark's full stop and the running-turn mark; the accent when unset.
+    signature: Option<Hsla>,
+}
+
+impl Extensions {
+    fn from_theme(theme: &Value) -> Self {
+        Self {
+            prose: Prose::from_theme(theme),
+            signature: theme.get("signature").map(|color| {
+                color
+                    .as_str()
+                    .and_then(|color| Rgba::try_from(color).ok())
+                    .expect("bundled signature is a hex color")
+                    .into()
+            }),
+        }
+    }
+}
+
+/// How a theme sets agent prose in the transcript; unset fields use the UI font.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prose {
     pub family: Option<SharedString>,
@@ -126,7 +154,7 @@ impl Prose {
 
 struct Bundled {
     config: Rc<ThemeConfig>,
-    prose: Prose,
+    extensions: Extensions,
 }
 
 /// Bundled themes in file order; each mode has exactly one default.
@@ -140,7 +168,7 @@ fn parse_bundled() -> Vec<Bundled> {
         .zip(raw["themes"].as_array().expect("bundled themes are a list"))
         .map(|(config, raw)| Bundled {
             config: Rc::new(config),
-            prose: Prose::from_theme(raw),
+            extensions: Extensions::from_theme(raw),
         })
         .collect();
     for mode in [ThemeMode::Light, ThemeMode::Dark] {
@@ -236,8 +264,8 @@ struct Coordinator {
     bundled: Vec<Bundled>,
     native_appearance: Option<Appearance>,
     applied: Option<AppliedTheme>,
-    /// Prose of the theme in effect for the current mode.
-    prose: Prose,
+    /// Extensions of the theme in effect for the current mode.
+    extensions: Extensions,
     fonts_error: Option<String>,
     warnings: Vec<String>,
 }
@@ -249,7 +277,7 @@ impl Coordinator {
             bundled: parse_bundled(),
             native_appearance: None,
             applied: None,
-            prose: Prose::default(),
+            extensions: Extensions::default(),
             fonts_error,
             warnings: Vec::new(),
         }
@@ -265,11 +293,11 @@ impl Coordinator {
             .config
     }
 
-    fn prose(&self, theme: &Rc<ThemeConfig>) -> Prose {
+    fn extensions(&self, theme: &Rc<ThemeConfig>) -> Extensions {
         self.bundled
             .iter()
             .find(|bundled| Rc::ptr_eq(&bundled.config, theme))
-            .map(|bundled| bundled.prose.clone())
+            .map(|bundled| bundled.extensions.clone())
             .unwrap_or_default()
     }
 }
@@ -364,8 +392,15 @@ pub fn theme_names(mode: ThemeMode, cx: &App) -> Vec<String> {
 /// Agent prose in the theme in effect; empty fields fall back to the UI font.
 pub fn prose(cx: &App) -> Prose {
     cx.try_global::<Coordinator>()
-        .map(|coordinator| coordinator.prose.clone())
+        .map(|coordinator| coordinator.extensions.prose.clone())
         .unwrap_or_default()
+}
+
+/// The full stop's color in the theme in effect.
+pub fn signature(cx: &App) -> Hsla {
+    cx.try_global::<Coordinator>()
+        .and_then(|coordinator| coordinator.extensions.signature)
+        .unwrap_or_else(|| Theme::global(cx).primary)
 }
 
 /// Validate new choices while allowing an unavailable saved choice to survive
@@ -506,12 +541,12 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
                 || previous.light != applied.light
                 || previous.dark != applied.dark
         });
-    let prose = cx
-        .global::<Coordinator>()
-        .prose(if mode.is_dark() { &dark } else { &light });
+    let extensions =
+        cx.global::<Coordinator>()
+            .extensions(if mode.is_dark() { &dark } else { &light });
     let coordinator = cx.global_mut::<Coordinator>();
     coordinator.applied = Some(applied);
-    coordinator.prose = prose;
+    coordinator.extensions = extensions;
     if changed {
         // Kit only replaces optional typography/radius/highlight fields when
         // present. Reset those fields to Kit defaults so switching away from a
@@ -622,11 +657,11 @@ mod tests {
     // Not `use super::*`: the Kit facade exports a `test` macro that would
     // shadow `#[test]`.
     use super::{DISPLAY_FONT, FONTS, Prose, parse_bundled, saved_theme_name};
-    use gpui_kit::{FontStyle, FontWeight, component::ThemeMode, font, px};
+    use gpui_kit::{FontStyle, FontWeight, Hsla, Rgba, component::ThemeMode, font, px};
     use std::borrow::Cow;
 
     #[test]
-    fn bundled_themes_are_delft_by_default_and_ink_for_reading() {
+    fn bundled_themes_are_delft_by_default_with_ink_and_cootje_beside_it() {
         let bundled = parse_bundled();
         let names: Vec<_> = bundled
             .iter()
@@ -645,6 +680,8 @@ mod tests {
                 ("Delft Dark", ThemeMode::Dark, true),
                 ("Ink Light", ThemeMode::Light, false),
                 ("Ink Dark", ThemeMode::Dark, false),
+                ("Cootje Light", ThemeMode::Light, false),
+                ("Cootje Dark", ThemeMode::Dark, false),
             ]
         );
         let theme = |name: &str| {
@@ -662,7 +699,11 @@ mod tests {
             delft.config.mono_font_family.as_deref(),
             Some("IBM Plex Mono")
         );
-        assert_eq!(delft.prose, Prose::default(), "Delft prose is its UI font");
+        assert_eq!(
+            delft.extensions.prose,
+            Prose::default(),
+            "Delft prose is its UI font"
+        );
         for name in ["Ink Light", "Ink Dark"] {
             let ink = theme(name);
             assert_eq!(
@@ -670,12 +711,31 @@ mod tests {
                 Some("Monaspace Xenon")
             );
             assert_eq!(
-                ink.prose,
+                ink.extensions.prose,
                 Prose {
                     family: Some("Libron".into()),
                     size: Some(px(17.)),
                     line_height: Some(1.55),
                 }
+            );
+        }
+        let hex = |hex: &str| -> Hsla { Rgba::try_from(hex).unwrap().into() };
+        for (name, signature) in [("Cootje Light", "#c07f00"), ("Cootje Dark", "#f2b33d")] {
+            let cootje = theme(name);
+            assert_eq!(cootje.config.font_family.as_deref(), Some("Dosis"));
+            assert_eq!(cootje.config.font_size, Some(16.));
+            assert_eq!(
+                cootje.config.mono_font_family.as_deref(),
+                Some("Maple Mono NL")
+            );
+            assert_eq!(cootje.extensions.prose, Prose::default(), "{name}");
+            assert_eq!(cootje.extensions.signature, Some(hex(signature)), "{name}");
+        }
+        for name in ["Delft Light", "Delft Dark", "Ink Light", "Ink Dark"] {
+            assert_eq!(
+                theme(name).extensions.signature,
+                None,
+                "{name} uses its accent"
             );
         }
         for theme in &bundled {
@@ -714,7 +774,7 @@ mod tests {
                 [
                     theme.config.font_family.clone(),
                     theme.config.mono_font_family.clone(),
-                    theme.prose.family.clone(),
+                    theme.extensions.prose.family.clone(),
                 ]
                 .into_iter()
                 .flatten()
@@ -724,14 +784,15 @@ mod tests {
         for family in families {
             assert!(installed.contains(&family), "{family} is embedded");
         }
+        let face = |family, weight, style| {
+            let mut face = font(family);
+            face.weight = weight;
+            face.style = style;
+            text_system.font_id(&face).unwrap()
+        };
         // Bold and italic text uses real faces, not the regular one.
         for family in ["IBM Plex Sans", "Libron"] {
-            let face = |weight, style| {
-                let mut face = font(family);
-                face.weight = weight;
-                face.style = style;
-                text_system.font_id(&face).unwrap()
-            };
+            let face = |weight, style| face(family, weight, style);
             let regular = face(FontWeight::NORMAL, FontStyle::Normal);
             assert_ne!(
                 regular,
@@ -744,12 +805,16 @@ mod tests {
                 "{family} italic"
             );
         }
+        // Dosis has no Regular: normal text is set in Medium, and bold stays bold.
+        let normal = face("Dosis", FontWeight::NORMAL, FontStyle::Normal);
+        assert_eq!(normal, face("Dosis", FontWeight::MEDIUM, FontStyle::Normal));
+        assert_ne!(normal, face("Dosis", FontWeight::BOLD, FontStyle::Normal));
     }
 }
 
 #[cfg(all(test, feature = "runtime-qa"))]
 mod runtime_tests {
-    use super::{initialize, prose, resolve, theme_names, validate_preferences};
+    use super::{initialize, prose, resolve, signature, theme_names, validate_preferences};
     use gpui_kit::{
         Hsla, TestAppContext,
         component::{Theme, ThemeMode},
@@ -765,10 +830,10 @@ mod runtime_tests {
             initialize(None, None, cx);
 
             let light = theme_names(ThemeMode::Light, cx);
-            assert_eq!(light[..2], ["Delft Light", "Ink Light"]);
+            assert_eq!(light[..3], ["Delft Light", "Ink Light", "Cootje Light"]);
             assert_eq!(
-                theme_names(ThemeMode::Dark, cx)[..2],
-                ["Delft Dark", "Ink Dark"]
+                theme_names(ThemeMode::Dark, cx)[..3],
+                ["Delft Dark", "Ink Dark", "Cootje Dark"]
             );
             assert!(light.contains(&"Default Light".to_owned()));
 
@@ -783,6 +848,11 @@ mod runtime_tests {
             assert_eq!(theme.foreground, expected);
             assert_eq!(theme.font_family.as_ref(), "IBM Plex Sans");
             assert_eq!(prose(cx).family, None, "Delft prose is its UI font");
+            assert_eq!(
+                signature(cx),
+                theme.primary,
+                "Delft's full stop is its accent"
+            );
 
             validate_preferences("light", Some("Delft Light"), Some("Ink Dark"), cx)
                 .expect("bundled names validate");
@@ -822,6 +892,25 @@ mod runtime_tests {
             initialize(Some(&settings("Delft Light")), None, cx);
             assert_eq!(Theme::global(cx).mono_font_family.as_ref(), "IBM Plex Mono");
             assert_eq!(prose(cx).family, None);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn cootje_sets_the_ui_in_dosis_with_a_saffron_full_stop(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let settings = BTreeMap::from([
+                ("theme_mode".to_owned(), json!("dark")),
+                ("theme_dark".to_owned(), json!("Cootje Dark")),
+            ]);
+            initialize(Some(&settings), None, cx);
+            let theme = Theme::global(cx);
+            assert_eq!(theme.font_family.as_ref(), "Dosis");
+            assert_eq!(theme.mono_font_family.as_ref(), "Maple Mono NL");
+            assert_eq!(theme.font_size, gpui_kit::px(16.));
+            let saffron: Hsla = rgb(0xf2b33d).into();
+            assert_eq!(signature(cx), saffron);
+            assert_ne!(signature(cx), theme.primary);
         });
     }
 }

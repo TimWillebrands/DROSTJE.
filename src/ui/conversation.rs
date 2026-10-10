@@ -2691,7 +2691,7 @@ fn request_card(
 /// The centre pane while no thread is open: name the next step and offer it.
 const WORDMARK: &str = "DROSTJE.";
 
-/// The brand in its display face, the full stop in the theme's accent.
+/// The brand in its display face, the full stop in the theme's signature color.
 fn wordmark(cx: &App) -> impl IntoElement {
     let stop = WORDMARK.len() - 1;
     div()
@@ -2703,7 +2703,7 @@ fn wordmark(cx: &App) -> impl IntoElement {
         .child(StyledText::new(WORDMARK).with_highlights([(
             stop..WORDMARK.len(),
             HighlightStyle {
-                color: Some(cx.theme().primary),
+                color: Some(theme::signature(cx)),
                 ..Default::default()
             },
         )]))
