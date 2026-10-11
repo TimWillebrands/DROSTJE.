@@ -2067,7 +2067,15 @@ fn normalize_content(
                 });
             }
             Some("image") => {
-                let image = images.import(block, directory);
+                let image = block["mimeType"]
+                    .as_str()
+                    .context("Provider image has no MIME type")
+                    .and_then(|mime| {
+                        let encoded = block["data"]
+                            .as_str()
+                            .context("Provider image has no resolved byte data")?;
+                        images.import(mime, encoded, directory)
+                    });
                 match image {
                     Ok(image) => content.push(ContentBlock::Image(image)),
                     Err(error) => content.push(ContentBlock::ImageError(format!("{error:#}"))),
@@ -2087,56 +2095,6 @@ fn deadline_answer(answer: UserAnswer, deadline: Option<Instant>, now: Instant) 
         UserAnswer::Cancelled { timed_out: true }
     } else {
         answer
-    }
-}
-
-/// A bounded exact-byte cache avoids rewriting the same image on every canonical
-/// message snapshot. Files outlive cache eviction because messages own references.
-#[derive(Default)]
-struct ImageCache {
-    entries: VecDeque<(String, String, ImageAttachment)>,
-    bytes: usize,
-}
-impl ImageCache {
-    fn import(&mut self, block: &Value, directory: &std::path::Path) -> Result<ImageAttachment> {
-        let mime = block["mimeType"]
-            .as_str()
-            .context("Provider image has no MIME type")?;
-        ensure!(
-            matches!(mime, "image/png" | "image/jpeg" | "image/webp"),
-            "Unsupported provider image MIME: {mime}"
-        );
-        let encoded = block["data"]
-            .as_str()
-            .context("Provider image has no resolved byte data")?;
-        ensure!(
-            encoded.len() as u64 <= crate::attachments::FILE_LIMIT.div_ceil(3) * 4,
-            "Provider image exceeds 20 MiB"
-        );
-        if let Some((_, _, image)) = self
-            .entries
-            .iter()
-            .find(|(data, kind, _)| data == encoded && kind == mime)
-        {
-            return Ok(image.clone());
-        }
-        let bytes = STANDARD
-            .decode(encoded)
-            .context("Corrupt provider image base64")?;
-        let image =
-            crate::attachments::import_bytes(&bytes, mime, &directory.join("native-images"))?;
-        const CACHE_BYTES: usize = 32 * 1024 * 1024;
-        while self.entries.len() >= 16 || self.bytes + encoded.len() > CACHE_BYTES {
-            if let Some((data, _, _)) = self.entries.pop_front() {
-                self.bytes -= data.len();
-            } else {
-                break;
-            }
-        }
-        self.bytes += encoded.len();
-        self.entries
-            .push_back((encoded.into(), mime.into(), image.clone()));
-        Ok(image)
     }
 }
 

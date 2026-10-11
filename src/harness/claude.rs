@@ -326,6 +326,8 @@ struct Actor {
     idle_sleep_assertion: Option<IdleSleepAssertion>,
     permissions: HashMap<String, Permission>,
     tools: HashMap<String, ToolActivity>,
+    /// Tool result images already stored under the session directory.
+    images: ImageCache,
     /// `set_model` control requests awaiting the CLI's answer.
     model_requests: HashMap<String, ModelKey>,
     /// The `initialize` answer carried the model catalog, so `init` need not report one.
@@ -377,6 +379,7 @@ impl Actor {
             idle_sleep_assertion: None,
             permissions: HashMap::new(),
             tools: HashMap::new(),
+            images: ImageCache::default(),
             slash_commands: None,
             terminal_commands: Vec::new(),
             model_requests: HashMap::new(),
@@ -453,7 +456,12 @@ impl Actor {
                         if let Some((request_id, history)) = completed.accepted {
                             self.append_history(&history)?;
                             // Claude Code never echoes prompts; show one as soon as it is accepted.
-                            for message in normalize_history(&history, self.sequence)? {
+                            for message in normalize_history(
+                                &history,
+                                self.sequence,
+                                &self.config.session_dir,
+                                &mut self.images,
+                            )? {
                                 self.emit(ConversationEvent::MessageUpdated(message));
                             }
                             if self.turn.id == Some(request_id) && !self.turn.accepted {
@@ -763,7 +771,12 @@ impl Actor {
         let history = self.history.clone();
         let mut messages = Vec::new();
         for (index, frame) in history.iter().enumerate() {
-            messages.extend(normalize_history(frame, index)?);
+            messages.extend(normalize_history(
+                frame,
+                index,
+                &self.config.session_dir,
+                &mut self.images,
+            )?);
         }
         self.emit(ConversationEvent::History {
             messages,
@@ -848,7 +861,12 @@ impl Actor {
             }
             "user" => {
                 self.append_history(&frame)?;
-                for message in normalize_tool_results(&frame, self.sequence)? {
+                for message in normalize_tool_results(
+                    &frame,
+                    self.sequence,
+                    &self.config.session_dir,
+                    &mut self.images,
+                )? {
                     if let Some(id) = &message.tool_call_id {
                         let mut tool = self.tools.remove(id).unwrap_or_else(|| ToolActivity {
                             id: id.clone(),
@@ -1517,7 +1535,12 @@ fn destination_text(suggestion: &Value) -> String {
     }
 }
 
-fn normalize_history(frame: &Value, sequence: usize) -> Result<Vec<Message>> {
+fn normalize_history(
+    frame: &Value,
+    sequence: usize,
+    directory: &Path,
+    images: &mut ImageCache,
+) -> Result<Vec<Message>> {
     match frame["type"].as_str().unwrap_or("") {
         "drostje_user" => {
             let images: Vec<ImageAttachment> = serde_json::from_value(frame["images"].clone())?;
@@ -1537,7 +1560,7 @@ fn normalize_history(frame: &Value, sequence: usize) -> Result<Vec<Message>> {
             }])
         }
         "assistant" => Ok(vec![normalize_assistant(frame, sequence)?]),
-        "user" => normalize_tool_results(frame, sequence),
+        "user" => normalize_tool_results(frame, sequence, directory, images),
         _ => Ok(Vec::new()),
     }
 }
@@ -1594,7 +1617,12 @@ fn normalize_assistant(frame: &Value, sequence: usize) -> Result<Message> {
     })
 }
 
-fn normalize_tool_results(frame: &Value, sequence: usize) -> Result<Vec<Message>> {
+fn normalize_tool_results(
+    frame: &Value,
+    sequence: usize,
+    directory: &Path,
+    images: &mut ImageCache,
+) -> Result<Vec<Message>> {
     let Some(blocks) = frame["message"]["content"].as_array() else {
         return Ok(Vec::new());
     };
@@ -1607,14 +1635,17 @@ fn normalize_tool_results(frame: &Value, sequence: usize) -> Result<Vec<Message>
             Value::String(text) => vec![ContentBlock::Text(text.clone())],
             Value::Array(parts) => parts
                 .iter()
-                .map(|part| {
-                    ContentBlock::Text(
-                        part["text"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| part.to_string()),
-                    )
-                })
+                .map(
+                    |part| match (part["type"].as_str(), part["text"].as_str()) {
+                        (_, Some(text)) => ContentBlock::Text(text.into()),
+                        // `Read` on an image answers with the image itself.
+                        (Some("image"), None) => match tool_result_image(part, directory, images) {
+                            Ok(image) => ContentBlock::Image(image),
+                            Err(error) => ContentBlock::ImageError(format!("{error:#}")),
+                        },
+                        _ => ContentBlock::Text(part.to_string()),
+                    },
+                )
                 .collect(),
             value => vec![ContentBlock::Text(value.to_string())],
         };
@@ -1633,6 +1664,26 @@ fn normalize_tool_results(frame: &Value, sequence: usize) -> Result<Vec<Message>
         });
     }
     Ok(messages)
+}
+
+fn tool_result_image(
+    part: &Value,
+    directory: &Path,
+    images: &mut ImageCache,
+) -> Result<ImageAttachment> {
+    let source = &part["source"];
+    ensure!(
+        source["type"] == "base64",
+        "Unsupported tool result image source: {}",
+        source["type"]
+    );
+    let mime = source["media_type"]
+        .as_str()
+        .context("Tool result image has no media type")?;
+    let encoded = source["data"]
+        .as_str()
+        .context("Tool result image has no data")?;
+    images.import(mime, encoded, directory)
 }
 
 #[cfg(test)]
@@ -1661,7 +1712,12 @@ mod tests {
             "uuid":"event-2",
             "message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":"failed"}]}
         });
-        let messages = normalize_tool_results(&result, 1)?;
+        let messages = normalize_tool_results(
+            &result,
+            1,
+            Path::new("/nonexistent"),
+            &mut ImageCache::default(),
+        )?;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].tool_call_id.as_deref(), Some("tool-1"));
         assert!(messages[0].error);
@@ -1683,13 +1739,55 @@ mod tests {
             .map(|(index, frame)| normalize_assistant(frame, index).map(|message| message.id))
             .collect::<Result<_>>()?;
         assert_eq!(ids, ["event-1", "event-2", "claude-assistant-2"]);
+        let mut images = ImageCache::default();
         let history: Vec<String> = frames
             .iter()
             .enumerate()
-            .flat_map(|(index, frame)| normalize_history(frame, index).unwrap_or_default())
+            .flat_map(|(index, frame)| {
+                normalize_history(frame, index, Path::new("/nonexistent"), &mut images)
+                    .unwrap_or_default()
+            })
             .map(|message| message.id)
             .collect();
         assert_eq!(history, ids, "reloaded history keeps live message IDs");
+        Ok(())
+    }
+
+    #[test]
+    fn tool_result_images_become_viewable_images() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("drostje-claude-image-{}", Uuid::new_v4()));
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(4, 3)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+        let result = json!({
+            "type":"user",
+            "uuid":"event-1",
+            "message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":[
+                {"type":"text","text":"Read 1 image"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":STANDARD.encode(&png)}},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"not base64"}},
+                {"type":"document","title":"kept raw"}
+            ]}]}
+        });
+        let mut images = ImageCache::default();
+        let messages = normalize_tool_results(&result, 0, &root, &mut images)?;
+        let content = &messages[0].content;
+        assert!(matches!(&content[0], ContentBlock::Text(text) if text == "Read 1 image"));
+        let ContentBlock::Image(image) = &content[1] else {
+            panic!("expected an image, got {:?}", content[1]);
+        };
+        assert_eq!((image.width, image.height), (4, 3));
+        assert!(image.path.starts_with(root.join("native-images")));
+        assert_eq!(fs::read(&image.path)?, png);
+        assert!(matches!(&content[2], ContentBlock::ImageError(error) if error.contains("base64")));
+        assert!(matches!(&content[3], ContentBlock::Text(text) if text.contains("kept raw")));
+
+        let again = normalize_tool_results(&result, 0, &root, &mut images)?;
+        assert!(
+            matches!(&again[0].content[1], ContentBlock::Image(same) if same.path == image.path),
+            "reloading history reuses the stored copy"
+        );
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -1891,7 +1989,12 @@ mod tests {
     #[test]
     fn saved_transcript_reconstructs_user_and_tool_history() -> Result<()> {
         let user = json!({"type":"drostje_user","id":Uuid::nil(),"text":"Fix it","images":[]});
-        let messages = normalize_history(&user, 0)?;
+        let messages = normalize_history(
+            &user,
+            0,
+            Path::new("/nonexistent"),
+            &mut ImageCache::default(),
+        )?;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert!(matches!(&messages[0].content[0], ContentBlock::Text(text) if text == "Fix it"));
