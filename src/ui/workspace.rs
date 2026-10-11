@@ -1014,6 +1014,29 @@ impl Workspace {
         });
     }
 
+    fn open_harness_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id)
+        else {
+            return;
+        };
+        self.dismiss(window, cx);
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        self.palette = Some(Palette::open_harnesses(
+            cx.entity().downgrade(),
+            self.state.clone(),
+            id,
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
     fn open_space_picker(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(reason) = self.space_transition_reason(cx) {
             self.space_error(anyhow::anyhow!(reason), cx);
@@ -2436,6 +2459,10 @@ impl Workspace {
                 .read(cx)
                 .selected_project
                 .map(DialogKind::NewWorktreeConversation),
+            Command::SwitchHarness => {
+                self.open_harness_picker(window, cx);
+                None
+            }
             Command::RemoveWorktree => self
                 .state
                 .read(cx)
@@ -3004,6 +3031,9 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &NewConversationInWorktree, w, cx| {
                     this.execute(Command::NewConversationInWorktree, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SwitchHarness, w, cx| {
+                    this.execute(Command::SwitchHarness, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| {
                     this.execute(Command::RemoveWorktree, w, cx)

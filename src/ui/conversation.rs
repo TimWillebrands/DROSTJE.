@@ -1,6 +1,6 @@
 use super::{
     activity,
-    commands::{ClearQueuedMessages, Command, SelectLast, button},
+    commands::{ClearQueuedMessages, Command, SelectLast, SwitchHarness, button},
     job_notice::{self, JobKind, JobNotice, JobOutput, JobResult, JobStart},
     theme,
     todo_list::{self, TodoList, TodoStatus},
@@ -3377,6 +3377,31 @@ fn render_content(
                     )
                 }),
         );
+    // The harness name doubles as its switcher; once a turn exists it only names it.
+    let switch_reason = state.switch_harness_reason_for(id).or_else(|| {
+        (state.selected_thread != Some(id)).then(|| "Select this conversation first.".to_owned())
+    });
+    let switch = owner.clone();
+    leading = leading.child(
+        Button::new("switch-harness")
+            .small()
+            .ghost()
+            .label(crate::harness::display_name(&thread.harness).to_owned())
+            .disabled(switch_reason.is_some())
+            .map(|button| match switch_reason {
+                Some(reason) => button.tooltip(reason),
+                None => button.tooltip_with_action(
+                    Command::SwitchHarness.label(),
+                    &SwitchHarness,
+                    Some("Workspace"),
+                ),
+            })
+            .on_click(move |_, window, cx| {
+                let _ = switch.update(cx, |workspace, cx| {
+                    workspace.execute(Command::SwitchHarness, window, cx)
+                });
+            }),
+    );
     // A Conversation in a worktree names it quietly: codename and branch in the mono font,
     // the directory in the tooltip.
     if let Some(worktree) = state.thread_worktree(thread) {

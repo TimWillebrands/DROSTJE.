@@ -1957,6 +1957,52 @@ async fn conversation_harness_commands_are_visible_and_actionable(cx: &mut TestA
         cx.read(|cx| fixture.state.read(cx).thread().unwrap().harness.clone()),
         "claude-code"
     );
+    // Cmd-N continues with the harness used last, not the project default.
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-n");
+    until(
+        cx,
+        "new conversation on the last used harness",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).snapshot.threads.len() == before + 3,
+    )
+    .await;
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).thread().unwrap().harness.clone()),
+        "claude-code"
+    );
+    // The harness picker lists OMP, Pi, Claude Code; `g g` then `j` selects Pi.
+    let unstarted = cx.read(|cx| fixture.state.read(cx).thread().unwrap().id);
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-alt-h");
+    until(cx, "harness picker", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).palette.is_some()
+    })
+    .await;
+    // The picker takes focus on its next frame.
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+    cx.simulate_keystrokes(fixture.window.into(), "g g j enter");
+    until(cx, "harness switched", Duration::from_secs(5), |cx| {
+        fixture.workspace.read(cx).palette.is_none()
+            && fixture
+                .state
+                .read(cx)
+                .snapshot
+                .threads
+                .iter()
+                .any(|thread| thread.id == unstarted && thread.harness == "pi")
+    })
+    .await;
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).snapshot.threads.len()),
+        before + 3,
+        "Switching replaces the harness in place"
+    );
     quit(cx, &fixture).await;
 }
 

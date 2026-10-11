@@ -54,6 +54,9 @@ pub struct ConversationSession {
     /// Slash commands the harness offers for prompt text.
     pub slash_commands: CommandCatalog,
     pub messages: Vec<Arc<Message>>,
+    /// The harness delivered the last page of provider history since the latest reset, so
+    /// `messages` is the whole stored transcript.
+    pub history_loaded: bool,
     pub tools: BTreeMap<String, Arc<ToolActivity>>,
     pub requests: BTreeMap<String, UserRequest>,
     pub statuses: BTreeMap<String, String>,
@@ -98,6 +101,7 @@ impl ConversationSession {
             generation: Uuid::new_v4(),
             finished: None,
             messages: Vec::new(),
+            history_loaded: false,
             tools: BTreeMap::new(),
             requests: BTreeMap::new(),
             statuses: BTreeMap::new(),
@@ -189,6 +193,7 @@ impl ConversationSession {
     }
 
     fn reset_history(&mut self) {
+        self.history_loaded = false;
         self.messages.clear();
         self.indices.clear();
         self.tool_calls.clear();
@@ -1416,7 +1421,7 @@ impl AppState {
         Ok(())
     }
     /// A fresh Conversation row in `project`, on `worktree_id` or the project root, with the
-    /// project's harness and model defaults.
+    /// harness and model last used (see `conversation_defaults`).
     pub(crate) fn build_conversation(
         &self,
         project: &Project,
@@ -1425,21 +1430,17 @@ impl AppState {
         worktree_id: Option<WorktreeId>,
     ) -> Thread {
         let timestamp = platform::now();
+        let (harness, model) =
+            conversation::conversation_defaults(&self.snapshot.threads, project, harness);
         Thread {
             id,
             project_id: project.id,
             kind: ThreadKind::Conversation,
             factory: None,
             title: crate::titles::DEFAULT_CONVERSATION_TITLE.into(),
-            harness: harness.map(str::to_owned).unwrap_or_else(|| {
-                if project.defaults.interactive_harness.trim().is_empty() {
-                    "omp".into()
-                } else {
-                    project.defaults.interactive_harness.clone()
-                }
-            }),
+            harness,
             session_ref: None,
-            model: project.defaults.interactive_model.clone(),
+            model,
             effort: None,
             permission_mode: None,
             worktree_id,

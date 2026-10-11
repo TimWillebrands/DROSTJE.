@@ -28,6 +28,7 @@ gpui_kit::actions!(
         NewPiConversation,
         NewClaudeCodeConversation,
         NewConversationInWorktree,
+        SwitchHarness,
         NewFactoryThread,
         NewTerminal,
         RestartTerminal,
@@ -107,6 +108,7 @@ pub enum Command {
     NewPiConversation,
     NewClaudeCodeConversation,
     NewConversationInWorktree,
+    SwitchHarness,
     NewFactoryThread,
     NewTerminal,
     RestartTerminal,
@@ -145,7 +147,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 50] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -159,6 +161,7 @@ impl Command {
         Self::NewPiConversation,
         Self::NewClaudeCodeConversation,
         Self::NewConversationInWorktree,
+        Self::SwitchHarness,
         Self::NewFactoryThread,
         Self::NewTerminal,
         Self::RestartTerminal,
@@ -212,6 +215,7 @@ impl Command {
             Self::NewPiConversation => "New Pi conversation",
             Self::NewClaudeCodeConversation => "New Claude Code conversation",
             Self::NewConversationInWorktree => "New conversation in new worktree…",
+            Self::SwitchHarness => "Switch harness…",
             Self::NewFactoryThread => "New Factory thread",
             Self::NewTerminal => "New terminal",
             Self::RestartTerminal => "Restart terminal",
@@ -266,6 +270,7 @@ impl Command {
             Self::NewPiConversation => Box::new(NewPiConversation),
             Self::NewClaudeCodeConversation => Box::new(NewClaudeCodeConversation),
             Self::NewConversationInWorktree => Box::new(NewConversationInWorktree),
+            Self::SwitchHarness => Box::new(SwitchHarness),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::NewTerminal => Box::new(NewTerminal),
             Self::RestartTerminal => Box::new(RestartTerminal),
@@ -362,6 +367,7 @@ impl Command {
             Self::RegenerateTitle => state.regenerate_title_reason(),
             Self::ArchiveThread => state.archive_thread_reason(),
             Self::NewConversationInWorktree => state.create_worktree_reason(),
+            Self::SwitchHarness => state.switch_harness_reason(),
             Self::RemoveWorktree => state.remove_worktree_reason(),
             Self::SwitchBranch => state.switch_branch_reason(),
             Self::CloseThread | Self::FocusOutput | Self::ToggleOutput
@@ -484,6 +490,7 @@ pub const CLOSE_THREAD_KEY: &str = if cfg!(target_os = "macos") {
 pub fn bind_keys(cx: &mut App) {
     let workspace = Some("Workspace && !Command && !PopupMenu && !Sheet && !Dialog");
     let command = Some("DrostjePalette");
+    let picker = Some("SpacePicker || HarnessPicker");
     let navigation =
         Some("Workspace && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
     // Embedded editors and terminals reserve the same pane-navigation prefix.
@@ -505,12 +512,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-shift-p", OpenPalette, workspace),
         KeyBinding::new("secondary-alt-]", NextSpace, navigation),
         KeyBinding::new("secondary-alt-[", PreviousSpace, navigation),
-        KeyBinding::new("j", SelectNext, Some("SpacePicker")),
-        KeyBinding::new("k", SelectPrevious, Some("SpacePicker")),
-        KeyBinding::new("g g", SelectFirst, Some("SpacePicker")),
-        KeyBinding::new("shift-g", SelectLast, Some("SpacePicker")),
-        KeyBinding::new("home", SelectFirst, Some("SpacePicker")),
-        KeyBinding::new("end", SelectLast, Some("SpacePicker")),
+        KeyBinding::new("j", SelectNext, picker),
+        KeyBinding::new("k", SelectPrevious, picker),
+        KeyBinding::new("g g", SelectFirst, picker),
+        KeyBinding::new("shift-g", SelectLast, picker),
+        KeyBinding::new("home", SelectFirst, picker),
+        KeyBinding::new("end", SelectLast, picker),
         KeyBinding::new("ctrl-tab", NextThread, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, workspace),
         KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, workspace),
@@ -521,6 +528,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleOutput, workspace),
         KeyBinding::new("secondary-n", NewConversation, workspace),
         KeyBinding::new("secondary-alt-n", NewConversationInWorktree, workspace),
+        KeyBinding::new("secondary-alt-h", SwitchHarness, workspace),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
         KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
         KeyBinding::new("secondary-,", Settings, workspace),
@@ -533,6 +541,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleOutput, command),
         KeyBinding::new("secondary-n", NewConversation, command),
         KeyBinding::new("secondary-alt-n", NewConversationInWorktree, command),
+        KeyBinding::new("secondary-alt-h", SwitchHarness, command),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, command),
         KeyBinding::new("secondary-alt-t", NewTerminal, command),
         KeyBinding::new("secondary-,", Settings, command),
@@ -695,6 +704,8 @@ pub struct Palette {
     spaces: Option<SpacePicker>,
     /// The Conversation whose harness commands this palette lists instead of the app's.
     slash_commands: Option<Uuid>,
+    /// The Conversation this palette offers to move to another harness.
+    harnesses: Option<Uuid>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -705,7 +716,17 @@ impl Palette {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        Self::open_with_spaces(owner, state, None, None, window, cx)
+        Self::open_with_spaces(owner, state, None, None, None, window, cx)
+    }
+
+    pub fn open_harnesses(
+        owner: WeakEntity<Workspace>,
+        state: Entity<AppState>,
+        thread: Uuid,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::open_with_spaces(owner, state, None, None, Some(thread), window, cx)
     }
 
     pub fn open_slash_commands(
@@ -715,7 +736,7 @@ impl Palette {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        Self::open_with_spaces(owner, state, None, Some(thread), window, cx)
+        Self::open_with_spaces(owner, state, None, Some(thread), None, window, cx)
     }
 
     pub fn open_spaces(
@@ -735,7 +756,7 @@ impl Palette {
                 .cloned()
                 .collect(),
         };
-        Self::open_with_spaces(owner, state, Some(picker), None, window, cx)
+        Self::open_with_spaces(owner, state, Some(picker), None, None, window, cx)
     }
 
     fn open_with_spaces(
@@ -743,6 +764,7 @@ impl Palette {
         state: Entity<AppState>,
         spaces: Option<SpacePicker>,
         slash_commands: Option<Uuid>,
+        harnesses: Option<Uuid>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -772,6 +794,7 @@ impl Palette {
                 closed: false,
                 spaces,
                 slash_commands,
+                harnesses,
                 _subscriptions: subscriptions,
             }
         });
@@ -862,7 +885,7 @@ impl Palette {
         });
     }
 
-    fn navigate_spaces(
+    fn navigate_picker(
         &mut self,
         delta: isize,
         edge: bool,
@@ -870,7 +893,11 @@ impl Palette {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        let count = self.spaces.as_ref().map_or(0, |picker| picker.spaces.len());
+        let count = match (&self.spaces, self.harnesses) {
+            (Some(picker), _) => picker.spaces.len(),
+            (None, Some(_)) => crate::harness::CONVERSATION_HARNESSES.len(),
+            (None, None) => 0,
+        };
         if count == 0 {
             return;
         }
@@ -927,6 +954,38 @@ impl Palette {
                     cx.notify();
                 });
             }
+            cx.notify();
+        });
+    }
+
+    fn run_harness(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(thread), Some(harness)) = (
+            self.harnesses,
+            crate::harness::CONVERSATION_HARNESSES.get(row).copied(),
+        ) else {
+            return;
+        };
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let id = cx.entity().entity_id();
+        let _ = self.owner.update(cx, |workspace, cx| {
+            if !workspace
+                .palette
+                .as_ref()
+                .is_some_and(|palette| palette.entity_id() == id)
+            {
+                return;
+            }
+            workspace.palette = None;
+            window.close_dialog(cx);
+            workspace.state.update(cx, |state, cx| {
+                if let Err(error) = state.switch_harness(thread, harness) {
+                    state.notice(crate::app::NoticeLevel::Warning, format!("{error:#}"));
+                }
+                cx.notify();
+            });
             cx.notify();
         });
     }
@@ -1025,6 +1084,59 @@ impl Palette {
             .into_any_element()
     }
 
+    fn render_harnesses(&self, thread: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let current = self
+            .state
+            .read(cx)
+            .snapshot
+            .threads
+            .iter()
+            .find(|candidate| candidate.id == thread)
+            .map(|thread| thread.harness.clone())
+            .unwrap_or_default();
+        let mut group = CommandGroup::new().label("Switch harness");
+        for harness in crate::harness::CONVERSATION_HARNESSES {
+            let name = crate::harness::display_name(harness);
+            group = group.item(CommandItem::new().label(if harness == current {
+                format!("{name} — Current")
+            } else {
+                name.to_owned()
+            }));
+        }
+        let confirm = cx.entity().downgrade();
+        let cancel = cx.entity().downgrade();
+        div()
+            .id("harness-picker")
+            .key_context("HarnessPicker")
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                this.navigate_picker(1, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
+                this.navigate_picker(-1, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, window, cx| {
+                this.navigate_picker(-1, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
+                this.navigate_picker(1, true, window, cx)
+            }))
+            .child(
+                NativeCommand::new(&self.command)
+                    .searchable(false)
+                    .bordered(false)
+                    .max_h(rems(26.))
+                    .group(group)
+                    .on_confirm(move |index, window, cx| {
+                        let _ = confirm
+                            .update(cx, |palette, cx| palette.run_harness(index.row, window, cx));
+                    })
+                    .on_cancel(move |_, cx| {
+                        let _ = cancel.update(cx, |palette, cx| palette.cleanup(cx));
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_spaces(&self, picker: &SpacePicker, cx: &mut Context<Self>) -> AnyElement {
         let confirm = cx.entity().downgrade();
         let cancel = cx.entity().downgrade();
@@ -1045,16 +1157,16 @@ impl Palette {
             .id("space-picker")
             .key_context("SpacePicker")
             .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
-                this.navigate_spaces(1, false, window, cx)
+                this.navigate_picker(1, false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
-                this.navigate_spaces(-1, false, window, cx)
+                this.navigate_picker(-1, false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &SelectFirst, window, cx| {
-                this.navigate_spaces(-1, true, window, cx)
+                this.navigate_picker(-1, true, window, cx)
             }))
             .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
-                this.navigate_spaces(1, true, window, cx)
+                this.navigate_picker(1, true, window, cx)
             }))
             .child(
                 NativeCommand::new(&self.command)
@@ -1078,6 +1190,9 @@ impl Render for Palette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(picker) = &self.spaces {
             return self.render_spaces(picker, cx);
+        }
+        if let Some(thread) = self.harnesses {
+            return self.render_harnesses(thread, cx);
         }
         if let Some(thread) = self.slash_commands {
             return self.render_slash_commands(thread, cx);
@@ -1241,6 +1356,9 @@ impl Render for Palette {
                     w,
                     cx,
                 )
+            }))
+            .on_action(cx.listener(|this, _: &SwitchHarness, w, cx| {
+                this.run(PaletteTarget::Command(Command::SwitchHarness), w, cx)
             }))
             .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| {
                 this.run(PaletteTarget::Command(Command::RemoveWorktree), w, cx)

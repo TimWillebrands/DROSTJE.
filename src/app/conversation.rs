@@ -133,6 +133,77 @@ impl AppState {
         self.ensure_conversation(id);
     }
 
+    /// Why the selected Conversation cannot change harness, or `None` when it can. The
+    /// harness is fixed once a turn exists, because the provider session belongs to it.
+    pub fn switch_harness_reason(&self) -> Option<String> {
+        match self.conversation_thread() {
+            Some(thread) => self.switch_harness_reason_for(thread.id),
+            None => Some("Select a conversation first.".into()),
+        }
+    }
+
+    pub fn switch_harness_reason_for(&self, id: ThreadId) -> Option<String> {
+        if let Some(reason) = self.mutable_project_reason() {
+            return Some(reason);
+        }
+        let Some(thread) = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id && thread.kind == ThreadKind::Conversation)
+        else {
+            return Some("The conversation no longer exists.".into());
+        };
+        if thread.archived {
+            return Some("Archived threads are read-only.".into());
+        }
+        harness_lock_reason(
+            thread,
+            self.conversations.get(&thread.id),
+            self.active_threads.contains(&thread.id),
+        )
+    }
+
+    /// Reopens an unstarted Conversation on `harness`. The draft and attachments stay; the
+    /// model comes from the last Conversation on that harness, and harness-specific launch
+    /// flags (effort, permission mode) return to the harness defaults.
+    pub fn switch_harness(&mut self, id: ThreadId, harness: &str) -> Result<()> {
+        anyhow::ensure!(
+            harness::CONVERSATION_HARNESSES.contains(&harness),
+            "Unsupported conversation harness: {harness}"
+        );
+        if let Some(reason) = self.switch_harness_reason_for(id) {
+            anyhow::bail!(reason);
+        }
+        let mut thread = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .cloned()
+            .context("The conversation no longer exists.")?;
+        if thread.harness == harness {
+            return Ok(());
+        }
+        let project = self
+            .snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == thread.project_id)
+            .cloned()
+            .context("The conversation's project is missing.")?;
+        let (_, model) = conversation_defaults(&self.snapshot.threads, &project, Some(harness));
+        thread.harness = harness.to_owned();
+        thread.session_ref = None;
+        thread.model = model;
+        thread.effort = None;
+        thread.permission_mode = None;
+        self.save_thread(thread);
+        // Closes the old harness process and opens the new one in its place.
+        self.retry_conversation(id);
+        Ok(())
+    }
+
     pub fn submit_reason(&self, id: ThreadId) -> Option<String> {
         if self.editor.is_none() || self.editor_error.is_some() {
             return Some("Connect or restart Neovim before sending".into());
@@ -958,6 +1029,7 @@ impl AppState {
                 for message in messages {
                     session.message(message);
                 }
+                session.history_loaded = next_cursor.is_none();
                 if let (Some(cursor), Some(commands)) = (next_cursor, &session.commands) {
                     let _ = commands.try_send(ConversationCommand::LoadHistory {
                         cursor: Some(cursor),
@@ -1226,9 +1298,213 @@ fn queue_continues(outcome: &TurnOutcome, interrupt_for_queue: bool) -> bool {
     }
 }
 
+/// The harness and model a new Conversation in `project` starts with. An explicit `harness`
+/// wins; otherwise the most recently used Conversation's harness, so a new thread continues
+/// with whatever was used last. The model follows the last Conversation on that harness,
+/// else the project's default model when the harness is the project's default. With no
+/// history, the project defaults apply.
+pub(super) fn conversation_defaults(
+    threads: &[Thread],
+    project: &Project,
+    harness: Option<&str>,
+) -> (String, Option<ModelKey>) {
+    // Timestamps are fixed-width UTC, so they order as strings; `max_by` keeps the later
+    // row on a tie, which is the newer one because rows are appended.
+    let latest = |harness: Option<&str>| {
+        threads
+            .iter()
+            .filter(|thread| {
+                thread.kind == ThreadKind::Conversation
+                    && harness::CONVERSATION_HARNESSES.contains(&thread.harness.as_str())
+                    && harness.is_none_or(|harness| thread.harness == harness)
+            })
+            .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
+    };
+    let project_harness = Some(project.defaults.interactive_harness.trim())
+        .filter(|harness| !harness.is_empty())
+        .unwrap_or("omp");
+    let harness = harness
+        .map(str::to_owned)
+        .or_else(|| latest(None).map(|thread| thread.harness.clone()))
+        .unwrap_or_else(|| project_harness.to_owned());
+    let model = match latest(Some(&harness)) {
+        Some(thread) => thread.model.clone(),
+        None if harness == project_harness => project.defaults.interactive_model.clone(),
+        None => None,
+    };
+    (harness, model)
+}
+
+/// A Conversation keeps its harness once anything was sent or the provider may hold
+/// history: a running turn, an unresolved submission, a queue, a transcript turn, or a
+/// provider session that is not open to prove it is empty.
+fn harness_lock_reason(
+    thread: &Thread,
+    session: Option<&ConversationSession>,
+    active: bool,
+) -> Option<String> {
+    const STARTED: &str =
+        "The harness is fixed once a conversation has started. Start a new conversation instead.";
+    if active {
+        return Some("Stop the active turn first.".into());
+    }
+    if thread.submission.is_some() || !thread.queued.is_empty() {
+        return Some(STARTED.into());
+    }
+    match session {
+        Some(session)
+            if session
+                .messages
+                .iter()
+                .any(|message| matches!(message.role.as_str(), "user" | "assistant")) =>
+        {
+            Some(STARTED.into())
+        }
+        // Only fully loaded history proves an existing provider session is empty.
+        Some(session) if session.history_loaded => None,
+        _ if thread.session_ref.is_some() => {
+            Some("The conversation history has not loaded. Reconnect it first.".into())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TurnOutcome, queue_continues};
+    use super::{
+        ConversationSession, ConversationState, ModelKey, Project, ProjectDefaults, Thread,
+        ThreadKind, TurnOutcome, conversation_defaults, harness_lock_reason, queue_continues,
+    };
+    use crate::harness::{ContentBlock, Message};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn project(harness: &str, model: Option<ModelKey>) -> Project {
+        Project {
+            id: Uuid::from_u128(1),
+            name: "Project".into(),
+            root: "/fixture/project".into(),
+            archived: false,
+            defaults: ProjectDefaults {
+                interactive_harness: harness.into(),
+                interactive_model: model,
+                ..ProjectDefaults::default()
+            },
+        }
+    }
+
+    fn model(id: &str) -> Option<ModelKey> {
+        Some(ModelKey {
+            provider: "provider".into(),
+            id: id.into(),
+        })
+    }
+
+    fn conversation(n: u128, harness: &str, model: Option<ModelKey>, updated_at: &str) -> Thread {
+        Thread {
+            id: Uuid::from_u128(n),
+            project_id: Uuid::from_u128(if n.is_multiple_of(2) { 1 } else { 2 }),
+            kind: ThreadKind::Conversation,
+            factory: None,
+            title: "Conversation".into(),
+            harness: harness.into(),
+            session_ref: None,
+            model,
+            effort: None,
+            permission_mode: None,
+            worktree_id: None,
+            draft: String::new(),
+            attachments: Vec::new(),
+            submission: None,
+            queued: Vec::new(),
+            archived: false,
+            created_at: "2026-10-01T00:00:00Z".into(),
+            updated_at: updated_at.into(),
+        }
+    }
+
+    #[test]
+    fn new_conversations_continue_with_the_last_used_harness_and_its_model() {
+        let project = project("omp", model("omp-default"));
+        assert_eq!(
+            conversation_defaults(&[], &project, None),
+            ("omp".into(), model("omp-default")),
+            "No history falls back to the project defaults"
+        );
+        let mut factory = conversation(9, "opencode", None, "2026-10-09T00:00:00Z");
+        factory.kind = ThreadKind::Factory;
+        let threads = [
+            conversation(10, "omp", model("omp-used"), "2026-10-02T00:00:00Z"),
+            // Another project's Conversation still counts as the last one used.
+            conversation(11, "claude-code", model("opus"), "2026-10-05T00:00:00Z"),
+            conversation(12, "pi", model("pi-used"), "2026-10-03T00:00:00Z"),
+            factory,
+        ];
+        assert_eq!(
+            conversation_defaults(&threads, &project, None),
+            ("claude-code".into(), model("opus"))
+        );
+        assert_eq!(
+            conversation_defaults(&threads, &project, Some("pi")),
+            ("pi".into(), model("pi-used")),
+            "An explicit harness takes that harness's last model"
+        );
+        assert_eq!(
+            conversation_defaults(&threads[..1], &project, Some("claude-code")),
+            ("claude-code".into(), None),
+            "Another harness never inherits the project's model"
+        );
+        // Created in the same second: the later row is the newer one.
+        let tied = [
+            conversation(10, "omp", None, "2026-10-05T00:00:00Z"),
+            conversation(12, "pi", None, "2026-10-05T00:00:00Z"),
+        ];
+        assert_eq!(conversation_defaults(&tied, &project, None).0, "pi");
+    }
+
+    #[test]
+    fn harness_is_switchable_only_before_the_conversation_started() {
+        let mut thread = conversation(10, "omp", None, "2026-10-02T00:00:00Z");
+        assert_eq!(harness_lock_reason(&thread, None, false), None);
+        let mut session = ConversationSession::new(None);
+        session.state = ConversationState::Failed;
+        assert_eq!(
+            harness_lock_reason(&thread, Some(&session), false),
+            None,
+            "A harness that failed to open can be replaced"
+        );
+        assert!(harness_lock_reason(&thread, Some(&session), true).is_some());
+
+        // A provider session is switchable only once its whole history proved empty.
+        thread.session_ref = Some("session".into());
+        assert!(harness_lock_reason(&thread, None, false).is_some());
+        assert!(harness_lock_reason(&thread, Some(&session), false).is_some());
+        session.history_loaded = true;
+        session.message(Message {
+            id: "custom:1".into(),
+            role: "custom".into(),
+            content: vec![ContentBlock::Text("notice".into())],
+            raw: None,
+            tool_call_id: None,
+            error: false,
+            exit_code: None,
+        });
+        assert_eq!(harness_lock_reason(&thread, Some(&session), false), None);
+        session.message(Message {
+            id: "user:1".into(),
+            role: "user".into(),
+            content: vec![ContentBlock::Text("hello".into())],
+            raw: None,
+            tool_call_id: None,
+            error: false,
+            exit_code: None,
+        });
+        assert!(harness_lock_reason(&thread, Some(&session), false).is_some());
+
+        let mut pending = conversation(12, "omp", None, "2026-10-02T00:00:00Z");
+        pending.submission = Some(json!({"state": "pending"}));
+        assert!(harness_lock_reason(&pending, None, false).is_some());
+    }
 
     #[test]
     fn queue_continues_only_after_completion_or_a_requested_interrupt() {
