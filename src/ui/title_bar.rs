@@ -197,6 +197,8 @@ impl Render for WorkspaceTitle {
             .flex_shrink_0()
             .child(
                 TitleBar::new()
+                    .relative()
+                    .children(super::grain::layer(super::theme::grain(cx)))
                     // The macOS traffic lights sit over an open left dock, not over this bar.
                     .when(left_dock_open, |bar| bar.pl_3())
                     .on_close_window(move |_, window, cx| {
@@ -229,6 +231,10 @@ impl Render for WorkspaceTitle {
                                             .menu("Show archived", Box::new(ShowArchived))
                                             .separator()
                                             .menu("Settings…", Box::new(Settings))
+                                            .menu(
+                                                Command::CustomizeTheme.label(),
+                                                Command::CustomizeTheme.action(),
+                                            )
                                             .menu("Reset layout", Box::new(ResetLayout))
                                     }),
                             )

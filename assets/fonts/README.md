@@ -3,11 +3,12 @@
 `src/ui/theme.rs` embeds these faces so every platform renders the bundled themes
 the same. Each family is licensed under the SIL Open Font License 1.1; the
 licence sits beside its files as `OFL.txt`.
+Delft uses Zed's default faces: IBM Plex Sans for the UI and Lilex for code.
 
 | Family | Files | Source | Version |
 |---|---|---|---|
 | IBM Plex Sans | Regular, Italic, Medium, SemiBold, Bold, Bold Italic | [IBM/plex](https://github.com/IBM/plex) `@ibm/plex-sans@1.1.0`, `fonts/complete/ttf` | 1.1.0 |
-| IBM Plex Mono | Regular, Italic, Bold | [IBM/plex](https://github.com/IBM/plex) `@ibm/plex-mono@2.5.0`, `fonts/complete/ttf` | 2.5.0 |
+| Lilex | Regular, Italic, Bold | [mishamyrt/Lilex](https://github.com/mishamyrt/Lilex) `Lilex.zip` release 2.630, `ttf` (SHA-256 `c946bf02…6728e0`) | 2.630 |
 | Libron | Regular, Italic, Bold, Bold Italic | [nicoverbruggen/libron](https://github.com/nicoverbruggen/libron) `Libron.zip` | v0.31 |
 | Monaspace Xenon | Regular, Italic, Bold | [githubnext/monaspace](https://github.com/githubnext/monaspace) `monaspace-static-v1.400.zip` | 1.400 |
 | Dosis | Medium, SemiBold, Bold | [google/fonts](https://github.com/google/fonts/tree/main/ofl/dosis) `Dosis[wght].ttf` | see below |

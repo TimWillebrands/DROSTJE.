@@ -318,6 +318,8 @@ enum Write {
 pub enum SidebarTab {
     Changes,
     Output,
+    /// Offered only once the Conversation's agent works with other agents.
+    Agents,
 }
 impl SidebarTab {
     /// The sidebar `(open, tab)` after asking for `requested`: a hidden sidebar or
@@ -1041,6 +1043,7 @@ impl AppState {
             .and_then(Value::as_str)
         {
             Some("output") => SidebarTab::Output,
+            Some("agents") => SidebarTab::Agents,
             _ => SidebarTab::Changes,
         }
     }
@@ -1090,6 +1093,7 @@ impl AppState {
             match tab {
                 SidebarTab::Changes => tabs.remove(&key),
                 SidebarTab::Output => tabs.insert(key, Value::String("output".into())),
+                SidebarTab::Agents => tabs.insert(key, Value::String("agents".into())),
             };
             self.set_setting("thread_sidebar_tab", Value::Object(tabs));
         }

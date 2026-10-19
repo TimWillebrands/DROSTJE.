@@ -143,10 +143,12 @@ Settings groepeert de bestaande instellingen en kan zoeken op naam, beschrijving
 
 Eigen thema's staan in `<DROSTJE_DATA_DIR>/themes` (standaard `~/Library/Application Support/Drostje/themes`). Settings toont de map en kan die openen. Gebruik GPUI Kit `ThemeSet`-JSON: een object met een `themes`-array; iedere entry heeft een unieke `name` en `mode` (`light` of `dark`). Dit is niet het losse Zed-themaformaat. Ingebouwd zijn:
 
-- **Delft Light** en **Delft Dark**, de standaard: IBM Plex Sans en IBM Plex Mono, met Delfts blauw als enige accentkleur.
-- **Ink Light** en **Ink Dark**, een leesmodus naar e-readers: antwoorden van agents staan in Libron, code in Monaspace Xenon, met gedempte kleuren.
-- **Cootje Light** en **Cootje Dark**, de speelse: alles in Dosis, code in Maple Mono, rondere hoeken, Cootje-blauw en saffraan voor de punt die laat zien dat een agent bezig is.
+- **Delft Light** en **Delft Dark**, de standaard: IBM Plex Sans en Lilex, de standaardletters van Zed, met Delfts blauw als enige accentkleur.
+- **Ink Light** en **Ink Dark**, een leesmodus naar e-readers: antwoorden van agents staan in Libron, code in Monaspace Xenon, met gedempte kleuren en een lichte papierkorrel op de vensterrand.
+- **Cootje Light** en **Cootje Dark**, de speelse: alles in Dosis, code in Maple Mono, rondere hoeken, Cootje-blauw en saffraan voor de punt die laat zien dat een agent bezig is, en de meeste korrel.
 - GPUI Kit's Default Light en Default Dark.
+
+**Customize theme…** (command palette of het menu in de titelbalk) opent een thema-editor naar het voorbeeld van Zen Browser. Daarin kies je de weergave (System, Light, Dark), een accentkleur in een kleurenveld of uit een rij stalen, en de sterkte van de korrel. Alles is direct te zien; Save bewaart het, Cancel en Escape zetten het terug. De accentkleur geldt voor elk thema en houdt de lichtheid van dat thema aan, zodat tekst op de accentkleur even goed leesbaar blijft. Korrel ligt alleen op de vensterrand (titelbalk, Projects, startscherm), nooit achter gesprekken, de editor of code. Reset gaat terug naar de accentkleur en korrel van het thema zelf. Met het toetsenbord: Tab tussen de onderdelen, `h`/`l` voor tint, stalen of korrel, `j`/`k` voor intensiteit, met Shift in grotere stappen, `gg`/`G` naar de eerste of laatste staal of het minimum of maximum, en `Cmd-Return` om op te slaan.
 
 Een eerder opgeslagen keuze voor DROSTJE. Light of DROSTJE. Dark betekent nu Delft. Het woordmerk op het startscherm staat in Dosis; zolang een turn loopt, ademt de punt van DROSTJE. naast de composer. De lettertypes zitten in de app zelf en vallen onder de SIL Open Font License; herkomst en licenties staan in `assets/fonts`.
 

@@ -254,6 +254,9 @@ pub struct Workspace {
     thread_search: Entity<InputState>,
     pub palette: Option<Entity<Palette>>,
     pub dialog: Option<Entity<SurfaceContent>>,
+    pub(super) theme_editor: Option<Entity<super::theme_editor::ThemeEditor>>,
+    /// When to open each Conversation's Agents tab.
+    agent_activity: BTreeMap<ThreadId, super::agents::Follow>,
     pub(super) editor: Option<Entity<super::editor::PromptEditor>>,
     pub(super) editor_selection: Option<crate::model::DraftKey>,
     pub(super) editor_override: Option<(crate::model::DraftKey, String)>,
@@ -396,6 +399,8 @@ impl Workspace {
             detail_surface: None,
             palette: None,
             dialog: None,
+            theme_editor: None,
+            agent_activity: BTreeMap::new(),
             layout_save: None,
             presented_space,
             preparing_space_change: false,
@@ -502,6 +507,9 @@ impl Workspace {
             &workspace.state,
             window,
             |workspace, _, event: &PresentationChange, window, cx| {
+                if let PresentationChange::Thread(id) = *event {
+                    workspace.sync_agent_activity(id, cx);
+                }
                 match *event {
                     PresentationChange::Selection => {
                         workspace.sync_space(window, cx);
@@ -646,6 +654,7 @@ impl Workspace {
         };
         if self.dialog.is_some()
             || self.palette.is_some()
+            || self.theme_editor.is_some()
             || window.has_active_dialog(cx)
             || window.has_active_sheet(cx)
             || self.state.read(cx).spaces.len() < 2
@@ -1783,6 +1792,7 @@ impl Workspace {
             || self.state.read(cx).shutting_down
             || self.palette.is_some()
             || self.dialog.is_some()
+            || self.theme_editor.is_some()
             || self.extension.is_some()
             || self.image_preview.is_some()
             || self.tool_detail.is_some()
@@ -2067,6 +2077,28 @@ impl Workspace {
         let panel = self.threads.borrow().get(&id).cloned();
         if let Some(panel) = panel {
             self.focus_panel(panel, window, cx);
+        }
+    }
+    /// Open a Conversation's Agents tab when its running turn starts working with other
+    /// agents (see `agents::Follow`). Focus stays where it is.
+    fn sync_agent_activity(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(session) = state.conversations.get(&id) else {
+            return;
+        };
+        let count = super::agents::coordination_calls(session);
+        let running = state.active_threads.contains(&id);
+        let open = self
+            .agent_activity
+            .entry(id)
+            .or_insert_with(|| super::agents::Follow::new(count))
+            .observe(count, running);
+        if open {
+            self.state.update(cx, |state, cx| {
+                state.show_thread_sidebar(id, SidebarTab::Agents);
+                cx.emit(PresentationChange::Thread(id));
+            });
+            self.sync_diff_interest(cx);
         }
     }
     /// Show `tab` in a thread's sidebar, or hide the sidebar when `tab` is on screen.
@@ -2417,6 +2449,12 @@ impl Workspace {
                 }
                 None
             }
+            Command::ToggleAgents => {
+                if let Some(id) = self.state.read(cx).conversation_thread().map(|t| t.id) {
+                    self.toggle_sidebar_tab(id, SidebarTab::Agents, cx);
+                }
+                None
+            }
             Command::ToggleTaskList => {
                 self.toggle_dock("dock-todo", cx);
                 None
@@ -2484,7 +2522,10 @@ impl Workspace {
                     return;
                 }
                 self.dismiss(window, cx);
-                if self.detail_surface.is_some() || self.dialog.is_some() || self.palette.is_some()
+                if self.detail_surface.is_some()
+                    || self.dialog.is_some()
+                    || self.palette.is_some()
+                    || self.theme_editor.is_some()
                 {
                     return;
                 }
@@ -2499,6 +2540,10 @@ impl Workspace {
                 None
             }
             Command::Settings => Some(DialogKind::Settings(self.state.read(cx).selected_project)),
+            Command::CustomizeTheme => {
+                self.open_theme_editor(window, cx);
+                None
+            }
             Command::NewConversation
             | Command::NewOmpConversation
             | Command::NewPiConversation
@@ -2602,7 +2647,11 @@ impl Workspace {
             return;
         }
         self.dismiss(window, cx);
-        if self.detail_surface.is_some() || self.dialog.is_some() || self.palette.is_some() {
+        if self.detail_surface.is_some()
+            || self.dialog.is_some()
+            || self.palette.is_some()
+            || self.theme_editor.is_some()
+        {
             return;
         }
         let state = self.state.clone();
@@ -2632,6 +2681,9 @@ impl Workspace {
         self.tool_detail = None;
         if let Some(palette) = self.palette.take() {
             palette.update(cx, |palette, cx| palette.dismiss(window, cx));
+        }
+        if let Some(editor) = self.theme_editor.take() {
+            editor.update(cx, |editor, cx| editor.dismiss(window, cx));
         }
         if let Some(dialog) = self.dialog.take() {
             let kind = dialog.read(cx).kind.clone();
@@ -2914,10 +2966,40 @@ impl Workspace {
             return;
         }
         self.dismiss(window, cx);
-        if self.detail_surface.is_some() || self.dialog.is_some() || self.palette.is_some() {
+        if self.detail_surface.is_some()
+            || self.dialog.is_some()
+            || self.palette.is_some()
+            || self.theme_editor.is_some()
+        {
             return;
         }
         self.palette = Some(Palette::open(
+            cx.entity().downgrade(),
+            self.state.clone(),
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+    fn open_theme_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.extension.is_some()
+            || self.state.read(cx).shutting_down
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).has_composition())
+        {
+            return;
+        }
+        self.dismiss(window, cx);
+        if self.detail_surface.is_some()
+            || self.dialog.is_some()
+            || self.palette.is_some()
+            || self.theme_editor.is_some()
+        {
+            return;
+        }
+        self.theme_editor = Some(super::theme_editor::ThemeEditor::open(
             cx.entity().downgrade(),
             self.state.clone(),
             window,
@@ -3082,6 +3164,12 @@ impl Render for Workspace {
                 .on_action(
                     cx.listener(|this, _: &Settings, w, cx| this.execute(Command::Settings, w, cx)),
                 )
+                .on_action(cx.listener(|this, _: &ToggleAgents, w, cx| {
+                    this.execute(Command::ToggleAgents, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &CustomizeTheme, w, cx| {
+                    this.execute(Command::CustomizeTheme, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &ResetLayout, w, cx| {
                     this.execute(Command::ResetLayout, w, cx)
                 }))
