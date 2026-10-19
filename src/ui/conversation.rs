@@ -1,6 +1,6 @@
 use super::{
     activity,
-    commands::{ClearQueuedMessages, Command, SelectLast, SwitchHarness, button},
+    commands::{ClearQueuedMessages, Command, SelectLast, SwitchHarness, UnarchiveThread, button},
     job_notice::{self, JobKind, JobNotice, JobOutput, JobResult, JobStart},
     theme,
     todo_list::{self, TodoList, TodoStatus},
@@ -3086,6 +3086,39 @@ fn render_content(
                     .cached(StyleRefinement::default().absolute().size_full()),
             ),
         );
+        // A fresh Conversation offers its harness up front: the first thing to decide.
+        if state.is_untouched(thread) && state.switch_harness_reason_for(id).is_none() {
+            let switch = owner.clone();
+            history = history.child(inset(
+                h_flex()
+                    .id("untouched-harness-hint")
+                    .test_support()
+                    .gap_2()
+                    .items_center()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!(
+                        "Starts on {}. New conversation again picks another harness.",
+                        crate::harness::display_name(&thread.harness)
+                    ))
+                    .child(
+                        Button::new("untouched-switch-harness")
+                            .small()
+                            .ghost()
+                            .label(Command::SwitchHarness.label())
+                            .tooltip_with_action(
+                                Command::SwitchHarness.label(),
+                                &SwitchHarness,
+                                Some("Workspace"),
+                            )
+                            .on_click(move |_, window, cx| {
+                                let _ = switch.update(cx, |workspace, cx| {
+                                    workspace.execute(Command::SwitchHarness, window, cx)
+                                });
+                            }),
+                    ),
+            ));
+        }
         for request in session.requests.values() {
             history = history.child(inset(request_card(id, request, owner, cx)));
         }
@@ -3221,13 +3254,40 @@ fn render_content(
         ));
     }
     if thread.archived || project.archived {
+        // An archived thread in a live project can come back; an archived project cannot here.
+        let unarchive = (thread.archived && !project.archived).then(|| {
+            let reason = state.unarchive_thread_reason_for(id);
+            let owner = owner.clone();
+            Button::new("unarchive-thread")
+                .small()
+                .ghost()
+                .label(Command::UnarchiveThread.label())
+                .disabled(reason.is_some())
+                .map(|button| match reason {
+                    Some(reason) => button.tooltip(reason),
+                    None => button.tooltip_with_action(
+                        Command::UnarchiveThread.label(),
+                        &UnarchiveThread,
+                        Some("Workspace"),
+                    ),
+                })
+                .on_click(move |_, _, cx| {
+                    let _ = owner.update(cx, |workspace, cx| workspace.unarchive_thread(id, cx));
+                })
+        });
         return frame(
             root,
             history.child(inset(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Archived history · read-only"),
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Archived history · read-only"),
+                    )
+                    .children(unarchive),
             )),
             sidebar,
             None,

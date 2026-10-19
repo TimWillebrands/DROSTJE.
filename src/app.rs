@@ -27,6 +27,9 @@ pub use worktrees::{
     RemovalFailure, WorkingTree, WorktreeRequest, WorktreeRequestKind, WorktreeRequestStatus,
 };
 
+/// The title of a Factory thread nobody named or configured yet.
+pub const DEFAULT_FACTORY_TITLE: &str = "New Factory thread";
+
 /// Content changes are separate from structural workspace invalidation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PresentationChange {
@@ -1114,6 +1117,60 @@ impl AppState {
             .turn_ended(id, self.selected_thread, failed);
     }
 
+    /// Whether `thread` was never used: a placeholder made by New conversation or New
+    /// Factory thread that Projects lists only while its tab is open, so an abandoned one
+    /// disappears without being archived or deleted. Every user activity (drafting, sending,
+    /// queueing, renaming, editing a Factory configuration, archiving) bumps `updated_at`,
+    /// so an unused row still carries its creation timestamp and default title. Choosing a
+    /// harness, model or effort is configuration, not activity. Live state that is not
+    /// saved yet (a turn being prepared, a transcript) counts as activity too.
+    pub fn is_untouched(&self, thread: &Thread) -> bool {
+        let id = thread.id;
+        let unused = !thread.archived
+            && thread.created_at == thread.updated_at
+            && thread.draft.is_empty()
+            && thread.attachments.is_empty()
+            && thread.submission.is_none()
+            && thread.queued.is_empty()
+            && !self.active_threads.contains(&id);
+        unused
+            && match thread.kind {
+                ThreadKind::Conversation => {
+                    thread.title == crate::titles::DEFAULT_CONVERSATION_TITLE
+                        && self.conversations.get(&id).is_none_or(|session| {
+                            !session.preparing
+                                && !session.messages.iter().any(|message| {
+                                    matches!(message.role.as_str(), "user" | "assistant")
+                                })
+                        })
+                }
+                ThreadKind::Factory => {
+                    thread.title == DEFAULT_FACTORY_TITLE
+                        && !self.pending_factory.contains(&id)
+                        && !self
+                            .snapshot
+                            .launches
+                            .iter()
+                            .any(|launch| launch.factory_thread_id == id)
+                }
+            }
+    }
+
+    /// Whether Projects and the palette list `thread` in `space`: an untouched thread only
+    /// while its tab is open in that space.
+    pub fn thread_listed_in(&self, thread: &Thread, space: SpaceId) -> bool {
+        if !self.thread_in_space(thread.id, space) {
+            return false;
+        }
+        let open = if space == self.active_space {
+            self.open_threads.contains(&thread.id)
+        } else {
+            self.space_session(space)
+                .is_some_and(|session| session.open_threads.contains(&thread.id))
+        };
+        open || !self.is_untouched(thread)
+    }
+
     fn is_conversation(&self, id: ThreadId) -> bool {
         self.snapshot
             .threads
@@ -1238,6 +1295,57 @@ impl AppState {
         }
     }
 
+    /// Why `id` cannot return from the archive right now.
+    pub fn unarchive_thread_reason_for(&self, id: ThreadId) -> Option<String> {
+        if !self.thread_in_active_space(id) {
+            return Some("This thread belongs to another space.".into());
+        }
+        if let Some(reason) = self.space_mutation_reason() {
+            return Some(reason);
+        }
+        let Some(thread) = self.snapshot.threads.iter().find(|t| t.id == id) else {
+            return Some("This thread is no longer available.".into());
+        };
+        if !thread.archived {
+            return Some("This thread is not archived.".into());
+        }
+        if self
+            .snapshot
+            .projects
+            .iter()
+            .any(|p| p.id == thread.project_id && p.archived)
+        {
+            return Some("This project is archived. History is read-only.".into());
+        }
+        if self.thread_worktree(thread).is_some_and(|w| !w.is_live()) {
+            return Some("This thread's worktree was removed.".into());
+        }
+        None
+    }
+    pub fn unarchive_thread_reason(&self) -> Option<String> {
+        match self.thread() {
+            Some(thread) => self.unarchive_thread_reason_for(thread.id),
+            None => Some("Select a thread first.".into()),
+        }
+    }
+    /// Returns an archived thread to Projects with its history and draft.
+    pub fn unarchive_thread(&mut self, id: ThreadId) -> Result<()> {
+        if let Some(reason) = self.unarchive_thread_reason_for(id) {
+            anyhow::bail!(reason);
+        }
+        let mut thread = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .cloned()
+            .context("This thread is no longer available.")?;
+        thread.archived = false;
+        thread.updated_at = platform::now();
+        self.save_thread(thread);
+        Ok(())
+    }
+
     pub fn select_project(&mut self, id: ProjectId) {
         if !self.project_in_active_space(id) {
             return;
@@ -1327,6 +1435,23 @@ impl AppState {
         }
         self.persist_space_session();
     }
+    /// Closes every open tab of `project`, committing their drafts.
+    pub fn close_project_threads(&mut self, project: ProjectId) {
+        let open: Vec<_> = self
+            .open_threads
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.snapshot
+                    .threads
+                    .iter()
+                    .any(|thread| thread.id == *id && thread.project_id == project)
+            })
+            .collect();
+        for id in open {
+            self.close_thread(id);
+        }
+    }
     pub fn new_thread(&mut self, kind: ThreadKind) -> Result<()> {
         self.new_thread_with_harness(kind, None)
     }
@@ -1397,7 +1522,7 @@ impl AppState {
                                     .unwrap_or_default()
                             }),
                     }),
-                    title: "New Factory thread".into(),
+                    title: DEFAULT_FACTORY_TITLE.into(),
                     harness: String::new(),
                     session_ref: None,
                     model: None,
@@ -1420,8 +1545,8 @@ impl AppState {
         self.select_thread(id);
         Ok(())
     }
-    /// A fresh Conversation row in `project`, on `worktree_id` or the project root, with the
-    /// harness and model last used (see `conversation_defaults`).
+    /// A fresh Conversation row in `project`, on `worktree_id` or the project root. It copies
+    /// the selected Conversation's harness settings (see `conversation_defaults`).
     pub(crate) fn build_conversation(
         &self,
         project: &Project,
@@ -1430,19 +1555,23 @@ impl AppState {
         worktree_id: Option<WorktreeId>,
     ) -> Thread {
         let timestamp = platform::now();
-        let (harness, model) =
-            conversation::conversation_defaults(&self.snapshot.threads, project, harness);
+        let defaults = conversation::conversation_defaults(
+            &self.snapshot.threads,
+            project,
+            self.conversation_thread(),
+            harness,
+        );
         Thread {
             id,
             project_id: project.id,
             kind: ThreadKind::Conversation,
             factory: None,
             title: crate::titles::DEFAULT_CONVERSATION_TITLE.into(),
-            harness,
+            harness: defaults.harness,
             session_ref: None,
-            model,
-            effort: None,
-            permission_mode: None,
+            model: defaults.model,
+            effort: defaults.effort,
+            permission_mode: defaults.permission_mode,
             worktree_id,
             draft: String::new(),
             attachments: Vec::new(),
@@ -1546,6 +1675,175 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::{ContentBlock, ConversationSession, Message, SidebarTab, Value};
+
+    #[cfg(feature = "runtime-qa")]
+    mod threads {
+        use crate::app::{AppState, Bootstrap};
+        use crate::model::{Project, ProjectDefaults, ThreadKind};
+        use crate::store::Store;
+        use gpui_kit::{AppContext as _, Entity, TestAppContext};
+        use std::{collections::BTreeMap, fs, path::PathBuf};
+        use uuid::Uuid;
+
+        struct TempDirectory(PathBuf);
+        impl Drop for TempDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn open(cx: &mut TestAppContext) -> (TempDirectory, Entity<AppState>, Uuid) {
+            let dir = std::env::temp_dir().join(format!("drostje-app-{}", Uuid::new_v4()));
+            fs::create_dir(&dir).unwrap();
+            let dir = TempDirectory(dir);
+            let store = Store::open(dir.0.join("data")).unwrap();
+            let project = Project {
+                id: Uuid::new_v4(),
+                name: "Project".into(),
+                root: dir.0.join("root"),
+                archived: false,
+                defaults: ProjectDefaults::default(),
+            };
+            let id = project.id;
+            smol::block_on(store.save_project(project)).unwrap();
+            let snapshot = smol::block_on(store.snapshot()).unwrap();
+            let bootstrap = Bootstrap {
+                data_dir: dir.0.join("data"),
+                store,
+                snapshot,
+                diagnostics: BTreeMap::new(),
+                repositories: BTreeMap::new(),
+            };
+            let state = cx.new(|cx| AppState::new(bootstrap, cx));
+            state.update(cx, |state, _| state.select_project(id));
+            (dir, state, id)
+        }
+
+        fn new_conversation(state: &Entity<AppState>, cx: &mut TestAppContext) -> Uuid {
+            state.update(cx, |state, _| {
+                state.new_thread(ThreadKind::Conversation).unwrap();
+                state.selected_thread.unwrap()
+            })
+        }
+
+        /// Gives `id` the activity a sent prompt leaves behind.
+        fn use_thread(state: &Entity<AppState>, id: Uuid, cx: &mut TestAppContext) {
+            state.update(cx, |state, _| {
+                let mut thread = state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|t| t.id == id)
+                    .cloned()
+                    .unwrap();
+                thread.title = "Used".into();
+                thread.updated_at = "2999-01-01T00:00:00Z".into();
+                state.save_thread(thread);
+            });
+        }
+
+        #[gpui_kit::test]
+        fn untouched_threads_leave_projects_with_their_tab(cx: &mut TestAppContext) {
+            let (_dir, state, _) = open(cx);
+            let draft = new_conversation(&state, cx);
+            let used = new_conversation(&state, cx);
+            use_thread(&state, used, cx);
+            state.update(cx, |state, _| {
+                let listed = |state: &AppState, id| {
+                    let thread = state.snapshot.threads.iter().find(|t| t.id == id).unwrap();
+                    state.thread_listed_in(thread, state.active_space)
+                };
+                let thread = state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|t| t.id == draft)
+                    .unwrap();
+                assert!(state.is_untouched(thread));
+                assert!(listed(state, draft), "An open placeholder is listed");
+                state.close_thread(draft);
+                state.close_thread(used);
+                assert!(
+                    !listed(state, draft),
+                    "A closed placeholder leaves Projects"
+                );
+                assert!(
+                    listed(state, used),
+                    "A used thread stays after its tab closes"
+                );
+                assert!(
+                    state.snapshot.threads.iter().any(|t| t.id == draft),
+                    "Nothing is deleted"
+                );
+            });
+        }
+
+        #[gpui_kit::test]
+        fn archiving_closes_the_tab_without_selecting_the_thread(cx: &mut TestAppContext) {
+            let (_dir, state, _) = open(cx);
+            let archived = new_conversation(&state, cx);
+            use_thread(&state, archived, cx);
+            let current = new_conversation(&state, cx);
+            use_thread(&state, current, cx);
+            state.update(cx, |state, _| {
+                state.archive_thread(archived).unwrap();
+                assert_eq!(state.selected_thread, Some(current), "Selection stays put");
+                assert_eq!(state.open_threads, vec![current], "The archived tab closed");
+                assert!(!state.show_archived, "Archived threads stay hidden");
+                assert!(state.unarchive_thread_reason_for(archived).is_none());
+                state.unarchive_thread(archived).unwrap();
+                assert!(
+                    !state
+                        .snapshot
+                        .threads
+                        .iter()
+                        .find(|t| t.id == archived)
+                        .unwrap()
+                        .archived
+                );
+                assert_eq!(
+                    state.open_threads,
+                    vec![current],
+                    "Unarchiving opens nothing"
+                );
+
+                state.archive_thread(current).unwrap();
+                assert_eq!(state.selected_thread, None);
+                assert!(state.open_threads.is_empty());
+            });
+        }
+
+        #[gpui_kit::test]
+        fn a_new_conversation_copies_the_selected_one(cx: &mut TestAppContext) {
+            let (_dir, state, _) = open(cx);
+            let source = new_conversation(&state, cx);
+            state.update(cx, |state, _| {
+                let mut thread = state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|t| t.id == source)
+                    .cloned()
+                    .unwrap();
+                thread.harness = "claude-code".into();
+                thread.effort = Some("high".into());
+                thread.permission_mode = Some("plan".into());
+                state.save_thread(thread);
+            });
+            let copy = new_conversation(&state, cx);
+            state.update(cx, |state, _| {
+                let thread = state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|t| t.id == copy)
+                    .unwrap();
+                assert_eq!(thread.harness, "claude-code");
+                assert_eq!(thread.effort.as_deref(), Some("high"));
+                assert_eq!(thread.permission_mode.as_deref(), Some("plan"));
+            });
+        }
+    }
 
     #[test]
     fn sidebar_toggle_switches_tabs_before_hiding() {

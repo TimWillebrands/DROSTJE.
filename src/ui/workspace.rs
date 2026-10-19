@@ -2051,6 +2051,56 @@ impl Workspace {
         });
         self.sync_thread_panels(window, cx);
     }
+    /// Archive `id` without selecting it: its tab closes, and a neighbouring tab takes over
+    /// only when it was the selected one.
+    pub(super) fn archive_thread(
+        &mut self,
+        id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preparing_space_change
+            || self.extension.is_some()
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).has_composition())
+        {
+            return;
+        }
+        self.state.update(cx, |state, cx| {
+            if let Err(error) = state.archive_thread(id) {
+                state.notice(crate::app::NoticeLevel::Warning, format!("{error:#}"));
+            }
+            cx.notify();
+        });
+        self.sync_thread_panels(window, cx);
+    }
+    pub(super) fn unarchive_thread(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if let Err(error) = state.unarchive_thread(id) {
+                state.notice(crate::app::NoticeLevel::Warning, format!("{error:#}"));
+            }
+            cx.emit(PresentationChange::Thread(id));
+            cx.notify();
+        });
+    }
+    /// Rename `id` from Projects or its tab without opening or selecting it.
+    pub(super) fn rename_thread(
+        &mut self,
+        id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = self.state.read(cx).rename_thread_reason_for(id) {
+            self.state.update(cx, |state, cx| {
+                state.notice(crate::app::NoticeLevel::Warning, reason);
+                cx.notify();
+            });
+            return;
+        }
+        self.open_dialog(DialogKind::RenameThread(id), window, cx);
+    }
     /// Show `tab` in a thread's sidebar (tab click, Focus output).
     pub(super) fn show_sidebar_tab(
         &mut self,
@@ -2488,23 +2538,39 @@ impl Workspace {
                 {
                     return;
                 }
-                self.state.update(cx, |state, cx| {
-                    if let Some(id) = state.thread().map(|thread| thread.id)
-                        && let Err(error) = state.archive_thread(id)
-                    {
-                        state.notice(crate::app::NoticeLevel::Warning, format!("{error:#}"));
-                    }
-                    cx.notify();
-                });
+                if let Some(id) = self.state.read(cx).thread().map(|thread| thread.id) {
+                    self.archive_thread(id, window, cx);
+                }
+                None
+            }
+            Command::UnarchiveThread => {
+                if let Some(id) = self.state.read(cx).thread().map(|thread| thread.id) {
+                    self.unarchive_thread(id, cx);
+                }
                 None
             }
             Command::Settings => Some(DialogKind::Settings(self.state.read(cx).selected_project)),
+            // Asking again from a Conversation nobody used yet would only stack another
+            // blank one; offer its harness instead, so New conversation twice switches it.
+            Command::NewConversation
+                if self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .is_some_and(|thread| {
+                        let state = self.state.read(cx);
+                        state.is_untouched(thread) && state.switch_harness_reason().is_none()
+                    }) =>
+            {
+                self.open_harness_picker(window, cx);
+                None
+            }
             Command::NewConversation
             | Command::NewOmpConversation
             | Command::NewPiConversation
             | Command::NewClaudeCodeConversation
             | Command::NewFactoryThread => {
-                self.state.update(cx, |state, cx| {
+                let created = self.state.update(cx, |state, cx| {
                     let result = if command == Command::NewConversation {
                         state.new_thread(ThreadKind::Conversation)
                     } else if command == Command::NewOmpConversation {
@@ -2516,12 +2582,16 @@ impl Workspace {
                     } else {
                         state.new_thread(ThreadKind::Factory)
                     };
+                    let created = result.is_ok();
                     if let Err(error) = result {
                         state.notice(crate::app::NoticeLevel::Error, format!("{error:#}"));
                     }
                     cx.notify();
+                    created
                 });
-                self.focus_region(Region::Thread, window, cx);
+                if created {
+                    self.focus_region(Region::Thread, window, cx);
+                }
                 None
             }
             Command::ShowArchived => {
@@ -3057,6 +3127,9 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &ArchiveThread, w, cx| {
                     this.execute(Command::ArchiveThread, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &UnarchiveThread, w, cx| {
+                    this.execute(Command::UnarchiveThread, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &CloseThread, w, cx| {
                     this.execute(Command::CloseThread, w, cx)
@@ -3711,40 +3784,59 @@ impl Panel for WorkspacePanel {
                 )
             }
             PanelKind::Thread(id) => {
-                // The menu belongs to this pane: select its thread before the command runs.
-                let owned = |command: Command| {
-                    let owner = self.workspace.clone();
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        let _ = owner.update(cx, |workspace, cx| {
-                            if !workspace.state.read(cx).thread_in_active_space(id) {
-                                return;
-                            }
-                            workspace.state.update(cx, |state, cx| {
-                                state.select_thread(id);
-                                cx.notify();
+                // Rename, archive and close act on this tab's thread without selecting it.
+                let targeted =
+                    |run: fn(&mut Workspace, ThreadId, &mut Window, &mut Context<Workspace>)| {
+                        let owner = self.workspace.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            let _ = owner.update(cx, |workspace, cx| {
+                                if workspace.state.read(cx).thread_in_active_space(id) {
+                                    run(workspace, id, window, cx);
+                                }
                             });
-                            workspace.execute(command, window, cx);
-                        });
-                    }
-                };
-                let disabled = |command: Command| {
-                    state.selected_thread == Some(id) && command.disabled_reason(state).is_some()
-                };
+                        }
+                    };
+                let archived = state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .any(|thread| thread.id == id && thread.archived);
                 let details = self.workspace.clone();
                 menu.item(
-                    PopupMenuItem::new("Rename thread…")
-                        .disabled(disabled(Command::RenameThread))
-                        .on_click(owned(Command::RenameThread)),
+                    PopupMenuItem::new(Command::RenameThread.label())
+                        .action(Command::RenameThread.action())
+                        .disabled(state.rename_thread_reason_for(id).is_some())
+                        .on_click(targeted(|workspace, id, window, cx| {
+                            workspace.rename_thread(id, window, cx)
+                        })),
                 )
-                .item(
-                    PopupMenuItem::new(Command::ArchiveThread.label())
-                        .disabled(disabled(Command::ArchiveThread))
-                        .on_click(owned(Command::ArchiveThread)),
-                )
+                .map(|menu| {
+                    if archived {
+                        menu.item(
+                            PopupMenuItem::new(Command::UnarchiveThread.label())
+                                .action(Command::UnarchiveThread.action())
+                                .disabled(state.unarchive_thread_reason_for(id).is_some())
+                                .on_click(targeted(|workspace, id, _, cx| {
+                                    workspace.unarchive_thread(id, cx)
+                                })),
+                        )
+                    } else {
+                        menu.item(
+                            PopupMenuItem::new(Command::ArchiveThread.label())
+                                .action(Command::ArchiveThread.action())
+                                .disabled(state.archive_thread_reason_for(id).is_some())
+                                .on_click(targeted(|workspace, id, window, cx| {
+                                    workspace.archive_thread(id, window, cx)
+                                })),
+                        )
+                    }
+                })
                 .item(
                     PopupMenuItem::new(Command::CloseThread.label())
-                        .disabled(disabled(Command::CloseThread))
-                        .on_click(owned(Command::CloseThread)),
+                        .action(Command::CloseThread.action())
+                        .on_click(targeted(|workspace, id, window, cx| {
+                            workspace.close_thread_tab(id, window, cx)
+                        })),
                 )
                 .item(
                     PopupMenuItem::new("Thread details").on_click(move |_, window, cx| {

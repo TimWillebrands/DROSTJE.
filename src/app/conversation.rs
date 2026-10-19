@@ -192,7 +192,8 @@ impl AppState {
             .find(|project| project.id == thread.project_id)
             .cloned()
             .context("The conversation's project is missing.")?;
-        let (_, model) = conversation_defaults(&self.snapshot.threads, &project, Some(harness));
+        let model =
+            conversation_defaults(&self.snapshot.threads, &project, None, Some(harness)).model;
         thread.harness = harness.to_owned();
         thread.session_ref = None;
         thread.model = model;
@@ -1298,16 +1299,41 @@ fn queue_continues(outcome: &TurnOutcome, interrupt_for_queue: bool) -> bool {
     }
 }
 
-/// The harness and model a new Conversation in `project` starts with. An explicit `harness`
-/// wins; otherwise the most recently used Conversation's harness, so a new thread continues
-/// with whatever was used last. The model follows the last Conversation on that harness,
-/// else the project's default model when the harness is the project's default. With no
-/// history, the project defaults apply.
-pub(super) fn conversation_defaults(
+/// How a new Conversation starts: harness, model and the harness launch flags.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConversationDefaults {
+    pub harness: String,
+    pub model: Option<ModelKey>,
+    pub effort: Option<String>,
+    pub permission_mode: Option<String>,
+}
+
+/// How a new Conversation in `project` starts. `source` is the Conversation the user is in
+/// when asking for a new one; it is copied whole (harness, model, effort, permission mode)
+/// unless an explicit `harness` names another harness. Without a source, the most recently
+/// used Conversation's harness continues; the model follows the last Conversation on that
+/// harness, else the project's default model when the harness is the project's default.
+/// Launch flags only carry over from a source on the same harness, because their values are
+/// harness-specific. With no history, the project defaults apply.
+pub(crate) fn conversation_defaults(
     threads: &[Thread],
     project: &Project,
+    source: Option<&Thread>,
     harness: Option<&str>,
-) -> (String, Option<ModelKey>) {
+) -> ConversationDefaults {
+    let source = source.filter(|thread| {
+        thread.kind == ThreadKind::Conversation
+            && harness::CONVERSATION_HARNESSES.contains(&thread.harness.as_str())
+            && harness.is_none_or(|harness| thread.harness == harness)
+    });
+    if let Some(source) = source {
+        return ConversationDefaults {
+            harness: source.harness.clone(),
+            model: source.model.clone(),
+            effort: source.effort.clone(),
+            permission_mode: source.permission_mode.clone(),
+        };
+    }
     // Timestamps are fixed-width UTC, so they order as strings; `max_by` keeps the later
     // row on a tie, which is the newer one because rows are appended.
     let latest = |harness: Option<&str>| {
@@ -1332,7 +1358,12 @@ pub(super) fn conversation_defaults(
         None if harness == project_harness => project.defaults.interactive_model.clone(),
         None => None,
     };
-    (harness, model)
+    ConversationDefaults {
+        harness,
+        model,
+        effort: None,
+        permission_mode: None,
+    }
 }
 
 /// A Conversation keeps its harness once anything was sent or the provider may hold
@@ -1372,8 +1403,9 @@ fn harness_lock_reason(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationSession, ConversationState, ModelKey, Project, ProjectDefaults, Thread,
-        ThreadKind, TurnOutcome, conversation_defaults, harness_lock_reason, queue_continues,
+        ConversationDefaults, ConversationSession, ConversationState, ModelKey, Project,
+        ProjectDefaults, Thread, ThreadKind, TurnOutcome, conversation_defaults,
+        harness_lock_reason, queue_continues,
     };
     use crate::harness::{ContentBlock, Message};
     use serde_json::json;
@@ -1423,12 +1455,20 @@ mod tests {
         }
     }
 
+    fn defaults(harness: &str, model: Option<ModelKey>) -> ConversationDefaults {
+        ConversationDefaults {
+            harness: harness.into(),
+            model,
+            ..ConversationDefaults::default()
+        }
+    }
+
     #[test]
     fn new_conversations_continue_with_the_last_used_harness_and_its_model() {
         let project = project("omp", model("omp-default"));
         assert_eq!(
-            conversation_defaults(&[], &project, None),
-            ("omp".into(), model("omp-default")),
+            conversation_defaults(&[], &project, None, None),
+            defaults("omp", model("omp-default")),
             "No history falls back to the project defaults"
         );
         let mut factory = conversation(9, "opencode", None, "2026-10-09T00:00:00Z");
@@ -1441,17 +1481,17 @@ mod tests {
             factory,
         ];
         assert_eq!(
-            conversation_defaults(&threads, &project, None),
-            ("claude-code".into(), model("opus"))
+            conversation_defaults(&threads, &project, None, None),
+            defaults("claude-code", model("opus"))
         );
         assert_eq!(
-            conversation_defaults(&threads, &project, Some("pi")),
-            ("pi".into(), model("pi-used")),
+            conversation_defaults(&threads, &project, None, Some("pi")),
+            defaults("pi", model("pi-used")),
             "An explicit harness takes that harness's last model"
         );
         assert_eq!(
-            conversation_defaults(&threads[..1], &project, Some("claude-code")),
-            ("claude-code".into(), None),
+            conversation_defaults(&threads[..1], &project, None, Some("claude-code")),
+            defaults("claude-code", None),
             "Another harness never inherits the project's model"
         );
         // Created in the same second: the later row is the newer one.
@@ -1459,7 +1499,50 @@ mod tests {
             conversation(10, "omp", None, "2026-10-05T00:00:00Z"),
             conversation(12, "pi", None, "2026-10-05T00:00:00Z"),
         ];
-        assert_eq!(conversation_defaults(&tied, &project, None).0, "pi");
+        assert_eq!(
+            conversation_defaults(&tied, &project, None, None).harness,
+            "pi"
+        );
+    }
+
+    #[test]
+    fn new_conversations_copy_the_selected_conversation() {
+        let project = project("omp", model("omp-default"));
+        let mut source = conversation(12, "pi", model("pi-selected"), "2026-10-01T00:00:00Z");
+        source.effort = Some("high".into());
+        source.permission_mode = Some("plan".into());
+        let threads = [
+            source.clone(),
+            conversation(11, "claude-code", model("opus"), "2026-10-05T00:00:00Z"),
+        ];
+        let copied = ConversationDefaults {
+            harness: "pi".into(),
+            model: model("pi-selected"),
+            effort: Some("high".into()),
+            permission_mode: Some("plan".into()),
+        };
+        assert_eq!(
+            conversation_defaults(&threads, &project, Some(&source), None),
+            copied,
+            "The selected Conversation wins over the most recently used one"
+        );
+        assert_eq!(
+            conversation_defaults(&threads, &project, Some(&source), Some("pi")),
+            copied,
+            "Naming the selected harness still copies its settings"
+        );
+        assert_eq!(
+            conversation_defaults(&threads, &project, Some(&source), Some("claude-code")),
+            defaults("claude-code", model("opus")),
+            "Launch flags never cross to another harness"
+        );
+        let mut factory = source.clone();
+        factory.kind = ThreadKind::Factory;
+        assert_eq!(
+            conversation_defaults(&threads, &project, Some(&factory), None),
+            defaults("claude-code", model("opus")),
+            "A Factory thread is not a source"
+        );
     }
 
     #[test]

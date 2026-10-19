@@ -37,6 +37,7 @@ gpui_kit::actions!(
         RenameThread,
         RegenerateTitle,
         ArchiveThread,
+        UnarchiveThread,
         RemoveWorktree,
         SwitchBranch,
         CloseThread,
@@ -117,6 +118,7 @@ pub enum Command {
     RenameThread,
     RegenerateTitle,
     ArchiveThread,
+    UnarchiveThread,
     RemoveWorktree,
     SwitchBranch,
     CloseThread,
@@ -147,7 +149,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 51] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -170,6 +172,7 @@ impl Command {
         Self::RenameThread,
         Self::RegenerateTitle,
         Self::ArchiveThread,
+        Self::UnarchiveThread,
         Self::RemoveWorktree,
         Self::SwitchBranch,
         Self::CloseThread,
@@ -224,6 +227,7 @@ impl Command {
             Self::RenameThread => "Rename thread…",
             Self::RegenerateTitle => "Regenerate conversation title",
             Self::ArchiveThread => "Archive thread",
+            Self::UnarchiveThread => "Unarchive thread",
             Self::RemoveWorktree => "Remove worktree…",
             Self::SwitchBranch => "Switch branch…",
             Self::CloseThread => "Close tab",
@@ -279,6 +283,7 @@ impl Command {
             Self::RenameThread => Box::new(RenameThread),
             Self::RegenerateTitle => Box::new(RegenerateTitle),
             Self::ArchiveThread => Box::new(ArchiveThread),
+            Self::UnarchiveThread => Box::new(UnarchiveThread),
             Self::RemoveWorktree => Box::new(RemoveWorktree),
             Self::SwitchBranch => Box::new(SwitchBranch),
             Self::CloseThread => Box::new(CloseThread),
@@ -366,6 +371,7 @@ impl Command {
             Self::RenameThread => state.rename_thread_reason(),
             Self::RegenerateTitle => state.regenerate_title_reason(),
             Self::ArchiveThread => state.archive_thread_reason(),
+            Self::UnarchiveThread => state.unarchive_thread_reason(),
             Self::NewConversationInWorktree => state.create_worktree_reason(),
             Self::SwitchHarness => state.switch_harness_reason(),
             Self::RemoveWorktree => state.remove_worktree_reason(),
@@ -467,6 +473,38 @@ impl Command {
     }
 }
 
+/// The picker row a motion lands on among `count` rows: `delta` steps from `current` (wrapping;
+/// with no highlight, down starts at the top and up at the bottom), or the first or last row
+/// with `edge`. A `skipped` row (the current harness) is stepped over.
+fn picker_row(
+    count: usize,
+    current: Option<usize>,
+    delta: isize,
+    edge: bool,
+    skipped: Option<usize>,
+) -> usize {
+    let step =
+        |index: usize, delta: isize| (index as isize + delta).rem_euclid(count as isize) as usize;
+    let next = if edge {
+        if delta < 0 { 0 } else { count - 1 }
+    } else {
+        current.map_or(if delta < 0 { count - 1 } else { 0 }, |index| {
+            step(index, delta)
+        })
+    };
+    match skipped {
+        Some(skipped) if skipped == next && count > 1 => step(
+            next,
+            if edge {
+                -delta.signum()
+            } else {
+                delta.signum()
+            },
+        ),
+        _ => next,
+    }
+}
+
 // Workspace chords use GPUI's `secondary-` modifier: Cmd on macOS, Ctrl elsewhere.
 // Two chords cannot follow that rule on Linux, where Ctrl also belongs to Vim and
 // to the Ctrl-W pane chord; they keep the terminal convention Ctrl-Shift instead.
@@ -518,6 +556,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-g", SelectLast, picker),
         KeyBinding::new("home", SelectFirst, picker),
         KeyBinding::new("end", SelectLast, picker),
+        // New conversation again from its harness picker steps to the next harness.
+        KeyBinding::new("secondary-n", NewConversation, Some("HarnessPicker")),
         KeyBinding::new("ctrl-tab", NextThread, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, workspace),
         KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, workspace),
@@ -906,13 +946,20 @@ impl Palette {
             .read(cx)
             .selected_index()
             .map(|index| index.row);
-        let next = if edge {
-            if delta < 0 { 0 } else { count - 1 }
-        } else {
-            current.map_or(if delta < 0 { count - 1 } else { 0 }, |index| {
-                (index as isize + delta).rem_euclid(count as isize) as usize
-            })
-        };
+        // The harness picker's current harness is disabled; motion steps over it.
+        let skipped = self.harnesses.and_then(|thread| {
+            let state = self.state.read(cx);
+            let harness = &state
+                .snapshot
+                .threads
+                .iter()
+                .find(|t| t.id == thread)?
+                .harness;
+            crate::harness::CONVERSATION_HARNESSES
+                .iter()
+                .position(|candidate| candidate == harness)
+        });
+        let next = picker_row(count, current, delta, edge, skipped);
         self.command.update(cx, |command, cx| {
             command.set_selected_index(
                 Some(gpui_kit::component::IndexPath::new(0).row(next)),
@@ -1094,14 +1141,17 @@ impl Palette {
             .find(|candidate| candidate.id == thread)
             .map(|thread| thread.harness.clone())
             .unwrap_or_default();
+        // The current harness is checked and disabled, so the highlight opens on the next one:
+        // New conversation then Return switches a fresh Conversation in two keystrokes.
         let mut group = CommandGroup::new().label("Switch harness");
         for harness in crate::harness::CONVERSATION_HARNESSES {
             let name = crate::harness::display_name(harness);
-            group = group.item(CommandItem::new().label(if harness == current {
-                format!("{name} — Current")
-            } else {
-                name.to_owned()
-            }));
+            group = group.item(
+                CommandItem::new()
+                    .label(name)
+                    .checked(harness == current)
+                    .disabled(harness == current),
+            );
         }
         let confirm = cx.entity().downgrade();
         let cancel = cx.entity().downgrade();
@@ -1119,6 +1169,10 @@ impl Palette {
             }))
             .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
                 this.navigate_picker(1, true, window, cx)
+            }))
+            // Repeating New conversation steps through the harnesses.
+            .on_action(cx.listener(|this, _: &NewConversation, window, cx| {
+                this.navigate_picker(1, false, window, cx)
             }))
             .child(
                 NativeCommand::new(&self.command)
@@ -1241,7 +1295,7 @@ impl Render for Palette {
         let mut threads = CommandGroup::new().label("Threads");
         for thread in
             state.snapshot.threads.iter().filter(|thread| {
-                state.thread_in_active_space(thread.id)
+                state.thread_listed_in(thread, state.active_space)
                     && (state.show_archived
                         || (!thread.archived
                             && state.snapshot.projects.iter().any(|project| {
@@ -1393,6 +1447,9 @@ impl Render for Palette {
             .on_action(cx.listener(|this, _: &ArchiveThread, w, cx| {
                 this.run(PaletteTarget::Command(Command::ArchiveThread), w, cx)
             }))
+            .on_action(cx.listener(|this, _: &UnarchiveThread, w, cx| {
+                this.run(PaletteTarget::Command(Command::UnarchiveThread), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &CloseThread, w, cx| {
                 this.run(PaletteTarget::Command(Command::CloseThread), w, cx)
             }))
@@ -1462,5 +1519,25 @@ pub fn region_action(region: Region) -> &'static str {
     match region {
         Region::Projects => "Projects",
         Region::Thread => "Thread",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::picker_row;
+
+    #[test]
+    fn harness_picker_motion_steps_over_the_current_harness() {
+        // Three harnesses, the second is current: repeated steps alternate the other two.
+        assert_eq!(picker_row(3, Some(0), 1, false, Some(1)), 2);
+        assert_eq!(picker_row(3, Some(2), 1, false, Some(1)), 0);
+        assert_eq!(picker_row(3, Some(2), -1, false, Some(1)), 0);
+        assert_eq!(picker_row(3, None, 1, false, Some(0)), 1);
+        assert_eq!(picker_row(3, None, -1, false, Some(2)), 1);
+        // Edges land on the nearest selectable row.
+        assert_eq!(picker_row(3, Some(1), -1, true, Some(0)), 1);
+        assert_eq!(picker_row(3, Some(0), 1, true, Some(2)), 1);
+        // Without a skipped row motion wraps plainly.
+        assert_eq!(picker_row(3, Some(2), 1, false, None), 0);
     }
 }

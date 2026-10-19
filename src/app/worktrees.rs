@@ -606,11 +606,15 @@ impl AppState {
     }
 
     /// Archives a thread; when it was the last live thread of a worktree, that worktree is
-    /// inspected for automatic removal.
+    /// inspected for automatic removal. Archiving says the thread no longer matters: its tab
+    /// closes without the thread being selected first (a neighbouring tab takes over only when
+    /// it was the selected one), and it leaves Projects unless archived threads are shown.
     pub fn archive_thread(&mut self, id: ThreadId) -> Result<()> {
         if let Some(reason) = self.archive_thread_reason_for(id) {
             anyhow::bail!(reason);
         }
+        // Closing first commits the draft the tab held.
+        self.close_thread(id);
         let mut thread = self
             .snapshot
             .threads
@@ -621,8 +625,16 @@ impl AppState {
         thread.archived = true;
         thread.updated_at = platform::now();
         let worktree = thread.worktree_id;
+        let title = thread.title.clone();
+        // An untouched thread was never more than a placeholder; it leaves silently.
+        let untouched = self.is_untouched(&thread);
         self.save_thread(thread);
-        self.set_show_archived(true);
+        if !untouched && !self.show_archived {
+            self.notice(
+                NoticeLevel::Info,
+                format!("Archived {title}. Show archived threads to unarchive it."),
+            );
+        }
         if let Some(worktree) = worktree
             && !self.worktree_has_live_threads(worktree)
         {

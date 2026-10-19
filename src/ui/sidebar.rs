@@ -130,7 +130,7 @@ pub fn rows(state: &AppState, query: &str) -> Vec<Row> {
             .snapshot
             .threads
             .iter()
-            .filter(|thread| state.thread_in_active_space(thread.id)),
+            .filter(|thread| state.thread_listed_in(thread, state.active_space)),
         &state.collapsed,
         state.show_archived,
         query,
@@ -277,6 +277,26 @@ fn exceptional_state(state: &AppState, thread: &Thread) -> Option<(&'static str,
     }
 }
 
+/// A Projects menu item for one thread row: it shows `command`'s label and key, and runs
+/// `run` on that thread instead of dispatching the selection-based action.
+fn thread_item(
+    command: Command,
+    reason: Option<String>,
+    owner: &WeakEntity<Workspace>,
+    run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+) -> PopupMenuItem {
+    let owner = owner.clone();
+    PopupMenuItem::new(match &reason {
+        Some(reason) => SharedString::from(format!("{} — {reason}", command.label())),
+        None => command.label().into(),
+    })
+    .action(command.action())
+    .disabled(reason.is_some())
+    .on_click(move |_, window, cx| {
+        let _ = owner.update(cx, |workspace, cx| run(workspace, window, cx));
+    })
+}
+
 fn command_item(
     label: impl Into<SharedString>,
     command: Command,
@@ -299,10 +319,11 @@ fn row_menu(
     window: &mut Window,
     cx: &mut App,
 ) -> PopupMenu {
-    // Context actions operate on the clicked row, not the keyboard cursor or
-    // previously opened thread, using the same selection path as a normal click.
+    // Context actions operate on the clicked row, not the keyboard cursor or previously
+    // opened thread. A project row is selected like a click; a thread row only moves the
+    // cursor, so renaming, archiving or closing it never opens its tab first.
     let _ = owner.update(cx, |workspace, cx| {
-        workspace.select_row(row, true, window, cx)
+        workspace.select_row(row, matches!(row, Row::Project(_)), window, cx)
     });
     let Some(workspace) = owner.upgrade() else {
         return menu;
@@ -378,26 +399,50 @@ fn row_menu(
                 let row_thread = state.snapshot.threads.iter().find(|c| c.id == thread);
                 let in_worktree = row_thread.is_some_and(|c| c.worktree_id.is_some());
                 let conversation = row_thread.is_some_and(|c| c.kind == ThreadKind::Conversation);
-                menu.item(command_item("Rename thread…", Command::RenameThread, state))
-                    .item(command_item(
-                        Command::ArchiveThread.label(),
-                        Command::ArchiveThread,
-                        state,
-                    ))
-                    .when(conversation, |menu| {
-                        menu.item(command_item(
-                            Command::SwitchBranch.label(),
-                            Command::SwitchBranch,
-                            state,
-                        ))
+                let archived = row_thread.is_some_and(|c| c.archived);
+                // Checkout commands work on the open Conversation, so they open this one.
+                let opened = |command: Command| {
+                    let reason = if state.selected_thread == Some(thread) {
+                        command.disabled_reason(state)
+                    } else {
+                        None
+                    };
+                    thread_item(command, reason, owner, move |workspace, window, cx| {
+                        workspace.select_row(row, true, window, cx);
+                        workspace.execute(command, window, cx);
                     })
-                    .when(in_worktree, |menu| {
-                        menu.item(command_item(
-                            Command::RemoveWorktree.label(),
-                            Command::RemoveWorktree,
-                            state,
+                };
+                menu.item(thread_item(
+                    Command::RenameThread,
+                    state.rename_thread_reason_for(thread),
+                    owner,
+                    move |workspace, window, cx| workspace.rename_thread(thread, window, cx),
+                ))
+                .map(|menu| {
+                    if archived {
+                        menu.item(thread_item(
+                            Command::UnarchiveThread,
+                            state.unarchive_thread_reason_for(thread),
+                            owner,
+                            move |workspace, _, cx| workspace.unarchive_thread(thread, cx),
                         ))
-                    })
+                    } else {
+                        menu.item(thread_item(
+                            Command::ArchiveThread,
+                            state.archive_thread_reason_for(thread),
+                            owner,
+                            move |workspace, window, cx| {
+                                workspace.archive_thread(thread, window, cx)
+                            },
+                        ))
+                    }
+                })
+                .when(conversation, |menu| {
+                    menu.item(opened(Command::SwitchBranch))
+                })
+                .when(in_worktree, |menu| {
+                    menu.item(opened(Command::RemoveWorktree))
+                })
             };
             if let Some(reason) = reason {
                 menu =
@@ -429,10 +474,11 @@ fn row_menu(
                 }
             }
             let state = workspace.read(cx).state.read(cx);
-            menu.separator().item(command_item(
-                Command::CloseThread.label(),
+            menu.separator().item(thread_item(
                 Command::CloseThread,
-                state,
+                (!state.open_threads.contains(&thread)).then(|| "This thread is not open.".into()),
+                owner,
+                move |workspace, window, cx| workspace.close_thread_tab(thread, window, cx),
             ))
         }
     }
@@ -511,7 +557,7 @@ fn render_list(
             .snapshot
             .threads
             .iter()
-            .filter(|thread| state.thread_in_space(thread.id, space)),
+            .filter(|thread| state.thread_listed_in(thread, space)),
         collapsed_projects,
         show_archived,
         query,
@@ -776,7 +822,13 @@ fn render_list(
                         .child(div().flex_shrink_0().child("Archived"));
                     first_detail = false;
                 }
-                if let Some(age) = relative_age(&thread.updated_at, now) {
+                // An untouched thread is a placeholder that leaves Projects with its tab.
+                let untouched = state.is_untouched(thread);
+                if untouched {
+                    details = details
+                        .when(!first_detail, |view| view.child(separator()))
+                        .child(div().flex_shrink_0().child("Not started"));
+                } else if let Some(age) = relative_age(&thread.updated_at, now) {
                     details = details
                         .when(!first_detail, |view| view.child(separator()))
                         .child(div().flex_shrink_0().child(age));
@@ -815,7 +867,9 @@ fn render_list(
                                                 icon.small().text_color(theme.muted_foreground),
                                             ),
                                         )
-                                        .child(div().flex_1().min_w_0().truncate().map(|label| {
+                                        .child(div().flex_1().min_w_0().truncate().when(untouched, |label| {
+                                            label.italic().text_color(theme.muted_foreground)
+                                        }).map(|label| {
                                             match state.is_titling(id) {
                                                 true => label
                                                     .child(ShimmerText::new(thread.title.clone())),
@@ -882,19 +936,7 @@ fn render_list(
                                                                                 rename_owner.update(
                                                                                     cx,
                                                                                     |workspace, cx| {
-                                                                                        workspace
-                                                                                            .select_row(
-                                                                                                row,
-                                                                                                true,
-                                                                                                window,
-                                                                                                cx,
-                                                                                            );
-                                                                                        workspace
-                                                                                            .execute(
-                                                                                                Command::RenameThread,
-                                                                                                window,
-                                                                                                cx,
-                                                                                            );
+                                                                                        workspace.rename_thread(id, window, cx);
                                                                                     },
                                                                                 );
                                                                         },
@@ -932,19 +974,7 @@ fn render_list(
                                                                                 archive_owner.update(
                                                                                     cx,
                                                                                     |workspace, cx| {
-                                                                                        workspace
-                                                                                            .select_row(
-                                                                                                row,
-                                                                                                true,
-                                                                                                window,
-                                                                                                cx,
-                                                                                            );
-                                                                                        workspace
-                                                                                            .execute(
-                                                                                                Command::ArchiveThread,
-                                                                                                window,
-                                                                                                cx,
-                                                                                            );
+                                                                                        workspace.archive_thread(id, window, cx);
                                                                                     },
                                                                                 );
                                                                         },

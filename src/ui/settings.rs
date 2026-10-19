@@ -807,7 +807,7 @@ impl SurfaceContent {
             DialogKind::ArchiveProject(id) => {
                 anyhow::ensure!(
                     state.selected_project == Some(id),
-                    "Project selection changed; reopen Archive Project."
+                    "Project selection changed; open Archive project again."
                 );
                 if let Some(reason) = state.archive_project_reason() {
                     anyhow::bail!(reason);
@@ -816,9 +816,11 @@ impl SurfaceContent {
                     .project()
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("Select a project"))?;
+                // Archiving says the project no longer matters: its tabs close and it leaves
+                // Projects unless archived items are shown.
+                state.close_project_threads(project.id);
                 project.archived = true;
                 state.save_project(project);
-                state.set_show_archived(true);
             }
 
             DialogKind::Settings(project_id) => {
