@@ -1,22 +1,20 @@
-//! The UI only touches retained memory here. Process discovery, pipes and shutdown
-//! run on workers; Servo itself lives in a separately linked executable.
+//! The UI touches retained memory only. Servo and all rendering handles live on
+//! a dedicated worker thread; commands and evaluation results are bounded.
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, Read},
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-    sync::{Arc, mpsc},
+    io,
+    sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use serde_json::Value;
 
-#[path = "../crates/servo-browser/src/protocol.rs"]
-mod protocol;
-pub use protocol::BrowserCommand;
-use protocol::{Event, MAX_PENDING, PageState, Request};
+mod command;
+mod engine;
+pub use command::BrowserCommand;
+use command::{Event, MAX_PENDING, PageState, Request};
 
 pub type BrowserId = uuid::Uuid;
 
@@ -28,6 +26,8 @@ pub struct BrowserSnapshot {
     pub error: Option<String>,
     pub can_go_back: bool,
     pub can_go_forward: bool,
+    /// Natural document height in CSS pixels, measured only for opted-in artifacts.
+    pub content_height: Option<f32>,
     pub frame: Option<Arc<BrowserFrame>>,
 }
 
@@ -41,6 +41,7 @@ pub struct BrowserFrame {
 
 struct Session {
     wire_id: BrowserId,
+    content_sizing: bool,
     snapshot: BrowserSnapshot,
 }
 
@@ -59,13 +60,21 @@ struct Memory {
     started: bool,
     shutdown: bool,
     failure: Option<String>,
-    stderr: VecDeque<u8>,
+    stopped: bool,
 }
 
 #[derive(Default)]
 struct Shared {
     memory: Mutex<Memory>,
-    wake: Condvar,
+    worker: Mutex<Option<thread::Thread>>,
+}
+
+impl Shared {
+    fn wake(&self) {
+        if let Some(worker) = self.worker.lock().as_ref() {
+            worker.unpark();
+        }
+    }
 }
 
 struct Handle(Arc<Shared>);
@@ -73,7 +82,7 @@ struct Handle(Arc<Shared>);
 impl Drop for Handle {
     fn drop(&mut self) {
         self.0.memory.lock().shutdown = true;
-        self.0.wake.notify_one();
+        self.0.wake();
     }
 }
 
@@ -109,6 +118,7 @@ impl BrowserRuntime {
             id,
             Session {
                 wire_id,
+                content_sizing: false,
                 snapshot: BrowserSnapshot {
                     url: url.clone(),
                     title: String::new(),
@@ -116,6 +126,7 @@ impl BrowserRuntime {
                     error,
                     can_go_back: false,
                     can_go_forward: false,
+                    content_height: None,
                     frame: None,
                 },
             },
@@ -130,13 +141,14 @@ impl BrowserRuntime {
         if start {
             let worker_shared = shared.clone();
             if let Err(error) = thread::Builder::new()
-                .name("servo-supervisor".into())
-                .spawn(move || supervise(worker_shared))
+                .name("servo-engine".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || run_worker(worker_shared))
             {
                 fail(shared, format!("Could not start browser worker: {error}"));
             }
         }
-        shared.wake.notify_one();
+        shared.wake();
     }
 
     pub fn command(&self, id: BrowserId, command: BrowserCommand) {
@@ -190,9 +202,15 @@ impl BrowserRuntime {
         {
             session.snapshot.error = None;
             session.snapshot.loading = true;
+            session.snapshot.content_height = None;
             if let BrowserCommand::Navigate { url } = &command {
                 session.snapshot.url.clone_from(url);
             }
+        }
+        if let BrowserCommand::SetContentSizing { enabled } = &command
+            && let Some(session) = memory.sessions.get_mut(&id)
+        {
+            session.content_sizing = *enabled;
         }
         enqueue(
             &mut memory,
@@ -202,7 +220,7 @@ impl BrowserRuntime {
             },
         );
         drop(memory);
-        shared.wake.notify_one();
+        shared.wake();
     }
 
     pub fn close(&self, id: BrowserId) {
@@ -212,11 +230,9 @@ impl BrowserRuntime {
             memory.wire_ids.remove(&session.wire_id);
             memory
                 .queue
-                .retain(|request| request.id() != Some(session.wire_id));
-            // Lifecycle messages have priority over replaceable input and cannot be lost.
-            memory.queue.push_front(Request::Close {
-                id: session.wire_id,
-            });
+                .retain(|request| request.id() != session.wire_id);
+            // The worker reconciles live identities before each bounded batch.
+            // No Close message can be dropped or grow beyond the input bound.
         }
         for evaluation in memory
             .evaluations
@@ -228,7 +244,7 @@ impl BrowserRuntime {
             ));
         }
         drop(memory);
-        shared.wake.notify_one();
+        shared.wake();
     }
 
     pub fn snapshot(&self, id: BrowserId) -> Option<BrowserSnapshot> {
@@ -260,7 +276,7 @@ impl BrowserRuntime {
             evaluation.result = Some(Err("Browser runtime shut down".into()));
         }
         drop(memory);
-        shared.wake.notify_one();
+        shared.wake();
     }
 }
 
@@ -274,7 +290,7 @@ fn enqueue(memory: &mut Memory, request: Request) {
     }
     if memory.queue.len() >= MAX_PENDING {
         let error = "Browser input queue is full; wait for the page to respond before trying again";
-        if let Some(id) = request.id().and_then(|id| memory.wire_ids.get(&id))
+        if let Some(id) = memory.wire_ids.get(&request.id())
             && let Some(session) = memory.sessions.get_mut(id)
         {
             session.snapshot.error = Some(error.into());
@@ -293,31 +309,6 @@ fn enqueue(memory: &mut Memory, request: Request) {
     memory.queue.push_back(request);
 }
 
-fn helper_path() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("DROSTJE_SERVO") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(parent) = executable.parent()
-    {
-        let path = parent.join("drostje-servo");
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    for profile in ["debug", "release"] {
-        let path = root
-            .join("crates/servo-browser/target")
-            .join(profile)
-            .join("drostje-servo");
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    Err("Servo helper not found. Build it with `cargo build --manifest-path crates/servo-browser/Cargo.toml --locked`, reinstall with ./install.sh, or set DROSTJE_SERVO to the drostje-servo executable".into())
-}
-
 fn fail(shared: &Shared, error: String) {
     let mut memory = shared.memory.lock();
     memory.failure = Some(error.clone());
@@ -332,12 +323,12 @@ fn fail(shared: &Shared, error: String) {
     {
         evaluation.result = Some(Err(error.clone()));
     }
-    shared.wake.notify_one();
+    shared.wake();
 }
 
 fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<()> {
     if !matches!(event, Event::Frame { .. }) && !bytes.is_empty() {
-        return Err(protocol::invalid(
+        return Err(command::invalid(
             "Unexpected binary data in Servo status message",
         ));
     }
@@ -352,6 +343,7 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
                     error,
                     can_go_back,
                     can_go_forward,
+                    content_height,
                 },
         } => {
             if let Some(id) = memory.wire_ids.get(&id)
@@ -361,12 +353,13 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
                 snapshot.url = url;
                 snapshot.title = title;
                 snapshot.loading = loading;
-                // Local transport/input failures survive unrelated title/frame updates.
+                // Local queue/input failures survive unrelated title/frame updates.
                 if error.is_some() {
                     snapshot.error = error;
                 }
                 snapshot.can_go_back = can_go_back;
                 snapshot.can_go_forward = can_go_forward;
+                snapshot.content_height = content_height;
             }
         }
         Event::Frame {
@@ -375,8 +368,8 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
             width,
             height,
         } => {
-            if bytes.len() != protocol::frame_len(width, height)? {
-                return Err(protocol::invalid(
+            if bytes.len() != command::frame_len(width, height)? {
+                return Err(command::invalid(
                     "Servo frame length does not match its dimensions",
                 ));
             }
@@ -413,167 +406,29 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
     Ok(())
 }
 
-fn supervise(shared: Arc<Shared>) {
-    let result = run_helper(&shared);
-    if let Err(error) = result {
-        let stderr = {
-            let memory = shared.memory.lock();
-            String::from_utf8_lossy(&memory.stderr.iter().copied().collect::<Vec<_>>())
-                .trim()
-                .to_owned()
-        };
-        let detail = if stderr.is_empty() {
-            String::new()
-        } else {
-            format!("\nServo stderr: {stderr}")
-        };
+fn run_worker(shared: Arc<Shared>) {
+    *shared.worker.lock() = Some(thread::current());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine::run(&shared)));
+    let error = match result {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(payload) => Some(format!(
+            "Servo worker panicked: {}",
+            payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic")
+        )),
+    };
+    if let Some(error) = error {
         fail(
             &shared,
-            format!(
-                "{error}{detail}\nRebuild/reinstall drostje-servo and reopen DROSTJE to restart the browser"
-            ),
+            format!("{error}\nReopen DROSTJE to restart the browser"),
         );
     }
-}
-
-fn run_helper(shared: &Arc<Shared>) -> Result<(), String> {
-    let path = helper_path()?;
-    let mut child = Command::new(&path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Could not launch Servo helper {}: {error}", path.display()))?;
-    let result = communicate(shared, &mut child);
-    // This supervisor owns process reaping even when startup, a pipe or a worker fails.
-    let _ = child.kill();
-    let _ = child.wait();
-    result
-}
-
-fn communicate(shared: &Arc<Shared>, child: &mut Child) -> Result<(), String> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or("Servo helper stdin was not piped")?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or("Servo helper stdout was not piped")?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or("Servo helper stderr was not piped")?;
-    let (sender, receiver) = mpsc::sync_channel::<Request>(32);
-    let writer_shared = shared.clone();
-    thread::Builder::new()
-        .name("servo-input".into())
-        .spawn(move || {
-            while let Ok(request) = receiver.recv() {
-                if let Err(error) = protocol::write_packet(&mut stdin, &request, &[]) {
-                    fail(
-                        &writer_shared,
-                        format!("Could not send browser input: {error}"),
-                    );
-                    break;
-                }
-            }
-        })
-        .map_err(|error| format!("Could not start Servo input worker: {error}"))?;
-    let reader_shared = shared.clone();
-    thread::Builder::new()
-        .name("servo-output".into())
-        .spawn(move || {
-            let result = (|| -> io::Result<()> {
-                while let Some((event, bytes)) = protocol::read_packet::<Event>(&mut stdout)? {
-                    apply_event(&mut reader_shared.memory.lock(), event, bytes)?;
-                }
-                Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Servo helper closed its output",
-                ))
-            })();
-            if let Err(error) = result
-                && !reader_shared.memory.lock().shutdown
-            {
-                fail(&reader_shared, error.to_string());
-            }
-        })
-        .map_err(|error| format!("Could not start Servo output worker: {error}"))?;
-    let stderr_shared = shared.clone();
-    let stderr_worker = thread::Builder::new()
-        .name("servo-stderr".into())
-        .spawn(move || {
-            let mut buffer = [0; 2048];
-            loop {
-                match stderr.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(length) => {
-                        let mut memory = stderr_shared.memory.lock();
-                        memory.stderr.extend(&buffer[..length]);
-                        let excess = memory.stderr.len().saturating_sub(8192);
-                        memory.stderr.drain(..excess);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-        })
-        .map_err(|error| format!("Could not start Servo diagnostics worker: {error}"))?;
-    let mut stopping = None;
-    let result = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("Could not inspect Servo helper: {error}"))?
-        {
-            break if stopping.is_some() {
-                Ok(())
-            } else {
-                Err(format!("Servo helper exited ({status})"))
-            };
-        }
-        let mut memory = shared.memory.lock();
-        if memory.shutdown {
-            let deadline = stopping.get_or_insert_with(|| {
-                let _ = sender.try_send(Request::Shutdown);
-                Instant::now() + Duration::from_secs(2)
-            });
-            if Instant::now() >= *deadline {
-                break Ok(());
-            }
-        } else if let Some(error) = &memory.failure {
-            break Err(error.clone());
-        } else {
-            for evaluation in memory
-                .evaluations
-                .values_mut()
-                .filter(|evaluation| evaluation.result.is_none())
-            {
-                if evaluation.started.elapsed() > Duration::from_secs(30) {
-                    evaluation.result = Some(Err("JavaScript evaluation did not finish within 30 seconds; the page may be busy or navigating".into()));
-                }
-            }
-            while let Some(request) = memory.queue.pop_front() {
-                match sender.try_send(request) {
-                    Ok(()) => {}
-                    Err(mpsc::TrySendError::Full(request)) => {
-                        memory.queue.push_front(request);
-                        break;
-                    }
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        memory.failure = Some("Servo input worker stopped".into());
-                        break;
-                    }
-                }
-            }
-        }
-        shared.wake.wait_for(&mut memory, Duration::from_millis(25));
-    };
-    let _ = child.kill();
-    let _ = child.wait();
-    drop(sender);
-    let _ = stderr_worker.join();
-    result
+    shared.memory.lock().stopped = true;
+    *shared.worker.lock() = None;
 }
 
 #[cfg(test)]
@@ -589,6 +444,7 @@ mod tests {
             id,
             Session {
                 wire_id,
+                content_sizing: false,
                 snapshot: BrowserSnapshot {
                     url: "about:blank".into(),
                     title: String::new(),
@@ -596,6 +452,7 @@ mod tests {
                     error: None,
                     can_go_back: false,
                     can_go_forward: false,
+                    content_height: None,
                     frame: None,
                 },
             },
@@ -633,9 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn navigation_status_does_not_erase_transport_errors() {
+    fn navigation_status_does_not_erase_input_errors() {
         let (mut memory, id, wire_id) = memory_with_session();
-        memory.sessions.get_mut(&id).unwrap().snapshot.error = Some("pipe failed".into());
+        memory.sessions.get_mut(&id).unwrap().snapshot.error = Some("queue full".into());
         apply_event(
             &mut memory,
             Event::State {
@@ -650,12 +507,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             memory.sessions[&id].snapshot.error.as_deref(),
-            Some("pipe failed")
+            Some("queue full")
         );
     }
 
     #[test]
-    fn closing_completes_pending_evaluations_without_launching_a_helper() {
+    fn missing_session_evaluation_finishes_without_starting_the_engine() {
         let runtime = BrowserRuntime::new();
         let id = BrowserId::new_v4();
         runtime.command(
@@ -669,4 +526,101 @@ mod tests {
         assert!(runtime.evaluation("missing").is_none());
         assert!(!runtime.0.0.memory.lock().started);
     }
+
+    #[test]
+    fn closing_cancels_queued_open_and_evaluations_without_a_lifecycle_backlog() {
+        let runtime = BrowserRuntime::new();
+        // Hold startup so this test observes the queue before the worker consumes it.
+        runtime.0.0.memory.lock().started = true;
+        for _ in 0..MAX_PENDING * 2 {
+            let id = BrowserId::new_v4();
+            runtime.open(id, "about:blank".into());
+            runtime.command(
+                id,
+                BrowserCommand::Evaluate {
+                    request_id: "closing".into(),
+                    script: "1".into(),
+                },
+            );
+            runtime.close(id);
+            assert!(runtime.snapshot(id).is_none());
+            assert!(runtime.evaluation("closing").unwrap().is_err());
+        }
+        let memory = runtime.0.0.memory.lock();
+        assert!(memory.queue.is_empty());
+        assert!(memory.wire_ids.is_empty());
+    }
+
+    #[test]
+    fn full_input_queue_completes_rejected_evaluation_and_close_still_works() {
+        let (mut memory, id, wire_id) = memory_with_session();
+        memory.started = true;
+        let runtime = BrowserRuntime::new();
+        *runtime.0.0.memory.lock() = memory;
+        for _ in 0..MAX_PENDING {
+            runtime.command(id, BrowserCommand::Reload);
+        }
+        runtime.command(
+            id,
+            BrowserCommand::Evaluate {
+                request_id: "full".into(),
+                script: "1".into(),
+            },
+        );
+        assert!(runtime.evaluation("full").unwrap().is_err());
+        assert_eq!(runtime.0.0.memory.lock().queue.len(), MAX_PENDING);
+        runtime.close(id);
+        assert!(runtime.0.0.memory.lock().queue.is_empty());
+        assert!(!runtime.0.0.memory.lock().wire_ids.contains_key(&wire_id));
+    }
+
+    #[test]
+    fn completed_evaluations_are_retained_and_request_ids_cannot_overwrite_them() {
+        let runtime = BrowserRuntime::new();
+        let id = BrowserId::new_v4();
+        for ix in 0..MAX_PENDING {
+            runtime.command(
+                id,
+                BrowserCommand::Evaluate {
+                    request_id: ix.to_string(),
+                    script: "1".into(),
+                },
+            );
+        }
+        runtime
+            .0
+            .0
+            .memory
+            .lock()
+            .evaluations
+            .get_mut("0")
+            .unwrap()
+            .result = Some(Ok(serde_json::json!({"retained": true})));
+        runtime.command(
+            id,
+            BrowserCommand::Evaluate {
+                request_id: "overflow".into(),
+                script: "2".into(),
+            },
+        );
+        assert!(runtime.evaluation("overflow").is_none());
+        runtime.command(
+            id,
+            BrowserCommand::Evaluate {
+                request_id: "0".into(),
+                script: "3".into(),
+            },
+        );
+        assert_eq!(runtime.0.0.memory.lock().evaluations.len(), MAX_PENDING);
+        assert_eq!(
+            runtime.evaluation("0").unwrap().unwrap(),
+            serde_json::json!({"retained": true})
+        );
+        for ix in 1..MAX_PENDING {
+            assert!(runtime.evaluation(&ix.to_string()).unwrap().is_err());
+        }
+    }
 }
+
+#[cfg(test)]
+mod smoke;

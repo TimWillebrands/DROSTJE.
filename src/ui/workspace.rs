@@ -2511,7 +2511,8 @@ impl Workspace {
             Command::BrowserBack
             | Command::BrowserForward
             | Command::BrowserReload
-            | Command::BrowserAddress => {
+            | Command::BrowserAddress
+            | Command::ToggleArtifact => {
                 if let Some(pane) = self.selected_browser(cx) {
                     pane.update(cx, |pane, cx| pane.command(command, window, cx));
                 }
@@ -3280,6 +3281,9 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &BrowserAddress, w, cx| {
                     this.execute(Command::BrowserAddress, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &ToggleArtifact, w, cx| {
+                    this.execute(Command::ToggleArtifact, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &WidenSidebar, w, cx| {
                     this.execute(Command::WidenSidebar, w, cx)
                 }))
@@ -3905,6 +3909,35 @@ impl Panel for WorkspacePanel {
     /// closes the tab.
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.panel_title(cx);
+        if let PanelKind::Browser(id) = self.kind {
+            let owner = self.workspace.clone();
+            let panel = cx.entity().downgrade();
+            return h_flex()
+                .id(SharedString::from(format!("browser-tab-{id}")))
+                .items_center()
+                .gap_1()
+                .min_w_0()
+                .child(title)
+                .child(
+                    Button::new(SharedString::from(format!("close-browser-{id}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tab_stop(false)
+                        .tooltip_with_action(Command::CloseThread.label(), &CloseThread, None)
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            let Some(panel) = panel.upgrade() else {
+                                return;
+                            };
+                            let _ = owner.update(cx, |workspace, cx| {
+                                workspace.focus_panel(panel, window, cx);
+                            });
+                            window.dispatch_action(Command::CloseThread.action(), cx);
+                        }),
+                )
+                .into_any_element();
+        }
         if let PanelKind::Terminal(id) = self.kind {
             let close = self.workspace.clone();
             let middle = close.clone();
@@ -4005,9 +4038,10 @@ impl Panel for WorkspacePanel {
             .into_any_element()
     }
     fn tab_name(&self, cx: &App) -> Option<SharedString> {
-        // Threads draw their own tab (activity mark, close control); the rest use the name.
+        // The dock's closable flag adds a menu item, not a tab close button.
+        // Content tabs supply their own title controls instead of a plain name.
         match self.kind {
-            PanelKind::Thread(_) | PanelKind::Terminal(_) => None,
+            PanelKind::Thread(_) | PanelKind::Terminal(_) | PanelKind::Browser(_) => None,
             _ => Some(self.panel_title(cx).into()),
         }
     }

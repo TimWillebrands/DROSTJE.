@@ -30,7 +30,6 @@ Een **drost** (of drossaard, als je het deftig wilt zeggen) was vroeger de rentm
 ## Aan de slag
 
 ```sh
-cargo build --manifest-path crates/servo-browser/Cargo.toml --locked
 cargo run
 ```
 
@@ -38,7 +37,9 @@ Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor
 
 Een bronbuild vereist **Zig 0.16** (`zig` op PATH, of `ZIG=/pad/naar/zig`) voor de ingebedde libghostty-adapter. Op macOS is ook Xcode nodig; Linux vereist Wayland/EGL/OpenGL, libxml2 en de libc++-runtime van LLVM 21 of nieuwer. De eerste build compileert de meegeleverde Ghostty-broncode; volgende builds hergebruiken een cache op basis van broncode en toolchain. `GHOSTTY_NATIVE_CACHE_DIR` kan die cache verplaatsen. Een gebouwde app heeft geen Zig of afzonderlijk geïnstalleerde Ghostty nodig.
 
-De ingebedde browser gebruikt **Servo 0.7.0** in `drostje-servo`. Die helper heeft een eigen Cargo-workspace omdat Servo en de vastgepinde GPUI-versie verschillende `freetype-sys`-versies linken. Nodig: CMake, pkg-config, Python 3, make en de platform-SDK; Linux heeft daarnaast fontconfig-ontwikkelbestanden en Mesa EGL/OpenGL nodig. SpiderMonkey downloadt normaal een passend vooraf gebouwd archief. Een bronbuild daarvan vereist LLVM/Clang 19 of nieuwer; Apple Clang 17 volstaat niet. De installer bouwt en bundelt de helper; een ontwikkelbuild vindt hem onder `crates/servo-browser/target/{debug,release}`. Met `DROSTJE_SERVO` kun je een expliciet executable-pad opgeven. Ontbreekt de helper, dan blijft de app bruikbaar en toont het browserpaneel de bouwinstructie.
+De ingebedde browser gebruikt **Servo 0.7.0**, direct in de app gelinkt. De engine en zijn software-renderer draaien op een aparte worker-thread, nooit op de GPUI-thread; `cargo run` en de installer bouwen één executable met ingebedde Servo-resources. GPUI Kit blijft vastgepind op `0.6.6`; de lokale `zed-font-kit`-patch wijzigt alleen de FreeType-vereisten naar `freetype-sys 0.23` en de optionele `freetype 0.8`-wrapper, met behoud van de upstream-licenties. Nodig: CMake, pkg-config, Python 3, make en de platform-SDK; Linux heeft daarnaast fontconfig-ontwikkelbestanden en Mesa EGL/OpenGL nodig. SpiderMonkey downloadt normaal een passend vooraf gebouwd archief. Een bronbuild daarvan vereist LLVM/Clang 19 of nieuwer; Apple Clang 17 volstaat niet. Browsercommando's en JavaScript-resultaten blijven begrensd; alleen het laatste frame wordt bewaard. Shutdown is coöperatief: een vastgelopen native engine kan niet meer als afzonderlijk proces worden beëindigd.
+
+De tweede lokale patch, `stylo_derive 0.22.0` (MPL-2.0), geeft gegenereerde CSS-resultaten een expliciet `std::fmt::Error`-type; dat voorkomt een type-inferentieconflict met GPUI's log/serde-features. `Cargo.lock` behoudt `pkcs1 0.8.0-rc.4`, de prerelease waarmee Servo's `rsa 0.10.0-rc.18` compatibel is; `rc.5` heeft een gewijzigde sleutel-API. Gebruik de lockfile bij builds en dependency-updates.
 
 ### Installeren
 
@@ -101,16 +102,22 @@ Een terminal blijft draaien bij tab- en Space-wissels. Sluiten of **Restart term
 
 **Open browser** in de command palette opent een zelfstandig Servo-tabblad. Weblinks in Conversations openen ook zo'n tabblad. **Toggle browser sidebar** toont een blijvende browsersessie naast de Conversation. Sleep de scheidingslijn om de zijbalk te schalen, of gebruik **Widen thread sidebar** / **Narrow thread sidebar** in de palette; de breedte wordt per thread bewaard.
 
-De adresbalk accepteert web-URL's en absolute bestandspaden. `Cmd-L` focust het adres, Return navigeert en focust de pagina, `Cmd-R` herlaadt. Terug/vooruit, muis, scrollen, toetsenbord en tekstinvoer werken op de echte Servo-pagina. `Cmd-Escape` verplaatst focus van de pagina naar de adresbalk. Browser-tabs delen de gewone tabnavigatie en `Close tab`.
+De adresbalk accepteert web-URL's en absolute bestandspaden. `Cmd-L` focust het adres, Return navigeert en focust de pagina, `Cmd-R` herlaadt. Terug/vooruit, muis, scrollen, toetsenbord en tekstinvoer werken op de echte Servo-pagina. `Cmd-Escape` verplaatst focus van de pagina naar de adresbalk. Browser-tabs delen de gewone tabnavigatie en `Close tab`. De sluitknop blijft zichtbaar op het tabblad; `Cmd-W` werkt ook vanuit de adresbalk en de pagina. Sluiten beëindigt alleen die browsersessie en brengt de toetsenbordfocus terug naar een overgebleven paneel, zonder de Conversation te sluiten.
+
+`Ctrl-W`, gevolgd door `h/j/k/l`, verplaatst focus ook vanuit een browserpagina of de adresbalk naar het dichtstbijzijnde aangrenzende paneel. Control vasthouden voor de tweede toets werkt eveneens. Zonder buur blijft de focus staan; gewone letters en tekstbewerking blijven bij de webpagina.
 
 OMP, Pi en Claude Code krijgen bij het starten van hun sessie instructies en twee tools:
 
 - `show_artifact`: schrijf eerst een HTML-bestand, bijvoorbeeld `/tmp/chart.html`, en geef daarna `{"path":"/tmp/chart.html","title":"Chart"}` aan de tool. De toolkaart in de Conversation wordt een interactieve browser. Relatieve CSS-, JavaScript- en afbeeldingsbestanden blijven naast het HTML-bestand werken.
 - `browser`: open met `{"action":"open","url":"http://localhost:3000","placement":"sidebar"}` of `"placement":"tab"`. Gebruik het teruggegeven `id` voor `inspect`, `navigate`, `back`, `forward`, `reload`, `evaluate`, `click`, `type`, `key`, `scroll`, `screenshot` en `close`. `evaluate` geeft het echte JavaScript-resultaat terug; screenshots zijn PNG-bestanden. Navigatie en invoer worden in de wachtrij geplaatst: controleer `inspect` of de DOM vóór de volgende stap. In Claude Code heten de tools `mcp__drostje__show_artifact` en `mcp__drostje__browser`.
 
-Dit is bewust **geen sandbox**. Pagina's voeren JavaScript en netwerkverzoeken uit met de mogelijkheden van de browser; harness-toestemmingen beperken die pagina's niet. De helper is een link-/procesgrens, geen beveiligingsgrens.
+Inline artifacts hebben geen adresbalk: alleen een smalle titelregel met een inklapknop en een menu voor terug, vooruit en herladen. Inklappen bewaart de pagina, formulierwaarden en JavaScript-status. `Cmd-Shift-A` klapt het actieve artifact in of uit; Return en Spatie werken op de titelknop. `Cmd-Escape` brengt focus van de pagina naar die knop. Gewone browser-tabs en de browserzijbalk behouden hun volledige navigatiebalk.
 
-Tab-URL's, artifact-verwijzingen en zijbalkkeuzes blijven bewaard; een herstart laadt pagina's opnieuw, niet hun JavaScript- of formulierstatus. HTML-bestanden worden niet gekopieerd: verwijderde `/tmp`-bestanden geven een zichtbare fout. Servo is geen Chrome-vervanger: deze build gebruikt Servo's `SoftwareRenderingContext` en kopieert RGBA-frames naar GPUI, heeft geen WebGL/WebGPU en ondersteunt maximaal 16 gelijktijdige pagina's. Browserextensies, downloads, uploadkiezers en pop-upvensters zijn niet geïntegreerd. De browser- en werkruimteproeven zijn op macOS uitgevoerd; Linux-rendering is nog niet runtime-gecontroleerd.
+De hoogte volgt de inhoud, ook na wijzigingen en bij een andere breedte. Het bereik is 120–1600 logische pixels; op grote of hoge-resolutieschermen kan de framebufferlimiet het maximum verder beperken. Langere pagina's blijven scrollbaar. Agents krijgen daarom de instructie om alle inhoud in één `<main data-drostje-artifact>` te plaatsen, met responsieve breedte, natuurlijke documenthoogte, `box-sizing: border-box` en `body { margin: 0; }`. Vermijd `100vh`, schermvullende layouts en geneste scrollpanelen; verberg geen inhoud met `overflow: hidden`. Deze instructies gelden voor nieuw gestarte harness-sessies.
+
+Dit is bewust **geen sandbox**. Pagina's voeren JavaScript en netwerkverzoeken uit met de mogelijkheden en rechten van de app; harness-toestemmingen beperken die pagina's niet. Servo draait in hetzelfde proces als GPUI: een native crash of abort kan de hele app beëindigen.
+
+Tab-URL's, artifact-verwijzingen en zijbalkkeuzes blijven bewaard; een herstart laadt pagina's opnieuw, niet hun JavaScript- of formulierstatus. HTML-bestanden worden niet gekopieerd: verwijderde `/tmp`-bestanden geven een zichtbare fout. Servo is geen Chrome-vervanger: deze build gebruikt Servo's `SoftwareRenderingContext` en kopieert RGBA-frames naar GPUI, heeft geen WebGL/WebGPU en ondersteunt maximaal 16 gelijktijdige pagina's. Browserextensies, downloads, uploadkiezers en pop-upvensters zijn niet geïntegreerd. De in-process engine-, browser- en werkruimteproeven zijn uitgevoerd op **macOS 26.6.2 arm64** met Rust 1.98.1, inclusief echte Metal-pixels en invoer. De Linux-dependencygraaf resolveert met één FreeType-versie; Linux-builds en -rendering zijn nog niet runtime-gecontroleerd. De Metal-proef wacht begrensd op de daadwerkelijke schermpixels: de juiste framebufferafmetingen alleen betekenen nog niet dat Servo's repaint en GPUI's image-upload klaar zijn.
 
 De Conversation-tijdlijn toont denkstappen als gedempte inline tekst. Ingeklapte tools houden een begrensd voorbeeld van hun resultaat zichtbaar; open de kaart voor de volledige uitvoer. Mislukte tools openen hun foutdetails automatisch.
 
@@ -191,16 +198,15 @@ cargo test --features runtime-qa native_composition_is_recovery_only_until_commi
 
 De macOS-regressie `cargo test --features runtime-qa --test markdown_rendering` gebruikt echte fonts en offscreen Metal-pixels, zonder vensterbediening, schermopnametoestemming of provider-turns. Ze controleert zichtbare code-suffixen, afbreking, Unicode en tekstselectie in beide thema's.
 
-De Servo-proeven gebruiken echte HTML-bestanden, een echt helperproces en op macOS GPUI's Metal-renderer. Ze versturen geen provider-turns:
+De Servo-proeven gebruiken echte HTML-bestanden, de in-process worker en op macOS GPUI's Metal-renderer. Ze versturen geen provider-turns:
 
 ```sh
-cargo build --manifest-path crates/servo-browser/Cargo.toml --locked
-cargo test --manifest-path crates/servo-browser/Cargo.toml
-cargo test --manifest-path crates/servo-browser/Cargo.toml --test smoke -- --ignored --nocapture
+cargo test --lib browser::
+cargo test --lib browser::smoke -- --ignored --nocapture
 cargo test --features runtime-qa --test servo_rendering --test servo_workspace
 ```
 
-Dit controleert pixels in beide thema's, resize, klikken, tekstinvoer, adresfocus, geschiedenis, ontbrekende bestanden, de echte HTTP-toolroute, gescheiden artifact-/zijbalksessies, screenshots en het sluiten van browser-tabs zonder de Conversation te sluiten. `DROSTJE_QA_SCREENSHOTS=/tmp/drostje-browser-proof` bewaart de visuele bewijzen. Dit vervangt geen OS-inputcontrole; daarvoor moet macOS de gebruikte automatiseringstool Accessibility-toegang geven.
+De engine-proef controleert HTML/CSS-pixels, JavaScript-resultaten en exceptions, klikken, Unicode-tekst, toetsen, scrollen, resize, reload, geschiedenis, gescheiden WebViews, ontbrekende bestanden met herstel, sluiten/heropenen en het stoppen van de worker. De GPUI-proeven controleren daarnaast beide thema's, adresfocus, de echte HTTP-toolroute, gescheiden artifact-/zijbalksessies, screenshots en het sluiten van browser-tabs zonder de Conversation te sluiten. `DROSTJE_QA_SCREENSHOTS=/tmp/drostje-browser-proof` bewaart de visuele bewijzen. Dit vervangt geen OS-inputcontrole; daarvoor moet macOS de gebruikte automatiseringstool Accessibility-toegang geven.
 
 ### Expliciete desktop-QA
 

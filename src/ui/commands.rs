@@ -38,6 +38,7 @@ gpui_kit::actions!(
         BrowserForward,
         BrowserReload,
         BrowserAddress,
+        ToggleArtifact,
         WidenSidebar,
         NarrowSidebar,
         RenameProject,
@@ -129,6 +130,7 @@ pub enum Command {
     BrowserForward,
     BrowserReload,
     BrowserAddress,
+    ToggleArtifact,
     WidenSidebar,
     NarrowSidebar,
     RenameProject,
@@ -169,7 +171,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 61] = [
+    pub const ALL: [Self; 62] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -193,6 +195,7 @@ impl Command {
         Self::BrowserForward,
         Self::BrowserReload,
         Self::BrowserAddress,
+        Self::ToggleArtifact,
         Self::WidenSidebar,
         Self::NarrowSidebar,
         Self::RenameProject,
@@ -258,6 +261,7 @@ impl Command {
             Self::BrowserForward => "Browser forward",
             Self::BrowserReload => "Reload browser",
             Self::BrowserAddress => "Focus browser address",
+            Self::ToggleArtifact => "Collapse or expand artifact",
             Self::WidenSidebar => "Widen thread sidebar",
             Self::NarrowSidebar => "Narrow thread sidebar",
             Self::RenameProject => "Rename project…",
@@ -324,6 +328,7 @@ impl Command {
             Self::BrowserForward => Box::new(BrowserForward),
             Self::BrowserReload => Box::new(BrowserReload),
             Self::BrowserAddress => Box::new(BrowserAddress),
+            Self::ToggleArtifact => Box::new(ToggleArtifact),
             Self::WidenSidebar => Box::new(WidenSidebar),
             Self::NarrowSidebar => Box::new(NarrowSidebar),
             Self::RenameProject => Box::new(RenameProject),
@@ -530,7 +535,8 @@ impl Command {
             Self::BrowserBack
             | Self::BrowserForward
             | Self::BrowserReload
-            | Self::BrowserAddress => match workspace.selected_browser(cx) {
+            | Self::BrowserAddress
+            | Self::ToggleArtifact => match workspace.selected_browser(cx) {
                 Some(pane) => pane.read(cx).disabled_reason(self),
                 None => Some("Open a browser first".into()),
             },
@@ -603,9 +609,10 @@ pub fn bind_keys(cx: &mut App) {
     let navigation = Some(
         "Workspace && !Input && !NativeInput && !Browser && !Command && !PopupMenu && !Sheet && !Dialog",
     );
-    // Embedded editors and terminals reserve the same pane-navigation prefix.
+    // Embedded editors, terminals and browsers reserve the same pane-navigation prefix,
+    // including the browser's native address field. Other native inputs stay excluded.
     let editor_navigation = Some(
-        "(PromptEditor || Terminal || TerminalPane) && !Command && !PopupMenu && !Sheet && !Dialog",
+        "(PromptEditor || Terminal || TerminalPane || BrowserPane) && !Command && !PopupMenu && !Sheet && !Dialog",
     );
     let list =
         Some("List && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
@@ -646,6 +653,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
         KeyBinding::new("secondary-l", BrowserAddress, Some("BrowserPane || Browser")),
         KeyBinding::new("secondary-r", BrowserReload, Some("BrowserPane || Browser")),
+        KeyBinding::new("secondary-shift-a", ToggleArtifact, Some("BrowserPane")),
+        KeyBinding::new("enter", ToggleArtifact, Some("ArtifactDisclosure")),
+        KeyBinding::new("space", ToggleArtifact, Some("ArtifactDisclosure")),
         KeyBinding::new("secondary-escape", LeaveEditor, Some("Browser")),
         KeyBinding::new("secondary-,", Settings, workspace),
         KeyBinding::new("secondary-q", Quit, None),
@@ -1535,6 +1545,9 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &BrowserAddress, w, cx| {
                 this.run(PaletteTarget::Command(Command::BrowserAddress), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleArtifact, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleArtifact), w, cx)
             }))
             .on_action(cx.listener(|this, _: &WidenSidebar, w, cx| {
                 this.run(PaletteTarget::Command(Command::WidenSidebar), w, cx)

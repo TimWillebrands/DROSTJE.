@@ -10,6 +10,7 @@ mod macos {
     use drostje::{
         app::{AppState, Bootstrap, SidebarTab},
         browser_tools::BrowserToolServer,
+        harness::{ContentBlock, Message, ToolActivity},
         model::{Project, ThreadKind},
         platform,
         store::Store,
@@ -37,7 +38,7 @@ mod macos {
             .unwrap();
         std::thread::sleep(Duration::from_millis(20));
     }
-    fn tool(
+    fn request(
         cx: &mut HeadlessAppContext,
         window: WindowHandle<Root>,
         endpoint: &str,
@@ -66,12 +67,79 @@ mod macos {
         let deadline = Instant::now() + Duration::from_secs(40);
         loop {
             if let Ok(response) = receiver.try_recv() {
-                assert!(response.get("error").is_none(), "{response}");
-                return response["result"].clone();
+                return response;
             }
             assert!(Instant::now() < deadline, "Tool timed out");
             pump(cx, window);
         }
+    }
+    fn tool(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        endpoint: &str,
+        thread: Uuid,
+        name: &str,
+        args: Value,
+    ) -> Value {
+        let response = request(cx, window, endpoint, thread, name, args);
+        assert!(response.get("error").is_none(), "{response}");
+        response["result"].clone()
+    }
+    fn assert_tab_closed(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        state: &Entity<AppState>,
+        endpoint: &str,
+        thread: Uuid,
+        browser: &str,
+    ) {
+        pump(cx, window);
+        let response = request(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"inspect","id":browser}),
+        );
+        assert!(response["error"].is_string(), "{response}");
+        assert!(response.get("result").is_none(), "{response}");
+        state.read_with(cx, |state, _| {
+            assert_eq!(
+                state.snapshot.settings["browser_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(
+                state.snapshot.settings["browser_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|session| session["id"] != browser)
+            );
+            assert!(
+                state.open_threads.contains(&thread),
+                "Close tab must retain Conversation"
+            );
+            assert_eq!(state.selected_thread, Some(thread));
+        });
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(
+                window
+                    .try_find(SharedString::from(format!("close-browser-{browser}")))
+                    .is_none()
+            );
+            assert_eq!(
+                window
+                    .find(SharedString::from(format!("Thread:{thread}")))
+                    .focused(),
+                Some(true),
+                "Closing the active browser must restore keyboard focus to Conversation"
+            );
+        })
+        .unwrap();
     }
     fn screenshot(cx: &mut HeadlessAppContext, window: WindowHandle<Root>, name: &str) {
         if let Some(output) = std::env::var_os("DROSTJE_QA_SCREENSHOTS") {
@@ -81,6 +149,585 @@ mod macos {
                 .save(Path::new(&output).join(name))
                 .unwrap();
         }
+    }
+    fn assert_browser_pane_navigation(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        endpoint: &str,
+        thread: Uuid,
+        browser: &str,
+    ) {
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({
+                "action":"evaluate", "id":browser,
+                "script":"document.body.innerHTML = '<input id=\"pane-input\" value=\"keep\">'; window.chordKeys = []; document.addEventListener('keydown', e => window.chordKeys.push(e.key)); true"
+            }),
+        );
+        let panel = SharedString::from(format!("Browser:{browser}"));
+        for page_focused in [false, true] {
+            for held_control in [false, true] {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.press("secondary-l", cx);
+                    if page_focused {
+                        window.click("servo-surface", cx);
+                    }
+                    assert_eq!(window.find("servo-surface").focused(), Some(page_focused));
+                })
+                .unwrap();
+                tool(
+                    cx,
+                    window,
+                    endpoint,
+                    thread,
+                    "browser",
+                    json!({
+                        "action":"evaluate", "id":browser,
+                        "script":"{ const input = document.getElementById('pane-input'); input.focus(); input.setSelectionRange(input.value.length, input.value.length); window.chordKeys = []; } true"
+                    }),
+                );
+                cx.update_window(window.into(), |_, window, cx| {
+                    // There are no panes above, below or to the right of this tab.
+                    for direction in ["j", "k", "l"] {
+                        window.press("ctrl-w", cx);
+                        let key = if held_control {
+                            format!("ctrl-{direction}")
+                        } else {
+                            direction.into()
+                        };
+                        window.press(&key, cx);
+                        assert_eq!(window.find(panel.clone()).focused(), Some(true));
+                        assert_eq!(window.find("servo-surface").focused(), Some(page_focused));
+                    }
+                    window.press("ctrl-w", cx);
+                    window.press(if held_control { "ctrl-h" } else { "h" }, cx);
+                    assert_eq!(
+                        window.find("Projects").focused(),
+                        Some(true),
+                        "Ctrl-W must leave both browser address and page focus"
+                    );
+                    window.press("ctrl-w", cx);
+                    window.press(if held_control { "ctrl-l" } else { "l" }, cx);
+                    assert_eq!(window.find(panel.clone()).focused(), Some(true));
+                    assert_eq!(window.find("servo-surface").focused(), Some(true));
+                })
+                .unwrap();
+                let page = tool(
+                    cx,
+                    window,
+                    endpoint,
+                    thread,
+                    "browser",
+                    json!({
+                        "action":"evaluate", "id":browser,
+                        "script":"({value:document.getElementById('pane-input').value, keys:window.chordKeys})"
+                    }),
+                );
+                assert_eq!(
+                    page,
+                    json!({"value":"keep","keys":[]}),
+                    "Pane chords must not type into or dispatch keydowns to the page"
+                );
+            }
+        }
+        // Reserving the pane chord must not turn bare Vim motion letters into app actions.
+        cx.update_window(window.into(), |_, window, cx| {
+            for key in ["h", "j", "k", "l", "backspace"] {
+                window.press(key, cx);
+            }
+            assert_eq!(window.find(panel).focused(), Some(true));
+        })
+        .unwrap();
+        let text = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({
+                "action":"evaluate", "id":browser,
+                "script":"document.getElementById('pane-input').value"
+            }),
+        );
+        assert_eq!(text, "keephjk");
+        screenshot(cx, window, "workspace-browser-pane-navigation.png");
+    }
+    fn artifact_height(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        expected: f32,
+    ) -> Bounds<Pixels> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            pump(cx, window);
+            let bounds = cx
+                .update_window(window.into(), |_, window, _| {
+                    window
+                        .try_find("artifact-surface")
+                        .map(|surface| surface.bounds())
+                })
+                .unwrap();
+            if let Some(bounds) = bounds
+                && (f32::from(bounds.size.height) - expected).abs() <= 2.
+            {
+                return bounds;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Artifact height should be {expected}, got {bounds:?}"
+            );
+        }
+    }
+
+    fn assert_inline_artifact(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        workspace: &Entity<Workspace>,
+        state: &Entity<AppState>,
+        endpoint: &str,
+        thread: Uuid,
+        artifact: &Value,
+    ) {
+        use gpui_kit::component::{Theme, ThemeMode};
+        let id = artifact["id"].as_str().unwrap();
+        // The result is from the real HTTP tool and real Servo session. Populate the
+        // component's input directly; no harness process or fabricated provider turn.
+        state.update(cx, |state, cx| {
+            let session = state.conversations.get_mut(&thread).unwrap();
+            session.messages.push(Arc::new(Message {
+                id: "artifact-qa-message".into(),
+                role: "assistant".into(),
+                content: vec![ContentBlock::ToolCall {
+                    id: "artifact-qa-call".into(),
+                    name: "show_artifact".into(),
+                    intent: None,
+                    input: json!({"title":"HTML artifact"}),
+                }],
+                raw: None,
+                tool_call_id: None,
+                error: false,
+                exit_code: None,
+            }));
+            session.tools.insert(
+                "artifact-qa-call".into(),
+                Arc::new(ToolActivity {
+                    id: "artifact-qa-call".into(),
+                    name: "show_artifact".into(),
+                    intent: None,
+                    input: json!({}),
+                    result: vec![ContentBlock::Text(artifact.to_string())],
+                    error: false,
+                    exit_code: None,
+                    complete: true,
+                    raw: None,
+                }),
+            );
+            // A generation change makes the production transcript consume fixture rows.
+            session.generation = Uuid::new_v4();
+            cx.notify();
+        });
+        pump(cx, window);
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                window.find("browser-address-toolbar").visible(),
+                "Sidebar keeps its address bar"
+            );
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute(Command::ToggleBrowser, window, cx)
+            });
+        })
+        .unwrap();
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({
+                "action":"evaluate","id":id,
+                "script":"document.body.style.margin='0'; document.body.innerHTML='<main data-drostje-artifact style=\"height:220px;width:100%\">Retained artifact</main>'; window.artifactState=41; true"
+            }),
+        );
+        artifact_height(cx, window, 220.);
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            cx.update_window(window.into(), |_, window, cx| {
+                Theme::change(mode, Some(window), cx);
+            })
+            .unwrap();
+            pump(cx, window);
+            cx.update_window(window.into(), |_, window, cx| {
+                assert!(
+                    window.try_find("browser-address-toolbar").is_none(),
+                    "Inline artifacts have no URL bar"
+                );
+                assert!(
+                    window.try_find("browser-back").is_none(),
+                    "Inline navigation starts hidden"
+                );
+                assert!(window.find("artifact-header").bounds().size.height < px(40.));
+                window.click("artifact-disclosure", cx);
+            })
+            .unwrap();
+            pump(cx, window);
+            cx.update_window(window.into(), |_, window, cx| {
+                assert!(
+                    window.try_find("artifact-surface").is_none(),
+                    "Collapsed surfaces have no hit/input handlers"
+                );
+                assert_eq!(
+                    window.find("artifact-disclosure-focus").focused(),
+                    Some(true)
+                );
+                window.press("enter", cx);
+            })
+            .unwrap();
+            artifact_height(cx, window, 220.);
+            let retained = tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({
+                    "action":"evaluate","id":id,"script":"++window.artifactState"
+                }),
+            );
+            assert_eq!(
+                retained.as_f64(),
+                if mode == ThemeMode::Light {
+                    Some(42.)
+                } else {
+                    Some(43.)
+                }
+            );
+            cx.update_window(window.into(), |_, window, cx| {
+                // Leave-editor focuses the disclosure; Tab traverses the native buttons.
+                window.click("artifact-surface", cx);
+                window.press("secondary-escape", cx);
+                for _ in 0..30 {
+                    if window.find("artifact-navigation").focused() == Some(true) {
+                        break;
+                    }
+                    window.press("tab", cx);
+                }
+                assert_eq!(window.find("artifact-navigation").focused(), Some(true));
+                window.press("enter", cx);
+            })
+            .unwrap();
+            pump(cx, window);
+            cx.update_window(window.into(), |_, window, cx| {
+                // Escape dismisses a keyboard-opened native navigation menu.
+                assert!(
+                    window.find("popup-menu").visible(),
+                    "Navigation is reachable using native keyboard traversal"
+                );
+                window.press("escape", cx);
+            })
+            .unwrap();
+            screenshot(
+                cx,
+                window,
+                if mode == ThemeMode::Light {
+                    "artifact-inline-light.png"
+                } else {
+                    "artifact-inline-dark.png"
+                },
+            );
+        }
+        for height in [410., 150.] {
+            tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({
+                    "action":"evaluate","id":id,
+                    "script":format!("document.querySelector('main').style.height='{height}px'; true")
+                }),
+            );
+            artifact_height(cx, window, height);
+        }
+        // Width changes must reflow the page and invalidate the actual transcript row.
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({
+                "action":"evaluate","id":id,
+                "script":"document.querySelector('main').style.height='calc(800px - 50vw)'; true"
+            }),
+        );
+        let dimensions = |cx: &mut HeadlessAppContext| {
+            tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({
+                    "action":"evaluate","id":id,
+                    "script":"({width:innerWidth,height:document.querySelector('main').getBoundingClientRect().height})"
+                }),
+            )
+        };
+        let wide = dimensions(cx);
+        artifact_height(cx, window, wide["height"].as_f64().unwrap() as f32);
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute(Command::ToggleBrowser, window, cx)
+            });
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            pump(cx, window);
+            let narrow = dimensions(cx);
+            if narrow["width"].as_f64() < wide["width"].as_f64() {
+                artifact_height(cx, window, narrow["height"].as_f64().unwrap() as f32);
+                assert!(narrow["height"].as_f64() > wide["height"].as_f64());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Sidebar must reflow inline artifact"
+            );
+        }
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute(Command::ToggleBrowser, window, cx)
+            });
+        })
+        .unwrap();
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({
+                "action":"evaluate","id":id,
+                "script":"document.querySelector('main').style.height='5000px'; true"
+            }),
+        );
+        artifact_height(cx, window, 1600.);
+        let long_extent = workspace.read_with(cx, |workspace, cx| {
+            workspace.artifact_transcript_scroll_extent(thread, cx)
+        });
+        assert!(
+            long_extent > 500.,
+            "Virtualized list must remeasure the growing artifact row: {long_extent}"
+        );
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({
+                "action":"scroll","id":id,"x":30,"y":30,"dx":0,"dy":10000
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let bottom = tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({
+                    "action":"evaluate","id":id,"script":"scrollY + innerHeight >= document.documentElement.scrollHeight - 2"
+                }),
+            );
+            if bottom == true {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Capped artifact content must remain reachable by scrolling"
+            );
+            pump(cx, window);
+        }
+        cx.update_window(window.into(), |_, window, cx| {
+            // Tail following clips the center of this 1600px row above the transcript.
+            // Click its visible lower edge through native hit testing, not that center.
+            let surface = window.find("artifact-surface").bounds();
+            window.click_at(
+                "artifact-surface",
+                point(surface.size.width / 2., surface.size.height - px(20.)),
+                cx,
+            );
+            assert_eq!(window.find("artifact-surface").focused(), Some(true));
+            window.press("secondary-shift-a", cx);
+        })
+        .unwrap();
+        pump(cx, window);
+        let collapsed_extent = workspace.read_with(cx, |workspace, cx| {
+            workspace.artifact_transcript_scroll_extent(thread, cx)
+        });
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(window.try_find("artifact-surface").is_none());
+            assert_eq!(
+                window.find("artifact-disclosure-focus").focused(),
+                Some(true)
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            collapsed_extent, 0.,
+            "Collapsed single-row artifact must leave no cached transcript scroll extent"
+        );
+        cx.update_window(window.into(), |_, window, cx| window.press("space", cx))
+            .unwrap();
+        artifact_height(cx, window, 1600.);
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({
+                "action":"evaluate","id":id,"script":"document.querySelector('main').style.height='180px'; true"
+            }),
+        );
+        artifact_height(cx, window, 180.);
+        let short_extent = workspace.read_with(cx, |workspace, cx| {
+            workspace.artifact_transcript_scroll_extent(thread, cx)
+        });
+        assert_eq!(
+            short_extent, 0.,
+            "Shrinking to a fitted single-row artifact must clear the cached scroll extent"
+        );
+        // Evict a collapsed row from the real virtualized transcript and reattach it.
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("artifact-disclosure", cx)
+        })
+        .unwrap();
+        state.update(cx, |state, cx| {
+            let session = state.conversations.get_mut(&thread).unwrap();
+            for index in 0..80 {
+                session.messages.push(Arc::new(Message {
+                    id: format!("artifact-qa-filler-{index}"),
+                    role: "user".into(),
+                    content: vec![ContentBlock::Text(format!(
+                        "Transcript filler {index}\n\n{}",
+                        "A real virtualized row. ".repeat(40)
+                    ))],
+                    raw: None,
+                    tool_call_id: None,
+                    error: false,
+                    exit_code: None,
+                }));
+            }
+            session.generation = Uuid::new_v4();
+            cx.notify();
+        });
+        pump(cx, window);
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(
+                window.try_find("artifact-header").is_none(),
+                "The artifact row must actually leave the render window"
+            );
+        })
+        .unwrap();
+        state.update(cx, |state, cx| {
+            let session = state.conversations.get_mut(&thread).unwrap();
+            session
+                .messages
+                .retain(|message| !message.id.starts_with("artifact-qa-filler-"));
+            session.generation = Uuid::new_v4();
+            cx.notify();
+        });
+        pump(cx, window);
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(window.find("artifact-header").visible());
+            assert!(
+                window.try_find("artifact-surface").is_none(),
+                "Row virtualization must not reset collapse state"
+            );
+            window.click("artifact-disclosure", cx);
+        })
+        .unwrap();
+        artifact_height(cx, window, 180.);
+        assert_eq!(
+            tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({
+                    "action":"evaluate","id":id,"script":"window.artifactState"
+                })
+            )
+            .as_f64(),
+            Some(43.),
+            "Row virtualization must not recreate the WebView"
+        );
+        // The hidden navigation menu uses the same real reload Action as browser tabs.
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("artifact-navigation", cx);
+            window.press("up", cx); // Select the last menu item, Reload.
+            window.press("enter", cx);
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let snapshot = tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({"action":"inspect", "id":id}),
+            );
+            let restored = if snapshot["loading"] == false {
+                tool(
+                    cx,
+                    window,
+                    endpoint,
+                    thread,
+                    "browser",
+                    json!({
+                        "action":"evaluate", "id":id,
+                        "script":"document.querySelector('h1')?.textContent === 'Real Servo workspace' && typeof window.artifactState === 'undefined'"
+                    }),
+                )
+            } else {
+                Value::Bool(false)
+            };
+            if restored == true {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Artifact menu must reload its own real page"
+            );
+            pump(cx, window);
+        }
+        state.update(cx, |state, cx| {
+            let session = state.conversations.get_mut(&thread).unwrap();
+            session
+                .messages
+                .retain(|message| message.id != "artifact-qa-message");
+            session.tools.remove("artifact-qa-call");
+            session.generation = Uuid::new_v4();
+            cx.notify();
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute(Command::ToggleBrowser, window, cx)
+            });
+        })
+        .unwrap();
+        pump(cx, window);
     }
     pub fn run() {
         let directory =
@@ -197,6 +844,9 @@ mod macos {
             SidebarTab::Browser
         );
         pump(&mut cx, window);
+        assert_inline_artifact(
+            &mut cx, window, &workspace, &state, &endpoint, thread, &artifact,
+        );
         screenshot(&mut cx, window, "workspace-sidebar.png");
         let before = state.read_with(&cx, |state, _| state.thread_sidebar_width(thread));
         let before_bounds = cx
@@ -290,29 +940,69 @@ mod macos {
         .unwrap();
         pump(&mut cx, window);
         screenshot(&mut cx, window, "workspace-tab.png");
-        let sessions = state.read_with(&cx, |state, _| {
-            state.snapshot.settings["browser_sessions"]
+        let browser = state.read_with(&cx, |state, _| {
+            let sessions = state.snapshot.settings["browser_sessions"]
                 .as_array()
+                .unwrap();
+            assert_eq!(sessions.len(), 3);
+            sessions
+                .iter()
+                .find(|session| session["thread"].is_null())
+                .unwrap()["id"]
+                .as_str()
                 .unwrap()
-                .len()
+                .to_owned()
         });
-        assert_eq!(sessions, 3);
+        assert_browser_pane_navigation(&mut cx, window, &endpoint, thread, &browser);
         cx.update_window(window.into(), |_, window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                workspace.execute(Command::CloseThread, window, cx)
-            })
+            let close = SharedString::from(format!("close-browser-{browser}"));
+            assert!(
+                window.find(close.clone()).visible(),
+                "Browser close must not require hover"
+            );
+            window.click(close, cx);
         })
         .unwrap();
-        pump(&mut cx, window);
-        assert_eq!(
-            state.read_with(&cx, |state, _| state.snapshot.settings["browser_sessions"]
-                .as_array()
-                .unwrap()
-                .len()),
-            2,
-            "Closing a browser tab must retain the conversation and sidebar"
-        );
-        assert!(state.read_with(&cx, |state, _| state.open_threads.contains(&thread)));
+        assert_tab_closed(&mut cx, window, &state, &endpoint, thread, &browser);
+        screenshot(&mut cx, window, "workspace-tab-closed.png");
+
+        // The same Close tab action must route through both nested native-input
+        // focus scopes, not just a direct call to Workspace::execute.
+        for page_focused in [false, true] {
+            cx.update_window(window.into(), |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.execute(Command::NewBrowser, window, cx)
+                })
+            })
+            .unwrap();
+            pump(&mut cx, window);
+            let browser = state.read_with(&cx, |state, _| {
+                state.snapshot.settings["browser_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|session| session["thread"].is_null())
+                    .unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            });
+            cx.update_window(window.into(), |_, window, cx| {
+                if page_focused {
+                    window.click("servo-surface", cx);
+                }
+                assert_eq!(window.find("servo-surface").focused(), Some(page_focused));
+                assert_eq!(
+                    window
+                        .find(SharedString::from(format!("Browser:{browser}")))
+                        .focused(),
+                    Some(true)
+                );
+                window.press(commands::CLOSE_THREAD_KEY, cx);
+            })
+            .unwrap();
+            assert_tab_closed(&mut cx, window, &state, &endpoint, thread, &browser);
+        }
         tool(
             &mut cx,
             window,
@@ -344,7 +1034,7 @@ mod macos {
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
         println!(
-            "Servo workspace proof: HTML tool, separate artifact/sidebar sessions, real evaluate and PNG, keyboard sidebar resize, manual browser tab, close without closing thread"
+            "Servo workspace proof: HTML tool, separate artifact/sidebar sessions, real evaluate and PNG, keyboard sidebar resize, rendered browser tab close, address/page keyboard close, runtime removal and Conversation focus restoration"
         );
     }
 }

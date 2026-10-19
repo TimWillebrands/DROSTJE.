@@ -1,6 +1,7 @@
 //! GPUI presentation for a retained Servo session. The runtime owns all I/O and web state.
 use super::commands::{
     BrowserAddress, BrowserBack, BrowserForward, BrowserReload, Command, LeaveEditor,
+    ToggleArtifact,
 };
 use crate::browser::{BrowserCommand, BrowserId, BrowserRuntime};
 use gpui_kit::{
@@ -10,6 +11,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         h_flex,
         input::{Input, InputEvent, InputState},
+        menu::DropdownMenu,
         spinner::Spinner,
         v_flex,
     },
@@ -28,12 +30,18 @@ pub(super) struct BrowserNavigation;
 impl EventEmitter<BrowserNavigation> for BrowserPane {}
 pub(super) struct BrowserFocus;
 impl EventEmitter<BrowserFocus> for BrowserPane {}
+pub(super) struct BrowserLayout;
+impl EventEmitter<BrowserLayout> for BrowserPane {}
 
 pub struct BrowserPane {
     pub id: BrowserId,
     runtime: BrowserRuntime,
     address: Entity<InputState>,
     focus: FocusHandle,
+    header_focus: FocusHandle,
+    artifact: Option<String>,
+    collapsed: bool,
+    content_height: Option<f32>,
     frame: Option<Arc<RenderImage>>,
     revision: u64,
     bounds: Bounds<Pixels>,
@@ -63,6 +71,7 @@ impl BrowserPane {
         address.update(cx, |input, cx| input.set_value(url.clone(), window, cx));
         let address_focus = address.focus_handle(cx);
         let focus = cx.focus_handle();
+        let header_focus = cx.focus_handle();
         let subscriptions = vec![
             cx.subscribe_in(&address, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -95,6 +104,10 @@ impl BrowserPane {
                 cx.notify();
             }),
             cx.on_blur(&address_focus, window, |_, _, cx| cx.notify()),
+            cx.on_focus_in(&header_focus, window, |_, _, cx| {
+                cx.emit(BrowserFocus);
+                cx.notify();
+            }),
         ];
         let updates = cx.spawn_in(window, async move |pane, cx| {
             loop {
@@ -114,6 +127,10 @@ impl BrowserPane {
             runtime,
             address,
             focus,
+            header_focus,
+            artifact: None,
+            collapsed: false,
+            content_height: None,
             frame: None,
             revision: 0,
             bounds: Bounds::default(),
@@ -131,16 +148,68 @@ impl BrowserPane {
             _updates: updates,
         }
     }
+    /// Presentation belongs to the retained pane, never to a virtualized row.
+    pub(super) fn set_artifact(&mut self, title: String) {
+        if self.artifact.is_none() {
+            self.runtime
+                .command(self.id, BrowserCommand::SetContentSizing { enabled: true });
+        }
+        self.artifact = Some(title);
+    }
+
+    fn toggle_artifact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.artifact.is_none() {
+            return;
+        }
+        self.collapsed = !self.collapsed;
+        // Never leave IME or keyboard focus attached to a removed surface.
+        self.composition.clear();
+        self.header_focus.focus(window, cx);
+        self.runtime
+            .command(self.id, BrowserCommand::Focus { focused: false });
+        self.runtime.command(
+            self.id,
+            BrowserCommand::SetContentSizing {
+                enabled: !self.collapsed,
+            },
+        );
+        cx.emit(BrowserLayout);
+        cx.notify();
+    }
+
+    fn artifact_height(&self, window: &Window) -> f32 {
+        // Keep physical RGBA frames below the engine's 64 MiB limit, with headroom.
+        let scale = window.scale_factor();
+        let width = f32::from(self.bounds.size.width).max(1.);
+        let cap = (48. * 1024. * 1024. / (4. * width * scale * scale))
+            .floor()
+            .clamp(1., 1600.)
+            .min((8192. / scale).floor());
+        self.content_height
+            .unwrap_or(240.)
+            .ceil()
+            .max(120.)
+            .min(cap)
+    }
     pub fn focus_address(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.artifact.is_some() {
+            self.header_focus.focus(window, cx);
+            return;
+        }
         self.address
             .update(cx, |address, cx| address.focus(window, cx));
     }
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus.focus(window, cx);
+        if self.collapsed {
+            self.header_focus.focus(window, cx);
+        } else {
+            self.focus.focus(window, cx);
+        }
     }
-    pub fn command(&self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
             Command::BrowserAddress => self.focus_address(window, cx),
+            Command::ToggleArtifact => self.toggle_artifact(window, cx),
             Command::BrowserBack => self.runtime.command(self.id, BrowserCommand::Back),
             Command::BrowserForward => self.runtime.command(self.id, BrowserCommand::Forward),
             Command::BrowserReload => self.runtime.command(self.id, BrowserCommand::Reload),
@@ -149,6 +218,12 @@ impl BrowserPane {
     }
     pub fn disabled_reason(&self, command: Command) -> Option<String> {
         match command {
+            Command::BrowserAddress if self.artifact.is_some() => {
+                Some("Inline artifacts have no address bar".into())
+            }
+            Command::ToggleArtifact if self.artifact.is_none() => {
+                Some("Focus an inline artifact first".into())
+            }
             Command::BrowserBack if !self.back => Some("No previous page".into()),
             Command::BrowserForward if !self.forward => Some("No next page".into()),
             _ => None,
@@ -166,6 +241,23 @@ impl BrowserPane {
         let Some(snapshot) = self.runtime.snapshot(self.id) else {
             return;
         };
+        // Resize invalidates the engine measurement. Keep the previous usable height
+        // until its replacement arrives, rather than oscillating through the fallback.
+        if (snapshot.content_height.is_some() || self.url != snapshot.url)
+            && self.content_height != snapshot.content_height
+        {
+            self.content_height = snapshot.content_height;
+            if self.artifact.is_some() && !self.collapsed {
+                cx.emit(BrowserLayout);
+                cx.notify();
+            }
+        }
+        if self.artifact.is_some()
+            && (self.error != snapshot.error
+                || (self.url == "about:blank") != (snapshot.url == "about:blank"))
+        {
+            cx.emit(BrowserLayout);
+        }
         let navigated = self.url != snapshot.url || self.title != snapshot.title;
         let mut changed = self.url != snapshot.url
             || self.title != snapshot.title
@@ -187,6 +279,7 @@ impl BrowserPane {
         self.back = snapshot.can_go_back;
         self.forward = snapshot.can_go_forward;
         if let Some(frame) = snapshot.frame
+            && !self.collapsed
             && (self.frame.is_none() || frame.revision != self.revision)
         {
             // GPUI consumes BGRA while the engine/screenshot contract uses RGBA.
@@ -207,13 +300,19 @@ impl BrowserPane {
             cx.emit(BrowserNavigation);
         }
     }
-    fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window) {
+    fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.bounds = bounds;
         let scale = window.scale_factor();
         let width = (f32::from(bounds.size.width) * scale).round().max(1.) as u32;
         let height = (f32::from(bounds.size.height) * scale).round().max(1.) as u32;
         let dimensions = (width, height, scale.to_bits());
         if dimensions != self.dimensions {
+            if self.artifact.is_some()
+                && (self.dimensions.0 != width || self.dimensions.2 != scale.to_bits())
+            {
+                // The physical frame cap can change even if natural document height does not.
+                cx.emit(BrowserLayout);
+            }
             self.dimensions = dimensions;
             self.runtime.command(
                 self.id,
@@ -266,7 +365,9 @@ impl BrowserPane {
         if key.modifiers.control && key.key == "tab" {
             return;
         }
-        if shortcut && (key.key == "," || (key.key == "p" && key.modifiers.shift)) {
+        if shortcut
+            && (key.key == "," || (key.modifiers.shift && matches!(key.key.as_str(), "p" | "a")))
+        {
             return;
         }
         if pressed && shortcut && key.key == "v" {
@@ -343,90 +444,196 @@ impl BrowserPane {
 }
 impl Focusable for BrowserPane {
     fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus.clone()
+        if self.collapsed {
+            self.header_focus.clone()
+        } else {
+            self.focus.clone()
+        }
     }
 }
 impl Render for BrowserPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prepare = cx.entity();
         let input = cx.entity();
-        let address_focused = self.address.focus_handle(cx).is_focused(window);
-        let toolbar = h_flex()
-            .items_center()
-            .gap_1()
-            .p_1()
-            .when(self.focus.is_focused(window), |row| {
-                row.bg(cx.theme().secondary)
-            })
-            .child(
-                Button::new("browser-back")
-                    .ghost()
-                    .small()
-                    .icon(IconName::ArrowLeft)
-                    .disabled(!self.back)
-                    .tooltip_with_action(
-                        self.disabled_reason(Command::BrowserBack)
-                            .unwrap_or_else(|| Command::BrowserBack.label().into()),
-                        &BrowserBack,
-                        Some("BrowserPane"),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.focus(window, cx);
-                        window.dispatch_action(Command::BrowserBack.action(), cx);
-                    })),
-            )
-            .child(
-                Button::new("browser-forward")
-                    .ghost()
-                    .small()
-                    .icon(IconName::ArrowRight)
-                    .disabled(!self.forward)
-                    .tooltip_with_action(
-                        self.disabled_reason(Command::BrowserForward)
-                            .unwrap_or_else(|| Command::BrowserForward.label().into()),
-                        &BrowserForward,
-                        Some("BrowserPane"),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.focus(window, cx);
-                        window.dispatch_action(Command::BrowserForward.action(), cx);
-                    })),
-            )
-            .child(
-                Button::new("browser-reload")
-                    .ghost()
-                    .small()
-                    .label("Reload")
-                    .tooltip_with_action(
-                        Command::BrowserReload.label(),
-                        &BrowserReload,
-                        Some("BrowserPane"),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.focus(window, cx);
-                        window.dispatch_action(Command::BrowserReload.action(), cx);
-                    })),
-            )
-            .child(
-                div().flex_1().min_w_0().child(
-                    Input::new(&self.address)
+        let toolbar = self.artifact.is_none().then(|| {
+            let address_focused = self.address.focus_handle(cx).is_focused(window);
+            h_flex()
+                .id("browser-address-toolbar")
+                .test_support()
+                .items_center()
+                .gap_1()
+                .p_1()
+                .when(self.focus.is_focused(window), |row| {
+                    row.bg(cx.theme().secondary)
+                })
+                .child(
+                    Button::new("browser-back")
+                        .ghost()
                         .small()
-                        .focus_bordered(false)
-                        .when(address_focused, |input| {
-                            input
+                        .icon(IconName::ArrowLeft)
+                        .disabled(!self.back)
+                        .tooltip_with_action(
+                            self.disabled_reason(Command::BrowserBack)
+                                .unwrap_or_else(|| Command::BrowserBack.label().into()),
+                            &BrowserBack,
+                            Some("BrowserPane"),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.focus(window, cx);
+                            window.dispatch_action(Command::BrowserBack.action(), cx);
+                        })),
+                )
+                .child(
+                    Button::new("browser-forward")
+                        .ghost()
+                        .small()
+                        .icon(IconName::ArrowRight)
+                        .disabled(!self.forward)
+                        .tooltip_with_action(
+                            self.disabled_reason(Command::BrowserForward)
+                                .unwrap_or_else(|| Command::BrowserForward.label().into()),
+                            &BrowserForward,
+                            Some("BrowserPane"),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.focus(window, cx);
+                            window.dispatch_action(Command::BrowserForward.action(), cx);
+                        })),
+                )
+                .child(
+                    Button::new("browser-reload")
+                        .ghost()
+                        .small()
+                        .label("Reload")
+                        .tooltip_with_action(
+                            Command::BrowserReload.label(),
+                            &BrowserReload,
+                            Some("BrowserPane"),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.focus(window, cx);
+                            window.dispatch_action(Command::BrowserReload.action(), cx);
+                        })),
+                )
+                .child(
+                    div().flex_1().min_w_0().child(
+                        Input::new(&self.address)
+                            .small()
+                            .focus_bordered(false)
+                            .when(address_focused, |input| {
+                                input
+                                    .border_color(cx.theme().muted_foreground)
+                                    .bg(cx.theme().secondary)
+                            }),
+                    ),
+                )
+                .when(self.loading, |row| row.child(Spinner::new().small()))
+        });
+        let artifact_header = self.artifact.as_ref().map(|title| {
+            let pane = cx.entity().downgrade();
+            h_flex()
+                .id("artifact-header")
+                .test_support()
+                .w_full()
+                .min_w_0()
+                .flex_none()
+                .gap_1()
+                .px_1()
+                .bg(cx.theme().muted)
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    div()
+                        .id("artifact-disclosure-focus")
+                        .test_support()
+                        .key_context("ArtifactDisclosure")
+                        .track_focus(&self.header_focus)
+                        .flex_1()
+                        .min_w_0()
+                        .border_1()
+                        .border_color(cx.theme().muted)
+                        .when(self.header_focus.is_focused(window), |root| {
+                            root.bg(cx.theme().secondary)
                                 .border_color(cx.theme().muted_foreground)
-                                .bg(cx.theme().secondary)
+                        })
+                        .child(
+                            Button::new("artifact-disclosure")
+                                .ghost()
+                                .xsmall()
+                                .compact()
+                                .w_full()
+                                .icon(if self.collapsed {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .label(title.clone())
+                                .toggled(!self.collapsed)
+                                .tooltip_with_action(
+                                    if self.collapsed {
+                                        "Expand artifact"
+                                    } else {
+                                        "Collapse artifact"
+                                    },
+                                    &ToggleArtifact,
+                                    Some("BrowserPane"),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.header_focus.focus(window, cx);
+                                    window.dispatch_action(Command::ToggleArtifact.action(), cx);
+                                })),
+                        ),
+                )
+                .when(self.loading, |row| row.child(Spinner::new().xsmall()))
+                .child(
+                    Button::new("artifact-navigation")
+                        .ghost()
+                        .xsmall()
+                        .compact()
+                        .icon(IconName::Ellipsis)
+                        .tooltip("Artifact navigation")
+                        .dropdown_menu(move |mut menu, _, cx| {
+                            let Some(pane) = pane.upgrade() else {
+                                return menu;
+                            };
+                            pane.update(cx, |_, cx| cx.emit(BrowserFocus));
+                            menu = menu.action_context(pane.read(cx).header_focus.clone());
+                            for command in [
+                                Command::BrowserBack,
+                                Command::BrowserForward,
+                                Command::BrowserReload,
+                            ] {
+                                let reason = pane.read(cx).disabled_reason(command);
+                                let label = match &reason {
+                                    Some(reason) => format!("{} — {reason}", command.label()),
+                                    None => command.label().into(),
+                                };
+                                menu = menu.menu_with_disabled(
+                                    label,
+                                    command.action(),
+                                    reason.is_some(),
+                                );
+                            }
+                            menu
                         }),
-                ),
-            )
-            .when(self.loading, |row| row.child(Spinner::new().small()));
+                )
+        });
         let surface = div()
-            .id("servo-surface")
+            .id(if self.artifact.is_some() {
+                "artifact-surface"
+            } else {
+                "servo-surface"
+            })
             .test_support()
             .key_context("Browser NativeInput")
             .track_focus(&self.focus)
             .relative()
-            .flex_1()
+            .when(self.artifact.is_none(), |surface| surface.flex_1())
+            .when(self.artifact.is_some(), |surface| {
+                surface
+                    .flex_none()
+                    .w_full()
+                    .h(px(self.artifact_height(window)))
+            })
             .min_h_0()
             .min_w_0()
             .overflow_hidden()
@@ -490,6 +697,15 @@ impl Render for BrowserPane {
                 this.runtime.command(this.id, BrowserCommand::Move { x, y });
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                // A fitted artifact belongs to the transcript's scroll surface. Only the
+                // bounded fallback viewport scrolls internally.
+                if this.artifact.is_some()
+                    && this
+                        .content_height
+                        .is_none_or(|height| height <= f32::from(this.bounds.size.height) + 1.)
+                {
+                    return;
+                }
                 let (x, y) = this.position(event.position);
                 let (dx, dy) = match event.delta {
                     ScrollDelta::Pixels(p) => (-f32::from(p.x), -f32::from(p.y)),
@@ -511,7 +727,7 @@ impl Render for BrowserPane {
             .child(
                 canvas(
                     move |bounds, window, cx| {
-                        prepare.update(cx, |pane, _| pane.prepare(bounds, window))
+                        prepare.update(cx, |pane, cx| pane.prepare(bounds, window, cx))
                     },
                     move |bounds, (), window, cx| {
                         input.update(cx, |pane, cx| {
@@ -528,10 +744,18 @@ impl Render for BrowserPane {
                 .size_full(),
             );
         v_flex()
-            .id("browser-pane")
+            .id(if self.artifact.is_some() {
+                "inline-artifact"
+            } else {
+                "browser-pane"
+            })
             .test_support()
             .key_context("BrowserPane")
-            .size_full()
+            .w_full()
+            .when(self.artifact.is_none(), |root| root.h_full())
+            .when(self.artifact.is_some(), |root| {
+                root.flex_none().border_1().border_color(cx.theme().border)
+            })
             .min_w_0()
             .min_h_0()
             .bg(cx.theme().background)
@@ -549,24 +773,29 @@ impl Render for BrowserPane {
             .on_action(cx.listener(|this, _: &BrowserAddress, w, cx| {
                 this.command(Command::BrowserAddress, w, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleArtifact, w, cx| {
+                this.command(Command::ToggleArtifact, w, cx)
+            }))
             .on_action(cx.listener(|this, _: &LeaveEditor, w, cx| this.focus_address(w, cx)))
-            .child(toolbar)
+            .when_some(toolbar, |root, toolbar| root.child(toolbar))
+            .when_some(artifact_header, |root, header| root.child(header))
             .when_some(
                 self.address_error.clone().or_else(|| self.error.clone()),
                 |root, error| root.child(Alert::error("browser-error", error).small()),
             )
-            .when(self.url == "about:blank", |root| {
-                root.child(
-                    div()
-                        .p_2()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Enter a URL to browse with Servo"),
-                )
+            .when(self.url == "about:blank" && !self.collapsed, |root| {
+                root.child(div().p_2().text_color(cx.theme().muted_foreground).child(
+                    if self.artifact.is_some() {
+                        "This artifact is empty"
+                    } else {
+                        "Enter a URL to browse with Servo"
+                    },
+                ))
             })
             .when(!self.composition.is_empty(), |root| {
                 root.child(div().p_1().child(self.composition.clone()))
             })
-            .child(surface)
+            .when(!self.collapsed, |root| root.child(surface))
     }
 }
 impl EntityInputHandler for BrowserPane {

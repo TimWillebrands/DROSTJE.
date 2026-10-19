@@ -50,7 +50,12 @@ impl Browsers {
         let mut panes = BTreeMap::new();
         for record in &records {
             let pane = cx.new(|cx| {
-                BrowserPane::new(record.id, record.url.clone(), runtime.clone(), window, cx)
+                let mut pane =
+                    BrowserPane::new(record.id, record.url.clone(), runtime.clone(), window, cx);
+                if record.artifact.is_some() {
+                    pane.set_artifact(record.title.clone());
+                }
+                pane
             });
             if record.thread.is_none() && record.artifact.is_none() {
                 let panel = cx.new(|cx| {
@@ -119,6 +124,15 @@ pub(super) fn browser_of(state: &PanelState) -> Option<BrowserId> {
     }
 }
 impl Workspace {
+    /// Runtime QA observes the actual virtualized transcript cache, not a detached pane.
+    #[cfg(feature = "runtime-qa")]
+    pub fn artifact_transcript_scroll_extent(&self, thread: ThreadId, cx: &App) -> f32 {
+        self.threads
+            .borrow()
+            .get(&thread)
+            .and_then(|panel| panel.read(cx).transcript.as_ref())
+            .map_or(0., |transcript| transcript.read(cx).scroll_extent())
+    }
     pub(super) fn observe_browsers(&mut self, cx: &mut Context<Self>) {
         for (&id, pane) in &self.browsers.panes {
             if !self.browsers.observed.insert(id) {
@@ -145,6 +159,24 @@ impl Workspace {
                     let owner = cx.entity().downgrade();
                     cx.defer(move |cx| {
                         let _ = owner.update(cx, |workspace, cx| workspace.browser_focused(id, cx));
+                    });
+                },
+            ));
+            self._subscriptions.push(cx.subscribe(
+                pane,
+                move |_, _, _: &super::super::browser::BrowserLayout, cx| {
+                    let owner = cx.entity().downgrade();
+                    // Browser refresh and canvas layout must not borrow the list during layout.
+                    cx.defer(move |cx| {
+                        let _ = owner.update(cx, |workspace, cx| {
+                            if let Some(thread) =
+                                workspace.browsers.records.get(&id).and_then(|r| r.thread)
+                            {
+                                workspace.state.update(cx, |_, cx| {
+                                    cx.emit(PresentationChange::Thread(thread));
+                                });
+                            }
+                        });
                     });
                 },
             ));
@@ -274,8 +306,14 @@ impl Workspace {
             return id;
         }
         let id = Uuid::new_v4();
-        let pane = cx
-            .new(|cx| BrowserPane::new(id, url.clone(), self.browsers.runtime.clone(), window, cx));
+        let pane = cx.new(|cx| {
+            let mut pane =
+                BrowserPane::new(id, url.clone(), self.browsers.runtime.clone(), window, cx);
+            if artifact.is_some() {
+                pane.set_artifact("HTML artifact".into());
+            }
+            pane
+        });
         let record = BrowserRecord {
             id,
             url,
@@ -327,6 +365,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let restore_focus = self.browsers.active == Some(id);
         let record = self.browsers.records.remove(&id);
         self.browsers.runtime.close(id);
         self.browsers.panes.remove(&id);
@@ -355,6 +394,12 @@ impl Workspace {
         }
         self.save_browsers(cx);
         self.sync_thread_panels(window, cx);
+        if restore_focus {
+            let target = self
+                .thread_target(cx)
+                .unwrap_or_else(|| self.projects.clone());
+            self.focus_panel(target, window, cx);
+        }
         self.flush_layout(cx);
         cx.notify();
     }
@@ -481,6 +526,12 @@ impl Workspace {
                     Ok(url)=>{
                         let id=self.open_browser(url.to_string(),Some(thread),Some(path.clone()),window,cx);
                         if let Some(record)=self.browsers.records.get_mut(&id) {record.title=title.clone().unwrap_or_else(||"Artifact".into());}
+                        if let Some(pane) = self.browsers.panes.get(&id) {
+                            pane.update(cx, |pane, cx| {
+                                pane.set_artifact(title.clone().unwrap_or_else(|| "HTML artifact".into()));
+                                cx.notify();
+                            });
+                        }
                         self.save_browsers(cx);
                         self.state.update(cx,|_,cx|cx.emit(PresentationChange::Thread(thread)));
                         Ok(json!({"id":id,"path":path,"title":title,"loading":true}))

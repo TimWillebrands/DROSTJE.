@@ -1,21 +1,16 @@
-//! Servo is intentionally not linked into GPUI: both engines require different
-//! freetype-sys versions. stdout is exclusively the binary protocol; diagnostics
-//! go to stderr. All Servo handles stay on this process's main thread.
-mod protocol;
-
+//! All Servo, WebView and rendering handles are created, pumped and dropped on
+//! the browser worker. Only bounded commands and retained snapshots cross threads.
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
-    io,
     rc::Rc,
-    sync::{Arc, mpsc},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 
 use dpi::PhysicalSize;
 use euclid::{Box2D, Point2D, Scale, Size2D};
-use parking_lot::{Condvar, Mutex};
 use serde_json::Value;
 use servo::{
     Code, CompositionEvent, CompositionState, ConsoleLogLevel, EventLoopWaker, ImeEvent,
@@ -27,89 +22,112 @@ use servo::{
 use url::Url;
 use uuid::Uuid;
 
-use protocol::{BrowserCommand, Event, MAX_PENDING, PageState, Request};
+use super::command::{self, BrowserCommand, Event, PageState, Request};
+use super::{Shared, apply_event, fail};
 
 const MAX_WEBVIEWS: usize = 16;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+const CONTENT_MEASUREMENT_INTERVAL: Duration = Duration::from_millis(250);
 
-type Packet = (Event, Vec<u8>);
+// Do not use document/body.scrollHeight: the root scrolling element is at least
+// viewport-high, so it cannot report a shrink after the embedder grows the viewport.
+// A marked, naturally-sized root is authoritative. Ordinary body content uses
+// child rectangles and text-node ranges, never a range selecting the whole body:
+// Servo 0.7 returns that range's container box, including its viewport-height floor.
+// Neither path changes page styles or installs timers/observers inside the page.
+const CONTENT_HEIGHT_SCRIPT: &str = r#"(() => {
+    const body = document.body;
+    if (!body) return null;
+    const root = document.querySelector('[data-drostje-artifact]') || body;
+    const box = root.getBoundingClientRect();
+    const style = getComputedStyle(root);
+    const pixels = value => parseFloat(value) || 0;
+    let bottom = box.bottom;
+    if (root === body) {
+        bottom = box.top + pixels(style.paddingTop) + pixels(style.borderTopWidth);
+        const range = document.createRange();
+        const include = node => {
+            if (node.nodeType === Node.TEXT_NODE && node.textContent.trim()) {
+                range.selectNodeContents(node);
+                bottom = Math.max(bottom, range.getBoundingClientRect().bottom);
+            } else if (node.nodeType === Node.ELEMENT_NODE) {
+                const childStyle = getComputedStyle(node);
+                if (childStyle.display === 'contents') {
+                    for (const child of node.childNodes) include(child);
+                } else if (node.getClientRects().length) {
+                    bottom = Math.max(bottom, node.getBoundingClientRect().bottom
+                        + Math.max(0, pixels(childStyle.marginBottom)));
+                }
+            }
+        };
+        for (const child of body.childNodes) include(child);
+        bottom += pixels(style.paddingBottom) + pixels(style.borderBottomWidth);
+    } else {
+        bottom = Math.max(bottom, box.top + root.scrollHeight
+            + pixels(style.borderTopWidth) + pixels(style.borderBottomWidth));
+        const bodyStyle = getComputedStyle(body);
+        const inset = pixels(bodyStyle.paddingBottom) + pixels(bodyStyle.borderBottomWidth);
+        const bodyMargin = Math.max(0, pixels(bodyStyle.marginBottom));
+        const rootMargin = Math.max(0, pixels(style.marginBottom));
+        bottom += inset + (inset ? bodyMargin + rootMargin : Math.max(bodyMargin, rootMargin));
+    }
+    if (root === body) bottom += Math.max(0, pixels(style.marginBottom));
+    return Math.ceil(Math.max(0, bottom + window.scrollY));
+})()"#;
 
-#[derive(Default)]
-struct Outbox {
-    states: HashMap<Uuid, Packet>,
-    frames: HashMap<Uuid, Packet>,
-    replies: VecDeque<Packet>,
-    closed: bool,
+struct ContentSizing {
+    enabled: bool,
+    generation: u64,
+    pending: bool,
+    next_measurement: Instant,
 }
 
-#[derive(Default)]
-struct Output {
-    pending: Mutex<Outbox>,
-    ready: Condvar,
+impl ContentSizing {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            generation: 0,
+            pending: false,
+            next_measurement: Instant::now(),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.next_measurement = Instant::now();
+        // Keep the outstanding slot occupied until Servo calls it back, even
+        // across navigation or disable/re-enable. Never pile up native evaluations.
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.invalidate();
+        }
+    }
+
+    fn begin(&mut self, now: Instant) -> Option<u64> {
+        if !self.enabled || self.pending || now < self.next_measurement {
+            return None;
+        }
+        self.pending = true;
+        self.next_measurement = now + CONTENT_MEASUREMENT_INTERVAL;
+        Some(self.generation)
+    }
+
+    fn finish(&mut self, generation: u64) -> bool {
+        self.pending = false;
+        self.enabled && self.generation == generation
+    }
 }
+
+struct Output(Arc<Shared>);
 
 impl Output {
     fn send(&self, event: Event, bytes: Vec<u8>) {
-        let mut pending = self.pending.lock();
-        if pending.closed {
-            return;
-        }
-        match &event {
-            Event::State { id, .. } => {
-                pending.states.insert(*id, (event, bytes));
-            }
-            Event::Frame { id, .. } => {
-                pending.frames.insert(*id, (event, bytes));
-            }
-            Event::Evaluation { .. } | Event::Fatal { .. } => {
-                if pending.replies.len() >= MAX_PENDING {
-                    eprintln!("Servo result queue is full; parent stopped consuming responses");
-                    pending.closed = true;
-                } else {
-                    pending.replies.push_back((event, bytes));
-                }
-            }
-        }
-        self.ready.notify_one();
-    }
-
-    fn frame_pending(&self, id: Uuid) -> bool {
-        self.pending.lock().frames.contains_key(&id)
-    }
-
-    fn remove(&self, id: Uuid) {
-        let mut pending = self.pending.lock();
-        pending.states.remove(&id);
-        pending.frames.remove(&id);
-    }
-
-    fn write_loop(&self, main_thread: thread::Thread) -> io::Result<()> {
-        let stdout = io::stdout();
-        let mut stdout = stdout.lock();
-        loop {
-            let packet = {
-                let mut pending = self.pending.lock();
-                loop {
-                    if let Some(packet) = pending.replies.pop_front() {
-                        break Some(packet);
-                    }
-                    if let Some(id) = pending.states.keys().next().copied() {
-                        break pending.states.remove(&id);
-                    }
-                    if let Some(id) = pending.frames.keys().next().copied() {
-                        break pending.frames.remove(&id);
-                    }
-                    if pending.closed {
-                        break None;
-                    }
-                    self.ready.wait(&mut pending);
-                }
-            };
-            let Some((event, bytes)) = packet else {
-                return Ok(());
-            };
-            protocol::write_packet(&mut stdout, &event, &bytes)?;
-            main_thread.unpark();
+        let result = apply_event(&mut self.0.memory.lock(), event, bytes);
+        if let Err(error) = result {
+            fail(&self.0, error.to_string());
         }
     }
 }
@@ -143,6 +161,7 @@ struct Delegate {
     id: Uuid,
     state: RefCell<PageState>,
     dirty: Cell<bool>,
+    content_sizing: RefCell<ContentSizing>,
     output: Arc<Output>,
 }
 
@@ -165,10 +184,18 @@ impl Delegate {
             state.loading = false;
         });
     }
+
+    fn invalidate_content_height(&self) {
+        self.content_sizing.borrow_mut().invalidate();
+        if self.state.borrow().content_height.is_some() {
+            self.update(|state| state.content_height = None);
+        }
+    }
 }
 
 impl WebViewDelegate for Delegate {
     fn notify_url_changed(&self, _: WebView, url: Url) {
+        self.invalidate_content_height();
         self.update(|state| state.url = url.to_string());
     }
 
@@ -177,6 +204,9 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_load_status_changed(&self, _: WebView, status: LoadStatus) {
+        if status != LoadStatus::Complete {
+            self.invalidate_content_height();
+        }
         self.update(|state| state.loading = status != LoadStatus::Complete);
     }
 
@@ -225,6 +255,16 @@ impl Page {
         context.make_current().map_err(|error| {
             format!("Could not make Servo rendering context current: {error:?}")
         })?;
+        // Retain the opt-in even when an earlier open failed (for example a local
+        // artifact was missing), so navigating to a valid file restores sizing.
+        let sizing_enabled = {
+            let memory = output.0.memory.lock();
+            memory
+                .wire_ids
+                .get(&id)
+                .and_then(|id| memory.sessions.get(id))
+                .is_some_and(|session| session.content_sizing)
+        };
         let delegate = Rc::new(Delegate {
             id,
             state: RefCell::new(PageState {
@@ -233,6 +273,7 @@ impl Page {
                 ..PageState::default()
             }),
             dirty: Cell::new(false),
+            content_sizing: RefCell::new(ContentSizing::new(sizing_enabled)),
             output,
         });
         let view = WebViewBuilder::new(servo, context.clone())
@@ -265,6 +306,7 @@ impl Page {
         match command {
             BrowserCommand::Navigate { url } => {
                 let url = parse_url(&url)?;
+                self.delegate.invalidate_content_height();
                 self.delegate.update(|state| {
                     state.url = url.to_string();
                     state.error = None;
@@ -277,6 +319,7 @@ impl Page {
                     state.error = None;
                 });
                 if self.delegate.state.borrow().can_go_back {
+                    self.delegate.invalidate_content_height();
                     self.view.go_back(1);
                 }
             }
@@ -285,6 +328,7 @@ impl Page {
                     state.error = None;
                 });
                 if self.delegate.state.borrow().can_go_forward {
+                    self.delegate.invalidate_content_height();
                     self.view.go_forward(1);
                 }
             }
@@ -293,6 +337,7 @@ impl Page {
                 if let Some(url) = self.view.url() {
                     parse_url(url.as_str())?;
                 }
+                self.delegate.invalidate_content_height();
                 self.delegate.update(|state| {
                     state.error = None;
                     state.loading = true;
@@ -304,7 +349,7 @@ impl Page {
                 height,
                 scale,
             } => {
-                protocol::frame_len(width, height).map_err(|error| error.to_string())?;
+                command::frame_len(width, height).map_err(|error| error.to_string())?;
                 if !scale.is_finite() || !(0.25..=8.0).contains(&scale) {
                     return Err("Browser scale must be between 0.25 and 8".into());
                 }
@@ -313,11 +358,18 @@ impl Page {
                     self.context
                         .make_current()
                         .map_err(|error| format!("Could not resize Servo surface: {error:?}"))?;
+                    self.delegate.content_sizing.borrow_mut().invalidate();
                     self.scale = scale;
                     self.view.set_hidpi_scale_factor(Scale::new(scale));
                     self.view.resize(size);
                     self.delegate.dirty.set(true);
                 }
+            }
+            BrowserCommand::SetContentSizing { enabled } => {
+                self.delegate
+                    .content_sizing
+                    .borrow_mut()
+                    .set_enabled(enabled);
             }
             BrowserCommand::Pointer {
                 x,
@@ -448,11 +500,51 @@ impl Page {
         Ok(())
     }
 
-    fn paint_if_dirty(&mut self) {
-        if !self.delegate.dirty.get()
-            || self.last_frame.elapsed() < FRAME_INTERVAL
-            || self.delegate.output.frame_pending(self.delegate.id)
+    fn measure_content_if_due(&self) {
         {
+            let state = self.delegate.state.borrow();
+            if state.loading || state.error.is_some() {
+                return;
+            }
+        }
+        let Some(generation) = self
+            .delegate
+            .content_sizing
+            .borrow_mut()
+            .begin(Instant::now())
+        else {
+            return;
+        };
+        let delegate = Rc::downgrade(&self.delegate);
+        self.view
+            .evaluate_javascript(CONTENT_HEIGHT_SCRIPT, move |result| {
+                let Some(delegate) = delegate.upgrade() else {
+                    return;
+                };
+                if !delegate.content_sizing.borrow_mut().finish(generation) {
+                    return;
+                }
+                let Ok(JSValue::Number(height)) = result else {
+                    // Internal measurements must not consume tool evaluation IDs or
+                    // replace the page's loading/error state if a document disappears.
+                    return;
+                };
+                let height = height as f32;
+                if !height.is_finite() || height < 0.0 {
+                    return;
+                }
+                let state = delegate.state.borrow();
+                let changed =
+                    !state.loading && state.error.is_none() && state.content_height != Some(height);
+                drop(state);
+                if changed {
+                    delegate.update(|state| state.content_height = Some(height));
+                }
+            });
+    }
+
+    fn paint_if_dirty(&mut self) {
+        if !self.delegate.dirty.get() || self.last_frame.elapsed() < FRAME_INTERVAL {
             return;
         }
         self.delegate.dirty.set(false);
@@ -533,85 +625,45 @@ fn js_value(value: JSValue) -> Value {
     }
 }
 
-fn run() -> Result<(), String> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .map_err(|_| "Could not initialize Servo's TLS cryptography provider".to_owned())?;
-    let output = Arc::new(Output::default());
-    let output_writer = output.clone();
-    let main_thread = thread::current();
-    let writer_thread = main_thread.clone();
-    let writer = thread::Builder::new()
-        .name("servo-protocol-output".into())
-        .spawn(move || {
-            if let Err(error) = output_writer.write_loop(writer_thread.clone()) {
-                eprintln!("Could not write Servo output: {error}");
-                output_writer.pending.lock().closed = true;
-                writer_thread.unpark();
-            }
-        })
-        .map_err(|error| format!("Could not start Servo output: {error}"))?;
-    let (sender, requests) = mpsc::sync_channel(MAX_PENDING);
-    let input_thread = main_thread.clone();
-    thread::Builder::new()
-        .name("servo-protocol-input".into())
-        .spawn(move || {
-            let stdin = io::stdin();
-            let mut stdin = stdin.lock();
-            loop {
-                match protocol::read_packet::<Request>(&mut stdin) {
-                    Ok(Some((request, bytes))) if bytes.is_empty() => {
-                        // A broken/closed parent pipe terminates the engine, including
-                        // when no explicit Shutdown command could be sent.
-                        if sender.send(request).is_err() {
-                            break;
-                        }
-                        input_thread.unpark();
-                    }
-                    Ok(None) => break,
-                    Ok(Some((request, _))) => {
-                        eprintln!(
-                            "Unexpected binary payload in browser command for {:?}",
-                            request.id()
-                        );
-                        break;
-                    }
-                    Err(error) => {
-                        eprintln!("Could not read browser command: {error}");
-                        break;
-                    }
-                }
-            }
-            input_thread.unpark();
-        })
-        .map_err(|error| format!("Could not start Servo input: {error}"))?;
+pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
+    // Respect a provider already selected by the host. Concurrent installers may
+    // win the race; either way Rustls has a process-wide provider before Servo starts.
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+    let output = Arc::new(Output(shared.clone()));
     let servo = ServoBuilder::default()
-        .event_loop_waker(Box::new(Waker(main_thread)))
+        .event_loop_waker(Box::new(Waker(thread::current())))
         .build();
-    servo.setup_logging();
+    // Do not call Servo::setup_logging: it replaces the host's process-wide logger.
     servo.set_delegate(Rc::new(EngineDelegate(output.clone())));
     let mut pages = HashMap::<Uuid, Page>::new();
-    let mut shutdown = false;
     let mut batch = VecDeque::<Request>::with_capacity(64);
-    while !shutdown && !output.pending.lock().closed {
-        for _ in 0..64 {
-            let request = match requests.try_recv() {
-                Ok(request) => request,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    shutdown = true;
-                    break;
-                }
-            };
-            if batch
-                .back()
-                .is_some_and(|previous| request.supersedes(previous))
-            {
-                batch.pop_back();
+    loop {
+        {
+            let mut memory = shared.memory.lock();
+            if memory.shutdown || memory.failure.is_some() {
+                break;
             }
-            batch.push_back(request);
+            for evaluation in memory
+                .evaluations
+                .values_mut()
+                .filter(|evaluation| evaluation.result.is_none())
+            {
+                if evaluation.started.elapsed() > Duration::from_secs(30) {
+                    evaluation.result = Some(Err("JavaScript evaluation did not finish within 30 seconds; the page may be busy or navigating".into()));
+                }
+            }
+            let length = memory.queue.len().min(64);
+            batch.extend(memory.queue.drain(..length));
         }
+        // Closing is an identity removal, not an unbounded lifecycle queue. Drop
+        // obsolete WebViews here, never under the snapshot lock or on the UI thread.
+        pages.retain(|id, _| shared.memory.lock().wire_ids.contains_key(id));
         while let Some(request) = batch.pop_front() {
+            if !shared.memory.lock().wire_ids.contains_key(&request.id()) {
+                continue;
+            }
             match request {
                 Request::Open { id, url } => {
                     if let Some(page) = pages.get_mut(&id) {
@@ -663,67 +715,49 @@ fn run() -> Result<(), String> {
                                 }
                             }
                             BrowserCommand::Evaluate { request_id, .. } => output.send(Event::Evaluation { id, request_id, result: Err("Browser page is not available; navigate to a valid URL first".into()) }, vec![]),
-                            _ => {}
+                            BrowserCommand::Back
+                            | BrowserCommand::Forward
+                            | BrowserCommand::Reload
+                            | BrowserCommand::Resize { .. }
+                            | BrowserCommand::SetContentSizing { .. }
+                            | BrowserCommand::Pointer { .. }
+                            | BrowserCommand::Move { .. }
+                            | BrowserCommand::Scroll { .. }
+                            | BrowserCommand::Key { .. }
+                            | BrowserCommand::Text { .. }
+                            | BrowserCommand::Focus { .. } => {}
                         }
                     }
                 }
-                Request::Close { id } => {
-                    pages.remove(&id);
-                    output.remove(id);
-                }
-                Request::Shutdown => {
-                    shutdown = true;
-                    break;
-                }
             }
-        }
-        if shutdown {
-            break;
         }
         servo.spin_event_loop();
         for page in pages.values_mut() {
             page.paint_if_dirty();
+            page.measure_content_if_due();
+        }
+        if !shared.memory.lock().queue.is_empty() {
+            continue;
         }
         let animating = pages
             .values()
             .any(|page| page.view.animating() || page.delegate.dirty.get());
-        if animating {
-            thread::park_timeout(Duration::from_millis(16));
+        thread::park_timeout(if animating {
+            Duration::from_millis(16)
         } else {
-            thread::park_timeout(Duration::from_millis(250));
-        }
+            Duration::from_millis(250)
+        });
     }
-    // Dropping the final Servo handle drains its own shutdown protocol. The parent
-    // supervisor bounds this by two seconds and kills/reaps a wedged helper.
+    // Cooperative Servo shutdown stays on this worker. Unlike a helper process,
+    // an in-process engine cannot be forcibly killed without killing the app.
     pages.clear();
     drop(servo);
-    output.pending.lock().closed = true;
-    output.ready.notify_one();
-    writer
-        .join()
-        .map_err(|_| "Servo output worker panicked".to_owned())?;
     Ok(())
-}
-
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("drostje-servo: {error}");
-        std::process::exit(1);
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn missing_local_artifact_has_an_actionable_error() {
-        let path = std::env::temp_dir().join(format!("drostje-missing-{}.html", Uuid::new_v4()));
-        let url = Url::from_file_path(&path).unwrap();
-        let error = parse_url(url.as_str()).unwrap_err();
-        assert!(error.contains("Restore the file"));
-        assert!(error.contains(path.file_name().unwrap().to_str().unwrap()));
-    }
 
     #[test]
     fn javascript_results_preserve_nested_json_values() {
@@ -745,33 +779,33 @@ mod tests {
     }
 
     #[test]
-    fn output_storage_keeps_only_latest_frame_and_status_per_browser() {
-        let output = Output::default();
-        let id = Uuid::new_v4();
-        for revision in 1..100 {
-            output.send(
-                Event::Frame {
-                    id,
-                    revision,
-                    width: 1,
-                    height: 1,
-                },
-                vec![revision as u8; 4],
-            );
-            output.send(
-                Event::State {
-                    id,
-                    state: PageState {
-                        title: revision.to_string(),
-                        ..PageState::default()
-                    },
-                },
-                vec![],
-            );
-        }
-        let pending = output.pending.lock();
-        assert_eq!(pending.frames.len(), 1);
-        assert_eq!(pending.states.len(), 1);
-        assert_eq!(pending.frames[&id].1, [99; 4]);
+    fn sizing_is_opt_in_single_flight_rate_limited_and_rejects_stale_results() {
+        let mut sizing = ContentSizing::new(false);
+        let now = Instant::now();
+        assert!(sizing.begin(now).is_none());
+        sizing.set_enabled(true);
+        let now = Instant::now();
+        let first = sizing.begin(now).unwrap();
+        assert!(sizing.begin(now + CONTENT_MEASUREMENT_INTERVAL).is_none());
+        assert!(sizing.finish(first));
+        assert!(sizing.begin(now).is_none());
+        let next = sizing.begin(now + CONTENT_MEASUREMENT_INTERVAL).unwrap();
+        // Both navigation and viewport changes use this invalidation path.
+        sizing.invalidate();
+        assert!(sizing.begin(Instant::now()).is_none());
+        assert!(!sizing.finish(next));
+        let stale = sizing.begin(Instant::now()).unwrap();
+        sizing.set_enabled(false);
+        sizing.set_enabled(true);
+        assert!(sizing.begin(Instant::now()).is_none());
+        assert!(!sizing.finish(stale));
+        let active = sizing.begin(Instant::now()).unwrap();
+        sizing.set_enabled(false);
+        assert!(!sizing.finish(active));
+        assert!(
+            sizing
+                .begin(Instant::now() + CONTENT_MEASUREMENT_INTERVAL)
+                .is_none()
+        );
     }
 }

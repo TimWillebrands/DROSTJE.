@@ -74,6 +74,10 @@ pub(super) struct TranscriptView {
 }
 
 impl TranscriptView {
+    #[cfg(feature = "runtime-qa")]
+    pub(super) fn scroll_extent(&self) -> f32 {
+        f32::from(self.list.max_offset_for_scrollbar().y)
+    }
     pub(super) fn new(
         id: ThreadId,
         state: Entity<AppState>,
@@ -2192,22 +2196,7 @@ fn tool_call_row(
         if let Some(pane) =
             browser.and_then(|id| owner.upgrade()?.read(cx).artifact_browser(thread, id))
         {
-            return v_flex()
-                .w_full()
-                .min_w_0()
-                .h(rems(28.))
-                .border_1()
-                .border_color(cx.theme().border)
-                .child(
-                    div().flex_none().px_2().py_1().text_sm().child(
-                        call.input["title"]
-                            .as_str()
-                            .unwrap_or("HTML artifact")
-                            .to_owned(),
-                    ),
-                )
-                .child(pane)
-                .into_any_element();
+            return pane.into_any_element();
         }
     }
     let key = format!("tool:{thread}:{call_id}");

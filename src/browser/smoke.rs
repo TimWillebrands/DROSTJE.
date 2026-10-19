@@ -1,0 +1,436 @@
+//! Real engine regression migrated from the former helper-process smoke.
+//! cargo test --lib browser::smoke -- --ignored --nocapture
+use super::*;
+use std::time::Duration;
+
+struct Browser {
+    runtime: BrowserRuntime,
+    directory: std::path::PathBuf,
+}
+
+impl Browser {
+    fn start() -> Self {
+        let directory =
+            std::env::temp_dir().join(format!("drostje-servo-smoke-{}", BrowserId::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("style.css"), "html,body { margin:0; background:rgb(12,34,56); } body { min-height:2400px; } button { position:absolute; left:20px; top:20px; width:120px; height:60px; } input { position:absolute; left:20px; top:120px; }").unwrap();
+        std::fs::write(directory.join("index.html"), "<!doctype html><title>Servo smoke</title><link rel=stylesheet href=style.css><button onclick='window.clicked=(window.clicked||0)+1'>Click</button><input id=text><script>window.clicked=0</script>").unwrap();
+        Self {
+            runtime: BrowserRuntime::new(),
+            directory,
+        }
+    }
+
+    fn until(&self, label: &str, predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "Timed out: {label}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn snapshot(&self, id: BrowserId) -> BrowserSnapshot {
+        let snapshot = self.runtime.snapshot(id).expect("Browser was closed");
+        assert!(
+            snapshot.error.is_none(),
+            "Servo failed: {:?}",
+            snapshot.error
+        );
+        snapshot
+    }
+
+    fn evaluate(&self, id: BrowserId, script: &str) -> Value {
+        let request_id = BrowserId::new_v4().to_string();
+        self.runtime.command(
+            id,
+            BrowserCommand::Evaluate {
+                request_id: request_id.clone(),
+                script: script.into(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(result) = self.runtime.evaluation(&request_id) {
+                return result.expect("JavaScript evaluation failed");
+            }
+            assert!(Instant::now() < deadline, "Evaluation timed out: {script}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn until_height(&self, id: BrowserId, expected: f32) {
+        self.until(&format!("natural content height {expected}px"), || {
+            let snapshot = self.snapshot(id);
+            !snapshot.loading && snapshot.content_height == Some(expected)
+        });
+    }
+
+    fn click(&self, id: BrowserId, x: f32, y: f32) {
+        for pressed in [true, false] {
+            self.runtime.command(
+                id,
+                BrowserCommand::Pointer {
+                    x,
+                    y,
+                    button: 0,
+                    pressed,
+                },
+            );
+        }
+    }
+}
+
+impl Drop for Browser {
+    fn drop(&mut self) {
+        self.runtime.shutdown();
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+fn real_content_height_grows_shrinks_reflows_and_resumes(browser: &Browser) {
+    let path = browser.directory.join("sizing.html");
+    std::fs::write(
+        &path,
+        r#"<!doctype html><title>Content sizing</title>
+        <style>
+        html, body { margin:0; padding:0 }
+        main { width:100% }
+        #block { height:140px; background:#264 }
+        #wrap { display:flex; flex-wrap:wrap }
+        #wrap > div { flex:0 0 180px; height:60px; background:#426 }
+        </style>
+        <main data-drostje-artifact>
+          <div id=block></div>
+          <div id=wrap><div></div><div></div><div></div><div></div></div>
+        </main>"#,
+    )
+    .unwrap();
+    let url = url::Url::from_file_path(&path).unwrap().to_string();
+    let id = BrowserId::new_v4();
+    browser.runtime.open(id, url.clone());
+    browser.until("ordinary browser does not opt in to sizing", || {
+        let snapshot = browser.snapshot(id);
+        !snapshot.loading && snapshot.title == "Content sizing" && snapshot.frame.is_some()
+    });
+    assert_eq!(browser.snapshot(id).content_height, None);
+    browser
+        .runtime
+        .command(id, BrowserCommand::SetContentSizing { enabled: true });
+    browser.until_height(id, 200.0);
+    browser.evaluate(
+        id,
+        "document.getElementById('block').style.height = '920px'",
+    );
+    browser.until_height(id, 980.0);
+    browser.runtime.command(
+        id,
+        BrowserCommand::Resize {
+            width: 800,
+            height: 1200,
+            scale: 1.0,
+        },
+    );
+    browser.until("grown viewport before content shrink", || {
+        browser
+            .snapshot(id)
+            .frame
+            .is_some_and(|frame| frame.width == 800 && frame.height == 1200)
+    });
+    browser.evaluate(
+        id,
+        "document.getElementById('block').style.height = '140px'",
+    );
+    browser.until_height(id, 200.0);
+    // The document scrolling extent remains viewport-high, unlike natural content.
+    assert!(
+        browser
+            .evaluate(id, "document.documentElement.scrollHeight")
+            .as_f64()
+            .is_some_and(|height| height >= 1200.0)
+    );
+    browser.runtime.command(
+        id,
+        BrowserCommand::Resize {
+            width: 360,
+            height: 1200,
+            scale: 1.0,
+        },
+    );
+    browser.until_height(id, 260.0);
+    browser
+        .runtime
+        .command(id, BrowserCommand::SetContentSizing { enabled: false });
+    let revision = browser.snapshot(id).frame.unwrap().revision;
+    browser.evaluate(id, "document.getElementById('block').style.height = '80px'");
+    browser.until("disabled sizing still renders real content changes", || {
+        browser
+            .snapshot(id)
+            .frame
+            .is_some_and(|frame| frame.revision > revision)
+    });
+    assert_eq!(browser.snapshot(id).content_height, Some(260.0));
+    browser
+        .runtime
+        .command(id, BrowserCommand::SetContentSizing { enabled: true });
+    browser.until_height(id, 200.0);
+    browser.evaluate(
+        id,
+        "document.querySelector('main').removeAttribute('data-drostje-artifact'); \
+         document.body.style.minHeight = '100vh'; \
+         document.getElementById('block').style.height = '30px'",
+    );
+    browser.until_height(id, 150.0);
+    browser.runtime.command(
+        id,
+        BrowserCommand::Resize {
+            width: 800,
+            height: 1200,
+            scale: 1.0,
+        },
+    );
+    browser.until_height(id, 90.0);
+    // Exercise a page-initiated navigation while polling measurements, then an
+    // explicit navigation/resize barrier. Old document dimensions cannot win.
+    let replacement = browser.directory.join("sizing-replacement.html");
+    std::fs::write(
+        &replacement,
+        "<!doctype html><title>Replacement sizing</title><style>html,body{margin:0}</style><main data-drostje-artifact style='height:73px'></main>",
+    )
+    .unwrap();
+    let replacement_url = url::Url::from_file_path(&replacement).unwrap().to_string();
+    browser.evaluate(
+        id,
+        &format!(
+            "document.getElementById('block').style.height = '1900px'; \
+             location.href = {}; true",
+            serde_json::to_string(&replacement_url).unwrap()
+        ),
+    );
+    browser.until(
+        "page-initiated navigation has only replacement dimensions",
+        || {
+            let snapshot = browser.snapshot(id);
+            if snapshot.title != "Replacement sizing" || snapshot.loading {
+                return false;
+            }
+            assert!(snapshot.content_height.is_none() || snapshot.content_height == Some(73.0));
+            snapshot.content_height == Some(73.0)
+        },
+    );
+    browser
+        .runtime
+        .command(id, BrowserCommand::Navigate { url });
+    browser.runtime.command(
+        id,
+        BrowserCommand::Resize {
+            width: 360,
+            height: 1200,
+            scale: 1.0,
+        },
+    );
+    browser.until_height(id, 260.0);
+    assert!(
+        browser.runtime.0.0.memory.lock().evaluations.is_empty(),
+        "Internal content measurements must not occupy tool evaluation requests"
+    );
+    browser.runtime.close(id);
+}
+
+#[test]
+#[ignore = "requires a working native Servo renderer and desktop graphics session"]
+fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
+    let browser = Browser::start();
+    let id = BrowserId::new_v4();
+    let url = url::Url::from_file_path(browser.directory.join("index.html"))
+        .unwrap()
+        .to_string();
+    browser.runtime.open(id, url.clone());
+    browser.until("HTML, linked CSS and RGBA frame", || {
+        let snapshot = browser.snapshot(id);
+        !snapshot.loading
+            && snapshot.title == "Servo smoke"
+            && snapshot.frame.is_some_and(|frame| {
+                let offset =
+                    ((frame.height as usize - 1) * frame.width as usize + frame.width as usize - 1)
+                        * 4;
+                frame.rgba[offset..offset + 4] == [12, 34, 56, 255]
+            })
+    });
+    assert_ne!(
+        browser.runtime.0.0.worker.lock().as_ref().unwrap().id(),
+        thread::current().id()
+    );
+    assert_eq!(
+        browser.evaluate(id, "({title: document.title, nested: [true, null, 2]})"),
+        serde_json::json!({"title":"Servo smoke", "nested":[true, null, 2.0]})
+    );
+    browser.click(id, 50.0, 40.0);
+    browser.until("pointer click", || {
+        browser.evaluate(id, "window.clicked").as_f64() == Some(1.0)
+    });
+    browser.click(id, 50.0, 130.0);
+    browser.until("input focus", || {
+        browser.evaluate(id, "document.activeElement.id") == "text"
+    });
+    browser.runtime.command(
+        id,
+        BrowserCommand::Text {
+            text: "Servo ✓".into(),
+        },
+    );
+    browser.until("committed Unicode text", || {
+        browser.evaluate(id, "document.querySelector('input').value") == "Servo ✓"
+    });
+    for pressed in [true, false] {
+        browser.runtime.command(
+            id,
+            BrowserCommand::Key {
+                key: "Backspace".into(),
+                code: "Backspace".into(),
+                pressed,
+                shift: false,
+                control: false,
+                alt: false,
+                meta: false,
+            },
+        );
+    }
+    browser.until("DOM keyboard input", || {
+        browser.evaluate(id, "document.querySelector('input').value") == "Servo "
+    });
+    browser.runtime.command(
+        id,
+        BrowserCommand::Scroll {
+            x: 300.0,
+            y: 300.0,
+            dx: 0.0,
+            dy: 120.0,
+        },
+    );
+    browser.until("wheel scroll", || {
+        browser
+            .evaluate(id, "window.scrollY")
+            .as_f64()
+            .is_some_and(|y| y > 0.0)
+    });
+    browser.runtime.command(
+        id,
+        BrowserCommand::Resize {
+            width: 640,
+            height: 480,
+            scale: 1.0,
+        },
+    );
+    browser.until("resized RGBA frame", || {
+        browser.snapshot(id).frame.is_some_and(|frame| {
+            frame.width == 640 && frame.height == 480 && frame.rgba.len() == 640 * 480 * 4
+        })
+    });
+    if let Some(output) = std::env::var_os("DROSTJE_QA_SCREENSHOTS") {
+        std::fs::create_dir_all(&output).unwrap();
+        let frame = browser.snapshot(id).frame.unwrap();
+        image::save_buffer(
+            std::path::Path::new(&output).join("servo-engine.png"),
+            &frame.rgba,
+            frame.width,
+            frame.height,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+    }
+    real_content_height_grows_shrinks_reflows_and_resumes(&browser);
+    browser.runtime.command(
+        id,
+        BrowserCommand::Navigate {
+            url: "about:blank".into(),
+        },
+    );
+    browser.until("forward navigation", || {
+        let s = browser.snapshot(id);
+        s.url == "about:blank" && !s.loading && s.can_go_back
+    });
+    browser.runtime.command(id, BrowserCommand::Back);
+    browser.until("back history", || {
+        let s = browser.snapshot(id);
+        s.url == url && !s.loading && s.can_go_forward
+    });
+    browser.runtime.command(id, BrowserCommand::Forward);
+    browser.until("forward history", || {
+        let s = browser.snapshot(id);
+        s.url == "about:blank" && !s.loading && s.can_go_back
+    });
+    browser
+        .runtime
+        .command(id, BrowserCommand::Navigate { url: url.clone() });
+    browser.until("navigate back to artifact", || {
+        let s = browser.snapshot(id);
+        s.title == "Servo smoke" && !s.loading
+    });
+    browser.evaluate(id, "window.clicked = 9");
+    browser.runtime.command(id, BrowserCommand::Reload);
+    browser.until("reload clears JavaScript state", || {
+        !browser.snapshot(id).loading
+            && browser.evaluate(id, "window.clicked").as_f64() == Some(0.0)
+    });
+
+    let other = BrowserId::new_v4();
+    browser.runtime.open(other, url.clone());
+    browser.until("independent second WebView", || {
+        let s = browser.snapshot(other);
+        !s.loading && s.title == "Servo smoke"
+    });
+    browser.evaluate(id, "window.clicked = 7");
+    assert_eq!(
+        browser.evaluate(other, "window.clicked").as_f64(),
+        Some(0.0)
+    );
+    browser.runtime.command(
+        id,
+        BrowserCommand::Navigate {
+            url: url::Url::from_file_path(browser.directory.join("missing.html"))
+                .unwrap()
+                .to_string(),
+        },
+    );
+    browser.until("missing artifact error", || {
+        let snapshot = browser.runtime.snapshot(id).unwrap();
+        snapshot.error.is_some() && !snapshot.loading
+    });
+    browser
+        .runtime
+        .command(id, BrowserCommand::Navigate { url: url.clone() });
+    browser.until("error recovery", || {
+        let s = browser.runtime.snapshot(id).unwrap();
+        s.error.is_none() && !s.loading && s.url == url
+    });
+    browser.runtime.command(
+        id,
+        BrowserCommand::Evaluate {
+            request_id: "throws".into(),
+            script: "throw new Error('smoke')".into(),
+        },
+    );
+    browser.until("JavaScript exception result", || {
+        browser
+            .runtime
+            .evaluation("throws")
+            .is_some_and(|result| result.is_err())
+    });
+    browser.runtime.close(id);
+    assert!(browser.runtime.snapshot(id).is_none());
+    assert_eq!(browser.evaluate(other, "document.title"), "Servo smoke");
+    browser.runtime.open(id, "about:blank".into());
+    browser.until("reopened identity has fresh state", || {
+        let s = browser.snapshot(id);
+        s.url == "about:blank" && !s.loading && s.title.is_empty() && !s.can_go_back
+    });
+    browser.runtime.close(id);
+    browser.runtime.close(other);
+    browser.runtime.shutdown();
+    browser.until("Servo shutdown and worker exit", || {
+        browser.runtime.0.0.memory.lock().stopped
+    });
+    println!(
+        "In-process Servo proof: dedicated worker, HTML/CSS pixels, nested JS, click, Unicode text, key, wheel, resize, natural content-height opt-in/grow/shrink/width reflow/disable/resume/body fallback/navigation, reload, back/forward, isolated WebViews, missing-file recovery, JS exception, close/reopen, cooperative shutdown"
+    );
+}

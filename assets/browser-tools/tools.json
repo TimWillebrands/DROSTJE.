@@ -1,7 +1,7 @@
 [
   {
     "name": "show_artifact",
-    "description": "Display an existing HTML file in this conversation's live Servo artifact pane. First write the HTML file under /tmp, then pass its absolute path. The file is loaded in place so relative CSS, scripts and images resolve beside it. This is a real, unsandboxed browser: JavaScript and network requests execute. Returns the displayed browser ID and canonical file path, or a real file/runtime error. It does not create files or accept HTML source.",
+    "description": "Display an existing HTML file as a collapsible, content-sized inline Servo artifact without an address bar. First write the HTML file under /tmp, then pass its absolute path. Prefer a single naturally sized <main data-drostje-artifact> with responsive width; avoid viewport-height shells and nested scroll containers. Height adapts to content up to a safety limit. Relative CSS, scripts and images resolve beside the file. This is a real, unsandboxed browser: JavaScript and network requests execute. Returns the browser ID and canonical file path, or a real file/runtime error. It does not create files or accept HTML source.",
     "inputSchema": {
       "type": "object",
       "properties": {

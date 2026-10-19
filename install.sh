@@ -11,8 +11,6 @@ APP_NAME="DROSTJE."
 BINARY_NAME="drostje"
 BUILD_DIR="target/release"
 ICON_SRC="assets/drostje-app-icon.png"
-SERVO_BINARY_NAME="drostje-servo"
-SERVO_BUILD_DIR="crates/servo-browser/target/release"
 
 echo "--- Installing $APP_NAME ---"
 
@@ -22,8 +20,8 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
-# Servo's error pages, domain lists and other resources are linked into the helper.
-# Its independent workspace avoids GPUI's freetype-sys conflict.
+# Servo's resources and engine are linked into the application. Do not silently
+# install native prerequisites when a build cannot find them.
 for tool in cmake pkg-config python3 make curl; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Error: Servo requires $tool. Install the native build prerequisites, then rerun ./install.sh." >&2
@@ -46,21 +44,15 @@ fi
 
 echo "Detected version: $VERSION"
 
-# Build Servo first so prerequisite failures do not leave an apparently complete
-# app installation without its browser engine. Do not silently install tools.
-echo "Step 1: Building Servo helper (separate Cargo workspace)..."
-if ! cargo build --release --locked \
-    --manifest-path crates/servo-browser/Cargo.toml \
-    --target-dir crates/servo-browser/target; then
-    echo "Error: Servo helper build failed; nothing was installed." >&2
+echo "Step 1: Building application with in-process Servo..."
+if ! cargo build --release --locked; then
+    echo "Error: Application build failed; nothing was installed." >&2
     echo "SpiderMonkey normally downloads a platform-specific prebuilt archive from GitHub." >&2
     echo "A source build requires LLVM/Clang 19 or newer, libclang, Python 3, make, CMake and pkg-config." >&2
     echo "Apple Clang 17 is insufficient for a SpiderMonkey source build. Select an installed LLVM >=19 with CC, CXX and LIBCLANG_PATH, or restore access to GitHub release downloads." >&2
     echo "Linux also needs fontconfig development files and Mesa EGL/GL software drivers. See the preceding native build error for the missing library." >&2
     exit 1
 fi
-echo "Step 1: Building application release binary..."
-cargo build --release
 
 # Run a command directly when the target is writable, otherwise through sudo.
 as_owner() {
@@ -89,7 +81,6 @@ install_macos() {
 
     # Copy binary
     cp "$BUILD_DIR/$BINARY_NAME" "$APP_BUNDLE/Contents/MacOS/"
-    cp "$SERVO_BUILD_DIR/$SERVO_BINARY_NAME" "$APP_BUNDLE/Contents/MacOS/"
 
     # Create Info.plist
     cat <<PLIST > "$APP_BUNDLE/Contents/Info.plist"
@@ -176,7 +167,6 @@ install_linux() {
     fi
 
     as_owner install -m 755 "$BUILD_DIR/$BINARY_NAME" "$BIN_DIR/$BINARY_NAME"
-    as_owner install -m 755 "$SERVO_BUILD_DIR/$SERVO_BINARY_NAME" "$BIN_DIR/$SERVO_BINARY_NAME"
 
     # Icons go into the hicolor theme, which every icon theme inherits from. ImageMagick
     # renders the standard sizes; without it the launcher scales the source image itself.

@@ -140,17 +140,26 @@ mod macos {
                     .frame
                     .is_some_and(|frame| frame.width == physical_width)
             });
-            let screenshot = cx.capture_screenshot(window.into()).unwrap();
-            assert_eq!(
-                screenshot
+            // A resized framebuffer can precede the page's repaint and GPUI's
+            // asynchronous image upload. Wait for the actual displayed pixels.
+            let deadline = Instant::now() + Duration::from_secs(45);
+            let screenshot = loop {
+                let screenshot = cx.capture_screenshot(window.into()).unwrap();
+                let pixel = screenshot
                     .get_pixel(
                         ((bounds.left().as_f32() + 300.) * scale) as u32,
-                        ((bounds.top().as_f32() + 250.) * scale) as u32
+                        ((bounds.top().as_f32() + 250.) * scale) as u32,
                     )
-                    .0,
-                [12, 34, 56, 255],
-                "Servo RGBA must survive GPUI BGRA upload in {mode:?}"
-            );
+                    .0;
+                if pixel == [12, 34, 56, 255] {
+                    break screenshot;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Servo RGBA must survive GPUI BGRA upload in {mode:?}; last pixel {pixel:?}"
+                );
+                pump(&mut cx, window);
+            };
             if let Some(output) = std::env::var_os("DROSTJE_QA_SCREENSHOTS") {
                 std::fs::create_dir_all(&output).unwrap();
                 screenshot
