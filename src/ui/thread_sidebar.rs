@@ -1,6 +1,5 @@
-//! A thread's sidebar: the Changes and Output tabs beside a Conversation, plus Agents
-//! once its agent works with others; the Output tab beside a Factory thread. Open state
-//! and tab live in `AppState`.
+//! Retained, resizable thread sidebar: Changes, Output, Browser and optional Agents
+//! for Conversations; Output for Factory threads. AppState owns tab, open state and width.
 
 use super::{
     agents::{self, Activity, Event, EventKind, Outcome},
@@ -26,12 +25,117 @@ use gpui_kit::{
     *,
 };
 
+pub(super) struct SidebarLayout {
+    id: ThreadId,
+    width: f32,
+    open: bool,
+    owner: WeakEntity<Workspace>,
+    sizes: std::rc::Rc<
+        std::cell::RefCell<
+            std::collections::BTreeMap<
+                ThreadId,
+                Entity<gpui_kit::component::resizable::ResizableState>,
+            >,
+        >,
+    >,
+}
+
+impl SidebarLayout {
+    pub(super) fn new(
+        state: &AppState,
+        id: ThreadId,
+        owner: &WeakEntity<Workspace>,
+        cx: &App,
+    ) -> Self {
+        Self {
+            id,
+            width: state.thread_sidebar_width(id),
+            open: state.thread_sidebar_open(id),
+            sizes: owner
+                .upgrade()
+                .map(|owner| owner.read(cx).sidebar_sizes.clone())
+                .unwrap_or_default(),
+            owner: owner.clone(),
+        }
+    }
+
+    pub(super) fn wrap(self, content: AnyElement, sidebar: AnyElement) -> AnyElement {
+        if !self.open {
+            return h_flex()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .items_stretch()
+                .child(div().flex_1().min_w_0().h_full().child(content))
+                .child(sidebar)
+                .into_any_element();
+        }
+        SidebarSplit {
+            layout: self,
+            content,
+            sidebar,
+        }
+        .into_any_element()
+    }
+}
+
+#[derive(IntoElement)]
+struct SidebarSplit {
+    layout: SidebarLayout,
+    content: AnyElement,
+    sidebar: AnyElement,
+}
+impl RenderOnce for SidebarSplit {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        use gpui_kit::component::resizable::{ResizableState, h_resizable, resizable_panel};
+        let layout = self.layout;
+        let existing = layout.sizes.borrow().get(&layout.id).cloned();
+        let sizes = existing.unwrap_or_else(|| {
+            let state = cx.new(|_| ResizableState::default());
+            layout.sizes.borrow_mut().insert(layout.id, state.clone());
+            state
+        });
+        h_resizable(SharedString::from(format!("thread-split-{}", layout.id)))
+            .with_state(&sizes)
+            .child(
+                resizable_panel()
+                    .size_range(px(240.)..Pixels::MAX)
+                    .child(self.content),
+            )
+            .child(
+                resizable_panel()
+                    .size(px(layout.width.clamp(180., 1600.)))
+                    .size_range(px(180.)..px(1600.))
+                    .flex_none()
+                    .child(self.sidebar),
+            )
+            .on_resize(move |sizes, _, cx| {
+                if let Some(width) = sizes.read(cx).sizes().get(1).copied() {
+                    let owner = layout.owner.clone();
+                    let id = layout.id;
+                    cx.defer(move |cx| {
+                        let _ = owner.update(cx, |workspace, cx| {
+                            workspace.state.update(cx, |state, _| {
+                                state.set_thread_sidebar_width(id, f32::from(width))
+                            });
+                        });
+                    });
+                }
+            })
+    }
+}
+
 /// Tabs in display order; a Factory thread has no working-tree Changes, and Agents
 /// appears only once a Conversation's agent has worked with another.
 fn tabs(conversation: bool, agents: bool) -> &'static [SidebarTab] {
     match (conversation, agents) {
-        (true, true) => &[SidebarTab::Changes, SidebarTab::Output, SidebarTab::Agents],
-        (true, false) => &[SidebarTab::Changes, SidebarTab::Output],
+        (true, true) => &[
+            SidebarTab::Changes,
+            SidebarTab::Output,
+            SidebarTab::Agents,
+            SidebarTab::Browser,
+        ],
+        (true, false) => &[SidebarTab::Changes, SidebarTab::Output, SidebarTab::Browser],
         (false, _) => &[SidebarTab::Output],
     }
 }
@@ -41,6 +145,7 @@ fn label(tab: SidebarTab) -> &'static str {
         SidebarTab::Changes => "Changes",
         SidebarTab::Output => "Output",
         SidebarTab::Agents => "Agents",
+        SidebarTab::Browser => "Browser",
     }
 }
 
@@ -50,6 +155,7 @@ fn toggle_command(tab: SidebarTab) -> Command {
         SidebarTab::Changes => Command::ToggleConversationDiffs,
         SidebarTab::Output => Command::ToggleOutput,
         SidebarTab::Agents => Command::ToggleAgents,
+        SidebarTab::Browser => Command::ToggleBrowser,
     }
 }
 
@@ -133,6 +239,21 @@ pub(super) fn render(
         );
     let body = match active {
         SidebarTab::Changes => changes(state, id, cx),
+        SidebarTab::Browser => owner
+            .upgrade()
+            .and_then(|owner| owner.read(cx).sidebar_browser(id))
+            .map(|pane| pane.into_any_element())
+            .unwrap_or_else(|| {
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .child("No browser session")
+                    .child(
+                        button("open-sidebar-browser", Command::ToggleBrowser, owner, state)
+                            .label("Open browser"),
+                    )
+                    .into_any_element()
+            }),
         SidebarTab::Output => div()
             .flex_1()
             .min_h_0()
@@ -148,8 +269,7 @@ pub(super) fn render(
     v_flex()
         .id("thread-sidebar")
         .debug_selector(|| "thread-sidebar".into())
-        .w(rems(22.))
-        .max_w(relative(0.4))
+        .w_full()
         .h_full()
         .min_w_0()
         .min_h_0()
@@ -543,7 +663,7 @@ mod tests {
     fn factory_threads_only_offer_output() {
         assert_eq!(
             tabs(true, false),
-            &[SidebarTab::Changes, SidebarTab::Output]
+            &[SidebarTab::Changes, SidebarTab::Output, SidebarTab::Browser]
         );
         assert_eq!(tabs(false, false), &[SidebarTab::Output]);
         assert_eq!(tabs(false, true), &[SidebarTab::Output]);
@@ -553,7 +673,12 @@ mod tests {
     fn agents_appear_only_with_agent_activity() {
         assert_eq!(
             tabs(true, true),
-            &[SidebarTab::Changes, SidebarTab::Output, SidebarTab::Agents]
+            &[
+                SidebarTab::Changes,
+                SidebarTab::Output,
+                SidebarTab::Agents,
+                SidebarTab::Browser
+            ]
         );
     }
 }

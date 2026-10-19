@@ -1039,11 +1039,16 @@ impl RenderOnce for TranscriptMarkdown {
         .style(transcript_text_style(body))
         .plugin(InertResources)
         .selectable(true)
-        .on_link_click(|url, event, _, cx| {
+        .on_link_click(|url, event, window, cx| {
             if !event.is_right_click()
                 && (url.starts_with("https://") || url.starts_with("http://"))
             {
-                cx.open_url(url);
+                window.dispatch_action(
+                    Box::new(super::browser::OpenBrowserUrl {
+                        url: url.to_string(),
+                    }),
+                    cx,
+                );
             }
         })
     }
@@ -2165,6 +2170,46 @@ fn tool_call_row(
     markdown: Markdown,
     cx: &App,
 ) -> AnyElement {
+    if call.name.ends_with("show_artifact") {
+        let recorded = session.tool_result(call_id);
+        let blocks = session
+            .tools
+            .get(call_id)
+            .map(|tool| tool.result.as_slice())
+            .or_else(|| recorded.map(|result| result.content.as_slice()))
+            .unwrap_or(&[]);
+        let browser = blocks.iter().find_map(|block| {
+            let ContentBlock::Text(text) = block else {
+                return None;
+            };
+            let value: Value = serde_json::from_str(text).ok()?;
+            let id = value
+                .get("id")
+                .or_else(|| value.get("result")?.get("id"))?
+                .as_str()?;
+            uuid::Uuid::parse_str(id).ok()
+        });
+        if let Some(pane) =
+            browser.and_then(|id| owner.upgrade()?.read(cx).artifact_browser(thread, id))
+        {
+            return v_flex()
+                .w_full()
+                .min_w_0()
+                .h(rems(28.))
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div().flex_none().px_2().py_1().text_sm().child(
+                        call.input["title"]
+                            .as_str()
+                            .unwrap_or("HTML artifact")
+                            .to_owned(),
+                    ),
+                )
+                .child(pane)
+                .into_any_element();
+        }
+    }
     let key = format!("tool:{thread}:{call_id}");
     let outcome = call_outcome(session, call_id, active);
     if let Some(tool) = session.tools.get(call_id) {
@@ -3328,6 +3373,7 @@ fn queued_messages(
 }
 
 fn frame(
+    layout: super::thread_sidebar::SidebarLayout,
     root: Stateful<Div>,
     history: Div,
     sidebar: AnyElement,
@@ -3336,20 +3382,16 @@ fn frame(
     // The composer shares the history column so both centre over the same width;
     // the sidebar spans the full height beside them.
     root.child(
-        h_flex()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .items_stretch()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(history)
-                    .when_some(composer, |column, composer| column.child(composer)),
-            )
-            .child(sidebar),
+        layout.wrap(
+            v_flex()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(history)
+                .when_some(composer, |column, composer| column.child(composer))
+                .into_any_element(),
+            sidebar,
+        ),
     )
     .into_any_element()
 }
@@ -3364,6 +3406,7 @@ fn render_content(
 ) -> AnyElement {
     let drop_owner = owner.clone();
     let sidebar = super::thread_sidebar::render(state, id, true, owner, output_scroll, cx);
+    let layout = super::thread_sidebar::SidebarLayout::new(state, id, owner, cx);
     let root = v_flex()
         .id(SharedString::from(format!("conversation-view-{id}")))
         .size_full()
@@ -3382,6 +3425,7 @@ fn render_content(
     let mut history = v_flex().flex_1().min_w_0().min_h_0().gap_2().pb_2();
     let Some(thread) = state.snapshot.threads.iter().find(|thread| thread.id == id) else {
         return frame(
+            layout,
             root,
             history.child(div().p_3().child("This thread is no longer available.")),
             sidebar,
@@ -3395,6 +3439,7 @@ fn render_content(
         .find(|project| project.id == thread.project_id)
     else {
         return frame(
+            layout,
             root,
             history.child(
                 div()
@@ -3620,6 +3665,7 @@ fn render_content(
                 })
         });
         return frame(
+            layout,
             root,
             history.child(inset(
                 h_flex()
@@ -4019,6 +4065,7 @@ fn render_content(
             9.
         } + queued_messages_height(thread, owner, cx);
     frame(
+        layout,
         root,
         history,
         sidebar,

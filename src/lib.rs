@@ -1,5 +1,7 @@
 pub mod app;
 pub mod attachments;
+pub mod browser;
+pub mod browser_tools;
 pub mod factory;
 pub mod harness;
 pub mod model;

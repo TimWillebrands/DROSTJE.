@@ -22,6 +22,7 @@ base64 = "0.22"
 rmpv = "=1.3.1"
 parking_lot = "0.12"
 ghostty-terminal = { version = "0.1.0", path = "crates/ghostty-terminal" }
+url = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
@@ -30,5 +31,15 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["N
 
 [[test]]
 name = "markdown_rendering"
+harness = false
+required-features = ["runtime-qa"]
+
+[[test]]
+name = "servo_rendering"
+harness = false
+required-features = ["runtime-qa"]
+
+[[test]]
+name = "servo_workspace"
 harness = false
 required-features = ["runtime-qa"]

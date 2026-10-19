@@ -1,5 +1,6 @@
 mod activity;
 mod agents;
+pub mod browser;
 mod color;
 pub mod commands;
 pub mod conversation;

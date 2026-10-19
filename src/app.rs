@@ -245,6 +245,7 @@ pub struct Bootstrap {
     pub snapshot: WorkspaceSnapshot,
     pub diagnostics: BTreeMap<String, String>,
     pub repositories: BTreeMap<ProjectId, Result<platform::RepositoryInfo, String>>,
+    pub browser_tools: Option<crate::browser_tools::BrowserToolServer>,
 }
 
 impl Bootstrap {
@@ -266,7 +267,14 @@ impl Bootstrap {
             smol::block_on(store.set_setting("factory_data_root".into(), value.clone()))?;
             snapshot.settings.insert("factory_data_root".into(), value);
         }
-        let diagnostics = executable_diagnostics(&snapshot.settings);
+        let mut diagnostics = executable_diagnostics(&snapshot.settings);
+        let browser_tools = match crate::browser_tools::BrowserToolServer::start() {
+            Ok(server) => Some(server),
+            Err(error) => {
+                diagnostics.insert("browser tools".into(), format!("Unavailable: {error:#}"));
+                None
+            }
+        };
         let repositories = snapshot
             .projects
             .iter()
@@ -283,6 +291,7 @@ impl Bootstrap {
             snapshot,
             diagnostics,
             repositories,
+            browser_tools,
         })
     }
 }
@@ -323,6 +332,7 @@ pub enum SidebarTab {
     Output,
     /// Offered only once the Conversation's agent works with other agents.
     Agents,
+    Browser,
 }
 impl SidebarTab {
     /// The sidebar `(open, tab)` after asking for `requested`: a hidden sidebar or
@@ -394,6 +404,7 @@ pub struct AppState {
     pub collapsed: HashSet<ProjectId>,
     pub repositories: BTreeMap<ProjectId, Result<platform::RepositoryInfo, String>>,
     pub diagnostics: BTreeMap<String, String>,
+    pub browser_tools: Option<crate::browser_tools::BrowserToolServer>,
     /// Models the title providers have locally; `None` until first inspected.
     pub title_models: Option<crate::titles::InstalledModels>,
     /// The inspection in flight; results of earlier ones are dropped.
@@ -444,6 +455,7 @@ impl AppState {
             snapshot,
             diagnostics,
             repositories,
+            browser_tools,
         } = bootstrap;
         let (space_state, storage_error) = match spaces::Spaces::load(&snapshot) {
             Ok(spaces) => (spaces, None),
@@ -624,6 +636,7 @@ impl AppState {
             collapsed: session.collapsed,
             repositories,
             diagnostics,
+            browser_tools,
             title_models: None,
             title_models_request: None,
             notice_sequence: notices.len() as u64,
@@ -1060,6 +1073,7 @@ impl AppState {
         {
             Some("output") => SidebarTab::Output,
             Some("agents") => SidebarTab::Agents,
+            Some("browser") => SidebarTab::Browser,
             _ => SidebarTab::Changes,
         }
     }
@@ -1110,9 +1124,34 @@ impl AppState {
                 SidebarTab::Changes => tabs.remove(&key),
                 SidebarTab::Output => tabs.insert(key, Value::String("output".into())),
                 SidebarTab::Agents => tabs.insert(key, Value::String("agents".into())),
+                SidebarTab::Browser => tabs.insert(key, Value::String("browser".into())),
             };
             self.set_setting("thread_sidebar_tab", Value::Object(tabs));
         }
+    }
+    pub fn thread_sidebar_width(&self, id: ThreadId) -> f32 {
+        self.snapshot
+            .settings
+            .get("thread_sidebar_width")
+            .and_then(|widths| widths.get(id.to_string()))
+            .and_then(Value::as_f64)
+            .filter(|width| width.is_finite())
+            .unwrap_or(352.) as f32
+    }
+
+    pub fn set_thread_sidebar_width(&mut self, id: ThreadId, width: f32) {
+        if !width.is_finite() {
+            return;
+        }
+        let mut widths = self
+            .snapshot
+            .settings
+            .get("thread_sidebar_width")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        widths.insert(id.to_string(), json!(width.clamp(180., 1600.)));
+        self.set_setting("thread_sidebar_width", Value::Object(widths));
     }
     pub fn thread_activity(&self, id: ThreadId) -> ThreadActivity {
         self.unseen_turns
@@ -1755,6 +1794,7 @@ mod tests {
                 snapshot,
                 diagnostics: BTreeMap::new(),
                 repositories: BTreeMap::new(),
+                browser_tools: None,
             };
             let state = cx.new(|cx| AppState::new(bootstrap, cx));
             state.update(cx, |state, _| state.select_project(id));

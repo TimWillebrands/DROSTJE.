@@ -1,0 +1,32 @@
+[package]
+name = "drostje-servo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+# Servo and GPUI link incompatible freetype-sys versions. Keep their graphs separate.
+[workspace]
+
+[[bin]]
+name = "drostje-servo"
+path = "src/main.rs"
+
+# Servo's generated DOM bindings make debug symbols disproportionately large.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+debug = 0
+
+[dependencies]
+dpi = "0.1"
+euclid = "0.22"
+parking_lot = "0.12"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "webcrypto"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }

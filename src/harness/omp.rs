@@ -230,7 +230,10 @@ fn nonblocking(fd: i32) -> Result<()> {
     );
     Ok(())
 }
-fn prepare(config: &mut ConversationConfig, dialect: Dialect) -> Result<OwnedChild> {
+fn prepare(
+    config: &mut ConversationConfig,
+    dialect: Dialect,
+) -> Result<(OwnedChild, Option<String>)> {
     ensure!(
         Dialect::for_harness(&config.harness)? == dialect,
         "Conversation harness changed while opening"
@@ -287,15 +290,21 @@ fn prepare(config: &mut ConversationConfig, dialect: Dialect) -> Result<OwnedChi
     }
     let mut command = Command::new(&config.executable);
     command
-        .args(["--mode", "rpc", "--cwd"])
-        .arg(&config.cwd)
+        .args(["--mode", "rpc"])
         .arg("--session-dir")
         .arg(&config.session_dir)
         .current_dir(&config.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let browser_warning = crate::browser_tools::configure_harness(
+        &mut command,
+        &config.harness,
+        &config.session_dir,
+        config.browser_tools.as_ref(),
+    );
     if dialect == Dialect::Omp {
+        command.arg("--cwd").arg(&config.cwd);
         command.env("PI_RPC_EMIT_TITLE", "1");
     } else if let Ok(node) = crate::platform::resolve_executable("node", None)
         && let Some(directory) = node.parent()
@@ -347,7 +356,7 @@ fn prepare(config: &mut ConversationConfig, dialect: Dialect) -> Result<OwnedChi
     nonblocking(owned.stdin.as_ref().unwrap().as_raw_fd())?;
     nonblocking(owned.stdout.as_raw_fd())?;
     nonblocking(owned.stderr.as_raw_fd())?;
-    Ok(owned)
+    Ok((owned, browser_warning))
 }
 
 pub(super) async fn open(mut config: ConversationConfig) -> Result<ConversationHandle> {
@@ -355,7 +364,13 @@ pub(super) async fn open(mut config: ConversationConfig) -> Result<ConversationH
     let (commands, input) = async_channel::bounded(64);
     let (output, events) = async_channel::bounded(128);
     smol::unblock(move || -> Result<()> {
-        let child = prepare(&mut config, dialect)?;
+        let (child, browser_warning) = prepare(&mut config, dialect)?;
+        if let Some(text) = browser_warning {
+            let _ = output.try_send(ConversationEvent::Notice {
+                level: "warning".into(),
+                text,
+            });
+        }
         std::thread::Builder::new()
             .name(format!("drostje-{}", config.harness))
             .spawn(move || {
@@ -2201,6 +2216,7 @@ done
             model: None,
             effort: None,
             permission_mode: None,
+            browser_tools: None,
             allow_empty_session: true,
         }))?;
 
@@ -2312,10 +2328,11 @@ done
             model: None,
             effort: None,
             permission_mode: None,
+            browser_tools: None,
             allow_empty_session: true,
         };
         // Drive the actual actor handlers; this child requires no external agent or credentials.
-        let child = prepare(&mut config, Dialect::Omp)?;
+        let (child, _) = prepare(&mut config, Dialect::Omp)?;
         let (_commands, input) = async_channel::bounded(64);
         let (output, _events) = async_channel::bounded(128);
         let mut actor = Actor::new(config, child, input, output, Dialect::Omp);
@@ -2728,9 +2745,10 @@ done
             model: None,
             effort: None,
             permission_mode: None,
+            browser_tools: None,
             allow_empty_session: true,
         };
-        let child = prepare(&mut config, dialect)?;
+        let (child, _) = prepare(&mut config, dialect)?;
         let (_commands, input) = async_channel::bounded(64);
         let (output, _events) = async_channel::bounded(128);
         let mut actor = Actor::new(config, child, input, output, dialect);

@@ -182,6 +182,7 @@ async fn open_fixture_with_editor(
         snapshot,
         diagnostics: BTreeMap::new(),
         repositories,
+        browser_tools: None,
     };
     let mut view = None;
     let window = cx.add_window(|window, cx| {
@@ -386,6 +387,29 @@ async fn new_thread_tab_draws_its_title(cx: &mut TestAppContext) {
     assert!(
         visual.debug_bounds(selector).is_some(),
         "the tab bar draws the thread's own title element"
+    );
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; opens a real harness session, no provider turn"]
+async fn visible_thread_opens_its_conversation_without_selection(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let id = new_conversation(cx, &fixture).await;
+    // A restored tab that is on screen while a terminal or nothing holds the selection.
+    fixture.state.update(cx, |state, cx| {
+        let project = state.selected_project.unwrap();
+        state.select_terminal_project(project);
+        if let Some(commands) = state.conversations.remove(&id).and_then(|s| s.commands) {
+            let _ = commands.try_send(crate::harness::ConversationCommand::Close);
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.read(|cx| fixture.state.read(cx).selected_thread), None);
+    assert!(
+        cx.read(|cx| fixture.state.read(cx).conversations.contains_key(&id)),
+        "the visible tab opens its Conversation without a click"
     );
     quit(cx, &fixture).await;
 }

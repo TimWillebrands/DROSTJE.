@@ -10,7 +10,6 @@ use gpui_kit::{
         form::Field,
         h_flex,
         input::{Input, InputState},
-        link::Link,
         v_flex,
     },
     prelude::FluentBuilder,
@@ -641,10 +640,19 @@ impl DetailContent {
         }
         for (index, (url, instructions)) in session.links.iter().enumerate() {
             if url.starts_with("https://") || url.starts_with("http://") {
+                let url = url.clone();
+                let owner = self.owner.clone();
                 body = body.child(
-                    Link::new(("session-link", index))
-                        .href(url.clone())
-                        .child(instructions.clone().unwrap_or_else(|| url.clone())),
+                    Button::new(("session-link", index))
+                        .ghost()
+                        .label(instructions.clone().unwrap_or_else(|| url.clone()))
+                        .on_click(move |_, window, cx| {
+                            let _ = owner.update(cx, |workspace, cx| workspace.dismiss(window, cx));
+                            window.dispatch_action(
+                                Box::new(super::browser::OpenBrowserUrl { url: url.clone() }),
+                                cx,
+                            );
+                        }),
                 );
             }
         }

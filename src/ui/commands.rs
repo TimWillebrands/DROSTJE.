@@ -32,6 +32,14 @@ gpui_kit::actions!(
         NewFactoryThread,
         NewTerminal,
         RestartTerminal,
+        NewBrowser,
+        ToggleBrowser,
+        BrowserBack,
+        BrowserForward,
+        BrowserReload,
+        BrowserAddress,
+        WidenSidebar,
+        NarrowSidebar,
         RenameProject,
         ArchiveProject,
         RenameThread,
@@ -115,6 +123,14 @@ pub enum Command {
     NewFactoryThread,
     NewTerminal,
     RestartTerminal,
+    NewBrowser,
+    ToggleBrowser,
+    BrowserBack,
+    BrowserForward,
+    BrowserReload,
+    BrowserAddress,
+    WidenSidebar,
+    NarrowSidebar,
     RenameProject,
     ArchiveProject,
     RenameThread,
@@ -153,7 +169,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 53] = [
+    pub const ALL: [Self; 61] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -171,6 +187,14 @@ impl Command {
         Self::NewFactoryThread,
         Self::NewTerminal,
         Self::RestartTerminal,
+        Self::NewBrowser,
+        Self::ToggleBrowser,
+        Self::BrowserBack,
+        Self::BrowserForward,
+        Self::BrowserReload,
+        Self::BrowserAddress,
+        Self::WidenSidebar,
+        Self::NarrowSidebar,
         Self::RenameProject,
         Self::ArchiveProject,
         Self::RenameThread,
@@ -228,6 +252,14 @@ impl Command {
             Self::NewFactoryThread => "New Factory thread",
             Self::NewTerminal => "New terminal",
             Self::RestartTerminal => "Restart terminal",
+            Self::NewBrowser => "Open browser",
+            Self::ToggleBrowser => "Toggle browser sidebar",
+            Self::BrowserBack => "Browser back",
+            Self::BrowserForward => "Browser forward",
+            Self::BrowserReload => "Reload browser",
+            Self::BrowserAddress => "Focus browser address",
+            Self::WidenSidebar => "Widen thread sidebar",
+            Self::NarrowSidebar => "Narrow thread sidebar",
             Self::RenameProject => "Rename project…",
             Self::ArchiveProject => "Archive project…",
             Self::RenameThread => "Rename thread…",
@@ -286,6 +318,14 @@ impl Command {
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::NewTerminal => Box::new(NewTerminal),
             Self::RestartTerminal => Box::new(RestartTerminal),
+            Self::NewBrowser => Box::new(NewBrowser),
+            Self::ToggleBrowser => Box::new(ToggleBrowser),
+            Self::BrowserBack => Box::new(BrowserBack),
+            Self::BrowserForward => Box::new(BrowserForward),
+            Self::BrowserReload => Box::new(BrowserReload),
+            Self::BrowserAddress => Box::new(BrowserAddress),
+            Self::WidenSidebar => Box::new(WidenSidebar),
+            Self::NarrowSidebar => Box::new(NarrowSidebar),
             Self::RenameProject => Box::new(RenameProject),
             Self::ArchiveProject => Box::new(ArchiveProject),
             Self::RenameThread => Box::new(RenameThread),
@@ -413,6 +453,7 @@ impl Command {
                     })
             }),
             Self::ToggleConversationDiffs
+            | Self::ToggleBrowser
             | Self::ToggleAgents
             | Self::ToggleTaskList
             | Self::ToggleBackgroundJobs
@@ -482,6 +523,17 @@ impl Command {
             return Some("Application is shutting down.".into());
         }
         match self {
+            Self::WidenSidebar | Self::NarrowSidebar if state.thread().is_none() => {
+                Some("Select a thread first".into())
+            }
+            Self::CloseThread if workspace.browsers.active.is_some() => None,
+            Self::BrowserBack
+            | Self::BrowserForward
+            | Self::BrowserReload
+            | Self::BrowserAddress => match workspace.selected_browser(cx) {
+                Some(pane) => pane.read(cx).disabled_reason(self),
+                None => Some("Open a browser first".into()),
+            },
             Self::CloseThread if workspace.has_active_terminal(cx) => None,
             Self::NextThread | Self::PreviousThread => {
                 (workspace.center_panel_count(cx) < 2).then(|| "Open at least two tabs.".into())
@@ -548,8 +600,9 @@ pub fn bind_keys(cx: &mut App) {
     let workspace = Some("Workspace && !Command && !PopupMenu && !Sheet && !Dialog");
     let command = Some("DrostjePalette");
     let picker = Some("SpacePicker || HarnessPicker");
-    let navigation =
-        Some("Workspace && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
+    let navigation = Some(
+        "Workspace && !Input && !NativeInput && !Browser && !Command && !PopupMenu && !Sheet && !Dialog",
+    );
     // Embedded editors and terminals reserve the same pane-navigation prefix.
     let editor_navigation = Some(
         "(PromptEditor || Terminal || TerminalPane) && !Command && !PopupMenu && !Sheet && !Dialog",
@@ -559,10 +612,11 @@ pub fn bind_keys(cx: &mut App) {
     let projects = Some(
         "ProjectsList && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog",
     );
-    let thread =
-        Some("Thread && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
+    let thread = Some(
+        "Thread && !Input && !NativeInput && !Browser && !Command && !PopupMenu && !Sheet && !Dialog",
+    );
     let submit = Some(
-        "(Thread || PromptEditor || FactoryThreadForm) && !Command && !PopupMenu && !Sheet && !Dialog",
+        "(Thread || PromptEditor || FactoryThreadForm) && !Browser && !BrowserPane && !Command && !PopupMenu && !Sheet && !Dialog",
     );
     let caret_popup = Some("PromptEditor && CaretPopup && !Command && !Sheet && !Dialog");
     cx.bind_keys(vec![
@@ -590,6 +644,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-h", SwitchHarness, workspace),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
         KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
+        KeyBinding::new("secondary-l", BrowserAddress, Some("BrowserPane || Browser")),
+        KeyBinding::new("secondary-r", BrowserReload, Some("BrowserPane || Browser")),
+        KeyBinding::new("secondary-escape", LeaveEditor, Some("Browser")),
         KeyBinding::new("secondary-,", Settings, workspace),
         KeyBinding::new("secondary-q", Quit, None),
         // The native Command rows resolve hints against the palette's own action host.
@@ -703,7 +760,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "secondary-.",
             Interrupt,
-            Some("(Thread || PromptEditor) && !Command && !PopupMenu && !Sheet && !Dialog"),
+            Some("(Thread || PromptEditor) && !Browser && !BrowserPane && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
             "secondary-alt-backspace",
@@ -713,7 +770,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "secondary-alt-backspace",
             ClearQueuedMessages,
-            Some("(Thread || PromptEditor) && !Command && !PopupMenu && !Sheet && !Dialog"),
+            Some("(Thread || PromptEditor) && !Browser && !BrowserPane && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
             "secondary-enter",
@@ -1460,6 +1517,30 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &RestartTerminal, w, cx| {
                 this.run(PaletteTarget::Command(Command::RestartTerminal), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewBrowser, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewBrowser), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBrowser, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleBrowser), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &BrowserBack, w, cx| {
+                this.run(PaletteTarget::Command(Command::BrowserBack), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &BrowserForward, w, cx| {
+                this.run(PaletteTarget::Command(Command::BrowserForward), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &BrowserReload, w, cx| {
+                this.run(PaletteTarget::Command(Command::BrowserReload), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &BrowserAddress, w, cx| {
+                this.run(PaletteTarget::Command(Command::BrowserAddress), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &WidenSidebar, w, cx| {
+                this.run(PaletteTarget::Command(Command::WidenSidebar), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NarrowSidebar, w, cx| {
+                this.run(PaletteTarget::Command(Command::NarrowSidebar), w, cx)
             }))
             .on_action(cx.listener(|this, _: &RenameProject, w, cx| {
                 this.run(PaletteTarget::Command(Command::RenameProject), w, cx)

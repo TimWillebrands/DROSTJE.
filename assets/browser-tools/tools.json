@@ -1,0 +1,44 @@
+[
+  {
+    "name": "show_artifact",
+    "description": "Display an existing HTML file in this conversation's live Servo artifact pane. First write the HTML file under /tmp, then pass its absolute path. The file is loaded in place so relative CSS, scripts and images resolve beside it. This is a real, unsandboxed browser: JavaScript and network requests execute. Returns the displayed browser ID and canonical file path, or a real file/runtime error. It does not create files or accept HTML source.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "Absolute path to an existing HTML file, normally /tmp/artifact-name.html."},
+        "title": {"type": "string", "description": "Optional human-readable artifact title."}
+      },
+      "required": ["path"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "browser",
+    "description": "Operate DROSTJE's real embedded Servo browser, not external Chrome. open creates a browser in this thread's sidebar or a dock tab and returns its ID; reuse that ID for all other actions. inspect reads current URL, title, loading/error and navigation state. evaluate executes JavaScript in the page and returns its actual result (use it to inspect DOM or select elements). click uses viewport CSS-pixel coordinates; type inserts text into the focused element; key sends a named keyboard key with optional modifiers; scroll sends wheel deltas at viewport coordinates. navigate/back/forward/reload change page navigation. screenshot saves the current rendered frame to an absolute PNG file path. close closes that browser. This browser is unsandboxed; page scripts and network requests execute. Loading and rendering are asynchronous: inspect reports current state and screenshot can fail before a frame exists. Missing runtimes, files, pages and execution failures are returned as errors, never simulated.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {"type": "string", "enum": ["open", "inspect", "navigate", "back", "forward", "reload", "evaluate", "click", "type", "key", "scroll", "screenshot", "close"]},
+        "id": {"type": "string", "description": "Browser UUID returned by open or show_artifact; required except for open."},
+        "url": {"type": "string", "description": "URL for open or navigate. Supports http:, https: and file:."},
+        "placement": {"type": "string", "enum": ["sidebar", "tab"], "description": "Where open displays the browser; defaults to sidebar."},
+        "script": {"type": "string", "description": "JavaScript expression or script for evaluate."},
+        "x": {"type": "number", "description": "Viewport x coordinate in CSS pixels for click or scroll."},
+        "y": {"type": "number", "description": "Viewport y coordinate in CSS pixels for click or scroll."},
+        "button": {"type": "number", "description": "Click button: 0 left (default), 1 middle, 2 right."},
+        "text": {"type": "string", "description": "Text to insert for type."},
+        "key": {"type": "string", "description": "DOM key for key, e.g. Enter, Tab, ArrowDown or a."},
+        "code": {"type": "string", "description": "Optional DOM physical key code, e.g. Enter, Tab, ArrowDown or KeyA. Omitted means Unidentified."},
+        "shift": {"type": "boolean"},
+        "control": {"type": "boolean"},
+        "alt": {"type": "boolean"},
+        "meta": {"type": "boolean"},
+        "dx": {"type": "number", "description": "Horizontal wheel delta for scroll."},
+        "dy": {"type": "number", "description": "Vertical wheel delta for scroll."},
+        "path": {"type": "string", "description": "Absolute output PNG path for screenshot."}
+      },
+      "required": ["action"],
+      "additionalProperties": false
+    }
+  }
+]

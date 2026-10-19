@@ -30,12 +30,15 @@ Een **drost** (of drossaard, als je het deftig wilt zeggen) was vroeger de rentm
 ## Aan de slag
 
 ```sh
+cargo build --manifest-path crates/servo-browser/Cargo.toml --locked
 cargo run
 ```
 
 Wat ontbreekt, vertelt DROSTJE. je zelf. Wil je een aparte data-map (handig voor testen)? Zet `DROSTJE_DATA_DIR`.
 
 Een bronbuild vereist **Zig 0.16** (`zig` op PATH, of `ZIG=/pad/naar/zig`) voor de ingebedde libghostty-adapter. Op macOS is ook Xcode nodig; Linux vereist Wayland/EGL/OpenGL, libxml2 en de libc++-runtime van LLVM 21 of nieuwer. De eerste build compileert de meegeleverde Ghostty-broncode; volgende builds hergebruiken een cache op basis van broncode en toolchain. `GHOSTTY_NATIVE_CACHE_DIR` kan die cache verplaatsen. Een gebouwde app heeft geen Zig of afzonderlijk geïnstalleerde Ghostty nodig.
+
+De ingebedde browser gebruikt **Servo 0.7.0** in `drostje-servo`. Die helper heeft een eigen Cargo-workspace omdat Servo en de vastgepinde GPUI-versie verschillende `freetype-sys`-versies linken. Nodig: CMake, pkg-config, Python 3, make en de platform-SDK; Linux heeft daarnaast fontconfig-ontwikkelbestanden en Mesa EGL/OpenGL nodig. SpiderMonkey downloadt normaal een passend vooraf gebouwd archief. Een bronbuild daarvan vereist LLVM/Clang 19 of nieuwer; Apple Clang 17 volstaat niet. De installer bouwt en bundelt de helper; een ontwikkelbuild vindt hem onder `crates/servo-browser/target/{debug,release}`. Met `DROSTJE_SERVO` kun je een expliciet executable-pad opgeven. Ontbreekt de helper, dan blijft de app bruikbaar en toont het browserpaneel de bouwinstructie.
 
 ### Installeren
 
@@ -93,6 +96,21 @@ Projects bevat binnen de actieve Space een lijst met twee soorten threads:
 **Terminal** is een derde soort centraal paneel, geen opgeslagen thread. Kies **New terminal** in het projectmenu, het tabmenu of de command palette (`Cmd-Alt-T`). De standaard-shell start in de projectmap met je eigen gebruikersrechten. Op macOS is dit een login-shell, zodat systeem- en gebruikersprofielen (zoals `.zprofile` voor zsh) vóór de interactieve configuratie worden geladen, ook wanneer de app vanuit Finder start. Tabs, splitsingen, `Ctrl-Tab` en `Ctrl-W` + `h/j/k/l` werken ook voor terminals. `Cmd-Escape` verlaat de terminalinvoer zonder de shell te stoppen; `Ctrl-C` blijft een terminaltoets.
 
 Een terminal blijft draaien bij tab- en Space-wissels. Sluiten of **Restart terminal** vraagt bevestiging zolang de shell draait en stopt die shell plus het actieve proces op de voorgrond. Na een gewone shell-exit blijft het paneel zichtbaar met een herstartactie. Afsluiten van de app stopt alle terminals na bevestiging; terminaltabs en shellsessies worden niet bewaard of automatisch opnieuw gestart. Opstart- en rendererfouten blijven in het betreffende paneel zichtbaar, zonder Conversations of Factory-threads te blokkeren. De native backend gebruikt Metal op macOS en EGL/OpenGL op Linux/Wayland; X11 wordt voor Terminal niet ondersteund.
+
+### Browser en HTML-artifacts
+
+**Open browser** in de command palette opent een zelfstandig Servo-tabblad. Weblinks in Conversations openen ook zo'n tabblad. **Toggle browser sidebar** toont een blijvende browsersessie naast de Conversation. Sleep de scheidingslijn om de zijbalk te schalen, of gebruik **Widen thread sidebar** / **Narrow thread sidebar** in de palette; de breedte wordt per thread bewaard.
+
+De adresbalk accepteert web-URL's en absolute bestandspaden. `Cmd-L` focust het adres, Return navigeert en focust de pagina, `Cmd-R` herlaadt. Terug/vooruit, muis, scrollen, toetsenbord en tekstinvoer werken op de echte Servo-pagina. `Cmd-Escape` verplaatst focus van de pagina naar de adresbalk. Browser-tabs delen de gewone tabnavigatie en `Close tab`.
+
+OMP, Pi en Claude Code krijgen bij het starten van hun sessie instructies en twee tools:
+
+- `show_artifact`: schrijf eerst een HTML-bestand, bijvoorbeeld `/tmp/chart.html`, en geef daarna `{"path":"/tmp/chart.html","title":"Chart"}` aan de tool. De toolkaart in de Conversation wordt een interactieve browser. Relatieve CSS-, JavaScript- en afbeeldingsbestanden blijven naast het HTML-bestand werken.
+- `browser`: open met `{"action":"open","url":"http://localhost:3000","placement":"sidebar"}` of `"placement":"tab"`. Gebruik het teruggegeven `id` voor `inspect`, `navigate`, `back`, `forward`, `reload`, `evaluate`, `click`, `type`, `key`, `scroll`, `screenshot` en `close`. `evaluate` geeft het echte JavaScript-resultaat terug; screenshots zijn PNG-bestanden. Navigatie en invoer worden in de wachtrij geplaatst: controleer `inspect` of de DOM vóór de volgende stap. In Claude Code heten de tools `mcp__drostje__show_artifact` en `mcp__drostje__browser`.
+
+Dit is bewust **geen sandbox**. Pagina's voeren JavaScript en netwerkverzoeken uit met de mogelijkheden van de browser; harness-toestemmingen beperken die pagina's niet. De helper is een link-/procesgrens, geen beveiligingsgrens.
+
+Tab-URL's, artifact-verwijzingen en zijbalkkeuzes blijven bewaard; een herstart laadt pagina's opnieuw, niet hun JavaScript- of formulierstatus. HTML-bestanden worden niet gekopieerd: verwijderde `/tmp`-bestanden geven een zichtbare fout. Servo is geen Chrome-vervanger: deze build gebruikt Servo's `SoftwareRenderingContext` en kopieert RGBA-frames naar GPUI, heeft geen WebGL/WebGPU en ondersteunt maximaal 16 gelijktijdige pagina's. Browserextensies, downloads, uploadkiezers en pop-upvensters zijn niet geïntegreerd. De browser- en werkruimteproeven zijn op macOS uitgevoerd; Linux-rendering is nog niet runtime-gecontroleerd.
 
 De Conversation-tijdlijn toont denkstappen als gedempte inline tekst. Ingeklapte tools houden een begrensd voorbeeld van hun resultaat zichtbaar; open de kaart voor de volledige uitvoer. Mislukte tools openen hun foutdetails automatisch.
 
@@ -172,6 +190,17 @@ cargo test --features runtime-qa native_composition_is_recovery_only_until_commi
 ```
 
 De macOS-regressie `cargo test --features runtime-qa --test markdown_rendering` gebruikt echte fonts en offscreen Metal-pixels, zonder vensterbediening, schermopnametoestemming of provider-turns. Ze controleert zichtbare code-suffixen, afbreking, Unicode en tekstselectie in beide thema's.
+
+De Servo-proeven gebruiken echte HTML-bestanden, een echt helperproces en op macOS GPUI's Metal-renderer. Ze versturen geen provider-turns:
+
+```sh
+cargo build --manifest-path crates/servo-browser/Cargo.toml --locked
+cargo test --manifest-path crates/servo-browser/Cargo.toml
+cargo test --manifest-path crates/servo-browser/Cargo.toml --test smoke -- --ignored --nocapture
+cargo test --features runtime-qa --test servo_rendering --test servo_workspace
+```
+
+Dit controleert pixels in beide thema's, resize, klikken, tekstinvoer, adresfocus, geschiedenis, ontbrekende bestanden, de echte HTTP-toolroute, gescheiden artifact-/zijbalksessies, screenshots en het sluiten van browser-tabs zonder de Conversation te sluiten. `DROSTJE_QA_SCREENSHOTS=/tmp/drostje-browser-proof` bewaart de visuele bewijzen. Dit vervangt geen OS-inputcontrole; daarvoor moet macOS de gebruikte automatiseringstool Accessibility-toegang geven.
 
 ### Expliciete desktop-QA
 

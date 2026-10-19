@@ -180,7 +180,7 @@ fn session(config: &mut ConversationConfig) -> Result<Session> {
     })
 }
 
-fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session)> {
+fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session, Option<String>)> {
     let session = session(config)?;
     let mut command = Command::new(&config.executable);
     // `--permission-prompts host` only names who answers; without `--permission-prompt-tool
@@ -202,6 +202,12 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session)> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let browser_warning = crate::browser_tools::configure_harness(
+        &mut command,
+        &config.harness,
+        &config.session_dir,
+        config.browser_tools.as_ref(),
+    );
     if session.resume {
         command.arg("--resume").arg(session.id.to_string());
     } else {
@@ -248,14 +254,20 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session)> {
     nonblocking(owned.stdin.as_ref().unwrap().as_raw_fd())?;
     nonblocking(owned.stdout.as_raw_fd())?;
     nonblocking(owned.stderr.as_raw_fd())?;
-    Ok((owned, session))
+    Ok((owned, session, browser_warning))
 }
 
 pub(super) async fn open(mut config: ConversationConfig) -> Result<ConversationHandle> {
     let (commands, input) = async_channel::bounded(64);
     let (output, events) = async_channel::bounded(128);
     smol::unblock(move || -> Result<()> {
-        let (child, session) = prepare(&mut config)?;
+        let (child, session, browser_warning) = prepare(&mut config)?;
+        if let Some(text) = browser_warning {
+            let _ = output.try_send(ConversationEvent::Notice {
+                level: "warning".into(),
+                text,
+            });
+        }
         let actor = Actor::new(config, session, child, input, output)?;
         std::thread::Builder::new()
             .name("drostje-claude-code".into())
@@ -2112,6 +2124,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            browser_tools: None,
             allow_empty_session: true,
         };
 
@@ -2198,6 +2211,7 @@ done
             model: None,
             effort: Some("low".into()),
             permission_mode: Some("acceptEdits".into()),
+            browser_tools: None,
             allow_empty_session: true,
         }))?;
         let receive = || {

@@ -56,6 +56,8 @@ pub struct ConversationConfig {
     pub effort: Option<String>,
     /// Claude Code permission mode (`--permission-mode`); `None` means the harness default.
     pub permission_mode: Option<String>,
+    /// Optional live artifact/browser tools, scoped to this application's conversation.
+    pub browser_tools: Option<crate::browser_tools::BrowserToolConfig>,
     /// Only an unsent draft may replace an explicitly file-less provider session.
     pub allow_empty_session: bool,
 }

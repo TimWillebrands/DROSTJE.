@@ -1,4 +1,5 @@
 /target
+/crates/servo-browser/target/
 /dist
 /reports
 /research_notes

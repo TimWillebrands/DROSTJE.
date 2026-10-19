@@ -42,6 +42,13 @@ impl AppState {
         let saved = self.persist_thread(thread.clone());
         let sender = self.events.clone();
         let executables = self.snapshot.settings.get("executables").cloned();
+        let browser_tools =
+            self.browser_tools
+                .as_ref()
+                .map(|server| crate::browser_tools::BrowserToolConfig {
+                    endpoint: server.endpoint(),
+                    thread: id,
+                });
         let session_dir = self
             .data_dir
             .join(format!("{}-sessions", thread.harness))
@@ -62,6 +69,7 @@ impl AppState {
                         .and_then(Value::as_str);
                     Ok(harness::ConversationConfig {
                         allow_empty_session: thread.submission.is_none(),
+                        browser_tools,
                         harness: thread.harness,
                         executable: platform::resolve_executable(executable_name, explicit)?,
                         cwd: repository.root,

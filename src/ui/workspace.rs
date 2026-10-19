@@ -1,3 +1,6 @@
+#[path = "workspace_browser.rs"]
+mod browser_workspace;
+use super::browser::{BrowserPane, OpenBrowserUrl};
 use super::{
     activity,
     commands::{self, *},
@@ -12,6 +15,7 @@ use crate::{
     app::{AppState, NoticeLevel, PresentationChange, SidebarTab, ThreadActivity},
     model::{PaneDirection, ProjectId, SpaceId, ThreadId, ThreadKind, WorktreeId},
 };
+use browser_workspace::{Browsers, browser_of};
 use gpui_kit::{
     component::{
         ActiveTheme, IconName, Root, Sizable, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
@@ -70,12 +74,15 @@ pub enum PanelKind {
     Welcome,
     Thread(ThreadId),
     Terminal(TerminalId),
+    Browser(crate::browser::BrowserId),
 }
 impl PanelKind {
     pub fn region(self) -> Region {
         match self {
             Self::Projects => Region::Projects,
-            Self::Welcome | Self::Thread(_) | Self::Terminal(_) => Region::Thread,
+            Self::Welcome | Self::Thread(_) | Self::Terminal(_) | Self::Browser(_) => {
+                Region::Thread
+            }
         }
     }
     /// Persisted layout name; never change it.
@@ -85,6 +92,7 @@ impl PanelKind {
             Self::Welcome => "Welcome",
             Self::Thread(_) => "Thread",
             Self::Terminal(_) => "Terminal",
+            Self::Browser(_) => "Browser",
         }
     }
     fn context(self) -> &'static str {
@@ -92,12 +100,14 @@ impl PanelKind {
             Self::Projects => "List ProjectsList",
             Self::Welcome | Self::Thread(_) => "Thread",
             Self::Terminal(_) => "TerminalPane",
+            Self::Browser(_) => "BrowserPane",
         }
     }
     fn debug_name(self) -> String {
         match self {
             Self::Thread(id) => format!("Thread:{id}"),
             Self::Terminal(id) => format!("Terminal:{id}"),
+            Self::Browser(id) => format!("Browser:{id}"),
             other => other.name().to_owned(),
         }
     }
@@ -106,6 +116,7 @@ impl PanelKind {
             && match self {
                 Self::Thread(id) => thread_of(state) == Some(id),
                 Self::Terminal(id) => terminal_of(state) == Some(id),
+                Self::Browser(id) => browser_of(state) == Some(id),
                 _ => true,
             }
     }
@@ -234,6 +245,9 @@ pub struct Workspace {
     /// Shared with the panel registry so a restored layout rebuilds into the same map.
     threads: ThreadPanels,
     terminals: TerminalPanels,
+    pub(super) browsers: Browsers,
+    pub(super) sidebar_sizes:
+        Rc<RefCell<BTreeMap<ThreadId, Entity<gpui_kit::component::resizable::ResizableState>>>>,
     /// Live layouts reattach retained terminals; durable layouts reopen them with a new shell.
     live_layouts: BTreeMap<SpaceId, DockAreaState>,
     active_terminal: Option<TerminalId>,
@@ -297,6 +311,7 @@ impl Workspace {
         });
         let threads: ThreadPanels = Rc::default();
         let terminals: TerminalPanels = Rc::default();
+        let browsers = Browsers::new(&state, &owner, window, cx);
         let welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>> = Rc::default();
         {
             let panel = projects.clone();
@@ -368,6 +383,8 @@ impl Workspace {
             projects,
             threads,
             terminals,
+            browsers,
+            sidebar_sizes: Rc::default(),
             live_layouts: BTreeMap::new(),
             active_terminal: None,
             space_terminals: BTreeMap::new(),
@@ -409,6 +426,8 @@ impl Workspace {
             dock_measurement: Rc::new(Cell::new(None)),
             _subscriptions: Vec::new(),
         };
+        workspace.start_browser_tools(window, cx);
+        workspace.observe_browsers(cx);
         workspace._subscriptions.push(cx.on_focus_in(
             &workspace.focus,
             window,
@@ -499,7 +518,7 @@ impl Workspace {
                 workspace.sync_detail_surface(window, cx);
                 workspace.show_notices(window, cx);
                 workspace.sync_selection_panels(window, cx);
-                workspace.sync_diff_interest(cx);
+                workspace.sync_visible_threads(cx);
                 cx.notify();
             },
         ));
@@ -519,7 +538,7 @@ impl Workspace {
                         workspace.sync_effort_picker(window, cx);
                         workspace.sync_permission_mode_picker(window, cx);
                         workspace.sync_selection_panels(window, cx);
-                        workspace.sync_diff_interest(cx);
+                        workspace.sync_visible_threads(cx);
                     }
                     PresentationChange::Thread(id)
                         if workspace.state.read(cx).selected_thread == Some(id) =>
@@ -551,7 +570,7 @@ impl Workspace {
                     workspace.invalidate_panel_bounds(cx);
                     workspace.normalize_layout(workspace.reopening, window, cx);
                     workspace.schedule_layout_save(window, cx);
-                    workspace.sync_diff_interest(cx);
+                    workspace.sync_visible_threads(cx);
                     workspace.sync_terminal_visibility(window, cx);
                 }
             },
@@ -585,7 +604,7 @@ impl Workspace {
         workspace.sync_effort_picker(window, cx);
         workspace.sync_permission_mode_picker(window, cx);
         workspace.sync_selection_panels(window, cx);
-        workspace.sync_diff_interest(cx);
+        workspace.sync_visible_threads(cx);
         cx.defer_in(window, |workspace, window, cx| {
             workspace.show_notices(window, cx)
         });
@@ -1068,6 +1087,10 @@ impl Workspace {
     fn restorable_layout(&self, layout: DockAreaState, cx: &App) -> DockAreaState {
         let state = self.state.read(cx);
         filter_layout(layout, &|panel| {
+            if panel.panel_name == "Browser" {
+                return browser_of(panel)
+                    .is_some_and(|id| self.browsers.panels.borrow().contains_key(&id));
+            }
             panel.panel_name != "Terminal"
                 || terminal_of(panel).is_some_and(|id| self.terminals.borrow().contains_key(&id))
                 || terminal_tab(panel).is_some_and(|tab| {
@@ -1086,7 +1109,9 @@ impl Workspace {
             .filter(|pane| pane.read(cx).space_id == self.presented_space)
     }
     pub(super) fn center_panel_count(&self, cx: &App) -> usize {
-        self.open_thread_ids(cx).len() + self.active_space_terminals(cx).len()
+        self.open_thread_ids(cx).len()
+            + self.active_space_terminals(cx).len()
+            + self.browser_tab_count(cx)
     }
     #[cfg(all(test, feature = "runtime-qa"))]
     pub(super) fn terminal_count(&self, _: &App) -> usize {
@@ -1166,6 +1191,8 @@ impl Workspace {
             return;
         }
         let project = pane.read(cx).project_id;
+        self.browsers.active = None;
+        self.browsers.focused = None;
         self.active_terminal = Some(id);
         self.space_terminals.insert(self.presented_space, id);
         self.state.update(cx, |state, cx| {
@@ -1264,6 +1291,9 @@ impl Workspace {
             if let Some(id) = terminal_of(state).filter(|_| state.panel_name == "Terminal") {
                 kinds.push(PanelKind::Terminal(id));
             }
+            if let Some(id) = browser_of(state).filter(|_| state.panel_name == "Browser") {
+                kinds.push(PanelKind::Browser(id));
+            }
             for child in &state.children {
                 collect(child, kinds);
             }
@@ -1290,6 +1320,7 @@ impl Workspace {
         let target = match panels[next] {
             PanelKind::Thread(id) => self.threads.borrow().get(&id).cloned(),
             PanelKind::Terminal(id) => self.terminals.borrow().get(&id).cloned(),
+            PanelKind::Browser(id) => self.browsers.panels.borrow().get(&id).cloned(),
             _ => None,
         };
         if let Some(target) = target {
@@ -1297,6 +1328,10 @@ impl Workspace {
         }
     }
     pub(super) fn close_active_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.browsers.active {
+            self.close_browser(id, window, cx);
+            return;
+        }
         if let Some(id) = self.active_terminal {
             self.close_terminal_tab(id, window, cx);
         } else if let Some(id) = self.state.read(cx).selected_thread {
@@ -1478,9 +1513,17 @@ impl Workspace {
         panels.extend(self.welcome.borrow().iter().cloned());
         panels.extend(self.threads.borrow().values().cloned());
         panels.extend(self.terminals.borrow().values().cloned());
+        panels.extend(self.browsers.panels.borrow().values().cloned());
         panels
     }
     fn thread_target(&self, cx: &App) -> Option<Entity<WorkspacePanel>> {
+        if let Some(panel) = self
+            .browsers
+            .active
+            .and_then(|id| self.browsers.panels.borrow().get(&id).cloned())
+        {
+            return Some(panel);
+        }
         self.active_terminal
             .and_then(|id| self.terminals.borrow().get(&id).cloned())
             .or_else(|| {
@@ -1534,7 +1577,10 @@ impl Workspace {
             }
         }
         let owner = cx.entity().downgrade();
-        if open.is_empty() && self.active_space_terminals(cx).is_empty() {
+        if open.is_empty()
+            && self.active_space_terminals(cx).is_empty()
+            && self.browser_tab_count(cx) == 0
+        {
             if self.welcome.borrow().is_none() {
                 let welcome = welcome_panel(&self.welcome, &self.state, &owner, window, cx);
                 self.dock.update(cx, |dock, cx| {
@@ -1560,7 +1606,7 @@ impl Workspace {
             .filter(|panel| {
                 matches!(
                     panel.read(cx).kind,
-                    PanelKind::Thread(_) | PanelKind::Terminal(_)
+                    PanelKind::Thread(_) | PanelKind::Terminal(_) | PanelKind::Browser(_)
                 )
             })
             .or_else(|| selected.and_then(|id| self.threads.borrow().get(&id).cloned()))
@@ -1617,6 +1663,7 @@ impl Workspace {
                     .update(cx, |dock, cx| dock.remove_panel(panel.clone(), window, cx));
             }
         }
+        self.sync_browser_tabs(window, cx);
         if lost_focus {
             // The closed pane held focus; keyboard control continues in the next thread.
             if let Some(target) = self.thread_target(cx) {
@@ -1697,7 +1744,9 @@ impl Workspace {
         true
     }
 
-    fn sync_diff_interest(&mut self, cx: &mut Context<Self>) {
+    /// Every thread pane on screen opens its Conversation, not only the selected one, so
+    /// restored tabs beside the selection show their history without a click.
+    fn sync_visible_threads(&mut self, cx: &mut Context<Self>) {
         let dock = self.dock.read(cx);
         let layout = dock.dump(cx);
         let visible: Vec<_> = self
@@ -1707,8 +1756,12 @@ impl Workspace {
             .filter(|(_, panel)| panel_visible(panel, dock, &layout, cx))
             .map(|(id, _)| *id)
             .collect();
-        self.state
-            .update(cx, |state, cx| state.set_visible_conversations(visible, cx));
+        self.state.update(cx, |state, cx| {
+            for &id in &visible {
+                state.ensure_conversation(id);
+            }
+            state.set_visible_conversations(visible, cx);
+        });
     }
 
     /// A pane that gained focus (click, tab, Ctrl-W) is the selected thread.
@@ -1719,6 +1772,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.browsers.active = None;
+        self.browsers.focused = None;
         if self.rebuilding
             || self.preparing_space_change
             || !self.state.read(cx).thread_in_active_space(id)
@@ -1960,6 +2015,7 @@ impl Workspace {
         {
             return;
         }
+        self.save_browsers(cx);
         let live = self.dock.read(cx).dump(cx);
         self.live_layouts.insert(self.presented_space, live.clone());
         let sidebar = ProjectsSidebar::capture(&live).map(|sidebar| json!(sidebar));
@@ -2119,11 +2175,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if tab == SidebarTab::Browser {
+            self.ensure_sidebar_browser(id, window, cx);
+        }
         self.state.update(cx, |state, cx| {
             state.show_thread_sidebar(id, tab);
             cx.emit(PresentationChange::Thread(id));
         });
-        self.sync_diff_interest(cx);
+        self.sync_visible_threads(cx);
         let panel = self.threads.borrow().get(&id).cloned();
         if let Some(panel) = panel {
             self.focus_panel(panel, window, cx);
@@ -2148,7 +2207,7 @@ impl Workspace {
                 state.show_thread_sidebar(id, SidebarTab::Agents);
                 cx.emit(PresentationChange::Thread(id));
             });
-            self.sync_diff_interest(cx);
+            self.sync_visible_threads(cx);
         }
     }
     /// Show `tab` in a thread's sidebar, or hide the sidebar when `tab` is on screen.
@@ -2157,7 +2216,7 @@ impl Workspace {
             state.toggle_thread_sidebar(id, tab);
             cx.emit(PresentationChange::Thread(id));
         });
-        self.sync_diff_interest(cx);
+        self.sync_visible_threads(cx);
     }
     /// Fold or unfold one of the conversation's sticky docks (task list, background jobs).
     fn toggle_dock(&mut self, dock: &str, cx: &mut Context<Self>) {
@@ -2282,11 +2341,15 @@ impl Workspace {
         match kind {
             PanelKind::Thread(id) => self.thread_focused(id, panel.entity_id(), window, cx),
             PanelKind::Terminal(id) => self.terminal_focused(id, window, cx),
+            PanelKind::Browser(id) => self.browser_focused(id, cx),
             PanelKind::Projects | PanelKind::Welcome => {}
         }
         focus.focus(window, cx);
         if let Some(terminal) = panel.read(cx).terminal.clone() {
             terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+        }
+        if let Some(browser) = panel.read(cx).browser.clone() {
+            browser.update(cx, |browser, cx| browser.focus(window, cx));
         }
         self.sync_terminal_visibility(window, cx);
         cx.notify();
@@ -2385,6 +2448,7 @@ impl Workspace {
                 | Command::NewConversationInWorktree
                 | Command::NewFactoryThread
                 | Command::NewTerminal
+                | Command::NewBrowser
                 | Command::RestartTerminal
         ) && self
             .editor
@@ -2401,6 +2465,58 @@ impl Workspace {
             return;
         }
         let kind = match command {
+            Command::WidenSidebar | Command::NarrowSidebar => {
+                if let Some(id) = self.state.read(cx).selected_thread {
+                    let sizes = self.sidebar_sizes.borrow().get(&id).cloned();
+                    if let Some(sizes) = sizes {
+                        let width = sizes.read(cx).sizes().get(1).copied();
+                        if let Some(width) = width {
+                            let delta = if command == Command::WidenSidebar {
+                                48.
+                            } else {
+                                -48.
+                            };
+                            sizes.update(cx, |sizes, cx| {
+                                sizes.resize_panel(1, width + px(delta), window, cx)
+                            });
+                            if let Some(width) = sizes.read(cx).sizes().get(1).copied() {
+                                self.state.update(cx, |state, _| {
+                                    state.set_thread_sidebar_width(id, f32::from(width))
+                                });
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Command::NewBrowser => {
+                self.open_browser("about:blank".into(), None, None, window, cx);
+                None
+            }
+            Command::ToggleBrowser => {
+                if let Some(id) = self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .map(|thread| thread.id)
+                {
+                    if self.sidebar_browser(id).is_none() {
+                        self.ensure_sidebar_browser(id, window, cx);
+                    } else {
+                        self.toggle_sidebar_tab(id, SidebarTab::Browser, cx);
+                    }
+                }
+                None
+            }
+            Command::BrowserBack
+            | Command::BrowserForward
+            | Command::BrowserReload
+            | Command::BrowserAddress => {
+                if let Some(pane) = self.selected_browser(cx) {
+                    pane.update(cx, |pane, cx| pane.command(command, window, cx));
+                }
+                None
+            }
             Command::NewTerminal => {
                 self.new_terminal(window, cx);
                 None
@@ -3143,6 +3259,33 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &RestartTerminal, w, cx| {
                     this.execute(Command::RestartTerminal, w, cx)
                 }))
+                .on_action(cx.listener(|this, action: &OpenBrowserUrl, w, cx| {
+                    this.open_browser(action.url.clone(), None, None, w, cx);
+                }))
+                .on_action(cx.listener(|this, _: &NewBrowser, w, cx| {
+                    this.execute(Command::NewBrowser, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleBrowser, w, cx| {
+                    this.execute(Command::ToggleBrowser, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &BrowserBack, w, cx| {
+                    this.execute(Command::BrowserBack, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &BrowserForward, w, cx| {
+                    this.execute(Command::BrowserForward, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &BrowserReload, w, cx| {
+                    this.execute(Command::BrowserReload, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &BrowserAddress, w, cx| {
+                    this.execute(Command::BrowserAddress, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &WidenSidebar, w, cx| {
+                    this.execute(Command::WidenSidebar, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &NarrowSidebar, w, cx| {
+                    this.execute(Command::NarrowSidebar, w, cx)
+                }))
                 .on_action(
                     cx.listener(|this, _: &NewSpace, w, cx| this.execute(Command::NewSpace, w, cx)),
                 )
@@ -3518,6 +3661,7 @@ pub struct WorkspacePanel {
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     transcript: Option<Entity<conversation::TranscriptView>>,
     terminal: Option<Entity<TerminalPane>>,
+    browser: Option<Entity<BrowserPane>>,
     _subscriptions: Vec<Subscription>,
 }
 impl WorkspacePanel {
@@ -3608,6 +3752,15 @@ impl WorkspacePanel {
                 });
             }));
         }
+        if let PanelKind::Browser(id) = kind {
+            let owner = workspace.clone();
+            subscriptions.push(cx.on_focus_in(&focus, window, move |_, _, cx| {
+                let owner = owner.clone();
+                cx.defer(move |cx| {
+                    let _ = owner.update(cx, |workspace, cx| workspace.browser_focused(id, cx));
+                });
+            }));
+        }
         Self {
             kind,
             state,
@@ -3619,6 +3772,7 @@ impl WorkspacePanel {
             bounds: Rc::new(Cell::new(None)),
             transcript,
             terminal: None,
+            browser: None,
             _subscriptions: subscriptions,
         }
     }
@@ -3626,6 +3780,12 @@ impl WorkspacePanel {
         match self.kind {
             PanelKind::Projects => "Projects".into(),
             PanelKind::Welcome => "Threads".into(),
+            PanelKind::Browser(_) => self
+                .browser
+                .as_ref()
+                .map(|pane| pane.read(cx).title.clone())
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| "Browser".into()),
             PanelKind::Terminal(_) => {
                 let (project, worktree) = self
                     .terminal
@@ -3665,7 +3825,7 @@ impl BasePanel for WorkspacePanel {
         self.kind.name()
     }
     fn closable(&self, _: &App) -> bool {
-        matches!(self.kind, PanelKind::Thread(_))
+        matches!(self.kind, PanelKind::Thread(_) | PanelKind::Browser(_))
     }
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(terminal) = &self.terminal {
@@ -3707,6 +3867,15 @@ impl BasePanel for WorkspacePanel {
                 });
             });
         }
+        if let PanelKind::Browser(id) = self.kind {
+            cx.defer_in(window, move |panel, window, cx| {
+                if panel.group.is_none() {
+                    let _ = panel.workspace.update(cx, |workspace, cx| {
+                        workspace.browser_panel_removed(id, window, cx)
+                    });
+                }
+            });
+        }
     }
     fn dump(&self, cx: &App) -> PanelState {
         let mut state = PanelState::new(self.kind.name());
@@ -3721,6 +3890,11 @@ impl BasePanel for WorkspacePanel {
                 "project": pane.map(|pane| pane.project_id),
                 "worktree": pane.and_then(|pane| pane.worktree),
             }));
+        }
+        if let PanelKind::Browser(id) = self.kind {
+            state.info = PanelInfo::panel(
+                json!({ "browser": id, "url": self.browser.as_ref().map(|pane| pane.read(cx).url.clone()) }),
+            );
         }
         state
     }
@@ -3946,6 +4120,11 @@ impl Panel for WorkspacePanel {
                 )
                 .menu("New Factory thread", Box::new(NewFactoryThread))
             }
+            PanelKind::Browser(_) => menu
+                .menu(Command::NewBrowser.label(), Box::new(NewBrowser))
+                .menu(Command::BrowserAddress.label(), Box::new(BrowserAddress))
+                .menu(Command::BrowserReload.label(), Box::new(BrowserReload))
+                .menu(Command::CloseThread.label(), Box::new(CloseThread)),
             PanelKind::Welcome => menu
                 .menu("New conversation", Box::new(NewConversation))
                 .menu(
@@ -4000,6 +4179,11 @@ impl Render for WorkspacePanel {
                     )
                 }
                 PanelKind::Welcome => conversation::welcome(state, &self.workspace, cx),
+                PanelKind::Browser(_) => self
+                    .browser
+                    .as_ref()
+                    .map(|pane| pane.clone().into_any_element())
+                    .unwrap_or_else(|| div().into_any_element()),
                 PanelKind::Terminal(_) => self
                     .terminal
                     .as_ref()
@@ -4028,13 +4212,13 @@ impl Render for WorkspacePanel {
                                 div().into_any_element()
                             }
                         }
-                        ThreadKind::Factory => h_flex()
-                            .size_full()
-                            .min_h_0()
-                            .items_stretch()
-                            .child(
-                                div().flex_1().min_w_0().h_full().child(
-                                    if factory::launch_for(state, id).is_some() {
+                        ThreadKind::Factory => {
+                            thread_sidebar::SidebarLayout::new(state, id, &self.workspace, cx).wrap(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .child(if factory::launch_for(state, id).is_some() {
                                         factory::render(state, id, &self.workspace, scroll, cx)
                                     } else if let Some(form) = workspace
                                         .factory_form
@@ -4054,18 +4238,18 @@ impl Render for WorkspacePanel {
                                                 "Focus this pane to configure the Factory thread."
                                             })
                                             .into_any_element()
-                                    },
+                                    })
+                                    .into_any_element(),
+                                thread_sidebar::render(
+                                    state,
+                                    id,
+                                    false,
+                                    &self.workspace,
+                                    &self.output_scroll,
+                                    cx,
                                 ),
                             )
-                            .child(thread_sidebar::render(
-                                state,
-                                id,
-                                false,
-                                &self.workspace,
-                                &self.output_scroll,
-                                cx,
-                            ))
-                            .into_any_element(),
+                        }
                     }
                 }
             }
@@ -4293,9 +4477,10 @@ fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
         "Layout must contain exactly one Projects panel"
     );
     anyhow::ensure!(
-        names
-            .iter()
-            .all(|name| matches!(*name, "Projects" | "Welcome" | "Thread" | "Terminal")),
+        names.iter().all(|name| matches!(
+            *name,
+            "Projects" | "Welcome" | "Thread" | "Terminal" | "Browser"
+        )),
         "Layout contains an unknown panel"
     );
     Ok(())
