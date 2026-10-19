@@ -77,6 +77,19 @@ mod macos {
             pump(cx, window);
         }
     }
+    fn wait_for_script(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        runtime: &BrowserRuntime,
+        id: Uuid,
+        script: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while evaluate(cx, window, runtime, id, script) != true {
+            assert!(Instant::now() < deadline, "Condition timed out: {script}");
+        }
+    }
+
     pub fn run() {
         let directory = std::env::temp_dir().join(format!("drostje-servo-ui-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
@@ -198,6 +211,216 @@ mod macos {
         {
             assert!(Instant::now() < deadline);
         }
+        evaluate(
+            &mut cx,
+            window,
+            &runtime,
+            id,
+            "window.pointerEvents=0;window.wheelEvents=0;\
+             document.addEventListener('mousedown',e=>{window.pointerEvents++;window.lastDown=[e.clientX,e.clientY]});\
+             document.addEventListener('mousemove',e=>window.lastMove=[e.clientX,e.clientY]);\
+             document.addEventListener('wheel',e=>{e.preventDefault();window.wheelEvents++;window.lastWheel=[e.clientX,e.clientY,e.deltaY]}, {passive:false});\
+             const corner=document.createElement('div');corner.style='position:fixed;right:0;bottom:0;width:20px;height:20px;background:rgb(31,221,71)';document.body.append(corner);true",
+        );
+        let pane = cx.update(|cx| sample.read(cx).pane.clone());
+        cx.update(|cx| {
+            pane.update(cx, |pane, cx| {
+                for invalid in [
+                    (0, 100, 1.),
+                    (100, 100, f32::NAN),
+                    (100, 100, 0.24),
+                    (100, 100, 8.01),
+                    (8193, 1, 1.),
+                    (8192, 8192, 1.),
+                ] {
+                    assert!(pane.set_viewport(Some(invalid), cx).is_err());
+                }
+            })
+        });
+        for (css_width, css_height, device_scale) in [(960, 640, 2.), (320, 240, 1.25)] {
+            cx.update(|cx| {
+                pane.update(cx, |pane, cx| {
+                    pane.set_viewport(Some((css_width, css_height, device_scale)), cx)
+                        .unwrap()
+                })
+            });
+            for width in [760., 480.] {
+                cx.update_window(window.into(), |_, w, cx| {
+                    sample.update(cx, |sample, cx| {
+                        sample.width = width;
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                })
+                .unwrap();
+                until(&mut cx, window, "fixed viewport frame", || {
+                    runtime.snapshot(id).unwrap().frame.is_some_and(|frame| {
+                        frame.width == (css_width as f32 * device_scale).round() as u32
+                            && frame.height == (css_height as f32 * device_scale).round() as u32
+                            && frame.scale == device_scale
+                    })
+                });
+                wait_for_script(
+                    &mut cx,
+                    window,
+                    &runtime,
+                    id,
+                    &format!("innerWidth === {css_width} && innerHeight === {css_height}"),
+                );
+                let (bounds, native_scale) = cx
+                    .update_window(window.into(), |_, w, _| {
+                        (w.find("servo-surface").bounds(), w.scale_factor())
+                    })
+                    .unwrap();
+                let fit = (bounds.size.width.as_f32() / css_width as f32)
+                    .min(bounds.size.height.as_f32() / css_height as f32);
+                let left = (bounds.size.width.as_f32() - css_width as f32 * fit) / 2.;
+                let top = (bounds.size.height.as_f32() - css_height as f32 * fit) / 2.;
+                // The bottom-right marker proves the full, undistorted viewport is visible.
+                let deadline = Instant::now() + Duration::from_secs(45);
+                loop {
+                    let screenshot = cx.capture_screenshot(window.into()).unwrap();
+                    let pixel = screenshot
+                        .get_pixel(
+                            ((bounds.left().as_f32() + left + (css_width as f32 - 10.) * fit)
+                                * native_scale) as u32,
+                            ((bounds.top().as_f32() + top + (css_height as f32 - 10.) * fit)
+                                * native_scale) as u32,
+                        )
+                        .0;
+                    if pixel == [31, 221, 71, 255] {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "Fixed viewport must fit the pane: {pixel:?}"
+                    );
+                    pump(&mut cx, window);
+                }
+                let clicks = evaluate(&mut cx, window, &runtime, id, "window.clicked")
+                    .as_f64()
+                    .unwrap();
+                cx.update_window(window.into(), |_, w, cx| {
+                    w.click_at(
+                        "servo-surface",
+                        point(px(left + 50. * fit), px(top + 40. * fit)),
+                        cx,
+                    );
+                })
+                .unwrap();
+                wait_for_script(
+                    &mut cx,
+                    window,
+                    &runtime,
+                    id,
+                    &format!(
+                        "window.clicked === {} && Math.abs(lastDown[0]-50)<2 && Math.abs(lastDown[1]-40)<2",
+                        clicks + 1.
+                    ),
+                );
+                cx.update_window(window.into(), |_, w, cx| {
+                    w.click_at(
+                        "servo-surface",
+                        point(px(left + 50. * fit), px(top + 130. * fit)),
+                        cx,
+                    );
+                })
+                .unwrap();
+                wait_for_script(
+                    &mut cx,
+                    window,
+                    &runtime,
+                    id,
+                    "document.activeElement.id === 'text'",
+                );
+                cx.update_window(window.into(), |_, w, cx| {
+                    w.press("cmd-a", cx);
+                    w.input("Fixed viewport ✓", cx);
+                })
+                .unwrap();
+                wait_for_script(
+                    &mut cx,
+                    window,
+                    &runtime,
+                    id,
+                    "document.getElementById('text').value === 'Fixed viewport ✓'",
+                );
+                cx.update_window(window.into(), |_, w, cx| {
+                    w.hover("servo-surface", cx);
+                    w.scroll(
+                        "servo-surface",
+                        ScrollDelta::Pixels(point(px(0.), px(-30.))),
+                        cx,
+                    );
+                })
+                .unwrap();
+                wait_for_script(
+                    &mut cx,
+                    window,
+                    &runtime,
+                    id,
+                    &format!(
+                        "window.lastWheel && Math.abs(lastMove[0]-{})<2 && Math.abs(lastMove[1]-{})<2 && Math.abs(lastWheel[0]-{})<2 && Math.abs(lastWheel[1]-{})<2 && Math.abs(lastWheel[2]-{})<2",
+                        css_width / 2,
+                        css_height / 2,
+                        css_width / 2,
+                        css_height / 2,
+                        // Servo's native wheel contract and DOM wheel deltas use device pixels.
+                        30. / fit * device_scale,
+                    ),
+                );
+                let counts = evaluate(
+                    &mut cx,
+                    window,
+                    &runtime,
+                    id,
+                    "[window.pointerEvents,window.wheelEvents]",
+                );
+                cx.update_window(window.into(), |_, w, cx| {
+                    w.click_at("servo-surface", point(px(1.), px(1.)), cx);
+                    w.dispatch_event(
+                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position: bounds.origin + point(px(1.), px(1.)),
+                            delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
+                            ..Default::default()
+                        }),
+                        cx,
+                    );
+                })
+                .unwrap();
+                assert_eq!(
+                    evaluate(
+                        &mut cx,
+                        window,
+                        &runtime,
+                        id,
+                        "[window.pointerEvents,window.wheelEvents]"
+                    ),
+                    counts,
+                    "Letterboxing must not forward native input",
+                );
+            }
+        }
+        cx.update(|cx| pane.update(cx, |pane, cx| pane.set_viewport(None, cx).unwrap()));
+        for width in [760., 480.] {
+            let (bounds, scale) = cx
+                .update_window(window.into(), |_, w, cx| {
+                    sample.update(cx, |sample, cx| {
+                        sample.width = width;
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    (w.find("servo-surface").bounds(), w.scale_factor())
+                })
+                .unwrap();
+            until(&mut cx, window, "restored automatic viewport", || {
+                runtime.snapshot(id).unwrap().frame.is_some_and(|frame| {
+                    frame.width == (bounds.size.width.as_f32() * scale).round() as u32
+                        && frame.height == (bounds.size.height.as_f32() * scale).round() as u32
+                        && frame.scale == scale
+                })
+            });
+        }
         cx.update_window(window.into(), |_, w, cx| {
             w.press("cmd-l", cx);
             w.press("cmd-a", cx);
@@ -235,11 +458,12 @@ mod macos {
                 .unwrap();
         }
         runtime.shutdown();
+        drop(pane);
         drop(sample);
         drop(cx);
         std::fs::remove_dir_all(directory).unwrap();
         println!(
-            "Servo GPUI proof: light/dark pixels, resize, pointer click, committed text, address focus/navigation, toolbar history, navigation failure"
+            "Servo GPUI proof: light/dark pixels, resize, fixed viewport fitting and restore, scaled native click/move/wheel, letterbox exclusion, committed text, address focus/navigation, toolbar history, navigation failure"
         );
     }
 }

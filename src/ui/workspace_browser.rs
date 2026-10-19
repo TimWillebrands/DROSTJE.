@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     browser::{BrowserCommand, BrowserId, BrowserRuntime},
-    browser_tools::{BrowserToolOperation, BrowserToolRequest},
+    browser_tools::{BrowserAutomation, BrowserToolOperation, BrowserToolRequest},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -520,60 +520,90 @@ impl Workspace {
             let _ = reply.send(Err("Conversation no longer exists".into()));
             return;
         }
-        let result:Result<Value,String>=match operation {
-            BrowserToolOperation::ShowArtifact{path,title}=>{
+        let result: Result<Value, String> = match operation {
+            BrowserToolOperation::ShowArtifact { path, title } => {
                 match url::Url::from_file_path(&path) {
-                    Ok(url)=>{
-                        let id=self.open_browser(url.to_string(),Some(thread),Some(path.clone()),window,cx);
-                        if let Some(record)=self.browsers.records.get_mut(&id) {record.title=title.clone().unwrap_or_else(||"Artifact".into());}
+                    Ok(url) => {
+                        let id = self.open_browser(
+                            url.to_string(),
+                            Some(thread),
+                            Some(path.clone()),
+                            window,
+                            cx,
+                        );
+                        if let Some(record) = self.browsers.records.get_mut(&id) {
+                            record.title = title.clone().unwrap_or_else(|| "Artifact".into());
+                        }
                         if let Some(pane) = self.browsers.panes.get(&id) {
                             pane.update(cx, |pane, cx| {
-                                pane.set_artifact(title.clone().unwrap_or_else(|| "HTML artifact".into()));
+                                pane.set_artifact(
+                                    title.clone().unwrap_or_else(|| "HTML artifact".into()),
+                                );
                                 cx.notify();
                             });
                         }
                         self.save_browsers(cx);
-                        self.state.update(cx,|_,cx|cx.emit(PresentationChange::Thread(thread)));
+                        self.state
+                            .update(cx, |_, cx| cx.emit(PresentationChange::Thread(thread)));
                         Ok(json!({"id":id,"path":path,"title":title,"loading":true}))
                     }
-                    Err(_)=>Err("Artifact path is not an absolute file path".into()),
+                    Err(_) => Err("Artifact path is not an absolute file path".into()),
                 }
             }
-            BrowserToolOperation::Open{url,placement}=>match super::super::browser::navigation_url(&url) {
-                Ok(url)=>{let id=self.open_browser(url,(placement=="sidebar").then_some(thread),None,window,cx);Ok(json!({"id":id,"loading":true}))}
-                Err(error)=>Err(error),
-            },
-            BrowserToolOperation::Close{id}=>{self.close_browser(id,window,cx);Ok(json!({"closed":id}))},
-            BrowserToolOperation::Inspect{id}=>self.browsers.runtime.snapshot(id).map(|snapshot|json!({"id":id,"url":snapshot.url,"title":snapshot.title,"loading":snapshot.loading,"error":snapshot.error,"can_go_back":snapshot.can_go_back,"can_go_forward":snapshot.can_go_forward})).ok_or_else(||"Browser session does not exist".into()),
-            BrowserToolOperation::Control{id,command}=>{
-                if !self.browsers.panes.contains_key(&id) {Err("Browser session does not exist".into())} else {
-                    let evaluation=match &command {BrowserCommand::Evaluate{request_id,..}=>Some(request_id.clone()),_=>None};
-                    self.browsers.runtime.command(id,command);
-                    if let Some(request_id)=evaluation {
-                        let runtime=self.browsers.runtime.clone();
-                        smol::spawn(async move {
-                            let deadline=Instant::now()+Duration::from_secs(25);
-                            loop {
-                                if let Some(result)=runtime.evaluation(&request_id) {let _=reply.send(result);break;}
-                                if let Some(error)=runtime.snapshot(id).and_then(|state|state.error) {let _=reply.send(Err(error));break;}
-                                if Instant::now()>=deadline {let _=reply.send(Err("JavaScript evaluation timed out; inspect the page before trying again".into()));break;}
-                                smol::Timer::after(Duration::from_millis(10)).await;
-                            }
-                        }).detach();
-                        return;
+            BrowserToolOperation::Open { url, placement } => {
+                match super::super::browser::navigation_url(&url) {
+                    Ok(url) => {
+                        let id = self.open_browser(
+                            url,
+                            (placement == "sidebar").then_some(thread),
+                            None,
+                            window,
+                            cx,
+                        );
+                        Ok(json!({"id":id,"loading":true}))
                     }
-                    Ok(json!({"id":id,"queued":true}))
+                    Err(error) => Err(error),
                 }
             }
-            BrowserToolOperation::Screenshot{id,path}=>{
-                if let Some(frame)=self.browsers.runtime.snapshot(id).and_then(|snapshot|snapshot.frame) {
-                    smol::spawn(async move {
-                        let result=smol::unblock(move||image::save_buffer_with_format(&path,&frame.rgba,frame.width,frame.height,image::ColorType::Rgba8,image::ImageFormat::Png).map(|()|json!({"path":path,"width":frame.width,"height":frame.height})).map_err(|error|format!("Screenshot could not be saved: {error}"))).await;
-                        let _=reply.send(result);
-                    }).detach();return;
-                }
-                Err("Browser has not rendered a frame yet".into())
+            BrowserToolOperation::Close { id } => {
+                self.close_browser(id, window, cx);
+                Ok(json!({"closed":id}))
             }
+            BrowserToolOperation::Runtime { id, operation } => {
+                let runtime = self.browsers.runtime.clone();
+                smol::spawn(async move {
+                    let _ = reply.send(operation.execute(runtime, id).await);
+                })
+                .detach();
+                return;
+            }
+            BrowserToolOperation::Viewport { id, size } => match self.browsers.panes.get(&id) {
+                None => Err("Browser session does not exist".into()),
+                Some(pane) => {
+                    match pane.update(cx, |pane, cx| {
+                        pane.set_viewport(size, cx)?;
+                        Ok::<_, String>(pane.viewport_dimensions())
+                    }) {
+                        Err(error) => Err(error),
+                        Ok(dimensions) => {
+                            let runtime = self.browsers.runtime.clone();
+                            smol::spawn(async move {
+                                let _ = reply.send(
+                                    BrowserAutomation::viewport_result(
+                                        runtime,
+                                        id,
+                                        dimensions,
+                                        size.is_some(),
+                                    )
+                                    .await,
+                                );
+                            })
+                            .detach();
+                            return;
+                        }
+                    }
+                }
+            },
         };
         let _ = reply.send(result);
     }

@@ -16,8 +16,9 @@ use servo::{
     Code, CompositionEvent, CompositionState, ConsoleLogLevel, EventLoopWaker, ImeEvent,
     InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers,
     MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo,
-    ServoBuilder, ServoDelegate, ServoError, SoftwareRenderingContext, WebView, WebViewBuilder,
-    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
+    ServoBuilder, ServoDelegate, ServoError, SoftwareRenderingContext, UserContentManager,
+    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
+    WheelEvent, WheelMode,
 };
 use url::Url;
 use uuid::Uuid;
@@ -163,6 +164,10 @@ struct Delegate {
     dirty: Cell<bool>,
     content_sizing: RefCell<ContentSizing>,
     output: Arc<Output>,
+    frame_revision: Cell<u64>,
+    frame_generation: Cell<u64>,
+    frame_current: Cell<bool>,
+    capture_pending: Cell<bool>,
 }
 
 impl Delegate {
@@ -191,6 +196,41 @@ impl Delegate {
             self.update(|state| state.content_height = None);
         }
     }
+
+    fn invalidate_frame(&self) {
+        self.frame_generation
+            .set(self.frame_generation.get().wrapping_add(1));
+        self.frame_current.set(false);
+        self.dirty.set(false);
+    }
+
+    fn diagnostic(&self, kind: &'static str, level: String, message: String) {
+        self.output.send(
+            Event::Diagnostic {
+                id: self.id,
+                kind,
+                level,
+                message,
+            },
+            vec![],
+        );
+    }
+
+    fn frame(&self, image: servo::RgbaImage, scale: f32, document_revision: u64) {
+        let revision = self.frame_revision.get() + 1;
+        self.frame_revision.set(revision);
+        self.output.send(
+            Event::Frame {
+                id: self.id,
+                revision,
+                document_revision,
+                scale,
+                width: image.width(),
+                height: image.height(),
+            },
+            image.into_raw(),
+        );
+    }
 }
 
 impl WebViewDelegate for Delegate {
@@ -207,7 +247,18 @@ impl WebViewDelegate for Delegate {
         if status != LoadStatus::Complete {
             self.invalidate_content_height();
         }
-        self.update(|state| state.loading = status != LoadStatus::Complete);
+        if status == LoadStatus::Started {
+            self.invalidate_frame();
+        }
+        self.update(|state| {
+            if status == LoadStatus::Started {
+                state.document_revision += 1;
+            }
+            state.loading = status != LoadStatus::Complete;
+        });
+        if status == LoadStatus::Complete {
+            self.dirty.set(true);
+        }
     }
 
     fn notify_history_changed(&self, _: WebView, entries: Vec<Url>, current: usize) {
@@ -215,6 +266,17 @@ impl WebViewDelegate for Delegate {
             state.can_go_back = current > 0;
             state.can_go_forward = current + 1 < entries.len();
         });
+    }
+
+    fn notify_traversal_complete(&self, webview: WebView, _: servo::TraversalId) {
+        // Cached history traversal need not emit a load-status change.
+        self.invalidate_content_height();
+        self.invalidate_frame();
+        self.update(|state| {
+            state.document_revision += 1;
+            state.loading = webview.load_status() != LoadStatus::Complete;
+        });
+        self.dirty.set(true);
     }
 
     fn notify_new_frame_ready(&self, _: WebView) {
@@ -235,7 +297,28 @@ impl WebViewDelegate for Delegate {
     }
 
     fn show_console_message(&self, _: WebView, level: ConsoleLogLevel, message: String) {
-        eprintln!("Servo console {level:?}: {message}");
+        if let Some(encoded) = message.strip_prefix("__DROSTJE_DIAGNOSTIC__")
+            && encoded.len() <= 16 * 1024
+            && let Ok(event) = serde_json::from_str::<Value>(encoded)
+            && let Some(kind) = event["kind"].as_str()
+        {
+            match kind {
+                "network" => self.diagnostic("network", "error".into(), encoded.into()),
+                "runtime" => self.diagnostic("runtime", "error".into(), encoded.into()),
+                _ => self.diagnostic("console", format!("{level:?}"), message),
+            }
+        } else {
+            self.diagnostic("console", format!("{level:?}"), message);
+        }
+    }
+
+    fn load_web_resource(&self, _: WebView, load: WebResourceLoad) {
+        self.diagnostic(
+            "request",
+            "info".into(),
+            format!("{} {}", load.request().method, load.request().url),
+        );
+        // Dropping the responder explicitly leaves Servo's network request intact.
     }
 }
 
@@ -243,7 +326,6 @@ struct Page {
     view: WebView,
     context: Rc<SoftwareRenderingContext>,
     delegate: Rc<Delegate>,
-    revision: u64,
     last_frame: Instant,
     scale: f32,
 }
@@ -270,15 +352,25 @@ impl Page {
             state: RefCell::new(PageState {
                 url: url.to_string(),
                 loading: true,
+                viewport_width: 800,
+                viewport_height: 600,
+                scale: 1.0,
                 ..PageState::default()
             }),
             dirty: Cell::new(false),
             content_sizing: RefCell::new(ContentSizing::new(sizing_enabled)),
             output,
+            frame_revision: Cell::new(0),
+            frame_generation: Cell::new(0),
+            frame_current: Cell::new(false),
+            capture_pending: Cell::new(false),
         });
+        let user_contents = Rc::new(UserContentManager::new(servo));
+        user_contents.add_script(Rc::new(include_str!("diagnostics.js").into()));
         let view = WebViewBuilder::new(servo, context.clone())
             .url(url)
             .delegate(delegate.clone())
+            .user_content_manager(user_contents)
             .build();
         view.show();
         delegate.update(|_| {});
@@ -286,7 +378,6 @@ impl Page {
             view,
             context,
             delegate,
-            revision: 0,
             last_frame: Instant::now() - FRAME_INTERVAL,
             scale: 1.0,
         })
@@ -307,6 +398,7 @@ impl Page {
             BrowserCommand::Navigate { url } => {
                 let url = parse_url(&url)?;
                 self.delegate.invalidate_content_height();
+                self.delegate.invalidate_frame();
                 self.delegate.update(|state| {
                     state.url = url.to_string();
                     state.error = None;
@@ -320,6 +412,8 @@ impl Page {
                 });
                 if self.delegate.state.borrow().can_go_back {
                     self.delegate.invalidate_content_height();
+                    self.delegate.invalidate_frame();
+                    self.delegate.update(|state| state.loading = true);
                     self.view.go_back(1);
                 }
             }
@@ -329,6 +423,8 @@ impl Page {
                 });
                 if self.delegate.state.borrow().can_go_forward {
                     self.delegate.invalidate_content_height();
+                    self.delegate.invalidate_frame();
+                    self.delegate.update(|state| state.loading = true);
                     self.view.go_forward(1);
                 }
             }
@@ -338,9 +434,13 @@ impl Page {
                     parse_url(url.as_str())?;
                 }
                 self.delegate.invalidate_content_height();
+                self.delegate.invalidate_frame();
                 self.delegate.update(|state| {
                     state.error = None;
                     state.loading = true;
+                    // Servo::WebView::reload sets Started internally without
+                    // notifying its delegate, so invalidate this identity here.
+                    state.document_revision += 1;
                 });
                 self.view.reload();
             }
@@ -359,9 +459,15 @@ impl Page {
                         .make_current()
                         .map_err(|error| format!("Could not resize Servo surface: {error:?}"))?;
                     self.delegate.content_sizing.borrow_mut().invalidate();
+                    self.delegate.invalidate_frame();
                     self.scale = scale;
                     self.view.set_hidpi_scale_factor(Scale::new(scale));
                     self.view.resize(size);
+                    self.delegate.update(|state| {
+                        state.viewport_width = width;
+                        state.viewport_height = height;
+                        state.scale = scale;
+                    });
                     self.delegate.dirty.set(true);
                 }
             }
@@ -484,7 +590,7 @@ impl Page {
                         .map(js_value)
                         .map_err(|error| format!("JavaScript evaluation failed: {error:?}"));
                     if let Err(error) = &result {
-                        delegate.error(error.clone());
+                        delegate.diagnostic("evaluation", "error".into(), error.clone());
                     }
                     delegate.output.send(
                         Event::Evaluation {
@@ -544,7 +650,51 @@ impl Page {
     }
 
     fn paint_if_dirty(&mut self) {
-        if !self.delegate.dirty.get() || self.last_frame.elapsed() < FRAME_INTERVAL {
+        if !self.delegate.dirty.get()
+            || self.delegate.state.borrow().loading
+            || self.last_frame.elapsed() < FRAME_INTERVAL
+        {
+            return;
+        }
+        if !self.delegate.frame_current.get() {
+            if self.delegate.capture_pending.replace(true) {
+                // Readiness requests trigger a repaint; the callback is delivered
+                // during paint, not spin_event_loop. Do not publish unverified pixels.
+                self.delegate.dirty.set(false);
+                self.last_frame = Instant::now();
+                if let Err(error) = self.context.make_current() {
+                    self.delegate
+                        .error(format!("Could not activate Servo framebuffer: {error:?}"));
+                    return;
+                }
+                self.view.paint();
+                return;
+            }
+            self.delegate.dirty.set(false);
+            self.last_frame = Instant::now();
+            let delegate = self.delegate.clone();
+            let generation = delegate.frame_generation.get();
+            let scale = self.scale;
+            let document_revision = delegate.state.borrow().document_revision;
+            // Servo's screenshot barrier waits for the current pipeline's layout
+            // and compositor frames. A normal paint may still contain old pixels.
+            self.view.take_screenshot(None, move |result| {
+                delegate.capture_pending.set(false);
+                if delegate.frame_generation.get() != generation || delegate.state.borrow().loading
+                {
+                    delegate.dirty.set(true);
+                    return;
+                }
+                match result {
+                    Ok(image) => {
+                        delegate.frame_current.set(true);
+                        delegate.frame(image, scale, document_revision);
+                    }
+                    Err(error) => delegate.error(format!(
+                        "Could not capture current Servo document: {error:?}"
+                    )),
+                }
+            });
             return;
         }
         self.delegate.dirty.set(false);
@@ -565,17 +715,78 @@ impl Page {
                 .error("Could not read pixels from Servo's software framebuffer".into());
             return;
         };
-        self.revision += 1;
-        self.delegate.output.send(
-            Event::Frame {
-                id: self.delegate.id,
-                revision: self.revision,
-                width: image.width(),
-                height: image.height(),
-            },
-            image.into_raw(),
-        );
+        let document_revision = self.delegate.state.borrow().document_revision;
+        self.delegate.frame(image, self.scale, document_revision);
     }
+}
+
+fn validate_command(command: &BrowserCommand) -> Result<(), String> {
+    let point = |x: f32, y: f32| {
+        if x.is_finite() && y.is_finite() {
+            Ok(())
+        } else {
+            Err("Browser input coordinates must be finite".to_owned())
+        }
+    };
+    match command {
+        BrowserCommand::Navigate { url } => {
+            parse_url(url)?;
+        }
+        BrowserCommand::Resize {
+            width,
+            height,
+            scale,
+        } => {
+            command::frame_len(*width, *height).map_err(|error| error.to_string())?;
+            if !scale.is_finite() || !(0.25..=8.0).contains(scale) {
+                return Err("Browser scale must be between 0.25 and 8".into());
+            }
+        }
+        BrowserCommand::Pointer { x, y, button, .. } => {
+            point(*x, *y)?;
+            if *button > 4 {
+                return Err("Mouse button must be between 0 and 4".into());
+            }
+        }
+        BrowserCommand::Move { x, y } => point(*x, *y)?,
+        BrowserCommand::Scroll { x, y, dx, dy } => {
+            point(*x, *y)?;
+            point(*dx, *dy)?;
+        }
+        BrowserCommand::Key { key, code, .. } => {
+            key.parse::<Key>()
+                .map_err(|error| format!("Invalid DOM key {key:?}: {error:?}"))?;
+            if !code.is_empty() {
+                code.parse::<Code>()
+                    .map_err(|error| format!("Invalid DOM code {code:?}: {error:?}"))?;
+            }
+        }
+        BrowserCommand::Evaluate { .. } => {
+            return Err("Evaluation cannot be batched with input".into());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn deliver_commands(
+    commands: Vec<BrowserCommand>,
+    mut deliver: impl FnMut(BrowserCommand) -> Result<(), String>,
+) -> Result<Value, String> {
+    // Validate the entire batch before any input is delivered. Runtime surface
+    // failures cannot be rolled back; report the exact delivered prefix instead.
+    for command in &commands {
+        validate_command(command)?;
+    }
+    let count = commands.len();
+    for (index, command) in commands.into_iter().enumerate() {
+        deliver(command).map_err(|error| {
+            format!(
+                "Browser batch failed after {index} of {count} commands were delivered: {error}"
+            )
+        })?;
+    }
+    Ok(serde_json::json!({"status": "delivered", "delivered": count}))
 }
 
 fn parse_url(value: &str) -> Result<Url, String> {
@@ -651,7 +862,7 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
                 .filter(|evaluation| evaluation.result.is_none())
             {
                 if evaluation.started.elapsed() > Duration::from_secs(30) {
-                    evaluation.result = Some(Err("JavaScript evaluation did not finish within 30 seconds; the page may be busy or navigating".into()));
+                    evaluation.result = Some(Err("Browser request did not finish within 30 seconds; the page may be busy or navigating".into()));
                 }
             }
             let length = memory.queue.len().min(64);
@@ -661,8 +872,14 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
         // obsolete WebViews here, never under the snapshot lock or on the UI thread.
         pages.retain(|id, _| shared.memory.lock().wire_ids.contains_key(id));
         while let Some(request) = batch.pop_front() {
-            if !shared.memory.lock().wire_ids.contains_key(&request.id()) {
-                continue;
+            {
+                let memory = shared.memory.lock();
+                if memory.shutdown || memory.failure.is_some() {
+                    break;
+                }
+                if !memory.wire_ids.contains_key(&request.id()) {
+                    continue;
+                }
             }
             match request {
                 Request::Open { id, url } => {
@@ -729,6 +946,48 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
                         }
                     }
                 }
+                Request::Batch {
+                    id,
+                    request_id,
+                    commands,
+                    expected_document_revision,
+                } => {
+                    let document_matches = expected_document_revision.is_none_or(|expected| {
+                        pages.get(&id).is_some_and(|page| {
+                            let state = page.delegate.state.borrow();
+                            !state.loading && state.document_revision == expected
+                        })
+                    });
+                    let result = if !document_matches {
+                        Err("Browser document changed before input delivery; observe the page again".into())
+                    } else {
+                        deliver_commands(commands, |command| {
+                            if let Some(page) = pages.get_mut(&id) {
+                                return page.command(command);
+                            }
+                            let BrowserCommand::Navigate { url } = command else {
+                                return Err(
+                                    "Browser page is not available; navigate to a valid URL first"
+                                        .into(),
+                                );
+                            };
+                            if pages.len() >= MAX_WEBVIEWS {
+                                return Err("Close another browser before opening this page".into());
+                            }
+                            let page = Page::new(&servo, output.clone(), id, parse_url(&url)?)?;
+                            pages.insert(id, page);
+                            Ok(())
+                        })
+                    };
+                    output.send(
+                        Event::Evaluation {
+                            id,
+                            request_id,
+                            result,
+                        },
+                        vec![],
+                    );
+                }
             }
         }
         servo.spin_event_loop();
@@ -758,6 +1017,66 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batches_validate_all_commands_before_delivery_and_preserve_order() {
+        let mut delivered = Vec::new();
+        let result = deliver_commands(
+            vec![
+                BrowserCommand::Move { x: 1.0, y: 0.0 },
+                BrowserCommand::Move {
+                    x: f32::NAN,
+                    y: 0.0,
+                },
+            ],
+            |command| {
+                delivered.push(command);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(delivered.is_empty());
+        let result = deliver_commands(
+            vec![
+                BrowserCommand::Move { x: 1.0, y: 0.0 },
+                BrowserCommand::Move { x: 2.0, y: 0.0 },
+                BrowserCommand::Move { x: 3.0, y: 0.0 },
+            ],
+            |command| {
+                delivered.push(command);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result["status"], "delivered");
+        assert_eq!(result["delivered"], 3);
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|command| match command {
+                    BrowserCommand::Move { x, .. } => *x,
+                    _ => panic!("unexpected command"),
+                })
+                .collect::<Vec<_>>(),
+            [1.0, 2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn delivery_failures_report_the_delivered_prefix() {
+        let mut count = 0;
+        let error = deliver_commands(vec![BrowserCommand::Reload, BrowserCommand::Reload], |_| {
+            count += 1;
+            if count == 2 {
+                Err("surface unavailable".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("after 1 of 2"));
+        assert!(error.contains("surface unavailable"));
+    }
 
     #[test]
     fn javascript_results_preserve_nested_json_values() {

@@ -729,6 +729,272 @@ mod macos {
         .unwrap();
         pump(cx, window);
     }
+    fn assert_computer_use(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        endpoint: &str,
+        thread: Uuid,
+        directory: &Path,
+    ) {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const PAGE: &str = r#"<!doctype html><title>Automation workflow</title>
+        <style>body{margin:0;padding:20px;font:16px sans-serif;background:#fff}
+        input,button{display:block;margin:8px 0;height:32px}#drag{width:180px;height:50px;background:#ddd}
+        #footer{margin-top:1200px}</style>
+        <form><label for="name">Project name</label><input id="name"><button id="save">Save project</button></form>
+        <p id="status" role="status">Not saved</p><button id="disabled" disabled>Unavailable</button>
+        <input type="password" aria-label="Password" value="secret-not-observed">
+        <div id="drag" role="slider" tabindex="0" aria-label="Drag control">Drag here</div>
+        <div id="footer">Bottom of page</div>
+        <script>
+        window.submissions=0;window.hovered=false;window.dragged=false;window.trusted=[];
+        document.querySelector('form').onsubmit=e=>{e.preventDefault();submissions++;trusted.push(e.isTrusted);setTimeout(()=>{document.querySelector('#status').textContent='Saved '+document.querySelector('#name').value},150)};
+        const drag=document.querySelector('#drag');let down=false;
+        drag.onmouseenter=()=>window.hovered=true;
+        drag.onmousedown=e=>{down=true;trusted.push(e.isTrusted)};
+        document.addEventListener('mousemove',e=>{if(down&&e.clientX>150){window.dragged=true;trusted.push(e.isTrusted)}});
+        document.addEventListener('mouseup',()=>down=false);
+        console.error('automation console evidence');
+        fetch('/failed-fetch').then(()=>window.fetchFinished=true);
+        const xhr=new XMLHttpRequest();xhr.open('GET','/failed-xhr');xhr.onload=()=>window.xhrFinished=true;xhr.send();
+        </script><img src="/missing-image" alt=""></html>"#;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let mut buffer = [0; 4096];
+                        while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                            match stream.read(&mut buffer) {
+                                Ok(0) | Err(_) => break,
+                                Ok(length) => bytes.extend_from_slice(&buffer[..length]),
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&bytes);
+                        let path = request.split_whitespace().nth(1).unwrap_or("");
+                        let (status, body) = if path == "/" {
+                            ("200 OK", PAGE)
+                        } else {
+                            ("503 Service Unavailable", "Intentional diagnostic response")
+                        };
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("Local browser fixture failed: {error}"),
+                }
+            }
+        });
+        let opened = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"open","url":url,"placement":"tab"}),
+        );
+        let id = opened["id"].as_str().unwrap();
+        let call = |cx: &mut HeadlessAppContext, mut args: Value| {
+            args["id"] = json!(id);
+            tool(cx, window, endpoint, thread, "browser", args)
+        };
+        call(cx, json!({"action":"wait","timeout_ms":20000}));
+        let fixed = call(
+            cx,
+            json!({"action":"viewport","width":640,"height":480,"scale":2}),
+        );
+        assert_eq!(fixed["viewport"]["width"].as_f64(), Some(640.));
+        let observed = call(cx, json!({"action":"observe"}));
+        assert!(!observed.to_string().contains("secret-not-observed"));
+        let target = |observation: &Value, label: &str| {
+            observation["controls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|control| control["label"] == label)
+                .unwrap()["target"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let name = target(&observed, "Project name");
+        let drag = target(&observed, "Drag control");
+        let disabled = target(&observed, "Unavailable");
+        let rejected = request(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"click","id":id,"target":disabled}),
+        );
+        assert!(rejected["error"].is_string(), "{rejected}");
+        call(
+            cx,
+            json!({"action":"evaluate","script":"const cover=document.createElement('div');cover.id='cover';cover.style='position:fixed;inset:0;z-index:999;background:white';document.body.append(cover);true"}),
+        );
+        let covered = request(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"click","id":id,"target":name}),
+        );
+        assert!(covered["error"].is_string(), "{covered}");
+        call(
+            cx,
+            json!({"action":"evaluate","script":"document.querySelector('#cover').remove();true"}),
+        );
+        let delivered = call(cx, json!({"action":"click","target":name}));
+        assert!(delivered.get("queued").is_none(), "{delivered}");
+        call(cx, json!({"action":"type","text":"Verified UI"}));
+        call(cx, json!({"action":"key","key":"Enter","code":"Enter"}));
+        call(
+            cx,
+            json!({"action":"wait","script":"document.querySelector('#status').textContent === 'Saved Verified UI'"}),
+        );
+        call(cx, json!({"action":"hover","target":drag}));
+        call(
+            cx,
+            json!({"action":"wait","script":"window.hovered === true"}),
+        );
+        let bounds = call(
+            cx,
+            json!({"action":"evaluate","script":"(()=>{const r=document.querySelector('#drag').getBoundingClientRect();return {x:r.x,y:r.y}})()"}),
+        );
+        call(
+            cx,
+            json!({"action":"drag","x":bounds["x"].as_f64().unwrap()+10.,
+            "y":bounds["y"].as_f64().unwrap()+20.,"to_x":190.,
+            "to_y":bounds["y"].as_f64().unwrap()+20.}),
+        );
+        call(
+            cx,
+            json!({"action":"wait","script":"window.dragged === true && window.trusted.every(Boolean)"}),
+        );
+        let before = call(cx, json!({"action":"inspect"}));
+        call(
+            cx,
+            json!({"action":"evaluate","script":"document.body.style.background='rgb(12,34,56)'; true"}),
+        );
+        let png = directory.join("computer-use.png");
+        let shot = call(
+            cx,
+            json!({"action":"screenshot","path":png,"after_frame":before["frame"]["revision"]}),
+        );
+        let bytes = STANDARD
+            .decode(shot["image"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, std::fs::read(&png).unwrap());
+        let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (1280, 960));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let shot = call(cx, json!({"action":"screenshot"}));
+            let bytes = STANDARD
+                .decode(shot["image"]["data"].as_str().unwrap())
+                .unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            if image.get_pixel(1200, 900).0 == [12, 34, 56, 255] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Screenshot must observe actual updated pixels"
+            );
+        }
+        screenshot(cx, window, "computer-use-fixed.png");
+        let stale_frame = request(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"screenshot","id":id,"after_frame":u64::MAX,"timeout_ms":100}),
+        );
+        assert!(stale_frame["error"].is_string(), "{stale_frame}");
+        let diagnostics = call(cx, json!({"action":"diagnostics"}));
+        let encoded = diagnostics.to_string();
+        assert!(
+            encoded.contains("automation console evidence"),
+            "{diagnostics}"
+        );
+        assert!(encoded.contains("failed-fetch"), "{diagnostics}");
+        assert!(encoded.contains("failed-xhr"), "{diagnostics}");
+        assert!(encoded.contains("503"), "{diagnostics}");
+        let refreshed = call(cx, json!({"action":"observe","limit":1}));
+        assert_eq!(refreshed["truncated"], true);
+        let stale = request(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"click","id":id,"target":name}),
+        );
+        assert!(stale["error"].is_string(), "{stale}");
+        let timeout = request(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"wait","id":id,"script":"false","timeout_ms":100}),
+        );
+        assert!(timeout["error"].is_string(), "{timeout}");
+        let count = call(
+            cx,
+            json!({"action":"evaluate","script":"window.submissions"}),
+        );
+        assert_eq!(
+            count.as_f64(),
+            Some(1.),
+            "A condition timeout must not replay submission"
+        );
+        call(
+            cx,
+            json!({"action":"scroll","x":400,"y":400,"dx":0,"dy":500}),
+        );
+        call(cx, json!({"action":"wait","script":"scrollY > 0"}));
+        let pane = call(cx, json!({"action":"viewport","auto":true}));
+        assert_eq!(pane["viewport_mode"], "pane");
+        let document = call(cx, json!({"action":"inspect"}))["document_revision"].clone();
+        call(cx, json!({"action":"reload"}));
+        call(cx, json!({"action":"wait","timeout_ms":20000}));
+        let reloaded = call(cx, json!({"action":"inspect"}));
+        assert!(reloaded["document_revision"].as_u64().unwrap() > document.as_u64().unwrap());
+        let old_document = request(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"click","id":id,"target":name}),
+        );
+        assert!(old_document["error"].is_string(), "{old_document}");
+        call(cx, json!({"action":"close"}));
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        println!(
+            "Computer-use proof: real HTTP, named targets, trusted form/hover/drag input, condition waits, fixed 2x viewport, image pixels, console and HTTP failures, stale targets, timeout without replay, scroll and pane restoration"
+        );
+    }
+
     pub fn run() {
         let directory =
             std::env::temp_dir().join(format!("drostje-servo-workspace-{}", Uuid::new_v4()));
@@ -1003,6 +1269,7 @@ mod macos {
             .unwrap();
             assert_tab_closed(&mut cx, window, &state, &endpoint, thread, &browser);
         }
+        assert_computer_use(&mut cx, window, &endpoint, thread, &directory);
         tool(
             &mut cx,
             window,

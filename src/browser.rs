@@ -12,9 +12,12 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 mod command;
+mod diagnostics;
 mod engine;
 pub use command::BrowserCommand;
+pub(crate) use command::frame_len;
 use command::{Event, MAX_PENDING, PageState, Request};
+use diagnostics::Diagnostics;
 
 pub type BrowserId = uuid::Uuid;
 
@@ -28,12 +31,19 @@ pub struct BrowserSnapshot {
     pub can_go_forward: bool,
     /// Natural document height in CSS pixels, measured only for opted-in artifacts.
     pub content_height: Option<f32>,
+    pub document_revision: u64,
+    /// Physical surface dimensions; inspect exposes CSS dimensions.
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub scale: f32,
     pub frame: Option<Arc<BrowserFrame>>,
 }
 
 #[derive(Debug)]
 pub struct BrowserFrame {
     pub revision: u64,
+    pub document_revision: u64,
+    pub scale: f32,
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
@@ -43,6 +53,7 @@ struct Session {
     wire_id: BrowserId,
     content_sizing: bool,
     snapshot: BrowserSnapshot,
+    diagnostics: Diagnostics,
 }
 
 struct Evaluation {
@@ -119,6 +130,7 @@ impl BrowserRuntime {
             Session {
                 wire_id,
                 content_sizing: false,
+                diagnostics: Diagnostics::default(),
                 snapshot: BrowserSnapshot {
                     url: url.clone(),
                     title: String::new(),
@@ -127,6 +139,10 @@ impl BrowserRuntime {
                     can_go_back: false,
                     can_go_forward: false,
                     content_height: None,
+                    document_revision: 0,
+                    viewport_width: 800,
+                    viewport_height: 600,
+                    scale: 1.0,
                     frame: None,
                 },
             },
@@ -201,8 +217,16 @@ impl BrowserRuntime {
         ) && let Some(session) = memory.sessions.get_mut(&id)
         {
             session.snapshot.error = None;
-            session.snapshot.loading = true;
-            session.snapshot.content_height = None;
+            let navigates = match &command {
+                BrowserCommand::Back => session.snapshot.can_go_back,
+                BrowserCommand::Forward => session.snapshot.can_go_forward,
+                _ => true,
+            };
+            if navigates {
+                session.snapshot.loading = true;
+                session.snapshot.content_height = None;
+                session.snapshot.frame = None;
+            }
             if let BrowserCommand::Navigate { url } = &command {
                 session.snapshot.url.clone_from(url);
             }
@@ -223,6 +247,154 @@ impl BrowserRuntime {
         shared.wake();
     }
 
+    /// Enqueue one indivisible input batch. Completion acknowledges delivery to
+    /// Servo, not page-script handling, navigation completion or rendering.
+    pub fn dispatch(&self, id: BrowserId, commands: Vec<BrowserCommand>) -> Result<String, String> {
+        self.dispatch_batch(id, commands, None)
+    }
+
+    pub fn dispatch_in_document(
+        &self,
+        id: BrowserId,
+        commands: Vec<BrowserCommand>,
+        expected_document_revision: u64,
+    ) -> Result<String, String> {
+        self.dispatch_batch(id, commands, Some(expected_document_revision))
+    }
+
+    fn dispatch_batch(
+        &self,
+        id: BrowserId,
+        commands: Vec<BrowserCommand>,
+        expected_document_revision: Option<u64>,
+    ) -> Result<String, String> {
+        let shared = &self.0.0;
+        let mut memory = shared.memory.lock();
+        if memory.shutdown {
+            return Err("Browser runtime has shut down".into());
+        }
+        if let Some(error) = &memory.failure {
+            return Err(error.clone());
+        }
+        let wire_id = memory
+            .sessions
+            .get(&id)
+            .ok_or("Browser session is closed")?
+            .wire_id;
+        if commands.is_empty() || commands.len() > MAX_PENDING {
+            return Err(format!(
+                "Browser dispatch requires 1–{MAX_PENDING} commands"
+            ));
+        }
+        if commands
+            .iter()
+            .any(|command| matches!(command, BrowserCommand::Evaluate { .. }))
+        {
+            return Err(
+                "Evaluate is asynchronous; submit it separately with its own request ID".into(),
+            );
+        }
+        if memory.evaluations.len() >= MAX_PENDING {
+            return Err(
+                "Too many pending browser results; consume or discard previous results".into(),
+            );
+        }
+        if memory.queue.iter().map(Request::cost).sum::<usize>() + commands.len() > MAX_PENDING {
+            return Err(
+                "Browser input queue is full; wait for pending commands before retrying".into(),
+            );
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        memory.evaluations.insert(
+            request_id.clone(),
+            Evaluation {
+                id,
+                started: Instant::now(),
+                result: None,
+            },
+        );
+        memory.queue.push_back(Request::Batch {
+            id: wire_id,
+            request_id: request_id.clone(),
+            commands,
+            expected_document_revision,
+        });
+        drop(memory);
+        shared.wake();
+        Ok(request_id)
+    }
+
+    /// Asynchronous JavaScript evaluation with explicit admission failure.
+    pub fn evaluate(&self, id: BrowserId, script: String) -> Result<String, String> {
+        let shared = &self.0.0;
+        let mut memory = shared.memory.lock();
+        if memory.shutdown {
+            return Err("Browser runtime has shut down".into());
+        }
+        if let Some(error) = &memory.failure {
+            return Err(error.clone());
+        }
+        let wire_id = memory
+            .sessions
+            .get(&id)
+            .ok_or("Browser session is closed")?
+            .wire_id;
+        if memory.evaluations.len() >= MAX_PENDING {
+            return Err(
+                "Too many pending browser results; consume or discard previous results".into(),
+            );
+        }
+        if memory.queue.iter().map(Request::cost).sum::<usize>() >= MAX_PENDING {
+            return Err(
+                "Browser input queue is full; wait for pending commands before retrying".into(),
+            );
+        }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        memory.evaluations.insert(
+            request_id.clone(),
+            Evaluation {
+                id,
+                started: Instant::now(),
+                result: None,
+            },
+        );
+        memory.queue.push_back(Request::Command {
+            id: wire_id,
+            command: BrowserCommand::Evaluate {
+                request_id: request_id.clone(),
+                script,
+            },
+        });
+        drop(memory);
+        shared.wake();
+        Ok(request_id)
+    }
+
+    pub fn discard_evaluation(&self, request_id: &str) {
+        self.0.0.memory.lock().evaluations.remove(request_id);
+    }
+
+    pub fn inspect(&self, id: BrowserId) -> Option<Value> {
+        let snapshot = self.snapshot(id)?;
+        Some(serde_json::json!({
+            "url": snapshot.url, "title": snapshot.title, "loading": snapshot.loading,
+            "error": snapshot.error, "can_go_back": snapshot.can_go_back,
+            "can_go_forward": snapshot.can_go_forward, "content_height": snapshot.content_height,
+            "document_revision": snapshot.document_revision,
+            "viewport": { "width": snapshot.viewport_width as f32 / snapshot.scale,
+                "height": snapshot.viewport_height as f32 / snapshot.scale, "scale": snapshot.scale },
+            "frame": snapshot.frame.as_ref().map(|frame| serde_json::json!({
+                "revision": frame.revision, "document_revision": frame.document_revision,
+                "width": frame.width, "height": frame.height, "scale": frame.scale,
+            })),
+        }))
+    }
+
+    pub fn diagnostics(&self, id: BrowserId, after: u64) -> Option<Value> {
+        let memory = self.0.0.memory.lock();
+        Some(memory.sessions.get(&id)?.diagnostics.read(after))
+    }
+
     pub fn close(&self, id: BrowserId) {
         let shared = &self.0.0;
         let mut memory = shared.memory.lock();
@@ -240,7 +412,7 @@ impl BrowserRuntime {
             .filter(|evaluation| evaluation.id == id && evaluation.result.is_none())
         {
             evaluation.result = Some(Err(
-                "Browser session closed before JavaScript evaluation completed".into(),
+                "Browser session closed before the request completed".into()
             ));
         }
         drop(memory);
@@ -288,7 +460,7 @@ fn enqueue(memory: &mut Memory, request: Request) {
     {
         memory.queue.pop_back();
     }
-    if memory.queue.len() >= MAX_PENDING {
+    if memory.queue.iter().map(Request::cost).sum::<usize>() + request.cost() > MAX_PENDING {
         let error = "Browser input queue is full; wait for the page to respond before trying again";
         if let Some(id) = memory.wire_ids.get(&request.id())
             && let Some(session) = memory.sessions.get_mut(id)
@@ -344,12 +516,31 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
                     can_go_back,
                     can_go_forward,
                     content_height,
+                    document_revision,
+                    viewport_width,
+                    viewport_height,
+                    scale,
                 },
         } => {
             if let Some(id) = memory.wire_ids.get(&id)
                 && let Some(session) = memory.sessions.get_mut(id)
             {
                 let snapshot = &mut session.snapshot;
+                if loading && !snapshot.loading {
+                    snapshot.error = None;
+                }
+                if snapshot.document_revision != document_revision
+                    || loading
+                    || snapshot.viewport_width != viewport_width
+                    || snapshot.viewport_height != viewport_height
+                    || snapshot.scale != scale
+                {
+                    snapshot.frame = None;
+                }
+                snapshot.document_revision = document_revision;
+                snapshot.viewport_width = viewport_width;
+                snapshot.viewport_height = viewport_height;
+                snapshot.scale = scale;
                 snapshot.url = url;
                 snapshot.title = title;
                 snapshot.loading = loading;
@@ -365,6 +556,8 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
         Event::Frame {
             id,
             revision,
+            document_revision,
+            scale,
             width,
             height,
         } => {
@@ -375,6 +568,11 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
             }
             if let Some(id) = memory.wire_ids.get(&id)
                 && let Some(session) = memory.sessions.get_mut(id)
+                && !session.snapshot.loading
+                && document_revision == session.snapshot.document_revision
+                && scale == session.snapshot.scale
+                && width == session.snapshot.viewport_width
+                && height == session.snapshot.viewport_height
                 && session
                     .snapshot
                     .frame
@@ -383,6 +581,8 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
             {
                 session.snapshot.frame = Some(Arc::new(BrowserFrame {
                     revision,
+                    document_revision,
+                    scale,
                     width,
                     height,
                     rgba: bytes,
@@ -399,6 +599,18 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
                 && evaluation.result.is_none()
             {
                 evaluation.result = Some(result);
+            }
+        }
+        Event::Diagnostic {
+            id,
+            kind,
+            level,
+            message,
+        } => {
+            if let Some(id) = memory.wire_ids.get(&id)
+                && let Some(session) = memory.sessions.get_mut(id)
+            {
+                session.diagnostics.push(kind, level, message);
             }
         }
         Event::Fatal { error } => return Err(io::Error::other(error)),
@@ -445,6 +657,7 @@ mod tests {
             Session {
                 wire_id,
                 content_sizing: false,
+                diagnostics: Diagnostics::default(),
                 snapshot: BrowserSnapshot {
                     url: "about:blank".into(),
                     title: String::new(),
@@ -453,6 +666,10 @@ mod tests {
                     can_go_back: false,
                     can_go_forward: false,
                     content_height: None,
+                    document_revision: 0,
+                    viewport_width: 1,
+                    viewport_height: 1,
+                    scale: 1.0,
                     frame: None,
                 },
             },
@@ -461,11 +678,144 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rejects_full_batches_without_partial_queue_acceptance() {
+        let (mut memory, id, _) = memory_with_session();
+        memory.started = true;
+        let runtime = BrowserRuntime::new();
+        *runtime.0.0.memory.lock() = memory;
+        let commands = || vec![BrowserCommand::Move { x: 1.0, y: 2.0 }; MAX_PENDING];
+        let request_id = runtime.dispatch(id, commands()).unwrap();
+        assert!(
+            runtime.evaluation(&request_id).is_none(),
+            "queued is not delivered"
+        );
+        assert!(runtime.dispatch(id, vec![BrowserCommand::Reload]).is_err());
+        let memory = runtime.0.0.memory.lock();
+        assert_eq!(memory.queue.len(), 1);
+        assert_eq!(memory.queue.front().unwrap().cost(), MAX_PENDING);
+        assert_eq!(memory.evaluations.len(), 1);
+        drop(memory);
+        assert!(
+            runtime
+                .evaluate(id, "1".into())
+                .unwrap_err()
+                .contains("queue is full")
+        );
+        runtime.close(id);
+        assert!(
+            runtime
+                .evaluation(&request_id)
+                .unwrap()
+                .unwrap_err()
+                .contains("closed")
+        );
+    }
+
+    #[test]
+    fn dispatch_shutdown_and_discard_complete_without_an_engine() {
+        let (memory, id, _) = memory_with_session();
+        let runtime = BrowserRuntime::new();
+        *runtime.0.0.memory.lock() = memory;
+        let first = runtime.dispatch(id, vec![BrowserCommand::Reload]).unwrap();
+        let second = runtime.dispatch(id, vec![BrowserCommand::Reload]).unwrap();
+        runtime.discard_evaluation(&first);
+        assert!(runtime.evaluation(&first).is_none());
+        runtime.shutdown();
+        assert!(
+            runtime
+                .evaluation(&second)
+                .unwrap()
+                .unwrap_err()
+                .contains("shut down")
+        );
+        assert!(runtime.dispatch(id, vec![BrowserCommand::Reload]).is_err());
+        assert!(runtime.0.0.memory.lock().queue.is_empty());
+        assert!(
+            runtime
+                .evaluate(id, "1".into())
+                .unwrap_err()
+                .contains("shut down")
+        );
+    }
+
+    #[test]
+    fn explicit_evaluation_rejects_retained_result_overflow_and_missing_sessions() {
+        let (memory, id, _) = memory_with_session();
+        let runtime = BrowserRuntime::new();
+        *runtime.0.0.memory.lock() = memory;
+        assert!(runtime.evaluate(BrowserId::new_v4(), "1".into()).is_err());
+        for _ in 0..MAX_PENDING {
+            runtime.evaluate(id, "1".into()).unwrap();
+        }
+        runtime.0.0.memory.lock().queue.clear();
+        assert!(
+            runtime
+                .evaluate(id, "1".into())
+                .unwrap_err()
+                .contains("Too many pending")
+        );
+        assert_eq!(runtime.0.0.memory.lock().evaluations.len(), MAX_PENDING);
+    }
+
+    #[test]
+    fn navigation_and_resize_reject_old_document_pixels() {
+        let (mut memory, id, wire_id) = memory_with_session();
+        let frame = |document_revision, scale| Event::Frame {
+            id: wire_id,
+            revision: 1,
+            document_revision,
+            scale,
+            width: 1,
+            height: 1,
+        };
+        apply_event(&mut memory, frame(0, 1.0), vec![0; 4]).unwrap();
+        assert!(memory.sessions[&id].snapshot.frame.is_some());
+        apply_event(
+            &mut memory,
+            Event::State {
+                id: wire_id,
+                state: PageState {
+                    loading: true,
+                    document_revision: 1,
+                    viewport_width: 1,
+                    viewport_height: 1,
+                    scale: 1.0,
+                    ..PageState::default()
+                },
+            },
+            vec![],
+        )
+        .unwrap();
+        assert!(memory.sessions[&id].snapshot.frame.is_none());
+        apply_event(&mut memory, frame(1, 1.0), vec![0; 4]).unwrap();
+        assert!(
+            memory.sessions[&id].snapshot.frame.is_none(),
+            "loading cannot publish old pixels"
+        );
+        memory.sessions.get_mut(&id).unwrap().snapshot.loading = false;
+        apply_event(&mut memory, frame(0, 1.0), vec![0; 4]).unwrap();
+        apply_event(&mut memory, frame(1, 2.0), vec![0; 4]).unwrap();
+        assert!(memory.sessions[&id].snapshot.frame.is_none());
+        apply_event(&mut memory, frame(1, 1.0), vec![0; 4]).unwrap();
+        assert_eq!(
+            memory.sessions[&id]
+                .snapshot
+                .frame
+                .as_ref()
+                .unwrap()
+                .document_revision,
+            1
+        );
+    }
+
+    #[test]
     fn frames_are_bounded_validated_and_stale_revisions_are_ignored() {
         let (mut memory, id, wire_id) = memory_with_session();
         let frame = |revision| Event::Frame {
             id: wire_id,
             revision,
+            document_revision: 0,
+            scale: 1.0,
             width: 1,
             height: 1,
         };

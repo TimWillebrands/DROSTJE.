@@ -70,14 +70,33 @@ pub enum BrowserCommand {
 
 #[derive(Debug)]
 pub(super) enum Request {
-    Open { id: Uuid, url: String },
-    Command { id: Uuid, command: BrowserCommand },
+    Open {
+        id: Uuid,
+        url: String,
+    },
+    Command {
+        id: Uuid,
+        command: BrowserCommand,
+    },
+    Batch {
+        id: Uuid,
+        request_id: String,
+        commands: Vec<BrowserCommand>,
+        expected_document_revision: Option<u64>,
+    },
 }
 
 impl Request {
     pub fn id(&self) -> Uuid {
         match self {
-            Self::Open { id, .. } | Self::Command { id, .. } => *id,
+            Self::Open { id, .. } | Self::Command { id, .. } | Self::Batch { id, .. } => *id,
+        }
+    }
+
+    pub fn cost(&self) -> usize {
+        match self {
+            Self::Batch { commands, .. } => commands.len(),
+            _ => 1,
         }
     }
 
@@ -105,7 +124,7 @@ impl Request {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PageState {
     pub url: String,
     pub title: String,
@@ -114,6 +133,28 @@ pub struct PageState {
     pub can_go_back: bool,
     pub can_go_forward: bool,
     pub content_height: Option<f32>,
+    pub document_revision: u64,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub scale: f32,
+}
+
+impl Default for PageState {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            title: String::new(),
+            loading: false,
+            error: None,
+            can_go_back: false,
+            can_go_forward: false,
+            content_height: None,
+            document_revision: 0,
+            viewport_width: 800,
+            viewport_height: 600,
+            scale: 1.0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -125,6 +166,8 @@ pub enum Event {
     Frame {
         id: Uuid,
         revision: u64,
+        document_revision: u64,
+        scale: f32,
         width: u32,
         height: u32,
     },
@@ -132,6 +175,12 @@ pub enum Event {
         id: Uuid,
         request_id: String,
         result: Result<Value, String>,
+    },
+    Diagnostic {
+        id: Uuid,
+        kind: &'static str,
+        level: String,
+        message: String,
     },
     Fatal {
         error: String,

@@ -29,10 +29,18 @@ export function registerBrowserTools(api, schema) {
           throw new Error(body.error || `DROSTJE browser endpoint returned HTTP ${response.status}`);
         }
         if (!("result" in body)) throw new Error("DROSTJE browser endpoint returned no result");
-        return {
-          content: [{ type: "text", text: JSON.stringify(body.result) }],
-          details: body.result,
-        };
+        const result = body.result;
+        const content = [];
+        let details = result;
+        if (tool.name === "browser" && args.action === "screenshot" && result.image) {
+          const { image, ...metadata } = result;
+          content.push({ type: "text", text: JSON.stringify(metadata) });
+          content.push({ type: "image", mimeType: image.mimeType, data: image.data });
+          details = metadata;
+        } else {
+          content.push({ type: "text", text: JSON.stringify(result) });
+        }
+        return { content, details };
       },
     });
   }

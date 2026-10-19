@@ -66,17 +66,24 @@ impl Browser {
     }
 
     fn click(&self, id: BrowserId, x: f32, y: f32) {
-        for pressed in [true, false] {
-            self.runtime.command(
-                id,
-                BrowserCommand::Pointer {
-                    x,
-                    y,
-                    button: 0,
-                    pressed,
-                },
-            );
-        }
+        let commands = [true, false]
+            .into_iter()
+            .map(|pressed| BrowserCommand::Pointer {
+                x,
+                y,
+                button: 0,
+                pressed,
+            })
+            .collect();
+        let request_id = self.runtime.dispatch(id, commands).unwrap();
+        self.until("input delivery acknowledgement", || {
+            self.runtime.evaluation(&request_id).is_some_and(|result| {
+                let result = result.expect("Input batch was not delivered");
+                assert_eq!(result["status"], "delivered");
+                assert_eq!(result["delivered"], 2);
+                true
+            })
+        });
     }
 }
 
@@ -157,6 +164,12 @@ fn real_content_height_grows_shrinks_reflows_and_resumes(browser: &Browser) {
         },
     );
     browser.until_height(id, 260.0);
+    browser.until("current frame after narrow resize", || {
+        browser
+            .snapshot(id)
+            .frame
+            .is_some_and(|frame| frame.width == 360 && frame.height == 1200)
+    });
     browser
         .runtime
         .command(id, BrowserCommand::SetContentSizing { enabled: false });
@@ -233,6 +246,152 @@ fn real_content_height_grows_shrinks_reflows_and_resumes(browser: &Browser) {
         browser.runtime.0.0.memory.lock().evaluations.is_empty(),
         "Internal content measurements must not occupy tool evaluation requests"
     );
+    browser.runtime.close(id);
+}
+
+struct DiagnosticServer {
+    url: String,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl DiagnosticServer {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = stopped.clone();
+        let worker = thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("HTTP fixture accept: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut buffer = [0; 8192];
+                let length = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..length]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                if path == "/broken" {
+                    continue;
+                } // Real dropped HTTP connection.
+                let (status, body) = if path == "/" {
+                    (
+                        "200 OK",
+                        r#"<!doctype html><title>Diagnostics smoke</title>
+                    <script>
+                    console.warn('native-console-smoke');
+                    fetch('/missing').then(r => { window.fetchStatus = r.status; });
+                    fetch('/broken').catch(() => { window.fetchFailed = true; });
+                    const xhr = new XMLHttpRequest(); xhr.open('GET', '/missing');
+                    xhr.onload = () => { window.xhrStatus = xhr.status; }; xhr.send();
+                    </script><img src='/missing'>"#,
+                    )
+                } else {
+                    ("404 Not Found", "missing")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        Self {
+            url,
+            stopped,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for DiagnosticServer {
+    fn drop(&mut self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+fn real_diagnostics_and_document_metadata(browser: &Browser) {
+    let server = DiagnosticServer::start();
+    let id = BrowserId::new_v4();
+    browser.runtime.open(id, server.url.clone());
+    browser.until("startup network diagnostics", || {
+        let diagnostics = browser.runtime.diagnostics(id, 0).unwrap();
+        let events = diagnostics["events"].as_array().unwrap();
+        let contains = |kind: &str, text: &str| {
+            events.iter().any(|event| {
+                event["kind"] == kind
+                    && event["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(text))
+            })
+        };
+        contains("console", "native-console-smoke")
+            && contains("network", "\"api\":\"fetch\"")
+            && contains("network", "\"api\":\"xhr\"")
+            && contains("network", "request_failed")
+            && contains("network", "resource_error")
+    });
+    browser.until("diagnostic document frame", || {
+        let snapshot = browser.snapshot(id);
+        !snapshot.loading
+            && snapshot.frame.as_ref().is_some_and(|frame| {
+                frame.document_revision == snapshot.document_revision
+                    && frame.scale == snapshot.scale
+            })
+    });
+    assert_eq!(browser.evaluate(id, "window.fetchStatus"), 404.0);
+    assert_eq!(browser.evaluate(id, "window.xhrStatus"), 404.0);
+    assert_eq!(browser.evaluate(id, "window.fetchFailed"), true);
+    let old_document = browser.snapshot(id).document_revision;
+    let request_id = browser
+        .runtime
+        .dispatch(id, vec![BrowserCommand::Reload])
+        .unwrap();
+    browser.until("reload delivered", || {
+        browser
+            .runtime
+            .evaluation(&request_id)
+            .is_some_and(|result| {
+                result.unwrap();
+                true
+            })
+    });
+    browser.until("reload frame has a new document identity", || {
+        let snapshot = browser.snapshot(id);
+        snapshot.document_revision > old_document
+            && !snapshot.loading
+            && snapshot
+                .frame
+                .as_ref()
+                .is_some_and(|frame| frame.document_revision == snapshot.document_revision)
+    });
+    let stale = browser
+        .runtime
+        .dispatch_in_document(
+            id,
+            vec![BrowserCommand::Move { x: 1.0, y: 1.0 }],
+            old_document,
+        )
+        .unwrap();
+    browser.until("stale document batch rejected", || {
+        browser.runtime.evaluation(&stale).is_some_and(|result| {
+            assert!(result.unwrap_err().contains("document changed"));
+            true
+        })
+    });
     browser.runtime.close(id);
 }
 
@@ -339,6 +498,7 @@ fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
         .unwrap();
     }
     real_content_height_grows_shrinks_reflows_and_resumes(&browser);
+    real_diagnostics_and_document_metadata(&browser);
     browser.runtime.command(
         id,
         BrowserCommand::Navigate {
@@ -416,6 +576,10 @@ fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
             .evaluation("throws")
             .is_some_and(|result| result.is_err())
     });
+    assert!(
+        browser.snapshot(id).error.is_none(),
+        "Evaluation errors must not poison page health"
+    );
     browser.runtime.close(id);
     assert!(browser.runtime.snapshot(id).is_none());
     assert_eq!(browser.evaluate(other, "document.title"), "Servo smoke");

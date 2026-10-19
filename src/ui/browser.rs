@@ -43,9 +43,13 @@ pub struct BrowserPane {
     collapsed: bool,
     content_height: Option<f32>,
     frame: Option<Arc<RenderImage>>,
+    frame_dimensions: Option<(u32, u32, f32)>,
     revision: u64,
     bounds: Bounds<Pixels>,
     dimensions: (u32, u32, u32),
+    layout_dimensions: (u32, u32, u32),
+    fixed_viewport: Option<(u32, u32, u32)>,
+    pressed_buttons: [bool; 3],
     pub url: String,
     pub title: String,
     loading: bool,
@@ -67,6 +71,17 @@ impl BrowserPane {
         cx: &mut Context<Self>,
     ) -> Self {
         runtime.open(id, url.clone());
+        let dimensions = runtime
+            .snapshot(id)
+            .map(|snapshot| {
+                (
+                    snapshot.viewport_width,
+                    snapshot.viewport_height,
+                    snapshot.scale.to_bits(),
+                )
+            })
+            // A concurrently closed session has no viewport; resize skips zero dimensions.
+            .unwrap_or((0, 0, 1_f32.to_bits()));
         let address = cx.new(|cx| InputState::new(window, cx).placeholder("Enter a URL…"));
         address.update(cx, |input, cx| input.set_value(url.clone(), window, cx));
         let address_focus = address.focus_handle(cx);
@@ -132,9 +147,13 @@ impl BrowserPane {
             collapsed: false,
             content_height: None,
             frame: None,
+            frame_dimensions: None,
             revision: 0,
             bounds: Bounds::default(),
-            dimensions: (0, 0, 0),
+            dimensions,
+            layout_dimensions: dimensions,
+            fixed_viewport: None,
+            pressed_buttons: [false; 3],
             url,
             title: "Browser".into(),
             loading: true,
@@ -150,7 +169,7 @@ impl BrowserPane {
     }
     /// Presentation belongs to the retained pane, never to a virtualized row.
     pub(super) fn set_artifact(&mut self, title: String) {
-        if self.artifact.is_none() {
+        if self.artifact.is_none() && self.fixed_viewport.is_none() {
             self.runtime
                 .command(self.id, BrowserCommand::SetContentSizing { enabled: true });
         }
@@ -170,14 +189,65 @@ impl BrowserPane {
         self.runtime.command(
             self.id,
             BrowserCommand::SetContentSizing {
-                enabled: !self.collapsed,
+                enabled: !self.collapsed && self.fixed_viewport.is_none(),
             },
         );
         cx.emit(BrowserLayout);
         cx.notify();
     }
 
+    /// Fix the CSS viewport and device scale, or restore following the pane's layout.
+    pub fn set_viewport(
+        &mut self,
+        viewport: Option<(u32, u32, f32)>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let dimensions = viewport
+            .map(|(width, height, scale)| {
+                if !scale.is_finite() || !(0.25..=8.).contains(&scale) {
+                    return Err("Browser scale must be between 0.25 and 8".to_owned());
+                }
+                if width == 0 || height == 0 {
+                    return Err("Browser CSS viewport dimensions must be positive".to_owned());
+                }
+                let width = (width as f64 * f64::from(scale)).round() as u32;
+                let height = (height as f64 * f64::from(scale)).round() as u32;
+                crate::browser::frame_len(width, height).map_err(|error| error.to_string())?;
+                Ok((width, height, scale.to_bits()))
+            })
+            .transpose()?;
+        if self.fixed_viewport == dimensions {
+            return Ok(());
+        }
+        self.fixed_viewport = dimensions;
+        if self.artifact.is_some() {
+            self.runtime.command(
+                self.id,
+                BrowserCommand::SetContentSizing {
+                    enabled: dimensions.is_none() && !self.collapsed,
+                },
+            );
+            cx.emit(BrowserLayout);
+        }
+        self.resize(dimensions.unwrap_or(self.layout_dimensions));
+        cx.notify();
+        Ok(())
+    }
+
+    /// Physical dimensions most recently requested from Servo.
+    pub(super) fn viewport_dimensions(&self) -> (u32, u32, f32) {
+        (
+            self.dimensions.0,
+            self.dimensions.1,
+            f32::from_bits(self.dimensions.2),
+        )
+    }
+
     fn artifact_height(&self, window: &Window) -> f32 {
+        if let Some((width, height, _)) = self.fixed_viewport {
+            return (f32::from(self.bounds.size.width).max(1.) * height as f32 / width as f32)
+                .clamp(120., 1600.);
+        }
         // Keep physical RGBA frames below the engine's 64 MiB limit, with headroom.
         let scale = window.scale_factor();
         let width = f32::from(self.bounds.size.width).max(1.);
@@ -247,7 +317,7 @@ impl BrowserPane {
             && self.content_height != snapshot.content_height
         {
             self.content_height = snapshot.content_height;
-            if self.artifact.is_some() && !self.collapsed {
+            if self.artifact.is_some() && !self.collapsed && self.fixed_viewport.is_none() {
                 cx.emit(BrowserLayout);
                 cx.notify();
             }
@@ -290,6 +360,7 @@ impl BrowserPane {
             if let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, pixels) {
                 self.frame = Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])));
                 self.revision = frame.revision;
+                self.frame_dimensions = Some((frame.width, frame.height, frame.scale));
                 changed = true;
             }
         }
@@ -301,43 +372,82 @@ impl BrowserPane {
         }
     }
     fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.fixed_viewport.is_some()
+            && self.artifact.is_some()
+            && self.bounds.size.width != bounds.size.width
+        {
+            cx.emit(BrowserLayout);
+        }
         self.bounds = bounds;
         let scale = window.scale_factor();
         let width = (f32::from(bounds.size.width) * scale).round().max(1.) as u32;
         let height = (f32::from(bounds.size.height) * scale).round().max(1.) as u32;
         let dimensions = (width, height, scale.to_bits());
-        if dimensions != self.dimensions {
+        self.layout_dimensions = dimensions;
+        if self.fixed_viewport.is_none() {
             if self.artifact.is_some()
                 && (self.dimensions.0 != width || self.dimensions.2 != scale.to_bits())
             {
                 // The physical frame cap can change even if natural document height does not.
                 cx.emit(BrowserLayout);
             }
-            self.dimensions = dimensions;
-            self.runtime.command(
-                self.id,
-                BrowserCommand::Resize {
-                    width,
-                    height,
-                    scale,
-                },
-            );
+            self.resize(dimensions);
         }
     }
-    fn position(&self, point: Point<Pixels>) -> (f32, f32) {
-        (
-            f32::from(point.x - self.bounds.origin.x),
-            f32::from(point.y - self.bounds.origin.y),
-        )
+    fn resize(&mut self, dimensions: (u32, u32, u32)) {
+        if dimensions == self.dimensions || dimensions.0 == 0 || dimensions.1 == 0 {
+            return;
+        }
+        self.dimensions = dimensions;
+        self.runtime.command(
+            self.id,
+            BrowserCommand::Resize {
+                width: dimensions.0,
+                height: dimensions.1,
+                scale: f32::from_bits(dimensions.2),
+            },
+        );
     }
-    fn pointer(&self, position: Point<Pixels>, button: MouseButton, pressed: bool) {
-        let (x, y) = self.position(position);
+
+    /// Use the same fit operation as the image, including while a resize is pending.
+    fn presentation(&self) -> Option<(Bounds<Pixels>, f32)> {
+        let (width, height, scale) = self.frame_dimensions?;
+        if self.bounds.size.width <= px(0.) || self.bounds.size.height <= px(0.) {
+            return None;
+        }
+        let bounds = ObjectFit::Contain.get_bounds(self.bounds, size(width.into(), height.into()));
+        let css_per_pixel = width as f32 / scale / f32::from(bounds.size.width);
+        Some((bounds, css_per_pixel))
+    }
+
+    fn position(&self, point: Point<Pixels>) -> Option<(f32, f32)> {
+        let (bounds, scale) = self.presentation()?;
+        bounds.contains(&point).then(|| {
+            (
+                f32::from(point.x - bounds.origin.x) * scale,
+                f32::from(point.y - bounds.origin.y) * scale,
+            )
+        })
+    }
+    fn pointer(&mut self, position: Point<Pixels>, button: MouseButton, pressed: bool) {
         let button = match button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
             MouseButton::Right => 2,
             _ => return,
         };
+        let Some((bounds, scale)) = self.presentation() else {
+            return;
+        };
+        // Ignore letterboxing, but always release a press begun on the web surface.
+        if pressed && !bounds.contains(&position)
+            || !pressed && !self.pressed_buttons[button as usize]
+        {
+            return;
+        }
+        self.pressed_buttons[button as usize] = pressed;
+        let x = f32::from(position.x - bounds.origin.x) * scale;
+        let y = f32::from(position.y - bounds.origin.y) * scale;
         self.runtime.command(
             self.id,
             BrowserCommand::Pointer {
@@ -646,6 +756,9 @@ impl Render for BrowserPane {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, w, cx| {
+                    if this.position(event.position).is_none() {
+                        return;
+                    }
                     this.focus(w, cx);
                     this.pointer(event.position, event.button, true);
                     cx.stop_propagation();
@@ -693,26 +806,40 @@ impl Render for BrowserPane {
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
-                let (x, y) = this.position(event.position);
-                this.runtime.command(this.id, BrowserCommand::Move { x, y });
+                if let Some((x, y)) = this.position(event.position) {
+                    this.runtime.command(this.id, BrowserCommand::Move { x, y });
+                }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                 // A fitted artifact belongs to the transcript's scroll surface. Only the
                 // bounded fallback viewport scrolls internally.
                 if this.artifact.is_some()
+                    && this.fixed_viewport.is_none()
                     && this
                         .content_height
                         .is_none_or(|height| height <= f32::from(this.bounds.size.height) + 1.)
                 {
                     return;
                 }
-                let (x, y) = this.position(event.position);
+                let Some((x, y)) = this.position(event.position) else {
+                    return;
+                };
+                let Some((_, scale)) = this.presentation() else {
+                    return;
+                };
                 let (dx, dy) = match event.delta {
                     ScrollDelta::Pixels(p) => (-f32::from(p.x), -f32::from(p.y)),
                     ScrollDelta::Lines(p) => (-p.x * 40., -p.y * 40.),
                 };
-                this.runtime
-                    .command(this.id, BrowserCommand::Scroll { x, y, dx, dy });
+                this.runtime.command(
+                    this.id,
+                    BrowserCommand::Scroll {
+                        x,
+                        y,
+                        dx: dx * scale,
+                        dy: dy * scale,
+                    },
+                );
                 cx.stop_propagation();
             }))
             .when_some(self.frame.clone(), |surface, frame| {
@@ -721,7 +848,7 @@ impl Render for BrowserPane {
                         .absolute()
                         .inset_0()
                         .size_full()
-                        .object_fit(ObjectFit::Fill),
+                        .object_fit(ObjectFit::Contain),
                 )
             })
             .child(
