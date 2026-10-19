@@ -46,6 +46,13 @@ pub(super) async fn open(config: NvimConfig) -> Result<NvimEditor> {
     })
 }
 
+fn theme_args(colors: [u32; 4]) -> Vec<Value> {
+    vec![
+        "return drostje.theme(...)".into(),
+        Value::Array(colors.into_iter().map(Value::from).collect()),
+    ]
+}
+
 struct Draft {
     handle: Value,
     snapshot: DraftSnapshot,
@@ -187,6 +194,8 @@ struct Session {
     composition: bool,
     frozen: bool,
     theme: Option<[u32; 4]>,
+    /// Requests sent by `detach`, by RPC ID, whose replies arrive as `Incoming::Response`.
+    detached: HashMap<u64, &'static str>,
     failed: Option<String>,
 }
 impl Session {
@@ -208,6 +217,7 @@ impl Session {
             composition: false,
             frozen: false,
             theme: None,
+            detached: HashMap::new(),
             failed: None,
         }
     }
@@ -240,6 +250,8 @@ impl Session {
 
     async fn initialize(&mut self) -> Result<()> {
         self.rpc = Some(Rpc::spawn(&self.config)?);
+        // RPC IDs restart with each process.
+        self.detached.clear();
         let info = self.call("nvim_get_api_info", vec![]).await?;
         let info = info
             .as_array()
@@ -339,12 +351,22 @@ impl Session {
         Ok(())
     }
     async fn apply_theme(&mut self, colors: [u32; 4]) -> Result<()> {
-        self.lua(
-            "return drostje.theme(...)",
-            colors.into_iter().map(Value::from).collect(),
-        )
-        .await?;
+        self.call("nvim_exec_lua", theme_args(colors)).await?;
         self.call("nvim_command", vec!["redraw!".into()]).await?;
+        Ok(())
+    }
+    async fn send_theme(&mut self, colors: [u32; 4]) -> Result<()> {
+        self.detach("nvim_exec_lua", theme_args(colors)).await?;
+        self.detach("nvim_command", vec!["redraw!".into()]).await
+    }
+    /// Send a non-editing UI request without awaiting its reply. Neovim defers
+    /// non-fast requests while a key sequence is unfinished (Visual `g`, `"`,
+    /// `<C-w>`…); awaiting one there would hold every later key, including the
+    /// one that completes the sequence, until the RPC timeout. Requests still
+    /// run in send order; `process_incoming` reports a failed reply.
+    async fn detach(&mut self, method: &'static str, args: Vec<Value>) -> Result<()> {
+        let id = self.rpc()?.call(method, args).await?;
+        self.detached.insert(id, method);
         Ok(())
     }
     async fn lua(&mut self, code: &str, args: Vec<Value>) -> Result<Value> {
@@ -426,7 +448,14 @@ impl Session {
     }
     fn process_incoming(&mut self, incoming: Incoming) -> Result<()> {
         match incoming {
-            Incoming::Response { .. } => {}
+            Incoming::Response { id, result } => {
+                if let Some(method) = self.detached.remove(&id)
+                    && let Err(error) = result
+                {
+                    self.events
+                        .emit(NvimEvent::InputRejected(format!("{method}: {error}")));
+                }
+            }
             Incoming::Failed(error) => bail!(error),
             Incoming::Request { id, method, args } => {
                 if method == "drostje_clipboard_get" && args.is_empty() {
@@ -1200,7 +1229,7 @@ impl Session {
                 // Theme updates are non-editing and remain valid while input is
                 // frozen. Retain the newest colors through failed restarts.
                 if self.failed.is_none()
-                    && let Err(error) = self.apply_theme(colors).await
+                    && let Err(error) = self.send_theme(colors).await
                 {
                     self.fail(format!("Could not apply editor theme: {error:#}"));
                 }
@@ -1319,7 +1348,7 @@ impl Session {
                         NvimCommand::Resize { cols, rows } => {
                             self.config.cols = cols.max(1);
                             self.config.rows = rows.max(2);
-                            self.call(
+                            self.detach(
                                 "nvim_ui_try_resize",
                                 vec![self.config.cols.into(), self.config.rows.into()],
                             )
@@ -1327,7 +1356,8 @@ impl Session {
                         }
                         NvimCommand::Focus(focused) => {
                             if self.methods.contains("nvim_ui_set_focus") {
-                                self.call("nvim_ui_set_focus", vec![focused.into()]).await?;
+                                self.detach("nvim_ui_set_focus", vec![focused.into()])
+                                    .await?;
                             }
                         }
                         NvimCommand::Copy { cut } => {

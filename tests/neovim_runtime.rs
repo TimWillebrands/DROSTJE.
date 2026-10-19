@@ -415,6 +415,55 @@ fn theme_updates_follow_serialized_input_and_survive_restart() {
 
 #[test]
 #[ignore = "requires a real Neovim executable; spawns disposable isolated processes"]
+fn focus_resize_and_theme_wait_out_an_unfinished_key_sequence() {
+    smol::block_on(async {
+        let runtime = Runtime::start().await;
+        let key = runtime.draft("first\nsecond").await;
+        // Visual `g` waits for its second key; Neovim defers non-fast requests
+        // until it arrives, which only the user can send.
+        runtime.keys("<Esc>vg").await;
+        let started = std::time::Instant::now();
+        for command in [
+            NvimCommand::Focus(false),
+            NvimCommand::Resize { cols: 40, rows: 6 },
+            NvimCommand::Theme {
+                foreground: 0x172135,
+                background: 0xe7edf5,
+                selection: 0xb2c6df,
+                caret: 0x285daa,
+            },
+            NvimCommand::Focus(true),
+        ] {
+            runtime.editor.commands.send(command).await.unwrap();
+        }
+        runtime.keys("g<Esc>").await;
+        let saved = runtime.editor.snapshot(key).await.unwrap();
+        assert_eq!(saved.text, "first\nsecond");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "advisory requests held later input for {:?}",
+            started.elapsed()
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !runtime
+            .grid
+            .lock()
+            .as_ref()
+            .is_some_and(|grid| grid.default_fg == 0x172135 && grid.default_bg == 0xe7edf5)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deferred theme was never applied"
+            );
+            smol::Timer::after(Duration::from_millis(5)).await;
+        }
+        assert!(runtime.diagnostics.lock().is_empty());
+        runtime.close().await;
+    });
+}
+
+#[test]
+#[ignore = "requires a real Neovim executable; spawns disposable isolated processes"]
 fn persistence_barrier_freezes_every_draft_until_explicit_resume() {
     smol::block_on(async {
         let runtime = Runtime::start().await;
