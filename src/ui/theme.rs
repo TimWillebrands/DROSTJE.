@@ -1131,6 +1131,7 @@ mod tests {
 
     /// The test platform's text system is a stub, so this asks the real one.
     #[test]
+    #[ignore = "creates the macOS platform, which panics off the main thread where libtest runs tests; needs a harness = false runner"]
     fn every_family_a_bundled_theme_names_is_embedded() {
         let text_system = gpui_kit::platform::current_platform(true).text_system();
         text_system
