@@ -9,6 +9,7 @@ use gpui_kit::{
 };
 use serde_json::Value;
 
+use super::color::{Oklch, hex};
 use crate::app::{AppState, NoticeLevel};
 
 /// Themes shipped with DROSTJE.: Delft, the default, and Ink, a reading mode. The
@@ -30,9 +31,9 @@ const FONTS: [&[u8]; 22] = [
     include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"),
     include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Bold.ttf"),
     include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-BoldItalic.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Regular.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Italic.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-mono/IBMPlexMono-Bold.ttf"),
+    include_bytes!("../../assets/fonts/lilex/Lilex-Regular.ttf"),
+    include_bytes!("../../assets/fonts/lilex/Lilex-Italic.ttf"),
+    include_bytes!("../../assets/fonts/lilex/Lilex-Bold.ttf"),
     include_bytes!("../../assets/fonts/libron/Libron-Regular.ttf"),
     include_bytes!("../../assets/fonts/libron/Libron-Italic.ttf"),
     include_bytes!("../../assets/fonts/libron/Libron-Bold.ttf"),
@@ -97,13 +98,15 @@ pub(super) fn terminal_theme(cx: &App) -> ghostty_terminal::TerminalTheme {
     )
 }
 
-/// What bundled themes set beyond Kit's format, as `prose.*` and `signature` keys beside
-/// Kit's own. Other themes get the defaults.
+/// What bundled themes set beyond Kit's format, as `prose.*`, `signature` and `grain`
+/// keys beside Kit's own. Other themes get the defaults.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Extensions {
     prose: Prose,
     /// The wordmark's full stop and the running-turn mark; the accent when unset.
     signature: Option<Hsla>,
+    /// Grain strength over window chrome, 0 to 1; none when unset.
+    grain: Option<f32>,
 }
 
 impl Extensions {
@@ -116,6 +119,13 @@ impl Extensions {
                     .and_then(|color| Rgba::try_from(color).ok())
                     .expect("bundled signature is a hex color")
                     .into()
+            }),
+            grain: theme.get("grain").map(|grain| {
+                grain
+                    .as_f64()
+                    .map(|grain| grain as f32)
+                    .filter(|grain| (0. ..=1.).contains(grain))
+                    .expect("bundled grain is a strength from 0 to 1")
             }),
         }
     }
@@ -193,8 +203,9 @@ pub fn saved_theme_name(name: &str) -> &str {
         .map_or(name, |(_, new)| new)
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum Appearance {
+/// Whether the app follows the system's light or dark mode or fixes one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Appearance {
     #[default]
     System,
     Light,
@@ -202,6 +213,25 @@ enum Appearance {
 }
 
 impl Appearance {
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+
+    /// The `theme_mode` setting value.
+    pub fn setting(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
     fn from_setting(value: Option<&Value>) -> Self {
         match value.and_then(Value::as_str) {
             Some("light") => Self::Light,
@@ -219,11 +249,100 @@ impl Appearance {
     }
 }
 
+/// Where the user's adjustments to every theme are saved.
+pub const ADJUSTMENTS_SETTING: &str = "theme_adjustments";
+/// The most colorful accent offered; sRGB accents beyond it are mostly out of gamut.
+pub const MAX_CHROMA: f32 = 0.25;
+/// Below this chroma a theme's primary is grey and has no hue to keep.
+const NEUTRAL_CHROMA: f32 = 0.02;
+/// Colors that carry a theme's accent. Adjusting the accent re-hues each one at its own
+/// lightness, so the theme's contrast with the text on them is kept.
+const ACCENT_COLORS: [&str; 14] = [
+    "primary.background",
+    "primary.hover.background",
+    "primary.active.background",
+    "button.primary.background",
+    "button.primary.hover.background",
+    "button.primary.active.background",
+    "sidebar.primary.background",
+    "selection.background",
+    "link",
+    "link.hover",
+    "link.active",
+    "ring",
+    "list.active.border",
+    "table.active.border",
+];
+
+/// An accent in OKLCH hue and chroma; each theme supplies the lightness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Accent {
+    /// Degrees, 0 up to 360.
+    pub hue: f32,
+    /// 0 (grey) to [`MAX_CHROMA`].
+    pub chroma: f32,
+}
+
+impl Accent {
+    pub fn new(hue: f32, chroma: f32) -> Self {
+        Self {
+            hue: hue.rem_euclid(360.),
+            chroma: chroma.clamp(0., MAX_CHROMA),
+        }
+    }
+}
+
+/// The user's changes over every theme. Unset fields keep the theme's own value.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Adjustments {
+    pub accent: Option<Accent>,
+    /// Grain strength, 0 to 1.
+    pub grain: Option<f32>,
+}
+
+impl Adjustments {
+    /// Malformed fields are ignored, so a hand-edited value cannot block startup.
+    pub(crate) fn from_setting(value: Option<&Value>) -> Self {
+        let number = |value: &Value, key: &str| value.get(key).and_then(Value::as_f64);
+        let Some(value) = value else {
+            return Self::default();
+        };
+        Self {
+            accent: value.get("accent").and_then(|accent| {
+                let hue = number(accent, "hue").filter(|hue| hue.is_finite())?;
+                let chroma = number(accent, "chroma").filter(|chroma| chroma.is_finite())?;
+                Some(Accent::new(hue as f32, chroma as f32))
+            }),
+            grain: number(value, "grain")
+                .filter(|grain| grain.is_finite())
+                .map(|grain| (grain as f32).clamp(0., 1.)),
+        }
+    }
+
+    pub fn to_setting(self) -> Value {
+        serde_json::json!({
+            "accent": self.accent.map(|accent| serde_json::json!({
+                "hue": accent.hue,
+                "chroma": accent.chroma,
+            })),
+            "grain": self.grain,
+        })
+    }
+}
+
+/// Appearance and adjustments as the theme editor previews them before saving.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ThemeDraft {
+    pub appearance: Appearance,
+    pub adjustments: Adjustments,
+}
+
 #[derive(Clone, Default)]
 struct Preferences {
     appearance: Appearance,
     light: Option<String>,
     dark: Option<String>,
+    adjustments: Adjustments,
 }
 
 fn saved_name(value: Option<&Value>) -> Option<&str> {
@@ -239,6 +358,7 @@ impl Preferences {
             appearance: Appearance::from_setting(settings.get("theme_mode")),
             light: saved_name(settings.get("theme_light")).map(str::to_owned),
             dark: saved_name(settings.get("theme_dark")).map(str::to_owned),
+            adjustments: Adjustments::from_setting(settings.get(ADJUSTMENTS_SETTING)),
         }
     }
 
@@ -246,13 +366,79 @@ impl Preferences {
         self.appearance == Appearance::from_setting(settings.get("theme_mode"))
             && self.light.as_deref() == saved_name(settings.get("theme_light"))
             && self.dark.as_deref() == saved_name(settings.get("theme_dark"))
+            && self.adjustments == Adjustments::from_setting(settings.get(ADJUSTMENTS_SETTING))
     }
+}
+
+/// `config` with its accent colors re-hued to `accent`. A theme without a primary color
+/// gets one at a lightness that suits its mode.
+fn with_accent(config: &ThemeConfig, accent: Accent) -> ThemeConfig {
+    let mut value = serde_json::to_value(config).expect("Kit theme fields are JSON-compatible");
+    let colors = value["colors"]
+        .as_object_mut()
+        .expect("Kit theme colors are an object");
+    fn color(colors: &serde_json::Map<String, Value>, key: &str) -> Option<Rgba> {
+        colors
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|color| Rgba::try_from(color).ok())
+    }
+    let reference = color(colors, "primary.background").map(Oklch::from_rgba);
+    if reference.is_none() {
+        let l = if config.mode.is_dark() { 0.75 } else { 0.5 };
+        let primary = Oklch {
+            l,
+            c: accent.chroma,
+            h: accent.hue,
+        };
+        colors.insert("primary.background".into(), hex(primary.to_rgba(1.)).into());
+    }
+    let reference_chroma = reference.map_or(accent.chroma, |reference| reference.c);
+    for key in ACCENT_COLORS {
+        let Some(rgba) = color(colors, key) else {
+            continue;
+        };
+        let original = Oklch::from_rgba(rgba);
+        let chroma = if reference_chroma > NEUTRAL_CHROMA {
+            original.c * accent.chroma / reference_chroma
+        } else if original.c > NEUTRAL_CHROMA || key.contains("primary") {
+            accent.chroma
+        } else {
+            // A grey ring or caret beside a grey primary stays grey.
+            original.c
+        };
+        let tinted = Oklch {
+            l: original.l,
+            c: chroma,
+            h: accent.hue,
+        };
+        colors.insert(key.into(), hex(tinted.to_rgba(rgba.a)).into());
+    }
+    serde_json::from_value(value).expect("a re-hued Kit theme is still a Kit theme")
+}
+
+/// The primary color of `config` in OKLCH, or a neutral stand-in when it has none.
+fn primary_of(config: &ThemeConfig) -> Oklch {
+    config
+        .colors
+        .primary
+        .as_deref()
+        .and_then(|color| Rgba::try_from(color).ok())
+        .map(Oklch::from_rgba)
+        .unwrap_or(Oklch {
+            l: if config.mode.is_dark() { 0.75 } else { 0.5 },
+            c: 0.,
+            h: 0.,
+        })
 }
 
 struct AppliedTheme {
     mode: ThemeMode,
     light_config: Rc<ThemeConfig>,
     dark_config: Rc<ThemeConfig>,
+    adjustments: Adjustments,
+    /// The unadjusted primary of the theme in effect, which accents take lightness from.
+    reference: Oklch,
     // Kit's ThemeConfig has no PartialEq. Compare its JSON data only when
     // resolving a changed configuration, never on a render or routine state update.
     light: Value,
@@ -261,6 +447,8 @@ struct AppliedTheme {
 
 struct Coordinator {
     preferences: Preferences,
+    /// The theme editor's unsaved choices, shown in place of the saved ones.
+    preview: Option<ThemeDraft>,
     bundled: Vec<Bundled>,
     native_appearance: Option<Appearance>,
     applied: Option<AppliedTheme>,
@@ -274,6 +462,7 @@ impl Coordinator {
     fn new(preferences: Preferences, fonts_error: Option<String>) -> Self {
         Self {
             preferences,
+            preview: None,
             bundled: parse_bundled(),
             native_appearance: None,
             applied: None,
@@ -291,6 +480,16 @@ impl Coordinator {
             .find(|theme| theme.config.mode == mode && theme.config.is_default)
             .expect("parse_bundled checked one default per mode")
             .config
+    }
+
+    /// The saved preferences with the editor's preview, if one is open, over them.
+    fn effective(&self) -> Preferences {
+        let mut preferences = self.preferences.clone();
+        if let Some(draft) = self.preview {
+            preferences.appearance = draft.appearance;
+            preferences.adjustments = draft.adjustments;
+        }
+        preferences
     }
 
     fn extensions(&self, theme: &Rc<ThemeConfig>) -> Extensions {
@@ -403,6 +602,93 @@ pub fn signature(cx: &App) -> Hsla {
         .unwrap_or_else(|| Theme::global(cx).primary)
 }
 
+/// Grain strength over window chrome in the theme in effect, 0 to 1.
+pub fn grain(cx: &App) -> f32 {
+    cx.try_global::<Coordinator>().map_or(0., |coordinator| {
+        coordinator
+            .effective()
+            .adjustments
+            .grain
+            .or(coordinator.extensions.grain)
+            .unwrap_or(0.)
+    })
+}
+
+/// The grain the theme in effect sets itself, before the user's adjustment.
+pub fn theme_grain(cx: &App) -> f32 {
+    cx.try_global::<Coordinator>()
+        .and_then(|coordinator| coordinator.extensions.grain)
+        .unwrap_or(0.)
+}
+
+/// The saved appearance and adjustments, or the editor's preview while one is open.
+pub fn draft(cx: &App) -> ThemeDraft {
+    cx.try_global::<Coordinator>()
+        .map(|coordinator| {
+            let preferences = coordinator.effective();
+            ThemeDraft {
+                appearance: preferences.appearance,
+                adjustments: preferences.adjustments,
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// The name of the theme in effect, as its unadjusted file names it.
+pub fn active_name(cx: &App) -> SharedString {
+    cx.try_global::<Coordinator>()
+        .and_then(|coordinator| coordinator.applied.as_ref())
+        .map(|applied| {
+            if applied.mode.is_dark() {
+                applied.dark_config.name.clone()
+            } else {
+                applied.light_config.name.clone()
+            }
+        })
+        .unwrap_or_else(|| Theme::global(cx).theme_name().clone())
+}
+
+/// The accent the theme in effect has before any adjustment.
+pub fn theme_accent(cx: &App) -> Accent {
+    let reference = reference(cx);
+    Accent::new(reference.h, reference.c)
+}
+
+/// How `accent` looks as the primary color of the theme in effect.
+pub fn accent_color(accent: Accent, cx: &App) -> Hsla {
+    Oklch {
+        l: reference(cx).l,
+        c: accent.chroma,
+        h: accent.hue,
+    }
+    .to_rgba(1.)
+    .into()
+}
+
+fn reference(cx: &App) -> Oklch {
+    cx.try_global::<Coordinator>()
+        .and_then(|coordinator| coordinator.applied.as_ref())
+        .map_or_else(
+            || Oklch::from_rgba(Theme::global(cx).primary.into()),
+            |applied| applied.reference,
+        )
+}
+
+/// Show `draft` in place of the saved choices until [`end_preview`].
+pub fn preview(draft: ThemeDraft, state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
+    cx.global_mut::<Coordinator>().preview = Some(draft);
+    update(state, window, cx);
+}
+
+/// Return to the saved choices, including any the editor saved just before.
+pub fn end_preview(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
+    let preferences = Preferences::from_settings(&state.read(cx).snapshot.settings);
+    let coordinator = cx.global_mut::<Coordinator>();
+    coordinator.preview = None;
+    coordinator.preferences = preferences;
+    update(state, window, cx);
+}
+
 /// Validate new choices while allowing an unavailable saved choice to survive
 /// an unrelated Settings save. Resolution keeps that name and uses a fallback.
 pub fn validate_preferences(
@@ -477,7 +763,7 @@ fn resolve(
 }
 
 fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
-    let preferences = cx.global::<Coordinator>().preferences.clone();
+    let preferences = cx.global::<Coordinator>().effective();
     if cx.global::<Coordinator>().native_appearance != Some(preferences.appearance) {
         // Record before calling the platform: resulting appearance notifications
         // must not set the native override a second time.
@@ -513,6 +799,7 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
         cx,
         &mut warnings,
     );
+    let adjustments = preferences.adjustments;
     if cx
         .global::<Coordinator>()
         .applied
@@ -521,26 +808,36 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
             applied.mode == mode
                 && Rc::ptr_eq(&applied.light_config, &light)
                 && Rc::ptr_eq(&applied.dark_config, &dark)
+                && applied.adjustments == adjustments
         })
     {
         return warnings;
     }
+    let adjusted = |config: &Rc<ThemeConfig>| match adjustments.accent {
+        Some(accent) => Rc::new(with_accent(config, accent)),
+        None => config.clone(),
+    };
+    let (light_theme, dark_theme) = (adjusted(&light), adjusted(&dark));
     let applied = AppliedTheme {
         mode,
         light_config: light.clone(),
         dark_config: dark.clone(),
-        light: serde_json::to_value(light.as_ref()).expect("Kit theme fields are JSON-compatible"),
-        dark: serde_json::to_value(dark.as_ref()).expect("Kit theme fields are JSON-compatible"),
+        adjustments,
+        reference: primary_of(if mode.is_dark() { &dark } else { &light }),
+        light: serde_json::to_value(light_theme.as_ref())
+            .expect("Kit theme fields are JSON-compatible"),
+        dark: serde_json::to_value(dark_theme.as_ref())
+            .expect("Kit theme fields are JSON-compatible"),
     };
-    let changed = cx
-        .global::<Coordinator>()
-        .applied
-        .as_ref()
-        .is_none_or(|previous| {
-            previous.mode != applied.mode
-                || previous.light != applied.light
-                || previous.dark != applied.dark
-        });
+    let previous = cx.global::<Coordinator>().applied.as_ref();
+    let changed = previous.is_none_or(|previous| {
+        previous.mode != applied.mode
+            || previous.light != applied.light
+            || previous.dark != applied.dark
+    });
+    // Grain is drawn by views, not Kit's palette, so it needs its own refresh.
+    let grain_changed =
+        previous.is_some_and(|previous| previous.adjustments.grain != adjustments.grain);
     let extensions =
         cx.global::<Coordinator>()
             .extensions(if mode.is_dark() { &dark } else { &light });
@@ -565,11 +862,13 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
         } else {
             HighlightTheme::default_light()
         };
-        theme.light_theme = light;
-        theme.dark_theme = dark;
+        theme.light_theme = light_theme;
+        theme.dark_theme = dark_theme;
         // change applies the effective config and syncs all direct mutations to
         // Base; a separate sync_base would duplicate that projection.
         Theme::change(mode, window, cx);
+        cx.refresh_windows();
+    } else if grain_changed {
         cx.refresh_windows();
     }
     warnings
@@ -656,9 +955,82 @@ pub fn attach_recovery(window: &mut Window, cx: &mut App) -> Subscription {
 mod tests {
     // Not `use super::*`: the Kit facade exports a `test` macro that would
     // shadow `#[test]`.
-    use super::{DISPLAY_FONT, FONTS, Prose, parse_bundled, saved_theme_name};
+    use super::{
+        Accent, Adjustments, DISPLAY_FONT, FONTS, Prose, parse_bundled, saved_theme_name,
+        with_accent,
+    };
+    use crate::ui::color::Oklch;
     use gpui_kit::{FontStyle, FontWeight, Hsla, Rgba, component::ThemeMode, font, px};
+    use serde_json::json;
     use std::borrow::Cow;
+
+    fn oklch(color: Option<&str>) -> Oklch {
+        Oklch::from_rgba(Rgba::try_from(color.expect("color is set")).unwrap())
+    }
+
+    #[test]
+    fn an_accent_re_hues_accent_colors_at_their_own_lightness() {
+        let bundled = parse_bundled();
+        for name in ["Delft Light", "Delft Dark", "Ink Light", "Cootje Dark"] {
+            let original = &bundled
+                .iter()
+                .find(|theme| theme.config.name.as_ref() == name)
+                .unwrap()
+                .config;
+            let accent = Accent::new(140., 0.12);
+            let adjusted = with_accent(original, accent);
+            let (before, after) = (
+                oklch(original.colors.primary.as_deref()),
+                oklch(adjusted.colors.primary.as_deref()),
+            );
+            assert!((after.l - before.l).abs() < 0.01, "{name} keeps lightness");
+            assert!(
+                (after.h - 140.).abs() < 2.,
+                "{name} takes the hue: {after:?}"
+            );
+            assert!((after.c - 0.12).abs() < 0.01, "{name} takes the chroma");
+            let ring = oklch(adjusted.colors.ring.as_deref());
+            assert!((ring.h - 140.).abs() < 2., "{name} ring follows: {ring:?}");
+            assert_eq!(
+                adjusted.colors.primary_foreground, original.colors.primary_foreground,
+                "{name} text on the accent is the theme's own"
+            );
+            assert_eq!(adjusted.colors.foreground, original.colors.foreground);
+            assert_eq!(adjusted.colors.background, original.colors.background);
+            assert_eq!(adjusted.name, original.name);
+        }
+    }
+
+    #[test]
+    fn adjustments_round_trip_and_ignore_malformed_fields() {
+        let adjustments = Adjustments {
+            accent: Some(Accent::new(200., 0.1)),
+            grain: Some(0.3),
+        };
+        let saved = adjustments.to_setting();
+        assert_eq!(Adjustments::from_setting(Some(&saved)), adjustments);
+        assert_eq!(
+            Adjustments::from_setting(Some(&Adjustments::default().to_setting())),
+            Adjustments::default()
+        );
+        assert_eq!(Adjustments::from_setting(None), Adjustments::default());
+        assert_eq!(
+            Adjustments::from_setting(Some(&json!({
+                "accent": {"hue": "blue", "chroma": 0.1},
+                "grain": 7,
+            }))),
+            Adjustments {
+                accent: None,
+                grain: Some(1.),
+            },
+            "an unreadable accent is ignored and grain is clamped"
+        );
+        assert_eq!(
+            Accent::new(-30., 9.),
+            Accent::new(330., super::MAX_CHROMA),
+            "hue wraps and chroma is capped"
+        );
+    }
 
     #[test]
     fn bundled_themes_are_delft_by_default_with_ink_and_cootje_beside_it() {
@@ -695,10 +1067,7 @@ mod tests {
         assert_eq!(delft.config.colors.foreground.as_deref(), Some("#1b2740"));
         assert_eq!(delft.config.colors.primary.as_deref(), Some("#2453a6"));
         assert_eq!(delft.config.font_family.as_deref(), Some("IBM Plex Sans"));
-        assert_eq!(
-            delft.config.mono_font_family.as_deref(),
-            Some("IBM Plex Mono")
-        );
+        assert_eq!(delft.config.mono_font_family.as_deref(), Some("Lilex"));
         assert_eq!(
             delft.extensions.prose,
             Prose::default(),
@@ -791,7 +1160,7 @@ mod tests {
             text_system.font_id(&face).unwrap()
         };
         // Bold and italic text uses real faces, not the regular one.
-        for family in ["IBM Plex Sans", "Libron"] {
+        for family in ["IBM Plex Sans", "Lilex", "Libron"] {
             let face = |weight, style| face(family, weight, style);
             let regular = face(FontWeight::NORMAL, FontStyle::Normal);
             assert_ne!(
@@ -814,7 +1183,11 @@ mod tests {
 
 #[cfg(all(test, feature = "runtime-qa"))]
 mod runtime_tests {
-    use super::{initialize, prose, resolve, signature, theme_names, validate_preferences};
+    use super::{
+        ADJUSTMENTS_SETTING, active_name, grain, initialize, prose, resolve, signature,
+        theme_grain, theme_names, validate_preferences,
+    };
+    use crate::ui::color::Oklch;
     use gpui_kit::{
         Hsla, TestAppContext,
         component::{Theme, ThemeMode},
@@ -822,6 +1195,37 @@ mod runtime_tests {
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[gpui_kit::test]
+    fn saved_adjustments_tint_every_theme_and_grain_falls_back_to_the_theme(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let settings = |theme: &str, adjustments: serde_json::Value| {
+                BTreeMap::from([
+                    ("theme_mode".to_owned(), json!("dark")),
+                    ("theme_dark".to_owned(), json!(theme)),
+                    (ADJUSTMENTS_SETTING.to_owned(), adjustments),
+                ])
+            };
+            let adjusted = json!({"accent": {"hue": 140.0, "chroma": 0.12}, "grain": 0.4});
+            initialize(Some(&settings("Delft Dark", adjusted.clone())), None, cx);
+            assert_eq!(active_name(cx).as_ref(), "Delft Dark");
+            let primary = Oklch::from_rgba(Theme::global(cx).primary.into());
+            assert!((primary.h - 140.).abs() < 2., "{primary:?}");
+            assert_eq!(grain(cx), 0.4);
+            assert_eq!(theme_grain(cx), 0., "Delft has no grain of its own");
+
+            initialize(Some(&settings("Cootje Dark", json!(null))), None, cx);
+            assert_eq!(grain(cx), 0.25, "Cootje's own grain");
+            let primary = Oklch::from_rgba(Theme::global(cx).primary.into());
+            assert!(
+                (primary.h - 140.).abs() > 10.,
+                "no accent left over: {primary:?}"
+            );
+        });
+    }
 
     #[gpui_kit::test]
     fn bundled_themes_are_the_fallback_and_listed_first(cx: &mut TestAppContext) {
@@ -890,7 +1294,7 @@ mod runtime_tests {
             assert_eq!(prose(cx).family.as_deref(), Some("Libron"));
 
             initialize(Some(&settings("Delft Light")), None, cx);
-            assert_eq!(Theme::global(cx).mono_font_family.as_ref(), "IBM Plex Mono");
+            assert_eq!(Theme::global(cx).mono_font_family.as_ref(), "Lilex");
             assert_eq!(prose(cx).family, None);
         });
     }

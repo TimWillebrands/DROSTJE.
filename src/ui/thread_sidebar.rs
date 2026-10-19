@@ -1,9 +1,11 @@
-//! A thread's sidebar: the Changes and Output tabs beside a Conversation, the Output
-//! tab beside a Factory thread. Open state and tab live in `AppState`.
+//! A thread's sidebar: the Changes and Output tabs beside a Conversation, plus Agents
+//! once its agent works with others; the Output tab beside a Factory thread. Open state
+//! and tab live in `AppState`.
 
 use super::{
+    agents::{self, Activity, Event, EventKind, Outcome},
     commands::{Command, button},
-    factory,
+    factory, theme,
     workspace::Workspace,
 };
 use crate::{
@@ -17,18 +19,20 @@ use gpui_kit::{
         h_flex,
         spinner::Spinner,
         tab::{Tab, TabBar},
+        tag::Tag,
         v_flex,
     },
     prelude::FluentBuilder,
     *,
 };
 
-/// Tabs in display order; a Factory thread has no working-tree Changes.
-fn tabs(conversation: bool) -> &'static [SidebarTab] {
-    if conversation {
-        &[SidebarTab::Changes, SidebarTab::Output]
-    } else {
-        &[SidebarTab::Output]
+/// Tabs in display order; a Factory thread has no working-tree Changes, and Agents
+/// appears only once a Conversation's agent has worked with another.
+fn tabs(conversation: bool, agents: bool) -> &'static [SidebarTab] {
+    match (conversation, agents) {
+        (true, true) => &[SidebarTab::Changes, SidebarTab::Output, SidebarTab::Agents],
+        (true, false) => &[SidebarTab::Changes, SidebarTab::Output],
+        (false, _) => &[SidebarTab::Output],
     }
 }
 
@@ -36,6 +40,7 @@ fn label(tab: SidebarTab) -> &'static str {
     match tab {
         SidebarTab::Changes => "Changes",
         SidebarTab::Output => "Output",
+        SidebarTab::Agents => "Agents",
     }
 }
 
@@ -44,6 +49,7 @@ fn toggle_command(tab: SidebarTab) -> Command {
     match tab {
         SidebarTab::Changes => Command::ToggleConversationDiffs,
         SidebarTab::Output => Command::ToggleOutput,
+        SidebarTab::Agents => Command::ToggleAgents,
     }
 }
 
@@ -56,7 +62,13 @@ pub(super) fn render(
     cx: &App,
 ) -> AnyElement {
     let open = state.thread_sidebar_open(id);
-    let active = state.thread_sidebar_tab(id);
+    let session = conversation.then(|| state.conversations.get(&id)).flatten();
+    let has_agents = session.is_some_and(|session| agents::coordination_calls(session) > 0);
+    let tabs = tabs(conversation, has_agents);
+    // A saved Agents tab whose activity is not loaded yet shows the first tab meanwhile.
+    let active = Some(state.thread_sidebar_tab(id))
+        .filter(|tab| tabs.contains(tab))
+        .unwrap_or(tabs[0]);
     let toggle = button(
         "toggle-thread-sidebar",
         toggle_command(active),
@@ -83,7 +95,6 @@ pub(super) fn render(
             .child(toggle)
             .into_any_element();
     }
-    let tabs = tabs(conversation);
     let selected = tabs.iter().position(|tab| *tab == active).unwrap_or(0);
     let tab_owner = owner.clone();
     let loading = active == SidebarTab::Changes
@@ -127,6 +138,12 @@ pub(super) fn render(
             .min_h_0()
             .child(factory::output(state, id, owner, output_scroll, cx))
             .into_any_element(),
+        SidebarTab::Agents => agent_activity(
+            &session
+                .map(|session| Activity::from_session(session, state.active_threads.contains(&id)))
+                .unwrap_or_default(),
+            cx,
+        ),
     };
     v_flex()
         .id("thread-sidebar")
@@ -223,13 +240,320 @@ fn changes(state: &AppState, id: ThreadId, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+fn caption(text: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.into())
+}
+
+/// The state word of a coordination call, in the terms of what it did.
+fn outcome(event: &Event) -> Option<Tag> {
+    let background = matches!(
+        event.kind,
+        EventKind::Spawn {
+            background: true,
+            ..
+        }
+    );
+    let tag = match (event.outcome, &event.kind) {
+        (Outcome::Pending, EventKind::Message { .. }) => Tag::secondary().child("Sending"),
+        (Outcome::Pending, _) => Tag::secondary().child("Running"),
+        // A background spawn answers once the subagent has started, not finished.
+        (Outcome::Done, EventKind::Spawn { .. }) if background => Tag::secondary().child("Started"),
+        (Outcome::Done, EventKind::Spawn { .. }) => Tag::secondary().child("Finished"),
+        // Delivered to the session; whether its agent read it is not reported.
+        (Outcome::Done, EventKind::Message { .. }) => Tag::secondary().child("Delivered"),
+        (Outcome::Done, EventKind::Listing { .. }) => return None,
+        (Outcome::Failed, _) => Tag::danger().child("Failed"),
+        (Outcome::Unknown, _) => Tag::secondary().outline().child("Unknown"),
+    };
+    Some(tag.xsmall())
+}
+
+fn event_row(event: &Event, cx: &App) -> AnyElement {
+    let (icon, title, body) = match &event.kind {
+        EventKind::Spawn {
+            description,
+            agent_type,
+            background,
+        } => (
+            IconName::Bot,
+            format!(
+                "Started {}{}",
+                agent_type.as_deref().unwrap_or("a subagent"),
+                if *background {
+                    " in the background"
+                } else {
+                    ""
+                }
+            ),
+            description.clone(),
+        ),
+        EventKind::Message {
+            to,
+            text,
+            notify_when_idle,
+        } => (
+            IconName::ArrowRight,
+            if to.is_empty() {
+                "Message without a recipient".to_owned()
+            } else {
+                format!("Message to {to}")
+            },
+            Some(if *notify_when_idle && text.trim().is_empty() {
+                "Asked to hear when it goes idle".to_owned()
+            } else {
+                text.clone()
+            }),
+        ),
+        EventKind::Listing { sessions } => (
+            IconName::Search,
+            match sessions {
+                Some(1) => "Listed 1 session".to_owned(),
+                Some(count) => format!("Listed {count} sessions"),
+                None => "Listed sessions".to_owned(),
+            },
+            None,
+        ),
+    };
+    let failed = event.outcome == Outcome::Failed;
+    h_flex()
+        .id(SharedString::from(format!("agent-event-{}", event.call_id)))
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .gap_2()
+        .py_1()
+        .child(
+            div()
+                .pt_0p5()
+                .text_color(cx.theme().muted_foreground)
+                .child(gpui_kit::component::Icon::new(icon).xsmall()),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_2()
+                        .justify_between()
+                        .child(div().min_w_0().text_sm().text_ellipsis().child(title))
+                        .children(outcome(event)),
+                )
+                .children(body.filter(|body| !body.trim().is_empty()).map(|body| {
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .line_clamp(6)
+                        .child(body)
+                }))
+                // A failure says why; other results repeat what the row shows.
+                .when(failed, |column| {
+                    column.children(event.result.clone().map(|result| caption(result, cx)))
+                }),
+        )
+        .into_any_element()
+}
+
+fn session_rows(activity: &Activity, cx: &App) -> Vec<AnyElement> {
+    let Some(sessions) = &activity.sessions else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    if let Some(own) = &sessions.own {
+        rows.push(
+            caption(format!("This conversation is reachable as {own}"), cx).into_any_element(),
+        );
+    }
+    if sessions.groups.is_empty() {
+        // Not the listing's usual shape: show it as the harness wrote it.
+        rows.push(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .whitespace_normal()
+                .child(sessions.raw.clone())
+                .into_any_element(),
+        );
+    }
+    for group in &sessions.groups {
+        rows.push(caption(group.title.clone(), cx).pt_1().into_any_element());
+        for row in &group.rows {
+            let messages = activity.messages_to(&row.name);
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_2()
+                    .py_0p5()
+                    .child(
+                        // Busy sessions carry the same mark as this app's running turns.
+                        div()
+                            .size_1p5()
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(if row.is_busy() {
+                                theme::signature(cx)
+                            } else {
+                                cx.theme().border
+                            }),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_sm()
+                                            .text_ellipsis()
+                                            .child(row.name.clone()),
+                                    )
+                                    .children(row.reference.clone().map(|reference| {
+                                        div()
+                                            .flex_shrink_0()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(reference)
+                                    })),
+                            )
+                            .child(caption(row.details.join(" · "), cx).text_ellipsis()),
+                    )
+                    .when(messages > 0, |row| {
+                        row.child(caption(
+                            if messages == 1 {
+                                "1 message".to_owned()
+                            } else {
+                                format!("{messages} messages")
+                            },
+                            cx,
+                        ))
+                    })
+                    .into_any_element(),
+            );
+        }
+    }
+    rows
+}
+
+fn agent_activity(activity: &Activity, cx: &App) -> AnyElement {
+    let spawns = activity
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Spawn { .. }))
+        .count();
+    let messages = activity
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Message { .. }))
+        .count();
+    let plural = |count: usize, one: &str, many: &str| {
+        if count == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{count} {many}")
+        }
+    };
+    let mut summary = Vec::new();
+    if spawns > 0 {
+        summary.push(plural(spawns, "subagent", "subagents"));
+    }
+    if messages > 0 {
+        summary.push(plural(messages, "message", "messages"));
+    }
+    if let Some(sessions) = &activity.sessions {
+        summary.push(plural(sessions.len(), "session", "sessions"));
+    }
+    let content = if activity.is_empty() {
+        div()
+            .flex_1()
+            .p_3()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("Subagents this conversation starts, messages it sends, and the sessions it can reach appear here.")
+            .into_any_element()
+    } else {
+        let session_rows = session_rows(activity, cx);
+        v_flex()
+            .id("agent-activity")
+            .debug_selector(|| "agent-activity".into())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .pb_2()
+            .gap_3()
+            .child(
+                v_flex()
+                    .child(caption("Activity, newest first", cx).py_1())
+                    .children(
+                        activity
+                            .events
+                            .iter()
+                            .rev()
+                            .map(|event| event_row(event, cx)),
+                    ),
+            )
+            .when(!session_rows.is_empty(), |list| {
+                list.child(
+                    v_flex()
+                        .child(caption("Sessions, as last listed", cx).py_1())
+                        .children(session_rows),
+                )
+            })
+            .into_any_element()
+    };
+    v_flex()
+        .id("agent-sidebar")
+        .debug_selector(|| "agent-sidebar".into())
+        .flex_1()
+        .min_h_0()
+        .child(
+            div()
+                .flex_shrink_0()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(if summary.is_empty() {
+                    "No agent activity".to_owned()
+                } else {
+                    summary.join(" · ")
+                }),
+        )
+        .child(content)
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SidebarTab, tabs};
 
     #[test]
     fn factory_threads_only_offer_output() {
-        assert_eq!(tabs(true), &[SidebarTab::Changes, SidebarTab::Output]);
-        assert_eq!(tabs(false), &[SidebarTab::Output]);
+        assert_eq!(
+            tabs(true, false),
+            &[SidebarTab::Changes, SidebarTab::Output]
+        );
+        assert_eq!(tabs(false, false), &[SidebarTab::Output]);
+        assert_eq!(tabs(false, true), &[SidebarTab::Output]);
+    }
+
+    #[test]
+    fn agents_appear_only_with_agent_activity() {
+        assert_eq!(
+            tabs(true, true),
+            &[SidebarTab::Changes, SidebarTab::Output, SidebarTab::Agents]
+        );
     }
 }

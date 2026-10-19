@@ -2,6 +2,8 @@
 //!
 //! A missing llama executable, unreachable Ollama server, or empty Ollama model list means "no
 //! title", not an error. Calls block; run them off the GPUI thread.
+//!
+//! [`installed_models`] lists what each provider can use without a download, for Settings.
 
 use crate::{
     model::{Thread, ThreadKind},
@@ -38,6 +40,15 @@ pub enum TitleProvider {
     Automatic,
     LlamaCpp,
     Ollama,
+}
+
+/// Models each title provider has locally; each source fails on its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledModels {
+    /// Hugging Face references in the llama.cpp cache, as `-hf` accepts them.
+    pub llama: Result<Vec<String>, String>,
+    /// Model names the Ollama server lists.
+    pub ollama: Result<Vec<String>, String>,
 }
 
 const DEFAULT_OLLAMA_HOST: &str = "127.0.0.1:11434";
@@ -149,6 +160,23 @@ fn generate_title_with_host(
     }
 }
 
+/// Lists the downloaded llama.cpp models and installed Ollama models.
+pub fn installed_models(llama_executable: Option<&str>) -> InstalledModels {
+    InstalledModels {
+        llama: llama_cached_models(llama_executable).map_err(|error| format!("{error:#}")),
+        ollama: ollama_models(&ollama_host()).map_err(|error| format!("{error:#}")),
+    }
+}
+
+fn ollama_models(host: &str) -> Result<Vec<String>> {
+    let address = resolve(host).with_context(|| format!("Ollama host {host} does not resolve"))?;
+    let mut stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+        .with_context(|| format!("Ollama is not running at {host}"))?;
+    let tags = request(&mut stream, host, "GET", "/api/tags", None, LIST_TIMEOUT)
+        .context("Could not list Ollama models")?;
+    Ok(model_names(&tags))
+}
+
 fn generate_ollama_title(host: &str, model: Option<&str>, prompt: &str) -> Result<Option<String>> {
     let Some(address) = resolve(host) else {
         return Ok(None);
@@ -161,7 +189,7 @@ fn generate_ollama_title(host: &str, model: Option<&str>, prompt: &str) -> Resul
         None => {
             let tags = request(&mut stream, host, "GET", "/api/tags", None, LIST_TIMEOUT)
                 .context("Could not list Ollama models")?;
-            let Some(model) = first_model(&tags) else {
+            let Some(model) = model_names(&tags).into_iter().next() else {
                 return Ok(None);
             };
             stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
@@ -251,12 +279,14 @@ fn parse_response(raw: &[u8]) -> Result<Value> {
     Ok(body)
 }
 
-fn first_model(tags: &Value) -> Option<String> {
-    tags.get("models")?
-        .as_array()?
-        .iter()
-        .find_map(|model| model.get("name").and_then(Value::as_str))
+fn model_names(tags: &Value) -> Vec<String> {
+    tags.get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("name").and_then(Value::as_str))
         .map(str::to_owned)
+        .collect()
 }
 
 fn truncate(text: &str, limit: usize) -> &str {
@@ -308,7 +338,7 @@ fn generate_llama_cli_title(
         "Name this coding conversation:\n\n{}",
         truncate(prompt.trim(), PROMPT_LIMIT)
     );
-    let mut child = Command::new(&executable)
+    let child = Command::new(&executable)
         .args([
             "cli",
             "-hf",
@@ -335,18 +365,60 @@ fn generate_llama_cli_title(
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("Start llama.cpp at {}", executable.display()))?;
-    let deadline = Instant::now() + GENERATE_TIMEOUT;
+    let stdout = finish(child, GENERATE_TIMEOUT, "title generation")?;
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty() && !line.starts_with("Exiting"))
+        .and_then(clean_title))
+}
+
+fn llama_cached_models(executable: Option<&str>) -> Result<Vec<String>> {
+    let executable = platform::resolve_executable("llama", executable)?;
+    let child = Command::new(&executable)
+        .args(["cli", "--cache-list"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("Start llama.cpp at {}", executable.display()))?;
+    Ok(parse_cache_list(&finish(
+        child,
+        LIST_TIMEOUT,
+        "model listing",
+    )?))
+}
+
+/// Model references from `llama cli --cache-list`, which numbers one per line.
+fn parse_cache_list(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (number, reference) = line.trim().split_once(". ")?;
+            number.parse::<usize>().ok()?;
+            let reference = reference.trim();
+            (!reference.is_empty()).then(|| reference.to_owned())
+        })
+        .collect()
+}
+
+/// Waits for a llama.cpp child that writes little output and returns its stdout.
+fn finish(mut child: std::process::Child, timeout: Duration, task: &str) -> Result<String> {
+    let deadline = Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child
             .try_wait()
-            .context("Wait for llama.cpp title generation")?
+            .with_context(|| format!("Wait for llama.cpp {task}"))?
         {
             break status;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("llama.cpp title generation timed out after 120 seconds");
+            anyhow::bail!(
+                "llama.cpp {task} timed out after {} seconds",
+                timeout.as_secs()
+            );
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -357,12 +429,8 @@ fn generate_llama_cli_title(
         .take()
         .context("llama.cpp stdout was not captured")?
         .read_to_string(&mut stdout)
-        .context("Read llama.cpp title")?;
-    Ok(stdout
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty() && !line.starts_with("Exiting"))
-        .and_then(clean_title))
+        .with_context(|| format!("Read llama.cpp {task}"))?;
+    Ok(stdout)
 }
 
 #[cfg(test)]
@@ -509,6 +577,74 @@ mod tests {
         assert!(arguments.contains("--reasoning\noff\n"));
         assert!(arguments.contains("-sys\n"));
         assert!(arguments.contains("-p\nName this coding conversation:\n\nFix parser recovery\n"));
+    }
+
+    #[test]
+    fn llama_cache_list_names_downloaded_models() {
+        let temp = TempDirectory::new();
+        let executable = temp.0.join("llama");
+        let arguments = temp.0.join("arguments");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'number of models in cache: 2\\n   1. ggml-org/gemma-4-12B-it-GGUF:Q8_0\\n   2. ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_0\\n'\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let models = llama_cached_models(Some(executable.to_str().unwrap())).unwrap();
+
+        assert_eq!(
+            models,
+            [
+                "ggml-org/gemma-4-12B-it-GGUF:Q8_0",
+                "ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_0"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(arguments).unwrap(),
+            "cli\n--cache-list\n"
+        );
+    }
+
+    #[test]
+    fn missing_llama_cli_cannot_list_models() {
+        let error = llama_cached_models(Some("/definitely/missing/llama")).unwrap_err();
+        assert!(format!("{error:#}").contains("missing or not executable"));
+    }
+
+    #[test]
+    fn cache_list_ignores_headers_and_blank_lines() {
+        assert_eq!(
+            parse_cache_list("number of models in cache: 0\n\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            parse_cache_list("  12. owner/repo:Q4_K_M  \n"),
+            ["owner/repo:Q4_K_M"]
+        );
+    }
+
+    #[test]
+    fn ollama_lists_every_installed_model() {
+        let (host, server) = serve(vec![ok(
+            json!({"models": [{"name": "lfm2:24b"}, {"model": "nameless"}, {"name": "llama3:8b"}]}),
+        )]);
+        assert_eq!(ollama_models(&host).unwrap(), ["lfm2:24b", "llama3:8b"]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unreachable_ollama_cannot_list_models() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let error = ollama_models(&host).unwrap_err();
+        assert!(format!("{error:#}").starts_with(&format!("Ollama is not running at {host}")));
     }
 
     #[test]

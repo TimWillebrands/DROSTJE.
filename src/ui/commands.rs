@@ -47,6 +47,7 @@ gpui_kit::actions!(
         SearchThreads,
         RefreshFactoryRuns,
         Settings,
+        CustomizeTheme,
         InstallPi,
         ResetLayout,
         FocusProjects,
@@ -55,6 +56,7 @@ gpui_kit::actions!(
         ToggleProjects,
         ToggleOutput,
         ToggleConversationDiffs,
+        ToggleAgents,
         ToggleTaskList,
         ToggleBackgroundJobs,
         RefreshConversationDiff,
@@ -128,6 +130,7 @@ pub enum Command {
     SearchThreads,
     RefreshFactoryRuns,
     Settings,
+    CustomizeTheme,
     InstallPi,
     ResetLayout,
     FocusProjects,
@@ -137,6 +140,7 @@ pub enum Command {
     ToggleOutput,
     RestartEditor,
     ToggleConversationDiffs,
+    ToggleAgents,
     ToggleTaskList,
     ToggleBackgroundJobs,
     RefreshConversationDiff,
@@ -149,7 +153,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 51] = [
+    pub const ALL: [Self; 53] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -182,6 +186,7 @@ impl Command {
         Self::SearchThreads,
         Self::RefreshFactoryRuns,
         Self::Settings,
+        Self::CustomizeTheme,
         Self::InstallPi,
         Self::ResetLayout,
         Self::FocusProjects,
@@ -190,6 +195,7 @@ impl Command {
         Self::ToggleProjects,
         Self::ToggleOutput,
         Self::ToggleConversationDiffs,
+        Self::ToggleAgents,
         Self::ToggleTaskList,
         Self::ToggleBackgroundJobs,
         Self::RefreshConversationDiff,
@@ -237,6 +243,7 @@ impl Command {
             Self::SearchThreads => "Search threads…",
             Self::RefreshFactoryRuns => "Refresh Factory runs",
             Self::Settings => "Settings…",
+            Self::CustomizeTheme => "Customize theme…",
             Self::InstallPi => "Install Pi",
             Self::ResetLayout => "Reset layout",
             Self::FocusProjects => "Focus projects",
@@ -245,6 +252,7 @@ impl Command {
             Self::ToggleProjects => "Toggle projects",
             Self::ToggleOutput => "Toggle output",
             Self::ToggleConversationDiffs => "Toggle conversation changes",
+            Self::ToggleAgents => "Toggle agents",
             Self::ToggleTaskList => "Toggle task list",
             Self::ToggleBackgroundJobs => "Toggle background jobs",
             Self::RefreshConversationDiff => "Refresh conversation changes",
@@ -293,6 +301,7 @@ impl Command {
             Self::SearchThreads => Box::new(SearchThreads),
             Self::RefreshFactoryRuns => Box::new(RefreshFactoryRuns),
             Self::Settings => Box::new(Settings),
+            Self::CustomizeTheme => Box::new(CustomizeTheme),
             Self::InstallPi => Box::new(InstallPi),
             Self::ResetLayout => Box::new(ResetLayout),
             Self::FocusProjects => Box::new(FocusProjects),
@@ -302,6 +311,7 @@ impl Command {
             Self::ToggleOutput => Box::new(ToggleOutput),
             Self::RestartEditor => Box::new(RestartEditor),
             Self::ToggleConversationDiffs => Box::new(ToggleConversationDiffs),
+            Self::ToggleAgents => Box::new(ToggleAgents),
             Self::ToggleTaskList => Box::new(ToggleTaskList),
             Self::ToggleBackgroundJobs => Box::new(ToggleBackgroundJobs),
             Self::RefreshConversationDiff => Box::new(RefreshConversationDiff),
@@ -403,12 +413,21 @@ impl Command {
                     })
             }),
             Self::ToggleConversationDiffs
+            | Self::ToggleAgents
             | Self::ToggleTaskList
             | Self::ToggleBackgroundJobs
             | Self::RefreshConversationDiff
                 if state.conversation_thread().is_none() =>
             {
                 Some("Select a conversation first.".into())
+            }
+            Self::ToggleAgents
+                if state
+                    .conversation_thread()
+                    .and_then(|thread| state.conversations.get(&thread.id))
+                    .is_none_or(|session| super::agents::coordination_calls(session) == 0) =>
+            {
+                Some("This conversation's agent has not worked with other agents yet.".into())
             }
             Self::PasteImage => {
                 state
@@ -703,6 +722,7 @@ pub fn bind_keys(cx: &mut App) {
             Some("Input && PromptEditor && DrostjeForm && !Command && !PopupMenu"),
         ),
     ]);
+    super::theme_editor::bind_keys(cx);
 }
 
 pub fn button(

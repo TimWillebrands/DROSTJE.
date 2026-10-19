@@ -1091,8 +1091,10 @@ pub(super) fn render(
     let swipe_owner = owner.clone();
     v_flex()
         .size_full()
+        .relative()
         .bg(theme.sidebar)
         .text_color(theme.sidebar_foreground)
+        .children(super::grain::layer(super::theme::grain(cx)))
         // Mouse back/forward buttons; macOS also reports three-finger swipes this way.
         .on_mouse_down(
             MouseButton::Navigate(NavigationDirection::Back),

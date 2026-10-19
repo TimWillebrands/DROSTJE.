@@ -160,6 +160,15 @@ impl TranscriptView {
         if matches!(changes, RowChanges::Reset) {
             self.markdown.clear();
         }
+        // A changed or new message can join or split a run of tool calls, which changes the
+        // height of that run's other rows.
+        let mut anchors = match &changes {
+            RowChanges::Rows(rows) => rows.clone(),
+            RowChanges::Reset | RowChanges::All => Vec::new(),
+        };
+        if count > self.count && !matches!(changes, RowChanges::Reset) {
+            anchors.push(self.count);
+        }
         update_rows(
             &self.list,
             &self.estimated_width,
@@ -167,6 +176,22 @@ impl TranscriptView {
             count,
             changes,
         );
+        let kept = self.count.min(count);
+        let part = |index: usize| run_part(&session.messages[index], session);
+        for anchor in anchors {
+            let start = anchor
+                .checked_sub(1)
+                .and_then(|before| tool_run(part, count, before))
+                .map_or(anchor, |run| run.head);
+            let end = (anchor + 1 < count)
+                .then(|| tool_run(part, count, anchor + 1))
+                .flatten()
+                .map_or(anchor + 1, |run| run.end);
+            let rows = start.min(kept)..end.min(kept);
+            if !rows.is_empty() {
+                self.list.remeasure_items(rows);
+            }
+        }
         self.generation = Some(session.generation);
         self.revision = session.transcript_revision;
         self.count = count;
@@ -298,6 +323,7 @@ impl Render for TranscriptView {
                 .map(|current| {
                     message(
                         current,
+                        index,
                         id,
                         session,
                         state.active_threads.contains(&id),
@@ -1879,6 +1905,252 @@ fn todo_checklist(list: &TodoList, cx: &App) -> Div {
     column
 }
 
+/// How a transcript message takes part in a run of consecutive tool calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunPart {
+    /// Visible content that ends a run.
+    Break,
+    /// Renders nothing (a result shown on its call's card, a hidden harness note).
+    Transparent,
+    /// Visible content followed by this many tool calls, which start a run.
+    Opens(usize),
+    /// Only tool calls and reasoning, which continue a run.
+    Calls(usize),
+}
+
+/// Consecutive tool calls across messages: `head` renders the run's header, rows up to
+/// `end` belong to it. Only a run of two or more calls folds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ToolRun {
+    head: usize,
+    end: usize,
+    calls: usize,
+}
+
+impl ToolRun {
+    fn folds(self) -> bool {
+        self.calls >= 2
+    }
+}
+
+/// Where a message's trailing tool calls start, and how many there are. Reasoning and blank
+/// text between them belong to the run; a `todo` call keeps its own card.
+fn trailing_calls(content: &[ContentBlock]) -> Option<(usize, usize)> {
+    let start = content
+        .iter()
+        .rposition(|block| match block {
+            ContentBlock::ToolCall { name, .. } => name == "todo",
+            ContentBlock::Thinking(_) => false,
+            ContentBlock::Text(text) => !text.trim().is_empty(),
+            ContentBlock::Image(_) | ContentBlock::ImageError(_) => true,
+        })
+        .map_or(0, |last| last + 1);
+    let calls = content[start..]
+        .iter()
+        .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
+        .count();
+    (calls > 0).then_some((start, calls))
+}
+
+fn run_part(message: &Message, session: &ConversationSession) -> RunPart {
+    if message.role == "toolResult" {
+        return if message
+            .tool_call_id
+            .as_deref()
+            .is_some_and(|call| session.has_tool_call(call))
+        {
+            RunPart::Transparent
+        } else {
+            RunPart::Break
+        };
+    }
+    if harness_note_hidden(message) {
+        return RunPart::Transparent;
+    }
+    if message.role != "assistant" {
+        return RunPart::Break;
+    }
+    match trailing_calls(&message.content) {
+        Some((0, calls)) => RunPart::Calls(calls),
+        Some((_, calls)) => RunPart::Opens(calls),
+        None => RunPart::Break,
+    }
+}
+
+/// The run of tool calls the message at `index` belongs to, if any.
+fn tool_run(part: impl Fn(usize) -> RunPart, len: usize, index: usize) -> Option<ToolRun> {
+    let mut head = None;
+    for ix in (0..=index).rev() {
+        match part(ix) {
+            RunPart::Break => break,
+            RunPart::Opens(_) => {
+                head = Some(ix);
+                break;
+            }
+            RunPart::Calls(_) => head = Some(ix),
+            RunPart::Transparent => {}
+        }
+    }
+    let head = head?;
+    let (RunPart::Opens(mut calls) | RunPart::Calls(mut calls)) = part(head) else {
+        return None;
+    };
+    let mut end = head + 1;
+    while end < len {
+        match part(end) {
+            RunPart::Calls(more) => calls += more,
+            RunPart::Transparent => {}
+            RunPart::Break | RunPart::Opens(_) => break,
+        }
+        end += 1;
+    }
+    Some(ToolRun { head, end, calls })
+}
+
+/// A call's outcome from live activity, else its recorded result; `active` is whether the
+/// thread is still working on a call without either.
+fn call_outcome(session: &ConversationSession, call_id: &str, active: bool) -> ToolOutcome {
+    let pending = if active {
+        ToolOutcome::Running
+    } else {
+        ToolOutcome::Unknown
+    };
+    if let Some(tool) = session.tools.get(call_id) {
+        return if tool.error || tool.exit_code.is_some_and(|code| code != 0) {
+            ToolOutcome::Failed
+        } else if tool.complete {
+            ToolOutcome::Succeeded
+        } else {
+            pending
+        };
+    }
+    session.tool_result(call_id).map_or(pending, |result| {
+        ToolResult::recorded(result.error, result.exit_code)
+    })
+}
+
+/// The folded face of a run: how many calls, the latest one, and what is running, failed or
+/// unknown, so nothing that needs attention hides behind the fold.
+fn tool_run_header(
+    key: String,
+    run: ToolRun,
+    expanded: bool,
+    session: &ConversationSession,
+    active: bool,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    let mut latest = None;
+    let (mut running, mut failed, mut unknown) = (0, 0, 0);
+    for message in &session.messages[run.head..run.end] {
+        let Some((start, _)) = trailing_calls(&message.content) else {
+            continue;
+        };
+        for block in &message.content[start..] {
+            let ContentBlock::ToolCall {
+                id,
+                name,
+                intent,
+                input,
+            } = block
+            else {
+                continue;
+            };
+            match call_outcome(session, id, active) {
+                ToolOutcome::Running => running += 1,
+                ToolOutcome::Failed => failed += 1,
+                ToolOutcome::Unknown => unknown += 1,
+                ToolOutcome::Succeeded => {}
+            }
+            let intent = intent.as_deref().or_else(|| {
+                session
+                    .tools
+                    .get(id)
+                    .and_then(|tool| tool.intent.as_deref())
+            });
+            latest = Some((intent.unwrap_or(name).to_owned(), tool_summary(name, input)));
+        }
+    }
+    let group: SharedString = format!("{key}:group").into();
+    h_flex()
+        .id(SharedString::from(format!("{key}:header")))
+        .debug_selector(|| "conversation-tool-run".into())
+        .test_support()
+        .group(group.clone())
+        .w_full()
+        .items_center()
+        .gap_2()
+        .py_1()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .on_click(toggle(owner, key.clone()))
+        .child(Icon::new(Lucide::Wrench).xsmall())
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_color(cx.theme().foreground)
+                .child(format!("{} tool calls", run.calls)),
+        )
+        .child(h_flex().flex_1().min_w_0().gap_2().when_some(
+            latest.filter(|_| !expanded),
+            |row, (caption, summary)| {
+                row.child(Icon::new(summary.icon).xsmall())
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .max_w(relative(0.5))
+                            .truncate()
+                            .child(caption),
+                    )
+                    .child(
+                        mono(cx)
+                            .flex_1()
+                            .truncate()
+                            .child(summary_line(&summary.body)),
+                    )
+            },
+        ))
+        .when(unknown > 0, |row| {
+            row.child(div().flex_shrink_0().text_xs().child(if unknown == 1 {
+                "1 without result".to_owned()
+            } else {
+                format!("{unknown} without result")
+            }))
+        })
+        .when(failed > 0, |row| {
+            row.child(
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .items_center()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(Icon::new(Lucide::CircleX).xsmall())
+                    .child(format!("{failed} failed")),
+            )
+        })
+        .when(running > 0, |row| row.child(Spinner::new().xsmall()))
+        .child(
+            div()
+                .when(!expanded, |chevron| {
+                    chevron
+                        .invisible()
+                        .group_hover(group, |style| style.visible())
+                })
+                .child(disclosure(
+                    key,
+                    expanded,
+                    owner,
+                    if expanded {
+                        "Hide tool calls"
+                    } else {
+                        "Show tool calls"
+                    },
+                )),
+        )
+        .into_any_element()
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "a row helper takes the row context message() renders with"
@@ -1894,19 +2166,8 @@ fn tool_call_row(
     cx: &App,
 ) -> AnyElement {
     let key = format!("tool:{thread}:{call_id}");
-    let pending = if active {
-        ToolOutcome::Running
-    } else {
-        ToolOutcome::Unknown
-    };
+    let outcome = call_outcome(session, call_id, active);
     if let Some(tool) = session.tools.get(call_id) {
-        let outcome = if tool.error || tool.exit_code.is_some_and(|code| code != 0) {
-            ToolOutcome::Failed
-        } else if tool.complete {
-            ToolOutcome::Succeeded
-        } else {
-            pending
-        };
         return tool_card(
             key,
             ToolCall {
@@ -1925,12 +2186,12 @@ fn tool_call_row(
     }
     let result = match session.tool_result(call_id) {
         Some(result) => ToolResult {
-            outcome: ToolResult::recorded(result.error, result.exit_code),
+            outcome,
             content: &result.content,
             exit_code: result.exit_code,
         },
         None => ToolResult {
-            outcome: pending,
+            outcome,
             content: &[],
             exit_code: None,
         },
@@ -1960,8 +2221,13 @@ fn harness_note_hidden(message: &Message) -> bool {
         })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a transcript row takes its position as well as the row context"
+)]
 fn message(
     message: Arc<Message>,
+    index: usize,
     id: ThreadId,
     session: &ConversationSession,
     active: bool,
@@ -1996,6 +2262,24 @@ fn message(
         ));
     }
     if harness_note_hidden(&message) {
+        return div().into_any_element();
+    }
+    // In a folding run, the head row carries the header and every row its own calls.
+    let run = tool_run(
+        |ix: usize| run_part(&session.messages[ix], session),
+        session.messages.len(),
+        index,
+    )
+    .filter(|run| run.folds());
+    let run_key = run.map(|run| format!("toolrun:{id}:{}", session.messages[run.head].id));
+    let run_expanded = run_key
+        .as_deref()
+        .is_some_and(|key| is_expanded(owner, key, cx));
+    let run_start = run
+        .and_then(|_| trailing_calls(&message.content))
+        .map(|(start, _)| start);
+    let head = run.is_some_and(|run| run.head == index);
+    if run.is_some() && !head && !run_expanded {
         return div().into_any_element();
     }
     let user_message = message.role == "user";
@@ -2059,8 +2343,57 @@ fn message(
     let mut body = v_flex().w_full().min_w_0().gap_2();
     let mut images = h_flex().flex_wrap().gap_2();
     let mut has_images = false;
+    // The run's calls sit indented under its header; folded, they are not rendered.
+    let mut folded = v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2()
+        .pl_3()
+        .border_l_1()
+        .border_color(cx.theme().border);
     for (part, item) in message.content.iter().enumerate() {
         let identity = format!("{id}:{}:{part}", message.id);
+        if let Some(start) = run_start.filter(|start| part >= *start) {
+            if part == start
+                && head
+                && let (Some(run), Some(key)) = (run, run_key.clone())
+            {
+                body = body.child(tool_run_header(
+                    key,
+                    run,
+                    run_expanded,
+                    session,
+                    active,
+                    owner,
+                    cx,
+                ));
+            }
+            if run_expanded {
+                folded = folded.child(match item {
+                    ContentBlock::ToolCall {
+                        id: call_id,
+                        name,
+                        intent,
+                        input,
+                    } => tool_call_row(
+                        id,
+                        call_id,
+                        ToolCall {
+                            name,
+                            intent: intent.as_deref(),
+                            input,
+                        },
+                        session,
+                        active,
+                        owner,
+                        markdown,
+                        cx,
+                    ),
+                    _ => block(item, identity, owner, markdown, cx),
+                });
+            }
+            continue;
+        }
         match item {
             ContentBlock::ToolCall {
                 id: call_id,
@@ -2110,6 +2443,10 @@ fn message(
     if has_images {
         body = body.child(images);
     }
+    if run_expanded {
+        // Rows of one run touch, so the rule runs unbroken from the header to the last call.
+        body = body.child(if head { folded.pb_1() } else { folded.py_1() });
+    }
     if let Some(raw) = message.raw.as_ref().filter(|_| raw_expanded) {
         body = body.child(mono(cx).child(raw.to_string()));
     }
@@ -2132,7 +2469,12 @@ fn message(
             .id(SharedString::from(format!("message-{id}-{}", message.id)))
             .group(group)
             .relative()
-            .map(|row| if user_message { row.py_2() } else { row.py_1() })
+            .map(|row| match (user_message, run_expanded, head) {
+                (true, ..) => row.py_2(),
+                (false, true, true) => row.pt_1(),
+                (false, true, false) => row,
+                (false, false, _) => row.py_1(),
+            })
             .child(body)
             .child(actions),
     )
@@ -2744,7 +3086,9 @@ pub fn welcome(state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> Any
         .size_full()
         .min_w_0()
         .min_h_0()
+        .relative()
         .text_color(cx.theme().foreground)
+        .children(super::grain::layer(super::theme::grain(cx)))
         .items_center()
         .justify_center()
         .p_6()
@@ -3719,10 +4063,11 @@ fn render_content(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContentBlock, ContextUsage, Duration, LimitWindow, Lucide, Message, SUMMARY_LIMIT,
-        SystemTime, ToolSummary, UsageLimit, Value, code_fence, compact_duration, compact_tokens,
-        context_percent, harness_note_hidden, humanise_key, limit_description, result_language,
-        summary_line, thinking_for_display, thinking_titles, tool_summary,
+        ContentBlock, ContextUsage, Duration, LimitWindow, Lucide, Message, RunPart, SUMMARY_LIMIT,
+        SystemTime, ToolRun, ToolSummary, UsageLimit, Value, code_fence, compact_duration,
+        compact_tokens, context_percent, harness_note_hidden, humanise_key, limit_description,
+        result_language, summary_line, thinking_for_display, thinking_titles, tool_run,
+        tool_summary, trailing_calls,
     };
     use serde_json::json;
 
@@ -4557,6 +4902,77 @@ mod tests {
             ["Planning the change", "Checking the result"]
         );
         assert!(thinking_titles("Just prose.").is_empty());
+    }
+
+    fn call(name: &str) -> ContentBlock {
+        ContentBlock::ToolCall {
+            id: name.into(),
+            name: name.into(),
+            intent: None,
+            input: Value::Null,
+        }
+    }
+
+    #[test]
+    fn trailing_calls_skip_reasoning_but_not_prose_or_todo() {
+        let text = |text: &str| ContentBlock::Text(text.into());
+        assert_eq!(trailing_calls(&[call("bash"), call("read")]), Some((0, 2)));
+        assert_eq!(
+            trailing_calls(&[
+                ContentBlock::Thinking("plan".into()),
+                call("bash"),
+                text(" "),
+            ]),
+            Some((0, 1))
+        );
+        assert_eq!(
+            trailing_calls(&[text("Reading files."), call("read")]),
+            Some((1, 1))
+        );
+        assert_eq!(trailing_calls(&[call("read"), call("todo")]), None);
+        assert_eq!(trailing_calls(&[call("read"), text("Done.")]), None);
+        assert_eq!(trailing_calls(&[]), None);
+    }
+
+    #[test]
+    fn runs_span_calls_across_messages_and_skip_hidden_rows() {
+        use RunPart::{Break, Calls, Opens, Transparent};
+        let parts = [
+            Break,
+            Opens(1),
+            Transparent,
+            Calls(1),
+            Transparent,
+            Calls(2),
+            Break,
+            Calls(1),
+            Opens(1),
+            Calls(1),
+        ];
+        let run = |index| tool_run(|ix| parts[ix], parts.len(), index);
+        let first = Some(ToolRun {
+            head: 1,
+            end: 6,
+            calls: 4,
+        });
+        assert_eq!(run(0), None);
+        for index in 1..6 {
+            assert_eq!(run(index), first, "row {index}");
+        }
+        assert_eq!(run(6), None);
+        // A lone call is a run that does not fold; prose with calls starts a new run.
+        let lone = run(7).unwrap();
+        assert_eq!((lone.head, lone.end, lone.folds()), (7, 8, false));
+        assert_eq!(
+            run(9),
+            Some(ToolRun {
+                head: 8,
+                end: 10,
+                calls: 2
+            })
+        );
+        // Hidden rows before any call belong to no run.
+        assert_eq!(tool_run(|ix| [Break, Transparent][ix], 2, 1), None);
     }
 
     #[test]
