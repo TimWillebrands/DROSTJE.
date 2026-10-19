@@ -354,6 +354,7 @@ pub enum AppEvent {
     RepositoryChecked(ProjectId, Result<platform::RepositoryInfo, String>),
     ProjectResolved(SpaceId, Result<platform::RepositoryInfo, String>),
     Diagnostics(BTreeMap<String, String>),
+    TitleModels(Uuid, crate::titles::InstalledModels),
     PiInstalled(Result<PathBuf, String>),
     StorageFailed(String),
     InteractiveActivity {
@@ -390,6 +391,10 @@ pub struct AppState {
     pub collapsed: HashSet<ProjectId>,
     pub repositories: BTreeMap<ProjectId, Result<platform::RepositoryInfo, String>>,
     pub diagnostics: BTreeMap<String, String>,
+    /// Models the title providers have locally; `None` until first inspected.
+    pub title_models: Option<crate::titles::InstalledModels>,
+    /// The inspection in flight; results of earlier ones are dropped.
+    title_models_request: Option<Uuid>,
     pub notices: VecDeque<WorkspaceNotice>,
     pub notice_sequence: u64,
     pub storage_error: Option<String>,
@@ -616,6 +621,8 @@ impl AppState {
             collapsed: session.collapsed,
             repositories,
             diagnostics,
+            title_models: None,
+            title_models_request: None,
             notice_sequence: notices.len() as u64,
             notices,
             installing_pi: false,
@@ -742,6 +749,12 @@ impl AppState {
                 }
             }
             AppEvent::Diagnostics(diagnostics) => self.diagnostics = diagnostics,
+            AppEvent::TitleModels(request, models) => {
+                if self.title_models_request == Some(request) {
+                    self.title_models_request = None;
+                    self.title_models = Some(models);
+                }
+            }
             AppEvent::PiInstalled(result) => {
                 self.installing_pi = false;
                 match result {
@@ -1507,6 +1520,31 @@ impl AppState {
                 .await
                 .map_err(|error| format!("{error:#}"));
             let _ = sender.send(AppEvent::PiInstalled(result)).await;
+        })
+        .detach();
+    }
+
+    /// Whether an inspection of installed title models is in flight.
+    pub fn title_models_loading(&self) -> bool {
+        self.title_models_request.is_some()
+    }
+
+    /// Lists installed title models in the background; earlier results stay visible meanwhile.
+    pub fn refresh_title_models(&mut self) {
+        let request = Uuid::new_v4();
+        self.title_models_request = Some(request);
+        let sender = self.events.clone();
+        let llama = self
+            .snapshot
+            .settings
+            .get("executables")
+            .and_then(|value| value.get("llama"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        smol::spawn(async move {
+            let models =
+                smol::unblock(move || crate::titles::installed_models(llama.as_deref())).await;
+            let _ = sender.send(AppEvent::TitleModels(request, models)).await;
         })
         .detach();
     }

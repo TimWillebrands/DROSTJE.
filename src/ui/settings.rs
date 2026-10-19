@@ -4,6 +4,7 @@ use crate::{
     harness,
     model::ModelKey,
     platform,
+    titles::{self, InstalledModels},
 };
 use gpui_kit::{
     component::{
@@ -94,6 +95,141 @@ fn retain_concurrent_value(initial: &str, draft: String, current: &str) -> Strin
     }
 }
 
+/// Title model select value that reveals the Hugging Face reference field.
+const OTHER_LLAMA_MODEL: &str = "<other>";
+/// Settings field for a llama.cpp model that is not in the cache yet.
+const LLAMA_MODEL_REFERENCE: &str = "llama_title_model_reference";
+
+/// Conversation title settings the selected generator reads, in display order.
+fn title_setting_keys(provider: &str, llama_model: &str) -> Vec<&'static str> {
+    let llama = provider != "ollama";
+    let ollama = provider != "llama_cpp";
+    let mut keys = vec![titles::PROVIDER_SETTING];
+    if llama {
+        keys.push(titles::LLAMA_MODEL_SETTING);
+        if llama_model == OTHER_LLAMA_MODEL {
+            keys.push(LLAMA_MODEL_REFERENCE);
+        }
+    }
+    if ollama {
+        keys.push(titles::MODEL_SETTING);
+    }
+    keys
+}
+
+/// The default, every cached model, the saved model when the cache lacks it (llama.cpp
+/// downloads it on first use), and an entry for naming another model.
+fn llama_model_choices(
+    cached: Option<&Result<Vec<String>, String>>,
+    selected: &str,
+) -> Vec<Choice> {
+    let cached = cached.and_then(|cached| cached.as_ref().ok());
+    let default = titles::DEFAULT_LLAMA_MODEL;
+    let mut choices = vec![Choice::new(
+        "",
+        match cached {
+            Some(cached) if !cached.iter().any(|model| model == default) => {
+                format!("Default ({default}, not downloaded)")
+            }
+            _ => format!("Default ({default})"),
+        },
+    )];
+    // The default is listed separately only when it was chosen explicitly.
+    choices.extend(
+        cached
+            .into_iter()
+            .flatten()
+            .filter(|model| *model != default || selected == default)
+            .map(|model| Choice::new(model.clone(), model.clone())),
+    );
+    if selected != OTHER_LLAMA_MODEL && !choices.iter().any(|choice| choice.value == selected) {
+        choices.push(Choice::new(
+            selected,
+            if cached.is_some() {
+                format!("{selected} (not downloaded)")
+            } else {
+                selected.to_owned()
+            },
+        ));
+    }
+    choices.push(Choice::new(OTHER_LLAMA_MODEL, "Other Hugging Face model…"));
+    choices
+}
+
+/// The first-installed default, every installed model, and the saved model when Ollama is
+/// known not to have it.
+fn ollama_model_choices(
+    installed: Option<&Result<Vec<String>, String>>,
+    selected: &str,
+) -> Vec<Choice> {
+    let installed = installed.and_then(|installed| installed.as_ref().ok());
+    let mut choices = vec![Choice::new(
+        "",
+        match installed.and_then(|models| models.first()) {
+            Some(first) => format!("First installed model ({first})"),
+            None => "First installed model".to_owned(),
+        },
+    )];
+    choices.extend(
+        installed
+            .into_iter()
+            .flatten()
+            .map(|model| Choice::new(model.clone(), model.clone())),
+    );
+    if !choices.iter().any(|choice| choice.value == selected) {
+        choices.push(Choice {
+            value: selected.to_owned(),
+            label: if installed.is_some() {
+                format!("{selected} (not installed)").into()
+            } else {
+                selected.to_owned().into()
+            },
+            unavailable: installed.is_some(),
+        });
+    }
+    choices
+}
+
+/// Factory launches require a local branch; blank takes the thread's branch when it starts.
+fn target_branch_choices(branches: Option<&[String]>, selected: &str) -> Vec<Choice> {
+    let mut choices = vec![Choice::new("", "Current branch when the thread starts")];
+    choices.extend(
+        branches
+            .into_iter()
+            .flatten()
+            .map(|branch| Choice::new(branch.clone(), branch.clone())),
+    );
+    if !choices.iter().any(|choice| choice.value == selected) {
+        choices.push(Choice {
+            value: selected.to_owned(),
+            label: if branches.is_some() {
+                format!("{selected} (not a local branch)").into()
+            } else {
+                selected.to_owned().into()
+            },
+            unavailable: branches.is_some(),
+        });
+    }
+    choices
+}
+
+/// The llama.cpp model to save: the selected entry, or the typed reference for another model.
+fn chosen_llama_model(selected: String, reference: String) -> anyhow::Result<String> {
+    if selected != OTHER_LLAMA_MODEL {
+        return Ok(selected);
+    }
+    if reference.is_empty() {
+        return Err(field_error(
+            LLAMA_MODEL_REFERENCE,
+            format!(
+                "Enter a Hugging Face model reference, such as {}.",
+                titles::DEFAULT_LLAMA_MODEL
+            ),
+        ));
+    }
+    Ok(reference)
+}
+
 #[derive(Clone)]
 pub enum DialogKind {
     AddProject,
@@ -133,6 +269,8 @@ pub struct SurfaceContent {
     /// Removal was refused for uncommitted changes; the next confirm discards them.
     force: bool,
     selects: Vec<SelectField>,
+    /// The installed models the title model choices were built from.
+    title_models: Option<InstalledModels>,
     surface_id: Uuid,
     settings_id: SharedString,
     hosted: bool,
@@ -336,26 +474,9 @@ impl SurfaceContent {
                             .into(),
                     );
                     field(
-                        crate::titles::LLAMA_MODEL_SETTING,
-                        "llama.cpp title model (blank: Gemma 4 26B)",
-                        state
-                            .snapshot
-                            .settings
-                            .get(crate::titles::LLAMA_MODEL_SETTING)
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .into(),
-                    );
-                    field(
-                        crate::titles::MODEL_SETTING,
-                        "Ollama title model (blank: first installed model)",
-                        state
-                            .snapshot
-                            .settings
-                            .get(crate::titles::MODEL_SETTING)
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .into(),
+                        LLAMA_MODEL_REFERENCE,
+                        "Hugging Face model (owner/repository:quantisation)",
+                        String::new(),
                     );
                     if let Some(project) = project.and_then(|id| {
                         state
@@ -398,26 +519,35 @@ impl SurfaceContent {
                                 .clone()
                                 .unwrap_or_default(),
                         );
-                        field(
+                        let target_branch = project
+                            .defaults
+                            .factory_target_branch
+                            .clone()
+                            .unwrap_or_default();
+                        let branches = state
+                            .repositories
+                            .get(&project.id)
+                            .and_then(|repository| repository.as_ref().ok())
+                            .map(|repository| repository.branches.as_slice());
+                        selects.push(select_field(
                             "factory_target_branch",
-                            "Factory target branch (blank: Git branch)",
-                            project
-                                .defaults
-                                .factory_target_branch
-                                .clone()
-                                .unwrap_or_default(),
-                        );
+                            "Factory target branch",
+                            target_branch_choices(branches, &target_branch),
+                            &target_branch,
+                            window,
+                            cx,
+                        ));
                     }
 
                     let title_provider = state
                         .snapshot
                         .settings
-                        .get(crate::titles::PROVIDER_SETTING)
+                        .get(titles::PROVIDER_SETTING)
                         .and_then(|value| value.as_str())
                         .filter(|value| ["automatic", "llama_cpp", "ollama"].contains(value))
                         .unwrap_or("automatic");
                     selects.push(select_field(
-                        crate::titles::PROVIDER_SETTING,
+                        titles::PROVIDER_SETTING,
                         "Title generator",
                         vec![
                             Choice::new("automatic", "Automatic (llama.cpp, then Ollama)"),
@@ -425,6 +555,39 @@ impl SurfaceContent {
                             Choice::new("ollama", "Ollama"),
                         ],
                         title_provider,
+                        window,
+                        cx,
+                    ));
+                    // Models change outside the app; earlier results show until these land.
+                    if !state.title_models_loading() {
+                        state.refresh_title_models();
+                    }
+                    let installed = state.title_models.as_ref();
+                    let saved = |key| {
+                        state
+                            .snapshot
+                            .settings
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned()
+                    };
+                    let llama_model = saved(titles::LLAMA_MODEL_SETTING);
+                    selects.push(select_field(
+                        titles::LLAMA_MODEL_SETTING,
+                        "llama.cpp model",
+                        llama_model_choices(installed.map(|models| &models.llama), &llama_model),
+                        &llama_model,
+                        window,
+                        cx,
+                    ));
+                    let ollama_model = saved(titles::MODEL_SETTING);
+                    selects.push(select_field(
+                        titles::MODEL_SETTING,
+                        "Ollama model",
+                        ollama_model_choices(installed.map(|models| &models.ollama), &ollama_model),
+                        &ollama_model,
                         window,
                         cx,
                     ));
@@ -527,7 +690,10 @@ impl SurfaceContent {
             _ => None,
         };
         let mut subscriptions = vec![
-            cx.observe(&state, |surface, _, cx| surface.refresh_presentation(cx)),
+            cx.observe_in(&state, window, |surface, _, window, cx| {
+                surface.refresh_presentation(cx);
+                surface.refresh_title_model_choices(window, cx);
+            }),
             cx.subscribe(
                 &state,
                 |surface, _, change: &PresentationChange, cx| match change {
@@ -566,6 +732,7 @@ impl SurfaceContent {
             subscriptions.push(cx.observe(&select.state, |_, _, cx| cx.notify()));
         }
         let surface_id = Uuid::new_v4();
+        let title_models = state.read(cx).title_models.clone();
         Self {
             kind,
             fields,
@@ -574,6 +741,7 @@ impl SurfaceContent {
             request: None,
             force: false,
             selects,
+            title_models,
             surface_id,
             settings_id: format!("drostje-settings-{surface_id}").into(),
             hosted: false,
@@ -822,6 +990,10 @@ impl SurfaceContent {
             }
 
             DialogKind::Settings(project_id) => {
+                let llama_model = chosen_llama_model(
+                    self.value(titles::LLAMA_MODEL_SETTING, cx),
+                    self.value(LLAMA_MODEL_REFERENCE, cx),
+                )?;
                 let root = self.value("factory_data_root", cx);
                 if !PathBuf::from(&root).is_absolute() {
                     return Err(field_error(
@@ -923,17 +1095,14 @@ impl SurfaceContent {
                     }),
                 );
                 state.set_setting("factory_data_root", json!(root));
+                state.set_setting(titles::LLAMA_MODEL_SETTING, json!(llama_model));
                 state.set_setting(
-                    crate::titles::LLAMA_MODEL_SETTING,
-                    json!(self.value(crate::titles::LLAMA_MODEL_SETTING, cx)),
+                    titles::MODEL_SETTING,
+                    json!(self.value(titles::MODEL_SETTING, cx)),
                 );
                 state.set_setting(
-                    crate::titles::MODEL_SETTING,
-                    json!(self.value(crate::titles::MODEL_SETTING, cx)),
-                );
-                state.set_setting(
-                    crate::titles::PROVIDER_SETTING,
-                    json!(self.value(crate::titles::PROVIDER_SETTING, cx)),
+                    titles::PROVIDER_SETTING,
+                    json!(self.value(titles::PROVIDER_SETTING, cx)),
                 );
                 state.set_setting("theme_mode", json!(mode));
                 state.set_setting("theme_light", json!(light));
@@ -942,6 +1111,7 @@ impl SurfaceContent {
                     state.save_project(project);
                 }
                 state.refresh_diagnostics();
+                state.refresh_title_models();
             }
         }
         Ok(SurfaceOutcome::Applied)
@@ -960,6 +1130,33 @@ impl SurfaceContent {
             DialogKind::SwitchBranch(_) => "Switch branch",
             DialogKind::Settings(_) => "Settings",
         }
+    }
+
+    /// Rebuilds the title model choices when an inspection lands, keeping the draft selection.
+    fn refresh_title_model_choices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let installed = &self.state.read(cx).title_models;
+        if *installed == self.title_models {
+            return;
+        }
+        self.title_models = installed.clone();
+        for key in [titles::LLAMA_MODEL_SETTING, titles::MODEL_SETTING] {
+            let Some(select) = self.select(key).cloned() else {
+                continue;
+            };
+            let selected = self.value(key, cx);
+            let models = self.title_models.as_ref();
+            let choices = if key == titles::LLAMA_MODEL_SETTING {
+                llama_model_choices(models.map(|models| &models.llama), &selected)
+            } else {
+                ollama_model_choices(models.map(|models| &models.ollama), &selected)
+            };
+            select.update(cx, |select, cx| {
+                select.set_items(choices, window, cx);
+                select.set_selected_value(&selected, window, cx);
+                cx.notify();
+            });
+        }
+        cx.notify();
     }
 
     fn refresh_theme_choices(&self, window: &mut Window, cx: &mut App) {
@@ -1019,6 +1216,32 @@ impl SurfaceContent {
                     )
                 })
             }
+            titles::MODEL_SETTING => {
+                let selected = self.value(key, cx);
+                let installed = self
+                    .state
+                    .read(cx)
+                    .title_models
+                    .as_ref()
+                    .and_then(|models| models.ollama.as_ref().ok());
+                (!selected.is_empty() && installed.is_some_and(|models| !models.contains(&selected)))
+                    .then(|| format!("Ollama has no model {selected}. Choose an installed model or pull it, then refresh models."))
+            }
+            "factory_target_branch" => {
+                let selected = self.value(key, cx);
+                let branches = match self.kind {
+                    DialogKind::Settings(Some(project)) => self
+                        .state
+                        .read(cx)
+                        .repositories
+                        .get(&project)
+                        .and_then(|repository| repository.as_ref().ok())
+                        .map(|repository| &repository.branches),
+                    _ => None,
+                };
+                (!selected.is_empty() && branches.is_some_and(|branches| !branches.contains(&selected)))
+                    .then(|| format!("{selected} is not a local branch. Factory launches need one; choose a branch."))
+            }
             "theme_light" | "theme_dark" => {
                 let selected = self.value(key, cx);
                 let mode = if key == "theme_light" {
@@ -1054,6 +1277,53 @@ impl SurfaceContent {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// What the app knows about a field's options, shown under its label.
+    fn field_description(&self, key: &str, state: &AppState) -> Option<String> {
+        let installed = state.title_models.as_ref();
+        let count = |models: &[String], noun: &str| match models.len() {
+            1 => format!("1 {noun}"),
+            n => format!("{n} {noun}s"),
+        };
+        match key {
+            titles::LLAMA_MODEL_SETTING => Some(match installed.map(|models| &models.llama) {
+                None => "Looking for downloaded models…".into(),
+                Some(Ok(models)) if models.is_empty() => {
+                    "The llama.cpp cache is empty. The chosen model downloads on first use.".into()
+                }
+                Some(Ok(models)) => format!(
+                    "{} in the llama.cpp cache. Other models download on first use.",
+                    count(models, "model")
+                ),
+                Some(Err(error)) => error.clone(),
+            }),
+            titles::MODEL_SETTING => {
+                let host = titles::ollama_host();
+                Some(match installed.map(|models| &models.ollama) {
+                    None => "Looking for installed models…".into(),
+                    Some(Ok(models)) if models.is_empty() => {
+                        format!("Ollama at {host} has no models. Pull one, then refresh models.")
+                    }
+                    Some(Ok(models)) => {
+                        format!("{} installed at {host}", count(models, "model"))
+                    }
+                    Some(Err(error)) => format!("{error}. Start Ollama, then refresh models."),
+                })
+            }
+            LLAMA_MODEL_REFERENCE => Some("Downloads from Hugging Face on first use.".into()),
+            "factory_target_branch" => {
+                let DialogKind::Settings(Some(project)) = self.kind else {
+                    return None;
+                };
+                match state.repositories.get(&project) {
+                    Some(Err(error)) => Some(format!("Local branches are unavailable: {error}")),
+                    None => Some("Reading local branches…".into()),
+                    Some(Ok(_)) => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn form_field(&self, key: &str, readonly: bool, cx: &App) -> FormField {
@@ -1104,14 +1374,19 @@ impl SurfaceContent {
         project_id: Option<Uuid>,
         state: &AppState,
         owner: &WeakEntity<SurfaceContent>,
-        _: &App,
+        cx: &App,
     ) -> AnyElement {
         let readonly = state.storage_error.is_some();
         let fields = |title: &'static str, keys: &[&'static str]| {
-            SettingGroup::new().title(title).items(
-                keys.iter()
-                    .filter_map(|key| self.setting_item(key, title, readonly, owner)),
-            )
+            SettingGroup::new()
+                .title(title)
+                .items(keys.iter().filter_map(|key| {
+                    let item = self.setting_item(key, title, readonly, owner)?;
+                    Some(match self.field_description(key, state) {
+                        Some(description) => item.description(description),
+                        None => item,
+                    })
+                }))
         };
         let theme_dir = state.data_dir.join("themes");
         let appearance = fields("Appearance", &["theme_mode", "theme_light", "theme_dark"])
@@ -1139,19 +1414,48 @@ impl SurfaceContent {
         .description(
             "Tool installation and upgrades run only at your explicit request. DROSTJE. does not authenticate for you.",
         );
+        let provider = self.value(titles::PROVIDER_SETTING, cx);
+        let loading = state.title_models_loading();
+        let refresh = owner.clone();
         let titles = fields(
             "Conversation titles",
-            &[
-                crate::titles::PROVIDER_SETTING,
-                crate::titles::LLAMA_MODEL_SETTING,
-                crate::titles::MODEL_SETTING,
-            ],
+            &title_setting_keys(&provider, &self.value(titles::LLAMA_MODEL_SETTING, cx)),
         )
-        .description(format!(
-            "Automatic generation runs the local llama.cpp CLI with {} before trying Ollama at {}.",
-            crate::titles::DEFAULT_LLAMA_MODEL,
-            crate::titles::ollama_host()
-        ));
+        .item(
+            SettingItem::new(
+                "Installed models",
+                SettingField::render(move |options, _, _| {
+                    let refresh = refresh.clone();
+                    Button::new("refresh-title-models")
+                        .small()
+                        .label("Refresh models")
+                        .loading(loading)
+                        .disabled(loading || options.is_disabled())
+                        .on_click(move |_, _, cx| {
+                            let _ = refresh.update(cx, |surface, cx| {
+                                surface.state.update(cx, |state, cx| {
+                                    state.refresh_title_models();
+                                    cx.notify();
+                                })
+                            });
+                        })
+                }),
+            )
+            .description(if loading {
+                "Looking for downloaded and installed models…"
+            } else {
+                "Lists the llama.cpp cache and the models Ollama has installed."
+            })
+            .keywords(["titles", "models", "refresh", "llama", "ollama"]),
+        )
+        .description(match provider.as_str() {
+            "llama_cpp" => "Runs the local llama.cpp CLI.".to_owned(),
+            "ollama" => format!("Asks the Ollama server at {}.", titles::ollama_host()),
+            _ => format!(
+                "Runs the local llama.cpp CLI first and asks Ollama at {} when llama.cpp is unavailable.",
+                titles::ollama_host()
+            ),
+        });
         let factory = fields(
             "Factory defaults",
             &[
@@ -1769,7 +2073,134 @@ pub(super) fn close_surface(kind: &DialogKind, window: &mut Window, cx: &mut App
 
 #[cfg(test)]
 mod tests {
-    use super::retain_concurrent_value;
+    use super::{
+        Choice, FieldError, LLAMA_MODEL_REFERENCE, OTHER_LLAMA_MODEL, chosen_llama_model,
+        llama_model_choices, ollama_model_choices, retain_concurrent_value, target_branch_choices,
+        title_setting_keys,
+    };
+    use crate::titles;
+
+    fn shown(choices: &[Choice]) -> Vec<(&str, &str, bool)> {
+        choices
+            .iter()
+            .map(|choice| {
+                (
+                    choice.value.as_str(),
+                    choice.label.as_ref(),
+                    choice.unavailable,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn title_settings_follow_the_selected_generator() {
+        use titles::{LLAMA_MODEL_SETTING as LLAMA, MODEL_SETTING as OLLAMA, PROVIDER_SETTING};
+        assert_eq!(
+            title_setting_keys("automatic", ""),
+            [PROVIDER_SETTING, LLAMA, OLLAMA]
+        );
+        assert_eq!(
+            title_setting_keys("llama_cpp", ""),
+            [PROVIDER_SETTING, LLAMA]
+        );
+        assert_eq!(
+            title_setting_keys("ollama", OTHER_LLAMA_MODEL),
+            [PROVIDER_SETTING, OLLAMA]
+        );
+        assert_eq!(
+            title_setting_keys("llama_cpp", OTHER_LLAMA_MODEL),
+            [PROVIDER_SETTING, LLAMA, LLAMA_MODEL_REFERENCE]
+        );
+    }
+
+    #[test]
+    fn llama_choices_list_the_cache_and_keep_a_saved_download() {
+        let default = titles::DEFAULT_LLAMA_MODEL;
+        let missing_default = format!("Default ({default}, not downloaded)");
+        let cached = Ok(vec!["org/a-GGUF:Q8_0".to_owned()]);
+        assert_eq!(
+            shown(&llama_model_choices(Some(&cached), "org/b-GGUF:Q4_0")),
+            [
+                ("", missing_default.as_str(), false),
+                ("org/a-GGUF:Q8_0", "org/a-GGUF:Q8_0", false),
+                ("org/b-GGUF:Q4_0", "org/b-GGUF:Q4_0 (not downloaded)", false),
+                (OTHER_LLAMA_MODEL, "Other Hugging Face model…", false),
+            ]
+        );
+        // Unknown cache: the saved model is listed without a claim about its download.
+        assert_eq!(
+            shown(&llama_model_choices(None, "org/b-GGUF:Q4_0"))[1],
+            ("org/b-GGUF:Q4_0", "org/b-GGUF:Q4_0", false)
+        );
+        // A cached default appears once, unless it was chosen explicitly.
+        let cached = Ok(vec![default.to_owned()]);
+        assert_eq!(
+            shown(&llama_model_choices(Some(&cached), "")),
+            [
+                ("", format!("Default ({default})").as_str(), false),
+                (OTHER_LLAMA_MODEL, "Other Hugging Face model…", false),
+            ]
+        );
+        assert_eq!(llama_model_choices(Some(&cached), default).len(), 3);
+        let failed = Err("llama was not found".to_owned());
+        assert_eq!(llama_model_choices(Some(&failed), "").len(), 2);
+    }
+
+    #[test]
+    fn ollama_choices_mark_a_saved_model_ollama_lacks() {
+        let installed = Ok(vec!["lfm2:24b".to_owned()]);
+        assert_eq!(
+            shown(&ollama_model_choices(Some(&installed), "gone:1b")),
+            [
+                ("", "First installed model (lfm2:24b)", false),
+                ("lfm2:24b", "lfm2:24b", false),
+                ("gone:1b", "gone:1b (not installed)", true),
+            ]
+        );
+        let unreachable = Err("Ollama is not running".to_owned());
+        assert_eq!(
+            shown(&ollama_model_choices(Some(&unreachable), "gone:1b"))[1],
+            ("gone:1b", "gone:1b", false)
+        );
+        assert_eq!(ollama_model_choices(None, "").len(), 1);
+    }
+
+    #[test]
+    fn target_branch_choices_offer_local_branches() {
+        let branches = ["main".to_owned(), "release".to_owned()];
+        assert_eq!(
+            shown(&target_branch_choices(Some(&branches), "gone")),
+            [
+                ("", "Current branch when the thread starts", false),
+                ("main", "main", false),
+                ("release", "release", false),
+                ("gone", "gone (not a local branch)", true),
+            ]
+        );
+        assert_eq!(target_branch_choices(Some(&branches), "main").len(), 3);
+        assert_eq!(
+            shown(&target_branch_choices(None, "main"))[1],
+            ("main", "main", false)
+        );
+    }
+
+    #[test]
+    fn other_llama_model_requires_a_reference() {
+        assert_eq!(
+            chosen_llama_model("org/a:Q8_0".into(), "ignored".into()).unwrap(),
+            "org/a:Q8_0"
+        );
+        assert_eq!(
+            chosen_llama_model(OTHER_LLAMA_MODEL.into(), "org/new:Q4_0".into()).unwrap(),
+            "org/new:Q4_0"
+        );
+        let error = chosen_llama_model(OTHER_LLAMA_MODEL.into(), String::new()).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<FieldError>().map(|error| error.key),
+            Some(LLAMA_MODEL_REFERENCE)
+        );
+    }
 
     #[test]
     fn unchanged_settings_draft_preserves_completed_install_path() {
