@@ -506,40 +506,20 @@ impl BrowserPane {
             return;
         }
         // Native committed text is delivered separately; avoid inserting printable keys twice.
-        if key.key.chars().count() == 1 && !key.modifiers.control && !key.modifiers.platform {
+        if (key.key.chars().count() == 1 || key.key == "space")
+            && !key.modifiers.control
+            && !key.modifiers.platform
+        {
             return;
         }
-        let name = match key.key.as_str() {
-            "enter" => "Enter",
-            "backspace" => "Backspace",
-            "delete" => "Delete",
-            "escape" => "Escape",
-            "tab" => "Tab",
-            "left" => "ArrowLeft",
-            "right" => "ArrowRight",
-            "up" => "ArrowUp",
-            "down" => "ArrowDown",
-            "home" => "Home",
-            "end" => "End",
-            "pageup" => "PageUp",
-            "pagedown" => "PageDown",
-            other => other,
-        };
-        let code = match name {
-            " " => "Space".to_owned(),
-            name if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() => {
-                format!("Key{}", name.to_ascii_uppercase())
-            }
-            name if name.len() == 1 && name.as_bytes()[0].is_ascii_digit() => {
-                format!("Digit{name}")
-            }
-            name if name.len() > 1 => name.to_owned(),
-            _ => String::new(),
+        // Keys without a DOM equivalent stay with GPUI instead of failing the whole input.
+        let Some((name, code)) = dom_key(&key.key) else {
+            return;
         };
         self.runtime.command(
             self.id,
             BrowserCommand::Key {
-                key: name.into(),
+                key: name,
                 code,
                 pressed,
                 shift: key.modifiers.shift,
@@ -551,6 +531,49 @@ impl BrowserPane {
         window.prevent_default();
         cx.stop_propagation();
     }
+}
+/// Maps a GPUI key name to a DOM `KeyboardEvent.key` and `code`, or `None` when
+/// the key has no DOM equivalent Servo would accept.
+fn dom_key(key: &str) -> Option<(String, String)> {
+    let named = match key {
+        "space" => return Some((" ".into(), "Space".into())),
+        "enter" => "Enter",
+        "backspace" => "Backspace",
+        "delete" => "Delete",
+        "insert" => "Insert",
+        "escape" => "Escape",
+        "tab" => "Tab",
+        "left" => "ArrowLeft",
+        "right" => "ArrowRight",
+        "up" => "ArrowUp",
+        "down" => "ArrowDown",
+        "home" => "Home",
+        "end" => "End",
+        "pageup" => "PageUp",
+        "pagedown" => "PageDown",
+        _ => "",
+    };
+    if !named.is_empty() {
+        return Some((named.into(), named.into()));
+    }
+    if let Some(n) = key.strip_prefix('f')
+        && let Ok(n) = n.parse::<u8>()
+        && (1..=24).contains(&n)
+    {
+        return Some((format!("F{n}"), format!("F{n}")));
+    }
+    let mut chars = key.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    let code = if c.is_ascii_alphabetic() {
+        format!("Key{}", c.to_ascii_uppercase())
+    } else if c.is_ascii_digit() {
+        format!("Digit{c}")
+    } else {
+        String::new()
+    };
+    Some((key.into(), code))
 }
 impl Focusable for BrowserPane {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -1020,7 +1043,48 @@ pub fn navigation_url(value: &str) -> Result<String, String> {
 }
 #[cfg(test)]
 mod tests {
-    use super::navigation_url;
+    use super::{dom_key, navigation_url};
+    use servo::{Code, Key};
+
+    #[test]
+    fn gpui_key_names_map_to_dom_keys_servo_accepts() {
+        for name in [
+            "space",
+            "enter",
+            "backspace",
+            "delete",
+            "insert",
+            "escape",
+            "tab",
+            "left",
+            "right",
+            "up",
+            "down",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "f1",
+            "f12",
+            "a",
+            "7",
+            "-",
+        ] {
+            let (key, code) = dom_key(name).unwrap();
+            key.parse::<Key>()
+                .unwrap_or_else(|error| panic!("{name}: key {key:?}: {error:?}"));
+            if !code.is_empty() {
+                code.parse::<Code>()
+                    .unwrap_or_else(|error| panic!("{name}: code {code:?}: {error:?}"));
+            }
+        }
+        assert_eq!(dom_key("space"), Some((" ".into(), "Space".into())));
+        assert_eq!(dom_key("f5"), Some(("F5".into(), "F5".into())));
+        assert_eq!(dom_key("a"), Some(("a".into(), "KeyA".into())));
+        assert_eq!(dom_key("f99"), None);
+        assert_eq!(dom_key("menu"), None);
+    }
+
     #[test]
     fn browser_addresses_preserve_local_ports_and_file_escaping() {
         assert_eq!(
