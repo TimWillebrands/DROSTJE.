@@ -607,6 +607,15 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextThread, command),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, command),
         KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, command),
+        // The terminal's shell and the composer's Neovim take Tab and Shift-Tab (completion,
+        // indent), so Root's focus navigation, which GPUI dispatches before their key
+        // handlers, stays out. The caret popup keeps Tab to accept.
+        KeyBinding::new(
+            "tab",
+            NoAction,
+            Some("Terminal || (PromptEditor && !CaretPopup)"),
+        ),
+        KeyBinding::new("shift-tab", NoAction, Some("Terminal || PromptEditor")),
         KeyBinding::new("ctrl-w h", FocusLeft, navigation),
         KeyBinding::new("ctrl-w j", FocusDown, navigation),
         KeyBinding::new("ctrl-w k", FocusUp, navigation),
@@ -1545,6 +1554,92 @@ pub fn region_action(region: Region) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::picker_row;
+
+    /// Tab and Shift-Tab reach a native input's key handler instead of Root's focus
+    /// navigation, which GPUI would dispatch first and which moves focus away. An open
+    /// caret popup still accepts with Tab.
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn tab_reaches_native_inputs_instead_of_moving_focus(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{
+            AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+            ParentElement, Render, TestSupportExt, Window, component::Root, div,
+            test::TestWindowExt,
+        };
+
+        struct NativeInputs {
+            context: &'static str,
+            input: FocusHandle,
+            neighbour: FocusHandle,
+            keys: Vec<String>,
+        }
+        impl Render for NativeInputs {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .child(
+                        div()
+                            .id("native-input")
+                            .test_support()
+                            .key_context(self.context)
+                            .track_focus(&self.input)
+                            .on_action(cx.listener(|this, _: &super::AcceptCompletion, _, _| {
+                                this.keys.push("accept".into());
+                            }))
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                                this.keys.push(event.keystroke.unparse());
+                                cx.stop_propagation();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("neighbour")
+                            .test_support()
+                            .track_focus(&self.neighbour),
+                    )
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, None, cx);
+            super::bind_keys(cx);
+        });
+        for (context, expected) in [
+            ("Terminal NativeInput", ["tab", "shift-tab"]),
+            ("NativeInput PromptEditor", ["tab", "shift-tab"]),
+            (
+                "NativeInput PromptEditor CaretPopup",
+                ["accept", "shift-tab"],
+            ),
+        ] {
+            let mut view = None;
+            let window = cx.add_window(|window, cx| {
+                let inputs = cx.new(|cx| NativeInputs {
+                    context,
+                    input: cx.focus_handle().tab_stop(true),
+                    neighbour: cx.focus_handle().tab_stop(true),
+                    keys: Vec::new(),
+                });
+                view = Some(inputs.clone());
+                Root::new(inputs, window, cx)
+            });
+            let view = view.unwrap();
+            cx.update_window(window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let input = view.read(cx).input.clone();
+                input.focus(window, cx);
+                for key in ["tab", "shift-tab"] {
+                    window.press(key, cx);
+                    assert!(
+                        input.is_focused(window),
+                        "{key} moved focus out of {context}"
+                    );
+                }
+            })
+            .unwrap();
+            cx.read(|cx| assert_eq!(view.read(cx).keys, expected, "{context}"));
+        }
+    }
 
     #[test]
     fn harness_picker_motion_steps_over_the_current_harness() {
