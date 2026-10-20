@@ -23,10 +23,12 @@ rmpv = "=1.3.1"
 parking_lot = "0.12"
 ghostty-terminal = { version = "0.1.0", path = "crates/ghostty-terminal" }
 url = "2"
-servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "webcrypto"] }
+servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "webcrypto", "webgpu"] }
 dpi = "0.1"
 euclid = "0.22"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+content-security-policy = { version = "=0.9.0", default-features = false }
+stylo_static_prefs = "=0.22.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
@@ -55,8 +57,22 @@ zed-font-kit = { path = "vendor/zed-font-kit" }
 # GPUI's log/serde features expose another From<_> for fmt::Error. Constrain the
 # generated CSS result type instead of relying on a unique conversion.
 stylo_derive = { path = "vendor/stylo_derive" }
+# Two WebGPU fixes, marked "DROSTJE patch"; the MPL-2.0 notices are retained.
+# `web_exposed_limits` clamps raw driver binding counts (524288 samplers on
+# Vulkan, from which PixiJS sizes its batch shader) to WebGPU's defaults.
+# `WebGpuExternalImages::lock` never hands WebRender fewer bytes than a
+# descriptor it may still upload with, which panicked when a canvas shrank.
+servo-webgpu = { path = "vendor/servo-webgpu" }
 
 # Servo's generated DOM bindings make debug symbols disproportionately large.
 [profile.dev]
 debug = 0
 incremental = false
+
+# WebGPU compiles every page shader through naga on Servo's WebGPU thread while
+# script waits synchronously; unoptimized, a shader-heavy page stalls for minutes.
+[profile.dev.package.naga]
+opt-level = 3
+
+[profile.dev.package.wgpu-core]
+opt-level = 3
