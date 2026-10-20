@@ -49,6 +49,7 @@ gpui_kit::actions!(
         UnarchiveThread,
         RemoveWorktree,
         SwitchBranch,
+        CommitChanges,
         CloseThread,
         NextThread,
         PreviousThread,
@@ -141,6 +142,7 @@ pub enum Command {
     UnarchiveThread,
     RemoveWorktree,
     SwitchBranch,
+    CommitChanges,
     CloseThread,
     NextThread,
     PreviousThread,
@@ -171,7 +173,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 63] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -206,6 +208,7 @@ impl Command {
         Self::UnarchiveThread,
         Self::RemoveWorktree,
         Self::SwitchBranch,
+        Self::CommitChanges,
         Self::CloseThread,
         Self::NextThread,
         Self::PreviousThread,
@@ -272,6 +275,7 @@ impl Command {
             Self::UnarchiveThread => "Unarchive thread",
             Self::RemoveWorktree => "Remove worktree…",
             Self::SwitchBranch => "Switch branch…",
+            Self::CommitChanges => "Commit changes…",
             Self::CloseThread => "Close tab",
             Self::NextThread => "Next tab",
             Self::PreviousThread => "Previous tab",
@@ -339,6 +343,7 @@ impl Command {
             Self::UnarchiveThread => Box::new(UnarchiveThread),
             Self::RemoveWorktree => Box::new(RemoveWorktree),
             Self::SwitchBranch => Box::new(SwitchBranch),
+            Self::CommitChanges => Box::new(CommitChanges),
             Self::CloseThread => Box::new(CloseThread),
             Self::NextThread => Box::new(NextThread),
             Self::PreviousThread => Box::new(PreviousThread),
@@ -431,6 +436,7 @@ impl Command {
             Self::SwitchHarness => state.switch_harness_reason(),
             Self::RemoveWorktree => state.remove_worktree_reason(),
             Self::SwitchBranch => state.switch_branch_reason(),
+            Self::CommitChanges => state.commit_reason(),
             Self::CloseThread | Self::FocusOutput | Self::ToggleOutput
                 if state.thread().is_none() =>
             {
@@ -796,6 +802,12 @@ pub fn bind_keys(cx: &mut App) {
             "secondary-enter",
             Confirm,
             Some("Input && PromptEditor && DrostjeForm && !Command && !PopupMenu"),
+        ),
+        // A multi-line message takes Return as a newline; Cmd-Return still confirms.
+        KeyBinding::new(
+            "secondary-enter",
+            Confirm,
+            Some("CommitMessage > Input && !Command && !PopupMenu"),
         ),
     ]);
     super::theme_editor::bind_keys(cx);
@@ -1515,6 +1527,9 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &SwitchBranch, w, cx| {
                 this.run(PaletteTarget::Command(Command::SwitchBranch), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CommitChanges, w, cx| {
+                this.run(PaletteTarget::Command(Command::CommitChanges), w, cx)
             }))
             .on_action(cx.listener(|this, _: &InstallPi, w, cx| {
                 this.run(PaletteTarget::Command(Command::InstallPi), w, cx)

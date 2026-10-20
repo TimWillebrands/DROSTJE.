@@ -248,6 +248,7 @@ pub struct Workspace {
     pub(super) browsers: Browsers,
     pub(super) sidebar_sizes:
         Rc<RefCell<BTreeMap<ThreadId, Entity<gpui_kit::component::resizable::ResizableState>>>>,
+    pub(super) changes_lists: super::changes::ChangesLists,
     /// Live layouts reattach retained terminals; durable layouts reopen them with a new shell.
     live_layouts: BTreeMap<SpaceId, DockAreaState>,
     active_terminal: Option<TerminalId>,
@@ -385,6 +386,7 @@ impl Workspace {
             terminals,
             browsers,
             sidebar_sizes: Rc::default(),
+            changes_lists: Rc::default(),
             live_layouts: BTreeMap::new(),
             active_terminal: None,
             space_terminals: BTreeMap::new(),
@@ -2679,6 +2681,11 @@ impl Workspace {
                 .read(cx)
                 .conversation_thread()
                 .map(|thread| DialogKind::SwitchBranch(thread.id)),
+            Command::CommitChanges => self
+                .state
+                .read(cx)
+                .conversation_thread()
+                .map(|thread| DialogKind::Commit(thread.id)),
             Command::ArchiveThread => {
                 if self.extension.is_some()
                     || self
@@ -2843,7 +2850,13 @@ impl Workspace {
         }
         let state = self.state.clone();
         let owner = cx.entity().downgrade();
-        self.dialog = Some(cx.new(|cx| SurfaceContent::new(kind, state, owner, window, cx)));
+        let commit = matches!(kind, DialogKind::Commit(_));
+        let dialog = cx.new(|cx| SurfaceContent::new(kind, state, owner, window, cx));
+        // The subject is ready to edit by the time the message is read, when a model answers.
+        if commit {
+            dialog.update(cx, |dialog, cx| dialog.write_commit_subject(cx));
+        }
+        self.dialog = Some(dialog);
         super::settings::open_surface(cx.entity().downgrade(), window, cx);
         cx.notify();
     }
@@ -3339,6 +3352,9 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &SwitchBranch, w, cx| {
                     this.execute(Command::SwitchBranch, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &CommitChanges, w, cx| {
+                    this.execute(Command::CommitChanges, w, cx)
                 }))
                 .on_action(
                     cx.listener(|this, _: &InstallPi, w, cx| {
@@ -4146,6 +4162,7 @@ impl Panel for WorkspacePanel {
                 )
                 .separator()
                 .menu(Command::SwitchBranch.label(), Box::new(SwitchBranch))
+                .menu(Command::CommitChanges.label(), Box::new(CommitChanges))
                 .separator()
                 .menu("New conversation", Box::new(NewConversation))
                 .menu(

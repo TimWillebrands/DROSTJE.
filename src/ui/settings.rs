@@ -1,6 +1,6 @@
 use super::{theme, workspace::Workspace};
 use crate::{
-    app::{AppState, PresentationChange, WorktreeRequestStatus},
+    app::{AppState, CommitSubjectStatus, PresentationChange, WorktreeRequestStatus},
     harness,
     model::ModelKey,
     platform,
@@ -13,7 +13,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         form::{Field as FormField, Form},
         h_flex,
-        input::{Input, InputEvent, InputState},
+        input::{Input, InputEvent, InputState, Textarea, TextareaState},
         searchable_list::SearchableListItem,
         select::{Select, SelectEvent, SelectState},
         setting::{SettingField, SettingGroup, SettingItem, SettingPage, Settings},
@@ -244,6 +244,8 @@ pub enum DialogKind {
     RemoveWorktree(Uuid),
     /// Check out another local branch, or a new one, in a Conversation's working tree.
     SwitchBranch(Uuid),
+    /// Stage and commit everything in a Conversation's working tree.
+    Commit(Uuid),
     Settings(Option<Uuid>),
 }
 pub enum SurfaceOutcome {
@@ -259,6 +261,18 @@ pub struct Field {
     pub input: Entity<InputState>,
     pub(crate) initial: String,
 }
+/// The Commit dialog's message and the generated subject it asked for.
+pub struct CommitDraft {
+    message: Entity<TextareaState>,
+    /// The subject request this dialog started; results of other requests are ignored.
+    subject_request: Option<Uuid>,
+    /// The message when the request started: a subject replaces it only if the user has not
+    /// edited it since, so typed text is never overwritten.
+    baseline: SharedString,
+    /// Why the last request produced no subject, shown next to the control that retries.
+    note: Option<String>,
+}
+
 pub struct SurfaceContent {
     pub kind: DialogKind,
     pub fields: Vec<Field>,
@@ -271,6 +285,7 @@ pub struct SurfaceContent {
     selects: Vec<SelectField>,
     /// The installed models the title model choices were built from.
     title_models: Option<InstalledModels>,
+    commit: Option<CommitDraft>,
     surface_id: Uuid,
     settings_id: SharedString,
     hosted: bool,
@@ -731,6 +746,38 @@ impl SurfaceContent {
             ));
             subscriptions.push(cx.observe(&select.state, |_, _, cx| cx.notify()));
         }
+        let commit = match &kind {
+            DialogKind::Commit(_) => {
+                let message = cx.new(|cx| {
+                    TextareaState::new(window, cx)
+                        .auto_grow(3, 10)
+                        .placeholder("Summarize the change in one line")
+                });
+                subscriptions.push(
+                    cx.subscribe(&message, |surface, _, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            surface.clear_field_error("message", cx);
+                        }
+                    }),
+                );
+                subscriptions.push(cx.subscribe_in(
+                    &state,
+                    window,
+                    |surface, _, change: &PresentationChange, window, cx| {
+                        if let PresentationChange::CommitSubject(request) = change {
+                            surface.commit_subject_changed(*request, window, cx);
+                        }
+                    },
+                ));
+                Some(CommitDraft {
+                    message,
+                    subject_request: None,
+                    baseline: SharedString::default(),
+                    note: None,
+                })
+            }
+            _ => None,
+        };
         let surface_id = Uuid::new_v4();
         let title_models = state.read(cx).title_models.clone();
         Self {
@@ -742,6 +789,7 @@ impl SurfaceContent {
             force: false,
             selects,
             title_models,
+            commit,
             surface_id,
             settings_id: format!("drostje-settings-{surface_id}").into(),
             hosted: false,
@@ -758,6 +806,84 @@ impl SurfaceContent {
         self.request = Some(request);
         self.error = None;
         self.error_field = None;
+        cx.notify();
+    }
+
+    /// The Commit dialog's message, for native tests that type into it.
+    #[cfg(all(test, feature = "runtime-qa"))]
+    pub(crate) fn commit_message(&self) -> Option<Entity<TextareaState>> {
+        self.commit.as_ref().map(|commit| commit.message.clone())
+    }
+
+    /// Asks the local model for a subject for the Commit dialog's changes.
+    pub fn write_commit_subject(&mut self, cx: &mut Context<Self>) {
+        let DialogKind::Commit(thread) = self.kind else {
+            return;
+        };
+        let Some(commit) = self.commit.as_mut() else {
+            return;
+        };
+        commit.baseline = commit.message.read(cx).value();
+        commit.note = None;
+        match self
+            .state
+            .update(cx, |state, cx| state.write_commit_subject(thread, cx))
+        {
+            Ok(request) => commit.subject_request = Some(request),
+            Err(error) => {
+                commit.subject_request = None;
+                commit.note = Some(format!("{error:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn commit_subject_changed(
+        &mut self,
+        request: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self
+            .commit
+            .as_mut()
+            .filter(|commit| commit.subject_request == Some(request))
+        else {
+            return;
+        };
+        let status = self
+            .state
+            .read(cx)
+            .commit_subject
+            .as_ref()
+            .filter(|pending| pending.id == request)
+            .map(|pending| pending.status.clone());
+        match status {
+            Some(CommitSubjectStatus::Pending) => return,
+            Some(CommitSubjectStatus::Written(subject)) => {
+                if commit.message.read(cx).value() == commit.baseline {
+                    commit
+                        .message
+                        .update(cx, |message, cx| message.set_value(subject, window, cx));
+                } else {
+                    commit.note =
+                        Some("Kept your edits; generate again to replace them.".to_owned());
+                }
+            }
+            Some(CommitSubjectStatus::Unavailable) => {
+                commit.note = Some(
+                    "No message generated: configure the llama.cpp executable or start Ollama, then try again."
+                        .to_owned(),
+                );
+            }
+            Some(CommitSubjectStatus::Failed(error)) => {
+                commit.note = Some(format!(
+                    "Could not generate a message: {error}. Check title generation in Settings."
+                ));
+            }
+            None => {}
+        }
+        commit.subject_request = None;
         cx.notify();
     }
 
@@ -972,6 +1098,19 @@ impl SurfaceContent {
                     .switch_branch(&branch, create)
                     .map(SurfaceOutcome::Pending);
             }
+            DialogKind::Commit(thread) => {
+                let message = self
+                    .commit
+                    .as_ref()
+                    .map(|commit| commit.message.read(cx).value().trim().to_owned())
+                    .unwrap_or_default();
+                if message.is_empty() {
+                    return Err(field_error("message", "Write a commit message."));
+                }
+                return state
+                    .commit_changes(thread, &message)
+                    .map(SurfaceOutcome::Pending);
+            }
             DialogKind::ArchiveProject(id) => {
                 anyhow::ensure!(
                     state.selected_project == Some(id),
@@ -1130,6 +1269,7 @@ impl SurfaceContent {
             DialogKind::NewWorktreeConversation(_) => "New conversation in new worktree",
             DialogKind::RemoveWorktree(_) => "Remove worktree",
             DialogKind::SwitchBranch(_) => "Switch branch",
+            DialogKind::Commit(_) => "Commit changes",
             DialogKind::Settings(_) => "Settings",
         }
     }
@@ -1694,6 +1834,110 @@ impl SurfaceContent {
                         )
                     });
             }
+            DialogKind::Commit(thread) => {
+                let pending = self.request.is_some();
+                let thread = state.snapshot.threads.iter().find(|t| t.id == thread);
+                let tree = thread
+                    .map(|thread| match state.thread_worktree(thread) {
+                        Some(worktree) => format!("worktree {}", worktree.codename),
+                        None => "the project root".to_owned(),
+                    })
+                    .unwrap_or_else(|| "this working tree".to_owned());
+                let summary = thread
+                    .and_then(|thread| state.conversation_diff(thread.id))
+                    .and_then(|diff| diff.result.as_ref())
+                    .and_then(|result| result.as_ref().ok())
+                    .filter(|diff| diff.changed_files > 0)
+                    .map(|diff| {
+                        format!(
+                            " ({} {}, +{} −{})",
+                            diff.changed_files,
+                            if diff.changed_files == 1 {
+                                "file"
+                            } else {
+                                "files"
+                            },
+                            diff.additions,
+                            diff.deletions
+                        )
+                    })
+                    .unwrap_or_default();
+                body = body.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "Stages and commits every change in {tree}{summary}, untracked files included. Hooks run as the repository configures them."
+                        )),
+                );
+                if let Some(commit) = &self.commit {
+                    let writing = commit.subject_request.is_some();
+                    let surface = owner.clone();
+                    body = body
+                        .child(
+                            Form::new().child(
+                                FormField::new().label("Message").child(
+                                    v_flex()
+                                        .key_context("NativeInput CommitMessage")
+                                        .w_full()
+                                        .gap_1()
+                                        .child(
+                                            Textarea::new(&commit.message)
+                                                .disabled(readonly || pending),
+                                        )
+                                        .when(self.error_field == Some("message"), |view| {
+                                            view.when_some(self.error.clone(), |view, error| {
+                                                view.child(
+                                                    Alert::error("field-error-message", error)
+                                                        .small(),
+                                                )
+                                            })
+                                        }),
+                                ),
+                            ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Button::new("generate-commit-message")
+                                        .small()
+                                        .label("Generate message")
+                                        .loading(writing)
+                                        .disabled(readonly || pending || writing)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = surface.update(cx, |surface, cx| {
+                                                surface.write_commit_subject(cx)
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .when(writing, |note| {
+                                            note.child("Writing a message with the local model…")
+                                        })
+                                        .when(!writing, |note| note.children(commit.note.clone())),
+                                ),
+                        );
+                }
+                body = body.when(pending, |view| {
+                    view.child(
+                        h_flex()
+                            .id("worktree-pending")
+                            .gap_2()
+                            .items_center()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(Spinner::new().xsmall())
+                            .child("Committing…"),
+                    )
+                });
+            }
             DialogKind::RemoveWorktree(id) => {
                 let pending = self.request.is_some();
                 match state.worktree(id) {
@@ -1915,6 +2159,8 @@ fn footer(dialog: &SurfaceContent) -> AnyElement {
                     "Create conversation"
                 } else if matches!(dialog.kind, DialogKind::SwitchBranch(_)) {
                     "Switch"
+                } else if matches!(dialog.kind, DialogKind::Commit(_)) {
+                    "Commit"
                 } else if matches!(dialog.kind, DialogKind::RemoveWorktree(_)) {
                     if dialog.force {
                         "Discard changes and remove"
@@ -2046,6 +2292,8 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                 .or_else(|| dialog.select("branch"))
             {
                 Some(select.focus_handle(cx))
+            } else if let Some(commit) = &dialog.commit {
+                Some(commit.message.focus_handle(cx))
             } else {
                 dialog
                     .fields

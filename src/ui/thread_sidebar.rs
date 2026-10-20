@@ -13,9 +13,7 @@ use crate::{
 };
 use gpui_kit::{
     component::{
-        ActiveTheme, IconName, Sizable,
-        alert::Alert,
-        h_flex,
+        ActiveTheme, IconName, Sizable, h_flex,
         spinner::Spinner,
         tab::{Tab, TabBar},
         tag::Tag,
@@ -238,7 +236,7 @@ pub(super) fn render(
                 .child(toggle),
         );
     let body = match active {
-        SidebarTab::Changes => changes(state, id, cx),
+        SidebarTab::Changes => super::changes::render(state, id, owner, cx),
         SidebarTab::Browser => owner
             .upgrade()
             .and_then(|owner| owner.read(cx).sidebar_browser(id))
@@ -279,84 +277,6 @@ pub(super) fn render(
         .bg(cx.theme().sidebar)
         .child(header)
         .child(body)
-        .into_any_element()
-}
-
-fn changes(state: &AppState, id: ThreadId, cx: &App) -> AnyElement {
-    let diff = state.conversation_diff(id);
-    let loading = diff.is_none_or(|diff| diff.loading);
-    let result = diff.and_then(|diff| diff.result.as_ref());
-    let summary = match result {
-        Some(Ok(diff)) if diff.changed_files > 0 => format!(
-            "{} files · +{} −{}",
-            diff.changed_files, diff.additions, diff.deletions
-        ),
-        Some(Ok(_)) => "Working tree clean".to_owned(),
-        Some(Err(_)) => "Changes unavailable".to_owned(),
-        None if loading => "Loading changes…".to_owned(),
-        None => "Changes not loaded".to_owned(),
-    };
-    let content = match result {
-        Some(Ok(diff)) if diff.patch.is_empty() => div()
-            .flex_1()
-            .p_3()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child("No uncommitted changes")
-            .into_any_element(),
-        Some(Ok(diff)) => div()
-            .id("conversation-diff-patch")
-            .debug_selector(|| "conversation-diff-patch".into())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .p_2()
-            .font_family(cx.theme().mono_font_family.clone())
-            .text_size(cx.theme().mono_font_size)
-            .whitespace_normal()
-            .child(diff.patch.clone())
-            .into_any_element(),
-        Some(Err(error)) => v_flex()
-            .flex_1()
-            .gap_2()
-            .p_3()
-            .text_sm()
-            .child(
-                Alert::error(
-                    "conversation-diff-error",
-                    format!("Changes could not be read: {error}"),
-                )
-                .small(),
-            )
-            .child("Retry after restoring access to the working tree.")
-            .into_any_element(),
-        None => div()
-            .flex_1()
-            .p_3()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(if loading {
-                "Reading working tree changes…"
-            } else {
-                "Open or refresh this conversation to read changes."
-            })
-            .into_any_element(),
-    };
-    v_flex()
-        .id("conversation-diff-sidebar")
-        .debug_selector(|| "conversation-diff-sidebar".into())
-        .flex_1()
-        .min_h_0()
-        .child(
-            div()
-                .flex_shrink_0()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(summary),
-        )
-        .child(content)
         .into_any_element()
 }
 

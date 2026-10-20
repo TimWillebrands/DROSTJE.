@@ -962,6 +962,84 @@ async fn conversation_diff_sidebar_tracks_working_tree(cx: &mut TestAppContext) 
     quit(cx, &fixture).await;
 }
 
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; commits in the fixture repository and rewinds it, no provider turn"]
+async fn commit_dialog_commits_the_working_tree(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let conversation = new_conversation(cx, &fixture).await;
+    let root = cx.read(|cx| fixture.state.read(cx).project().unwrap().root.clone());
+    let head = platform::git(&root, &["rev-parse", "HEAD"]).unwrap();
+    fs::write(root.join("notes.txt"), "after\n").unwrap();
+    fs::write(root.join("commit-new.txt"), "added\n").unwrap();
+
+    cx.dispatch_action(fixture.window.into(), commands::RefreshConversationDiff);
+    until(cx, "working tree diff", Duration::from_secs(5), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .conversation_diff(conversation)
+            .and_then(|diff| diff.result.as_ref())
+            .is_some_and(|result| result.as_ref().is_ok_and(|diff| diff.changed_files == 2))
+    })
+    .await;
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(visual.debug_bounds("conversation-diff-patch").is_some());
+    assert!(visual.debug_bounds("commit-changes").is_some());
+
+    cx.dispatch_action(fixture.window.into(), commands::CommitChanges);
+    cx.run_until_parked();
+    // The dialog asks the local model for a subject; typed text is never replaced by it.
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            let dialog = workspace.dialog.as_ref().unwrap().read(cx);
+            assert!(matches!(
+                dialog.kind,
+                crate::ui::settings::DialogKind::Commit(id) if id == conversation
+            ));
+            let message = dialog.commit_message().unwrap();
+            message.update(cx, |message, cx| {
+                message.set_value("Record fixture notes", window, cx)
+            });
+            message.focus_handle(cx).focus(window, cx);
+        },
+    );
+    cx.run_until_parked();
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(cx, "commit", Duration::from_secs(20), |cx| {
+        fixture.workspace.read(cx).dialog.is_none()
+            && fixture
+                .state
+                .read(cx)
+                .conversation_diff(conversation)
+                .and_then(|diff| diff.result.as_ref())
+                .is_some_and(|result| result.as_ref().is_ok_and(|diff| diff.changed_files == 0))
+    })
+    .await;
+    assert_eq!(
+        platform::git(&root, &["log", "-1", "--format=%s"]).unwrap(),
+        "Record fixture notes"
+    );
+    assert_eq!(
+        platform::git(&root, &["rev-parse", "HEAD~1"]).unwrap(),
+        head
+    );
+
+    platform::git(&root, &["reset", "--hard", &head]).unwrap();
+    quit(cx, &fixture).await;
+}
+
 async fn wait_for_saved_thread(
     cx: &mut TestAppContext,
     fixture: &Fixture,

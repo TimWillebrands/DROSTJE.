@@ -37,6 +37,10 @@ pub enum WorktreeRequestKind {
         branch: String,
         create: bool,
     },
+    /// Stage everything in the working tree and commit it.
+    Commit {
+        tree: WorkingTree,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,7 +151,7 @@ impl AppState {
         .detach();
     }
 
-    fn tree_threads(&self, tree: WorkingTree) -> Vec<ThreadId> {
+    pub(super) fn tree_threads(&self, tree: WorkingTree) -> Vec<ThreadId> {
         self.snapshot
             .threads
             .iter()
@@ -287,7 +291,7 @@ impl AppState {
             .collect()
     }
 
-    fn worktree_request_pending(&self) -> bool {
+    pub(super) fn worktree_request_pending(&self) -> bool {
         self.worktree_request
             .as_ref()
             .is_some_and(|request| request.status == WorktreeRequestStatus::Pending)

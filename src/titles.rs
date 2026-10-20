@@ -1,7 +1,8 @@
-//! Conversation titles from the local llama.cpp CLI or an optional Ollama server.
+//! Conversation titles and commit subjects from the local llama.cpp CLI or an optional Ollama
+//! server.
 //!
 //! A missing llama executable, unreachable Ollama server, or empty Ollama model list means "no
-//! title", not an error. Calls block; run them off the GPUI thread.
+//! text", not an error. Calls block; run them off the GPUI thread.
 //!
 //! [`installed_models`] lists what each provider can use without a download, for Settings.
 
@@ -57,12 +58,70 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Generation includes a cold model load.
 const GENERATE_TIMEOUT: Duration = Duration::from_secs(120);
 const RESPONSE_LIMIT: usize = 1024 * 1024;
-const PROMPT_LIMIT: usize = 4000;
-const TITLE_LIMIT: usize = 60;
 
-const SYSTEM_PROMPT: &str = "You name coding conversations. Reply with one short, evocative \
-title of two to five words that captures the user's requests. No quotes, no trailing punctuation, \
-no explanation.";
+/// One kind of short text the local model writes.
+struct Task {
+    system: &'static str,
+    /// Leads the prompt for the llama.cpp CLI, which has no separate user turn label.
+    lead: &'static str,
+    prompt_limit: usize,
+    output_limit: usize,
+}
+
+const TITLE: Task = Task {
+    system: "You name coding conversations. Reply with one short, evocative title of two to \
+five words that captures the user's requests. No quotes, no trailing punctuation, no explanation.",
+    lead: "Name this coding conversation:",
+    prompt_limit: 4000,
+    output_limit: 60,
+};
+
+const COMMIT: Task = Task {
+    system: "You write Git commit subjects. Reply with one line in the imperative mood, under \
+72 characters, that says what the change does and why when it fits. No quotes, no prefix, no \
+trailing period, no explanation.",
+    lead: "Write the commit subject for this change:",
+    prompt_limit: 12000,
+    output_limit: 72,
+};
+
+/// The configured local text generator, read from Settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Generator {
+    pub provider: TitleProvider,
+    pub llama_executable: Option<String>,
+    pub llama_model: Option<String>,
+    pub ollama_model: Option<String>,
+}
+
+impl Generator {
+    /// Names a Conversation from its user prompts.
+    pub fn title(&self, prompt: &str) -> Result<Option<String>> {
+        self.generate(&TITLE, &ollama_host(), prompt)
+    }
+
+    /// Writes a commit subject for `changes`, a diff summary and patch.
+    pub fn commit_subject(&self, changes: &str) -> Result<Option<String>> {
+        self.generate(&COMMIT, &ollama_host(), changes)
+    }
+
+    fn generate(&self, task: &Task, ollama_host: &str, prompt: &str) -> Result<Option<String>> {
+        let llama = || {
+            generate_llama_cli(
+                task,
+                self.llama_executable.as_deref(),
+                self.llama_model.as_deref(),
+                prompt,
+            )
+        };
+        let ollama = || generate_ollama(task, ollama_host, self.ollama_model.as_deref(), prompt);
+        match self.provider {
+            TitleProvider::Automatic => llama()?.map_or_else(ollama, |text| Ok(Some(text))),
+            TitleProvider::LlamaCpp => llama(),
+            TitleProvider::Ollama => ollama(),
+        }
+    }
+}
 
 /// Whether an explicitly requested title may replace this thread's title, whatever it is.
 pub fn accepts_regenerated_title(thread: &Thread) -> bool {
@@ -122,44 +181,6 @@ fn normalize_host(raw: &str, default_port: u16) -> String {
     }
 }
 
-/// Generates a title for `prompt` with the selected local provider.
-pub fn generate_title(
-    provider: TitleProvider,
-    llama_executable: Option<&str>,
-    llama_model: Option<&str>,
-    ollama_model: Option<&str>,
-    prompt: &str,
-) -> Result<Option<String>> {
-    generate_title_with_host(
-        provider,
-        llama_executable,
-        llama_model,
-        &ollama_host(),
-        ollama_model,
-        prompt,
-    )
-}
-
-fn generate_title_with_host(
-    provider: TitleProvider,
-    llama_executable: Option<&str>,
-    llama_model: Option<&str>,
-    ollama_host: &str,
-    ollama_model: Option<&str>,
-    prompt: &str,
-) -> Result<Option<String>> {
-    match provider {
-        TitleProvider::Automatic => {
-            generate_llama_cli_title(llama_executable, llama_model, prompt)?.map_or_else(
-                || generate_ollama_title(ollama_host, ollama_model, prompt),
-                |title| Ok(Some(title)),
-            )
-        }
-        TitleProvider::LlamaCpp => generate_llama_cli_title(llama_executable, llama_model, prompt),
-        TitleProvider::Ollama => generate_ollama_title(ollama_host, ollama_model, prompt),
-    }
-}
-
 /// Lists the downloaded llama.cpp models and installed Ollama models.
 pub fn installed_models(llama_executable: Option<&str>) -> InstalledModels {
     InstalledModels {
@@ -177,7 +198,12 @@ fn ollama_models(host: &str) -> Result<Vec<String>> {
     Ok(model_names(&tags))
 }
 
-fn generate_ollama_title(host: &str, model: Option<&str>, prompt: &str) -> Result<Option<String>> {
+fn generate_ollama(
+    task: &Task,
+    host: &str,
+    model: Option<&str>,
+    prompt: &str,
+) -> Result<Option<String>> {
     let Some(address) = resolve(host) else {
         return Ok(None);
     };
@@ -193,14 +219,14 @@ fn generate_ollama_title(host: &str, model: Option<&str>, prompt: &str) -> Resul
                 return Ok(None);
             };
             stream = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
-                .context("Ollama closed before generating a title")?;
+                .context("Ollama closed before generating")?;
             model
         }
     };
     let body = json!({
         "model": model,
-        "system": SYSTEM_PROMPT,
-        "prompt": truncate(prompt.trim(), PROMPT_LIMIT),
+        "system": task.system,
+        "prompt": truncate(prompt.trim(), task.prompt_limit),
         "stream": false,
         "options": {"temperature": 0.7},
     });
@@ -212,11 +238,11 @@ fn generate_ollama_title(host: &str, model: Option<&str>, prompt: &str) -> Resul
         Some(&body),
         GENERATE_TIMEOUT,
     )
-    .with_context(|| format!("Ollama model {model} could not generate a title"))?;
+    .with_context(|| format!("Ollama model {model} could not generate text"))?;
     Ok(response
         .get("response")
         .and_then(Value::as_str)
-        .and_then(clean_title))
+        .and_then(|output| clean_line(output, task.output_limit)))
 }
 
 fn resolve(host: &str) -> Option<SocketAddr> {
@@ -296,8 +322,9 @@ fn truncate(text: &str, limit: usize) -> &str {
     }
 }
 
-/// Reduces model output to a single-line title, or `None` when nothing usable remains.
-fn clean_title(output: &str) -> Option<String> {
+/// Reduces model output to one line of at most `limit` characters, or `None` when nothing
+/// usable remains.
+fn clean_line(output: &str, limit: usize) -> Option<String> {
     let output = match output.rfind("</think>") {
         Some(ix) => &output[ix + "</think>".len()..],
         None => output,
@@ -306,10 +333,16 @@ fn clean_title(output: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())?;
-    let line = line
-        .strip_prefix("Title:")
-        .or_else(|| line.strip_prefix("title:"))
-        .unwrap_or(line);
+    let line = [
+        "Title:",
+        "title:",
+        "Subject:",
+        "subject:",
+        "Commit message:",
+    ]
+    .iter()
+    .find_map(|prefix| line.strip_prefix(prefix))
+    .unwrap_or(line);
     let quotes: &[char] = &['"', '\'', '`', '*', '#', '“', '”', '‘', '’'];
     let line = line
         .trim()
@@ -318,11 +351,12 @@ fn clean_title(output: &str) -> Option<String> {
         .trim_end_matches(['.', ':', ';', ','])
         .trim();
     let words = line.split_whitespace().collect::<Vec<_>>().join(" ");
-    let title = truncate(&words, TITLE_LIMIT).trim_end().to_string();
+    let title = truncate(&words, limit).trim_end().to_string();
     (!title.is_empty()).then_some(title)
 }
 
-fn generate_llama_cli_title(
+fn generate_llama_cli(
+    task: &Task,
     executable: Option<&str>,
     model: Option<&str>,
     prompt: &str,
@@ -335,8 +369,9 @@ fn generate_llama_cli_title(
         .filter(|model| !model.is_empty())
         .unwrap_or(DEFAULT_LLAMA_MODEL);
     let prompt = format!(
-        "Name this coding conversation:\n\n{}",
-        truncate(prompt.trim(), PROMPT_LIMIT)
+        "{}\n\n{}",
+        task.lead,
+        truncate(prompt.trim(), task.prompt_limit)
     );
     let child = Command::new(&executable)
         .args([
@@ -356,7 +391,7 @@ fn generate_llama_cli_title(
             "-n",
             "64",
             "-sys",
-            SYSTEM_PROMPT,
+            task.system,
             "-p",
             &prompt,
         ])
@@ -365,12 +400,12 @@ fn generate_llama_cli_title(
         .stderr(Stdio::null())
         .spawn()
         .with_context(|| format!("Start llama.cpp at {}", executable.display()))?;
-    let stdout = finish(child, GENERATE_TIMEOUT, "title generation")?;
+    let stdout = finish(child, GENERATE_TIMEOUT, "generation")?;
     Ok(stdout
         .lines()
         .map(str::trim)
         .rfind(|line| !line.is_empty() && !line.starts_with("Exiting"))
-        .and_then(clean_title))
+        .and_then(|line| clean_line(line, task.output_limit)))
 }
 
 fn llama_cached_models(executable: Option<&str>) -> Result<Vec<String>> {
@@ -498,7 +533,7 @@ mod tests {
             ok(json!({"models": [{"name": "lfm2:24b"}, {"name": "llama3:8b"}]})),
             ok(json!({"response": "\"Taming the Borrow Checker.\"\n"})),
         ]);
-        let title = generate_ollama_title(&host, None, "Fix my lifetimes").unwrap();
+        let title = generate_ollama(&TITLE, &host, None, "Fix my lifetimes").unwrap();
         assert_eq!(title.as_deref(), Some("Taming the Borrow Checker"));
         let requests = server.join().unwrap();
         assert!(requests[0].starts_with("GET /api/tags HTTP/1.0"));
@@ -513,7 +548,7 @@ mod tests {
     #[test]
     fn configured_model_skips_listing() {
         let (host, server) = serve(vec![ok(json!({"response": "Sparks in the Parser"}))]);
-        let title = generate_ollama_title(&host, Some("llama3:8b"), "Parse this").unwrap();
+        let title = generate_ollama(&TITLE, &host, Some("llama3:8b"), "Parse this").unwrap();
         assert_eq!(title.as_deref(), Some("Sparks in the Parser"));
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
@@ -521,9 +556,26 @@ mod tests {
     }
 
     #[test]
+    fn commit_subjects_use_their_own_instructions_and_limit() {
+        let (host, server) = serve(vec![ok(json!({
+            "response": format!("Subject: `Colour the changes diff{}`.\n\nBody", " a".repeat(40))
+        }))]);
+        let subject = generate_ollama(&COMMIT, &host, Some("m"), "diff --git a/x b/x")
+            .unwrap()
+            .unwrap();
+        assert!(subject.starts_with("Colour the changes diff a a"));
+        assert!(subject.chars().count() <= 72);
+        let requests = server.join().unwrap();
+        let body: Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["system"], COMMIT.system);
+        assert_eq!(body["prompt"], "diff --git a/x b/x");
+    }
+
+    #[test]
     fn no_models_means_no_title() {
         let (host, server) = serve(vec![ok(json!({"models": []}))]);
-        assert_eq!(generate_ollama_title(&host, None, "Hello").unwrap(), None);
+        assert_eq!(generate_ollama(&TITLE, &host, None, "Hello").unwrap(), None);
         server.join().unwrap();
     }
 
@@ -532,7 +584,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let host = listener.local_addr().unwrap().to_string();
         drop(listener);
-        assert_eq!(generate_ollama_title(&host, None, "Hello").unwrap(), None);
+        assert_eq!(generate_ollama(&TITLE, &host, None, "Hello").unwrap(), None);
     }
 
     #[test]
@@ -541,7 +593,7 @@ mod tests {
             "HTTP/1.0 404 Not Found\r\n\r\n{}",
             json!({"error": "model \"missing\" not found"})
         )]);
-        let error = generate_ollama_title(&host, Some("missing"), "Hello").unwrap_err();
+        let error = generate_ollama(&TITLE, &host, Some("missing"), "Hello").unwrap_err();
         assert!(format!("{error:#}").contains("model \"missing\" not found"));
         server.join().unwrap();
     }
@@ -563,7 +615,8 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&executable, permissions).unwrap();
 
-        let title = generate_llama_cli_title(
+        let title = generate_llama_cli(
+            &TITLE,
             Some(executable.to_str().unwrap()),
             Some("ggml-org/gemma-test-GGUF:Q4_0"),
             "Fix parser recovery",
@@ -653,15 +706,15 @@ mod tests {
             "response": "Reliable Local Titles"
         }))]);
 
-        let title = generate_title_with_host(
-            TitleProvider::Automatic,
-            Some("/definitely/missing/llama"),
-            None,
-            &ollama_host,
-            Some("local-model"),
-            "Repair title generation",
-        )
-        .unwrap();
+        let generator = Generator {
+            provider: TitleProvider::Automatic,
+            llama_executable: Some("/definitely/missing/llama".into()),
+            llama_model: None,
+            ollama_model: Some("local-model".into()),
+        };
+        let title = generator
+            .generate(&TITLE, &ollama_host, "Repair title generation")
+            .unwrap();
 
         assert_eq!(title.as_deref(), Some("Reliable Local Titles"));
         ollama.join().unwrap();
@@ -670,12 +723,18 @@ mod tests {
     #[test]
     fn titles_are_single_line_and_bounded() {
         assert_eq!(
-            clean_title("<think>hmm</think>\n\nTitle: **Midnight   Migration**\nextra"),
+            clean_line(
+                "<think>hmm</think>\n\nTitle: **Midnight   Migration**\nextra",
+                TITLE.output_limit
+            ),
             Some("Midnight Migration".into())
         );
-        assert_eq!(clean_title("  \n\"\" \n"), None);
+        assert_eq!(clean_line("  \n\"\" \n", TITLE.output_limit), None);
         assert_eq!(
-            clean_title(&"word ".repeat(40)).unwrap().chars().count(),
+            clean_line(&"word ".repeat(40), TITLE.output_limit)
+                .unwrap()
+                .chars()
+                .count(),
             59
         );
     }
@@ -684,13 +743,13 @@ mod tests {
     #[test]
     #[ignore]
     fn local_ollama_names_a_prompt() {
-        let title = generate_title(
-            TitleProvider::Ollama,
-            None,
-            None,
-            None,
-            "The sidebar flickers when I resize the window; find out why",
-        )
+        let title = Generator {
+            provider: TitleProvider::Ollama,
+            llama_executable: None,
+            llama_model: None,
+            ollama_model: None,
+        }
+        .title("The sidebar flickers when I resize the window; find out why")
         .unwrap();
         eprintln!("title: {title:?}");
         assert!(title.is_some());

@@ -602,6 +602,30 @@ pub fn signature(cx: &App) -> Hsla {
         .unwrap_or_else(|| Theme::global(cx).primary)
 }
 
+/// Diff row colours in the theme in effect, from its success and danger roles. Washes stay
+/// faint so code keeps the foreground colour; the sign carries full strength.
+pub struct DiffColors {
+    pub added: Hsla,
+    pub added_sign: Hsla,
+    pub removed: Hsla,
+    pub removed_sign: Hsla,
+    pub hunk: Hsla,
+    pub file: Hsla,
+}
+
+pub fn diff_colors(cx: &App) -> DiffColors {
+    let theme = Theme::global(cx);
+    let wash = if theme.is_dark() { 0.16 } else { 0.12 };
+    DiffColors {
+        added: theme.success.alpha(wash),
+        added_sign: theme.success,
+        removed: theme.danger.alpha(wash),
+        removed_sign: theme.danger,
+        hunk: theme.info.alpha(wash * 0.75),
+        file: theme.muted,
+    }
+}
+
 /// Grain strength over window chrome in the theme in effect, 0 to 1.
 pub fn grain(cx: &App) -> f32 {
     cx.try_global::<Coordinator>().map_or(0., |coordinator| {

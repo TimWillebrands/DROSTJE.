@@ -439,6 +439,7 @@ fn row_menu(
                 })
                 .when(conversation, |menu| {
                     menu.item(opened(Command::SwitchBranch))
+                        .item(opened(Command::CommitChanges))
                 })
                 .when(in_worktree, |menu| {
                     menu.item(opened(Command::RemoveWorktree))

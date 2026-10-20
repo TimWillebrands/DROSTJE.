@@ -1,4 +1,5 @@
 mod activity;
+mod commit;
 mod conversation;
 mod factory;
 mod persistence;
@@ -14,6 +15,7 @@ use crate::harness::{
 use crate::{model::*, platform, store::Store};
 pub use activity::ThreadActivity;
 use anyhow::{Context as _, Result};
+pub use commit::{CommitSubjectRequest, CommitSubjectStatus};
 use gpui_kit::*;
 pub use project_diff::{ProjectDiffState, ProjectDiffs};
 use serde_json::{Value, json};
@@ -39,6 +41,8 @@ pub enum PresentationChange {
     Diff(WorkingTree),
     /// A worktree request changed status; the dialog that opened it reads the new state.
     WorktreeRequest(Uuid),
+    /// The commit subject request changed status; the Commit dialog reads the new state.
+    CommitSubject(Uuid),
     Persistence,
     Selection,
     Projects,
@@ -387,6 +391,8 @@ pub enum AppEvent {
     /// The live HEAD of a worktree; `Ok(None)` is detached.
     WorktreeHeadRead(WorktreeId, Result<Option<String>, String>),
     BranchSwitched(Uuid, WorkingTree, Result<String, String>),
+    /// A commit finished; `Ok` carries the new commit's short hash and subject.
+    Committed(Uuid, WorkingTree, Result<(String, String), String>),
 }
 
 pub struct AppState {
@@ -440,6 +446,8 @@ pub struct AppState {
     /// The worktree creation or removal in flight, kept until the next one starts so the
     /// dialog can show how it ended.
     pub worktree_request: Option<WorktreeRequest>,
+    /// The commit subject the local model is writing, or how that ended; one at a time.
+    pub commit_subject: Option<commit::CommitSubjectRequest>,
     /// Live HEAD per worktree as last read from Git; absent means not read yet.
     pub worktree_heads: HashMap<WorktreeId, Option<String>>,
     renaming_worktrees: HashSet<WorktreeId>,
@@ -662,6 +670,7 @@ impl AppState {
             pending_factory: HashSet::new(),
             titling: HashSet::new(),
             worktree_request: None,
+            commit_subject: None,
             worktree_heads: HashMap::new(),
             renaming_worktrees: HashSet::new(),
             inspecting_worktrees: HashSet::new(),
@@ -891,6 +900,7 @@ impl AppState {
             AppEvent::BranchSwitched(request, tree, result) => {
                 self.branch_switched(request, tree, result, cx)
             }
+            AppEvent::Committed(request, tree, result) => self.committed(request, tree, result, cx),
         }
         cx.notify();
     }

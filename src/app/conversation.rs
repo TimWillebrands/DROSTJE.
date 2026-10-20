@@ -786,6 +786,27 @@ impl AppState {
         self.generate_title(id, prompt, true, cx);
     }
 
+    /// The local text generator Settings configure, for titles and commit subjects.
+    pub(super) fn text_generator(&self) -> titles::Generator {
+        let settings = &self.snapshot.settings;
+        let text = |key: &str| settings.get(key).and_then(Value::as_str);
+        titles::Generator {
+            provider: match text(titles::PROVIDER_SETTING) {
+                Some("llama_cpp") => titles::TitleProvider::LlamaCpp,
+                Some("ollama") => titles::TitleProvider::Ollama,
+                _ => titles::DEFAULT_PROVIDER,
+            },
+            llama_executable: settings
+                .get("executables")
+                .and_then(|value| value.get("llama"))
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .map(str::to_owned),
+            llama_model: text(titles::LLAMA_MODEL_SETTING).map(str::to_owned),
+            ollama_model: text(titles::MODEL_SETTING).map(str::to_owned),
+        }
+    }
+
     /// Names a Conversation with the configured local title provider. Automatic mode tries the
     /// llama.cpp CLI before falling back to Ollama.
     fn generate_title(
@@ -798,50 +819,12 @@ impl AppState {
         if self.shutting_down || !self.titling.insert(id) {
             return;
         }
-        let provider = match self
-            .snapshot
-            .settings
-            .get(titles::PROVIDER_SETTING)
-            .and_then(Value::as_str)
-        {
-            Some("llama_cpp") => titles::TitleProvider::LlamaCpp,
-            Some("ollama") => titles::TitleProvider::Ollama,
-            _ => titles::DEFAULT_PROVIDER,
-        };
-        let llama_executable = self
-            .snapshot
-            .settings
-            .get("executables")
-            .and_then(|value| value.get("llama"))
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .map(str::to_owned);
-        let llama_model = self
-            .snapshot
-            .settings
-            .get(titles::LLAMA_MODEL_SETTING)
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let ollama_model = self
-            .snapshot
-            .settings
-            .get(titles::MODEL_SETTING)
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let generator = self.text_generator();
         cx.emit(PresentationChange::Thread(id));
         // The Projects list shimmers the row too, and only observes notifications.
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = smol::unblock(move || {
-                titles::generate_title(
-                    provider,
-                    llama_executable.as_deref(),
-                    llama_model.as_deref(),
-                    ollama_model.as_deref(),
-                    &prompt,
-                )
-            })
-            .await;
+            let result = smol::unblock(move || generator.title(&prompt)).await;
             let _ = this.update(cx, |this, cx| {
                 this.titling.remove(&id);
                 match result {

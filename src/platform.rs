@@ -284,6 +284,8 @@ pub struct RepositoryDiff {
     pub additions: usize,
     pub deletions: usize,
     pub truncated: bool,
+    /// `patch` split into display rows, parsed here so the UI thread never does.
+    pub rows: std::sync::Arc<crate::diff::Patch>,
 }
 
 const MAX_DIFF_BYTES: usize = 512 * 1024;
@@ -358,8 +360,10 @@ pub fn working_tree_diff(root: &Path) -> Result<RepositoryDiff> {
         .filter(|line| line.starts_with('-') && !line.starts_with("---"))
         .count();
     let head_branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
+    let rows = std::sync::Arc::new(crate::diff::parse(&patch));
     Ok(RepositoryDiff {
         head_branch,
+        rows,
         patch,
         changed_files: entries.len(),
         additions,
@@ -596,6 +600,21 @@ pub fn switch_branch(root: &Path, branch: &str, create: bool) -> Result<()> {
     Ok(())
 }
 
+/// Stages every change in the working tree, tracked and untracked, and commits it with
+/// `message`; returns the new commit's short hash. Hooks and signing run as the repository
+/// configures them, and a refusal fails with Git's message (the changes stay staged).
+pub fn commit_all(root: &Path, message: &str) -> Result<String> {
+    let message = message.trim();
+    ensure!(!message.is_empty(), "Write a commit message first");
+    ensure!(
+        !git(root, &["status", "--porcelain"])?.is_empty(),
+        "Nothing to commit; the working tree is clean"
+    );
+    git(root, &["add", "--all"])?;
+    git(root, &["commit", "--quiet", "-m", message])?;
+    git(root, &["rev-parse", "--short", "HEAD"])
+}
+
 /// Renames the branch checked out in `worktree`, only while it is still on `old` and `old`
 /// was never pushed; Git updates the worktree's HEAD with the rename.
 pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<()> {
@@ -760,6 +779,43 @@ mod tests {
         assert!(diff.patch.contains("+new line"));
         assert!(!diff.truncated);
     }
+    #[test]
+    fn commit_all_records_tracked_and_untracked_changes() {
+        use super::commit_all;
+        let repository = TempRepository::new();
+        git(&repository.0, &["config", "user.name", "DROSTJE."]);
+        git(
+            &repository.0,
+            &["config", "user.email", "drostje@example.invalid"],
+        );
+        assert!(
+            format!("{:#}", commit_all(&repository.0, "Nothing").unwrap_err())
+                .contains("Nothing to commit")
+        );
+        fs::write(repository.0.join("tracked.txt"), "after\n").unwrap();
+        fs::write(repository.0.join("new.txt"), "new line\n").unwrap();
+        assert!(commit_all(&repository.0, "  \n").is_err());
+
+        let hash = commit_all(&repository.0, "Update notes\n\nAdd new.txt").unwrap();
+
+        assert!(!hash.is_empty());
+        let diff = working_tree_diff(&repository.0).unwrap();
+        assert_eq!(diff.changed_files, 0);
+        assert!(diff.patch.is_empty());
+        let log = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repository.0)
+            .args(["log", "-1", "--format=%s%n%b", "--name-only"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8(log.stdout).unwrap();
+        assert!(log.starts_with("Update notes\nAdd new.txt"), "{log}");
+        assert!(
+            log.contains("new.txt") && log.contains("tracked.txt"),
+            "{log}"
+        );
+    }
+
     #[test]
     fn worktrees_are_created_renamed_inspected_and_removed() {
         use super::{
