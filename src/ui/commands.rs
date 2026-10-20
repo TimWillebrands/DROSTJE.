@@ -32,6 +32,8 @@ gpui_kit::actions!(
         NewFactoryThread,
         NewTerminal,
         RestartTerminal,
+        NewNeovim,
+        OpenConversationFile,
         NewBrowser,
         ToggleBrowser,
         BrowserBack,
@@ -105,6 +107,18 @@ gpui_kit::actions!(
     ]
 );
 
+/// `RestartTerminal` as a Neovim tab names it: same command, its own noun.
+pub const RESTART_NEOVIM_LABEL: &str = "Restart Neovim";
+
+/// Open a file a Conversation displays in a Neovim tab. `thread` is the Conversation
+/// whose working tree resolves a relative path; `None` uses the selected Conversation.
+#[derive(Clone, PartialEq, Action)]
+#[action(no_json)]
+pub struct OpenFileReference {
+    pub reference: crate::file_refs::FileReference,
+    pub thread: Option<Uuid>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     AddProject,
@@ -124,6 +138,8 @@ pub enum Command {
     NewFactoryThread,
     NewTerminal,
     RestartTerminal,
+    NewNeovim,
+    OpenConversationFile,
     NewBrowser,
     ToggleBrowser,
     BrowserBack,
@@ -171,7 +187,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 64] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -189,6 +205,8 @@ impl Command {
         Self::NewFactoryThread,
         Self::NewTerminal,
         Self::RestartTerminal,
+        Self::NewNeovim,
+        Self::OpenConversationFile,
         Self::NewBrowser,
         Self::ToggleBrowser,
         Self::BrowserBack,
@@ -255,6 +273,8 @@ impl Command {
             Self::NewFactoryThread => "New Factory thread",
             Self::NewTerminal => "New terminal",
             Self::RestartTerminal => "Restart terminal",
+            Self::NewNeovim => "New Neovim tab",
+            Self::OpenConversationFile => "Open file from conversation…",
             Self::NewBrowser => "Open browser",
             Self::ToggleBrowser => "Toggle browser sidebar",
             Self::BrowserBack => "Browser back",
@@ -322,6 +342,8 @@ impl Command {
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::NewTerminal => Box::new(NewTerminal),
             Self::RestartTerminal => Box::new(RestartTerminal),
+            Self::NewNeovim => Box::new(NewNeovim),
+            Self::OpenConversationFile => Box::new(OpenConversationFile),
             Self::NewBrowser => Box::new(NewBrowser),
             Self::ToggleBrowser => Box::new(ToggleBrowser),
             Self::BrowserBack => Box::new(BrowserBack),
@@ -439,7 +461,7 @@ impl Command {
             Self::NextThread | Self::PreviousThread if state.open_threads.len() < 2 => {
                 Some("Open at least two threads.".into())
             }
-            Self::NewTerminal => state.mutable_project_reason().or_else(|| {
+            Self::NewTerminal | Self::NewNeovim => state.mutable_project_reason().or_else(|| {
                 state
                     .selected_project
                     .and_then(|id| match state.repositories.get(&id) {
@@ -458,6 +480,7 @@ impl Command {
                     })
             }),
             Self::ToggleConversationDiffs
+            | Self::OpenConversationFile
             | Self::ToggleBrowser
             | Self::ToggleAgents
             | Self::ToggleTaskList
@@ -651,6 +674,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-h", SwitchHarness, workspace),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
         KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
+        KeyBinding::new("secondary-alt-o", OpenConversationFile, workspace),
         KeyBinding::new("secondary-l", BrowserAddress, Some("BrowserPane || Browser")),
         KeyBinding::new("secondary-r", BrowserReload, Some("BrowserPane || Browser")),
         KeyBinding::new("secondary-shift-a", ToggleArtifact, Some("BrowserPane")),
@@ -670,6 +694,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-h", SwitchHarness, command),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, command),
         KeyBinding::new("secondary-alt-t", NewTerminal, command),
+        KeyBinding::new("secondary-alt-o", OpenConversationFile, command),
         KeyBinding::new("secondary-,", Settings, command),
         KeyBinding::new("ctrl-tab", NextThread, command),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, command),
@@ -827,6 +852,12 @@ pub enum PaletteTarget {
     Thread(Uuid),
 }
 
+/// File references of one Conversation, most recent first.
+struct FilePicker {
+    thread: Uuid,
+    references: Vec<crate::file_refs::FileReference>,
+}
+
 struct SpacePicker {
     project: Option<Uuid>,
     spaces: Vec<crate::model::Space>,
@@ -842,6 +873,7 @@ pub struct Palette {
     slash_commands: Option<Uuid>,
     /// The Conversation this palette offers to move to another harness.
     harnesses: Option<Uuid>,
+    files: Option<FilePicker>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -852,7 +884,7 @@ impl Palette {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        Self::open_with_spaces(owner, state, None, None, None, window, cx)
+        Self::open_with_spaces(owner, state, None, None, None, None, window, cx)
     }
 
     pub fn open_harnesses(
@@ -862,7 +894,7 @@ impl Palette {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        Self::open_with_spaces(owner, state, None, None, Some(thread), window, cx)
+        Self::open_with_spaces(owner, state, None, None, Some(thread), None, window, cx)
     }
 
     pub fn open_slash_commands(
@@ -872,7 +904,7 @@ impl Palette {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        Self::open_with_spaces(owner, state, None, Some(thread), None, window, cx)
+        Self::open_with_spaces(owner, state, None, Some(thread), None, None, window, cx)
     }
 
     pub fn open_spaces(
@@ -892,15 +924,33 @@ impl Palette {
                 .cloned()
                 .collect(),
         };
-        Self::open_with_spaces(owner, state, Some(picker), None, None, window, cx)
+        Self::open_with_spaces(owner, state, Some(picker), None, None, None, window, cx)
     }
 
+    /// A picker of the files `thread` displayed; Return opens one in Neovim.
+    pub fn open_files(
+        owner: WeakEntity<Workspace>,
+        state: Entity<AppState>,
+        thread: Uuid,
+        references: Vec<crate::file_refs::FileReference>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let files = FilePicker { thread, references };
+        Self::open_with_spaces(owner, state, None, None, None, Some(files), window, cx)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one constructor for every picker mode"
+    )]
     fn open_with_spaces(
         owner: WeakEntity<Workspace>,
         state: Entity<AppState>,
         spaces: Option<SpacePicker>,
         slash_commands: Option<Uuid>,
         harnesses: Option<Uuid>,
+        files: Option<FilePicker>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -931,6 +981,7 @@ impl Palette {
                 spaces,
                 slash_commands,
                 harnesses,
+                files,
                 _subscriptions: subscriptions,
             }
         });
@@ -1157,6 +1208,68 @@ impl Palette {
         });
     }
 
+    fn run_file(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((thread, reference)) = self
+            .files
+            .as_ref()
+            .and_then(|picker| Some((picker.thread, picker.references.get(row)?.clone())))
+        else {
+            return;
+        };
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let id = cx.entity().entity_id();
+        let _ = self.owner.update(cx, |workspace, cx| {
+            if !workspace
+                .palette
+                .as_ref()
+                .is_some_and(|palette| palette.entity_id() == id)
+            {
+                return;
+            }
+            workspace.palette = None;
+            window.close_dialog(cx);
+            workspace.open_file_reference(reference, Some(thread), window, cx);
+            cx.notify();
+        });
+    }
+
+    fn render_files(&self, picker: &FilePicker, cx: &mut Context<Self>) -> AnyElement {
+        let mut group = CommandGroup::new().label("Files in this conversation");
+        for reference in &picker.references {
+            group = group.item(CommandItem::new().label(reference.label()));
+        }
+        let confirm = cx.entity().downgrade();
+        let cancel = cx.entity().downgrade();
+        div()
+            .id("conversation-file-picker")
+            .key_context("ConversationFilePicker")
+            .w_full()
+            .child(
+                NativeCommand::new(&self.command)
+                    .bordered(false)
+                    .placeholder("Search files…")
+                    .max_h(rems(26.))
+                    .group(group)
+                    .empty(|_, _, cx| {
+                        div()
+                            .p_3()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("No files mentioned or touched in this conversation yet")
+                    })
+                    .on_confirm(move |index, window, cx| {
+                        let _ = confirm
+                            .update(cx, |palette, cx| palette.run_file(index.row, window, cx));
+                    })
+                    .on_cancel(move |_, cx| {
+                        let _ = cancel.update(cx, |palette, cx| palette.cleanup(cx));
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_slash_commands(&self, thread: Uuid, cx: &mut Context<Self>) -> AnyElement {
         let state = self.state.read(cx);
         let catalog = state
@@ -1340,6 +1453,9 @@ impl Render for Palette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(picker) = &self.spaces {
             return self.render_spaces(picker, cx);
+        }
+        if let Some(picker) = &self.files {
+            return self.render_files(picker, cx);
         }
         if let Some(thread) = self.harnesses {
             return self.render_harnesses(thread, cx);
@@ -1527,6 +1643,12 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &RestartTerminal, w, cx| {
                 this.run(PaletteTarget::Command(Command::RestartTerminal), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewNeovim, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewNeovim), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenConversationFile, w, cx| {
+                this.run(PaletteTarget::Command(Command::OpenConversationFile), w, cx)
             }))
             .on_action(cx.listener(|this, _: &NewBrowser, w, cx| {
                 this.run(PaletteTarget::Command(Command::NewBrowser), w, cx)

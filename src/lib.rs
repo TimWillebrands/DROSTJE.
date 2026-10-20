@@ -3,6 +3,7 @@ pub mod attachments;
 pub mod browser;
 pub mod browser_tools;
 pub mod factory;
+pub mod file_refs;
 pub mod harness;
 pub mod model;
 pub mod neovim;

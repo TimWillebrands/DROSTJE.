@@ -98,6 +98,8 @@ Projects bevat binnen de actieve Space een lijst met twee soorten threads:
 
 Een terminal blijft draaien bij tab- en Space-wissels. Sluiten of **Restart terminal** vraagt bevestiging zolang de shell draait en stopt die shell plus het actieve proces op de voorgrond. Na een gewone shell-exit blijft het paneel zichtbaar met een herstartactie. Afsluiten van de app stopt alle terminals na bevestiging; terminaltabs en shellsessies worden niet bewaard of automatisch opnieuw gestart. Opstart- en rendererfouten blijven in het betreffende paneel zichtbaar, zonder Conversations of Factory-threads te blokkeren. De native backend gebruikt Metal op macOS en EGL/OpenGL op Linux/Wayland; X11 wordt voor Terminal niet ondersteund.
 
+**Neovim** is een terminaltab waarin je eigen Neovim draait, met je eigen configuratie en plugins (anders dan de geïsoleerde prompteditor). Kies **New Neovim tab** in het tabmenu of de command palette. Bestandspaden die een Conversation toont, worden aanklikbaar: inline code zoals `src/app.rs:42`, `src/browser_tools.rs:149-210` of `Cargo.toml`, Markdown-links naar bestanden, en de bestanden die een harness leest, schrijft of bewerkt (de knop verschijnt bij hover op de toolkaart). Een klik opent het bestand op die regel; relatieve paden horen bij de werkboom van die Conversation. Toont al een Neovim-tab dat bestand, dan springt die naar de regel in plaats van een tweede Neovim te openen. Zonder muis: **Open file from conversation…** (`Cmd-Alt-O`) toont alle genoemde bestanden, nieuwste eerst. Bestaat het bestand niet of is het geen tekst, dan verschijnt een melding en geen lege tab. `:q` sluit de tab; sluiten via de tab vraagt bevestiging zolang Neovim draait, want niet-opgeslagen wijzigingen gaan dan verloren. Na een herstart opent de tab hetzelfde bestand in een nieuwe Neovim; buffers en undo-historie van het oude proces komen niet terug. `Ctrl-W` + `h/j/k/l` blijft ook in Neovim een paneelbeweging.
+
 ### Browser en HTML-artifacts
 
 **Open browser** in de command palette opent een zelfstandig Servo-tabblad. Weblinks in Conversations openen ook zo'n tabblad. **Toggle browser sidebar** toont een blijvende browsersessie naast de Conversation. Sleep de scheidingslijn om de zijbalk te schalen, of gebruik **Widen thread sidebar** / **Narrow thread sidebar** in de palette; de breedte wordt per thread bewaard.
@@ -139,6 +141,7 @@ Tijdens het typen worden Conversation-concepten en Factory-velden alleen in het 
 |`Cmd-N` / `Cmd-Shift-N`|Nieuwe Conversation / Factory-thread|
 |`Cmd-Alt-N`|Nieuwe Conversation in een nieuwe Git-worktree|
 |`Cmd-Alt-T`|Nieuwe Terminal in het geselecteerde project|
+|`Cmd-Alt-O`|Bestand uit de geselecteerde Conversation openen in Neovim|
 |`Cmd-1` / `Cmd-2` / `Cmd-3`|Focus Projects / Thread / Output; opent zo nodig het dock|
 |`Cmd-B` / `Cmd-J`|Projects / Output tonen of verbergen|
 |`Ctrl-Tab` / `Ctrl-Shift-Tab`|Volgende / vorige centrale tab, inclusief terminals|
