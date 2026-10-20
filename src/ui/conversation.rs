@@ -2539,19 +2539,19 @@ fn current_todo(session: &ConversationSession) -> Option<TodoList> {
         .filter(|(name, _)| name == "todo")
         .find_map(|(_, id)| TodoList::parse(first_text(call_result(session, id)?)?))
 }
-/// Jobs started by `task` or async `bash` and not yet settled by a `hub`
-/// snapshot or a job notice, in start order.
+/// Jobs started by `task` or async `bash` and not yet settled by a `wait`
+/// result, historical `hub` snapshot or job notice, in start order.
 fn running_jobs(session: &ConversationSession) -> Vec<JobStart> {
     let mut jobs = Vec::new();
     let mut settled = std::collections::HashSet::new();
     for (name, id) in session.tool_call_order() {
-        if !matches!(name.as_str(), "task" | "bash" | "hub") {
+        if !matches!(name.as_str(), "task" | "bash" | "wait" | "hub") {
             continue;
         }
         let Some(text) = call_result(session, id).and_then(first_text) else {
             continue;
         };
-        if name == "hub" {
+        if matches!(name.as_str(), "wait" | "hub") {
             settled.extend(job_notice::settled_job_ids(name, text));
             continue;
         }

@@ -167,10 +167,10 @@ pub fn job_starts(tool: &str, input: &Value, result: &str) -> Vec<JobStart> {
         _ => Vec::new(),
     }
 }
-/// Job ids a `hub` snapshot reports as settled: every `### id [type] — status`
-/// entry outside the “Still Running” section, plus explicit cancellations.
+/// Job ids a `wait` result or historical `hub` snapshot reports as settled:
+/// each `### id [type] — status` entry outside “Still Running”, plus cancellations.
 pub fn settled_job_ids(tool: &str, result: &str) -> Vec<String> {
-    if tool != "hub" {
+    if !matches!(tool, "wait" | "hub") {
         return Vec::new();
     }
     let mut ids = Vec::new();
@@ -255,6 +255,12 @@ mod tests {
             ["bg_19", "SpecReview", "bg_3", "bg_3"]
         );
         assert!(settled_job_ids("bash", text).is_empty());
+    }
+
+    #[test]
+    fn wait_results_settle_completed_and_failed_jobs_without_hiding_running_jobs() {
+        let result = "## Completed (1)\n\n### bg_1 [bash] — completed\nLabel: cargo check --all-targets\nDelivery: not auto-delivered; recovered by this snapshot.\n\n## Failed (1)\n\n### bg_2 [bash] — failed\nError: command exited with code 101\n\n## Still Running (1)\n\n### bg_3 [bash] — running\n";
+        assert_eq!(settled_job_ids("wait", result), ["bg_1", "bg_2"]);
     }
 
     #[test]
