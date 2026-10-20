@@ -2,7 +2,8 @@ use anyhow::Result;
 use drostje::{
     model::{
         FactoryLaunch, FactorySourceKind, FactoryThreadConfig, ImageAttachment, ModelKey, Project,
-        ProjectDefaults, QueuedMessage, Thread, ThreadKind, Worktree,
+        ProjectDefaults, PullRequestLink, PullRequestState, QueuedMessage, Thread, ThreadKind,
+        Worktree,
     },
     store::{Store, StoreError},
 };
@@ -56,6 +57,7 @@ fn conversation(project: &Project) -> Thread {
         effort: None,
         permission_mode: None,
         worktree_id: None,
+        pull_request: None,
         draft: "Unsent draft\n日本語 é".into(),
         attachments: Vec::new(),
         submission: None,
@@ -279,7 +281,7 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
     });
 }
@@ -371,7 +373,7 @@ fn version_2_database_upgrades_in_place_and_persists_effort() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
     });
 }
@@ -438,7 +440,7 @@ fn version_3_database_upgrades_in_place_and_persists_permission_mode() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
     });
 }
@@ -513,7 +515,7 @@ fn version_4_database_upgrades_in_place_and_persists_queued_messages() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
         );
     });
 }
@@ -603,14 +605,72 @@ fn version_5_database_upgrades_in_place_and_persists_worktrees() {
             database
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
+            7
+        );
+    });
+}
+
+#[test]
+fn version_6_database_upgrades_in_place_and_persists_pull_request_links() {
+    smol::block_on(async {
+        let directory = TempDirectory::new();
+        let path = directory.0.join("drostje.sqlite3");
+        let project = project(directory.0.join("checkout"));
+        let mut thread = conversation(&project);
+        let worktree = worktree(&project, &thread, "amber-heron");
+        thread.worktree_id = Some(worktree.id);
+        // Build a version 6 database with the current store, then drop the new column.
+        let store = reopen(&directory.0);
+        store.save_project(project.clone()).await.unwrap();
+        store.save_worktree(worktree.clone()).await.unwrap();
+        store.save_thread(thread.clone()).await.unwrap();
+        store.flush().await.unwrap();
+        drop(store);
+        wait_for_release(&directory.0);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("ALTER TABLE threads DROP COLUMN pull_request_json")
+            .unwrap();
+        connection.pragma_update(None, "user_version", 6).unwrap();
+        drop(connection);
+
+        let store = reopen(&directory.0);
+        let snapshot = store.snapshot().await.unwrap();
+        assert_eq!(snapshot.threads[0].pull_request, None);
+        thread.pull_request = Some(PullRequestLink {
+            id: 3170,
+            url: "https://dev.azure.com/o/p/_git/r/pullrequest/3170".into(),
+            title: "Fix upload".into(),
+            state: PullRequestState::Unknown("notSet".into()),
+            work_items: vec![2596],
+            archived_on_close: true,
+        });
+        store.save_thread(thread.clone()).await.unwrap();
+        // A project-root Conversation has no branch of its own to link.
+        let mut rooted = conversation(&project);
+        rooted.pull_request = thread.pull_request.clone();
+        assert!(store.save_thread(rooted).await.is_err());
+        store.flush().await.unwrap();
+        drop(store);
+
+        let reopened = reopen(&directory.0);
+        let snapshot = reopened.snapshot().await.unwrap();
+        assert_eq!(snapshot.threads[0].pull_request, thread.pull_request);
+        drop(reopened);
+        wait_for_release(&directory.0);
+        let database = Connection::open(&path).unwrap();
+        assert_eq!(
+            database
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
         );
     });
 }
 
 #[test]
 fn incompatible_schema_is_refused_without_changing_database_bytes() {
-    for version in [1, 7] {
+    for version in [1, 8] {
         let directory = TempDirectory::new();
         let path = directory.0.join("drostje.sqlite3");
         let connection = Connection::open(&path).unwrap();

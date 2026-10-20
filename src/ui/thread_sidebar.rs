@@ -123,19 +123,23 @@ impl RenderOnce for SidebarSplit {
     }
 }
 
-/// Tabs in display order; a Factory thread has no working-tree Changes, and Agents
-/// appears only once a Conversation's agent has worked with another.
-fn tabs(conversation: bool, agents: bool) -> &'static [SidebarTab] {
-    match (conversation, agents) {
-        (true, true) => &[
-            SidebarTab::Changes,
-            SidebarTab::Output,
-            SidebarTab::Agents,
-            SidebarTab::Browser,
-        ],
-        (true, false) => &[SidebarTab::Changes, SidebarTab::Output, SidebarTab::Browser],
-        (false, _) => &[SidebarTab::Output],
+/// Tabs in display order; a Factory thread has no working-tree Changes, Agents appears
+/// only once a Conversation's agent has worked with another, and Review only once a pull
+/// request is linked.
+fn tabs(conversation: bool, agents: bool, review: bool) -> Vec<SidebarTab> {
+    if !conversation {
+        return vec![SidebarTab::Output];
     }
+    let mut tabs = vec![SidebarTab::Changes];
+    if review {
+        tabs.push(SidebarTab::Review);
+    }
+    tabs.push(SidebarTab::Output);
+    if agents {
+        tabs.push(SidebarTab::Agents);
+    }
+    tabs.push(SidebarTab::Browser);
+    tabs
 }
 
 fn label(tab: SidebarTab) -> &'static str {
@@ -144,6 +148,7 @@ fn label(tab: SidebarTab) -> &'static str {
         SidebarTab::Output => "Output",
         SidebarTab::Agents => "Agents",
         SidebarTab::Browser => "Browser",
+        SidebarTab::Review => "Review",
     }
 }
 
@@ -154,6 +159,7 @@ fn toggle_command(tab: SidebarTab) -> Command {
         SidebarTab::Output => Command::ToggleOutput,
         SidebarTab::Agents => Command::ToggleAgents,
         SidebarTab::Browser => Command::ToggleBrowser,
+        SidebarTab::Review => Command::ToggleReview,
     }
 }
 
@@ -168,7 +174,12 @@ pub(super) fn render(
     let open = state.thread_sidebar_open(id);
     let session = conversation.then(|| state.conversations.get(&id)).flatten();
     let has_agents = session.is_some_and(|session| agents::coordination_calls(session) > 0);
-    let tabs = tabs(conversation, has_agents);
+    let has_review = state
+        .snapshot
+        .threads
+        .iter()
+        .any(|thread| thread.id == id && thread.pull_request.is_some());
+    let tabs = tabs(conversation, has_agents, has_review);
     // A saved Agents tab whose activity is not loaded yet shows the first tab meanwhile.
     let active = Some(state.thread_sidebar_tab(id))
         .filter(|tab| tabs.contains(tab))
@@ -201,8 +212,11 @@ pub(super) fn render(
     }
     let selected = tabs.iter().position(|tab| *tab == active).unwrap_or(0);
     let tab_owner = owner.clone();
-    let loading = active == SidebarTab::Changes
-        && state.conversation_diff(id).is_none_or(|diff| diff.loading);
+    let loading = match active {
+        SidebarTab::Changes => state.conversation_diff(id).is_none_or(|diff| diff.loading),
+        SidebarTab::Review => state.review_state(id).is_some_and(|review| review.loading),
+        SidebarTab::Output | SidebarTab::Agents | SidebarTab::Browser => false,
+    };
     let header = TabBar::new("thread-sidebar-tabs")
         .selected_index(selected)
         .children(tabs.iter().map(|tab| Tab::new().label(label(*tab))))
@@ -221,6 +235,13 @@ pub(super) fn render(
                 .gap_1()
                 .px_1()
                 .when(loading, |row| row.child(Spinner::new().xsmall()))
+                .when(active == SidebarTab::Review, |row| {
+                    row.child(
+                        button("refresh-review", Command::RefreshReview, owner, state)
+                            .label("Refresh")
+                            .debug_selector(|| "refresh-review".into()),
+                    )
+                })
                 .when(active == SidebarTab::Changes, |row| {
                     row.child(
                         button(
@@ -237,6 +258,7 @@ pub(super) fn render(
         );
     let body = match active {
         SidebarTab::Changes => super::changes::render(state, id, owner, cx),
+        SidebarTab::Review => super::review::render(state, id, owner, cx),
         SidebarTab::Browser => owner
             .upgrade()
             .and_then(|owner| owner.read(cx).sidebar_browser(id))
@@ -582,19 +604,33 @@ mod tests {
     #[test]
     fn factory_threads_only_offer_output() {
         assert_eq!(
-            tabs(true, false),
-            &[SidebarTab::Changes, SidebarTab::Output, SidebarTab::Browser]
+            tabs(true, false, false),
+            [SidebarTab::Changes, SidebarTab::Output, SidebarTab::Browser]
         );
-        assert_eq!(tabs(false, false), &[SidebarTab::Output]);
-        assert_eq!(tabs(false, true), &[SidebarTab::Output]);
+        assert_eq!(tabs(false, false, false), [SidebarTab::Output]);
+        assert_eq!(tabs(false, true, true), [SidebarTab::Output]);
     }
 
     #[test]
     fn agents_appear_only_with_agent_activity() {
         assert_eq!(
-            tabs(true, true),
-            &[
+            tabs(true, true, false),
+            [
                 SidebarTab::Changes,
+                SidebarTab::Output,
+                SidebarTab::Agents,
+                SidebarTab::Browser
+            ]
+        );
+    }
+
+    #[test]
+    fn review_follows_changes_once_a_pull_request_is_linked() {
+        assert_eq!(
+            tabs(true, true, true),
+            [
+                SidebarTab::Changes,
+                SidebarTab::Review,
                 SidebarTab::Output,
                 SidebarTab::Agents,
                 SidebarTab::Browser

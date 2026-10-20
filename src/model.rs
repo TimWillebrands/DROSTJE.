@@ -198,6 +198,44 @@ impl Worktree {
     }
 }
 
+/// What the issue tracker last reported about a pull request. An unrecognised state is kept
+/// raw, never mapped to open or closed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestState {
+    Active,
+    Completed,
+    Abandoned,
+    Unknown(String),
+}
+impl PullRequestState {
+    /// Completed or abandoned: the Conversation's work has ended either way.
+    pub fn closed(&self) -> bool {
+        match self {
+            Self::Completed | Self::Abandoned => true,
+            Self::Active | Self::Unknown(_) => false,
+        }
+    }
+}
+
+/// A pull request pinned to a worktree Conversation once the tracker found exactly one for
+/// its branch. Pinned so its closure is still observed after the branch is deleted or the
+/// agent switches away; the fields other than `id` are the tracker's last report.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestLink {
+    pub id: u64,
+    pub url: String,
+    pub title: String,
+    pub state: PullRequestState,
+    /// Linked work item IDs, in the tracker's order.
+    #[serde(default)]
+    pub work_items: Vec<u64>,
+    /// DROSTJE. archived the Conversation when this pull request closed. Archiving happens
+    /// once: a Conversation the user unarchives afterwards stays.
+    #[serde(default)]
+    pub archived_on_close: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Thread {
     pub id: ThreadId,
@@ -218,6 +256,10 @@ pub struct Thread {
     /// harness sessions are pinned to the directory they started in.
     #[serde(default)]
     pub worktree_id: Option<WorktreeId>,
+    /// The pull request this Conversation's worktree branch was pinned to; see
+    /// [`PullRequestLink`]. Never set on project-root or Factory threads.
+    #[serde(default)]
+    pub pull_request: Option<PullRequestLink>,
     pub draft: String,
     pub attachments: Vec<ImageAttachment>,
     pub submission: Option<Value>,

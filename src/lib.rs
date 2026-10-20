@@ -10,6 +10,7 @@ pub mod neovim;
 pub mod platform;
 pub mod store;
 pub mod titles;
+pub mod tracker;
 pub mod ui;
 pub mod worktrees;
 

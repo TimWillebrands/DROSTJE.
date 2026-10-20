@@ -783,8 +783,8 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
         Some(worktree.branch.as_str())
     );
 
-    // Cmd-N from a Conversation in a worktree shares that worktree.
-    cx.dispatch_action(fixture.window.into(), commands::NewConversation);
+    // Explicit creation still shares the selected Conversation's checkout, even when blank.
+    cx.dispatch_action(fixture.window.into(), commands::NewOmpConversation);
     cx.run_until_parked();
     let sibling = cx.read(|cx| {
         fixture
@@ -797,6 +797,107 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
     assert_ne!(sibling.id, thread.id);
     assert_eq!(sibling.worktree_id, Some(worktree.id));
 
+    // The composer workspace menu can leave an inherited worktree without moving its session.
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("composer-workspace-picker", cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(fixture.window.into(), "down enter");
+    cx.run_until_parked();
+    assert!(cx.read(|cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| {
+                matches!(
+                    dialog.read(cx).kind,
+                    crate::ui::settings::DialogKind::NewWorkspaceConversation(_)
+                )
+            })
+    }));
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.within("workspace-choice").click("input", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(fixture.window.into(), "up enter");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    cx.run_until_parked();
+    let checkout = cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        let selected = state.conversation_thread().unwrap();
+        assert_ne!(selected.id, sibling.id);
+        assert_eq!(selected.worktree_id, None);
+        assert_eq!(state.working_tree_of(selected).unwrap().1, root);
+        assert_eq!(
+            state
+                .snapshot
+                .threads
+                .iter()
+                .find(|t| t.id == sibling.id)
+                .unwrap()
+                .worktree_id,
+            Some(worktree.id)
+        );
+        selected.id
+    });
+    // The same palette command can return to an existing worktree.
+    cx.dispatch_action(fixture.window.into(), commands::NewConversationInWorkspace);
+    cx.run_until_parked();
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.within("workspace-choice").click("input", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(fixture.window.into(), "down enter");
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    cx.run_until_parked();
+    let shared = cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        let selected = state.conversation_thread().unwrap();
+        assert_ne!(selected.id, checkout);
+        assert_eq!(selected.worktree_id, Some(worktree.id));
+        selected.id
+    });
+    for (mode, expected) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
+        fixture.state.update(cx, |state, cx| {
+            state.set_setting("theme_mode", json!(mode));
+            cx.notify();
+        });
+        until(cx, "workspace strip theme", Duration::from_secs(5), |cx| {
+            Theme::global(cx).mode == expected
+        })
+        .await;
+        for (width, height) in [(1440., 900.), (900., 600.)] {
+            cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
+            cx.update_window(fixture.window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                let workspace = window.find("composer-workspace-picker").bounds();
+                let branch = window.find("composer-branch-picker").bounds();
+                assert!(
+                    workspace.right() <= branch.left(),
+                    "workspace controls overlap"
+                );
+                assert!(window.find("composer-branch-picker").visible());
+            })
+            .unwrap();
+        }
+    }
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.click("composer-branch-picker", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_some()));
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    cx.run_until_parked();
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
+
     // Switching to a new branch from HEAD settles the title rename and updates the label.
     cx.dispatch_action(fixture.window.into(), commands::SwitchBranch);
     cx.run_until_parked();
@@ -807,6 +908,38 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
         "new_branch",
         "feature-x",
     );
+    let dirty = worktree.path.join("workspace-qa-uncommitted.txt");
+    fs::write(
+        &dirty,
+        "Keep this change until the branch switch is refused\n",
+    )
+    .unwrap();
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    until(
+        cx,
+        "dirty branch switch refusal",
+        Duration::from_secs(20),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.read(cx).error.is_some())
+        },
+    )
+    .await;
+    assert_eq!(
+        platform::worktree_head_branch(&worktree.path)
+            .unwrap()
+            .as_deref(),
+        Some(worktree.branch.as_str())
+    );
+    assert_eq!(
+        fs::read_to_string(&dirty).unwrap(),
+        "Keep this change until the branch switch is refused\n"
+    );
+    fs::remove_file(&dirty).unwrap();
     cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
     until(cx, "branch switch", Duration::from_secs(20), |cx| {
         let state = fixture.state.read(cx);
@@ -825,7 +958,7 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
     );
 
     // Archiving the last live thread removes a clean, merged worktree and its branch.
-    for id in [sibling.id, thread.id] {
+    for id in [sibling.id, thread.id, shared] {
         fixture.state.update(cx, |state, cx| {
             state.select_thread(id);
             cx.notify();
@@ -849,6 +982,127 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
     assert!(!worktree.path.exists());
     assert!(!platform::branch_exists(&root, "feature-x").unwrap());
     quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; Review sidebar states, no tracker call succeeds"]
+async fn review_sidebar_shows_tracker_failures_and_review_threads(cx: &mut TestAppContext) {
+    use crate::model::{PullRequestLink, PullRequestState, Worktree};
+    use crate::tracker::{ReviewComment, ReviewStatus, ReviewThread, ReviewThreads};
+    let fixture = open_fixture(cx, None).await;
+    let conversation = cx.update(|cx| {
+        fixture.state.update(cx, |state, cx| {
+            let project = state.project().unwrap().clone();
+            let id = Uuid::new_v4();
+            state.save_worktree(Worktree {
+                id,
+                project_id: project.id,
+                // The project checkout stands in for the worktree directory: its `origin` is
+                // not on Azure DevOps, so a real read fails without contacting a tracker.
+                path: project.root.clone(),
+                codename: "quiet-forest".into(),
+                branch: "drostje/review".into(),
+                base: "main".into(),
+                named: true,
+                created_by: Uuid::new_v4(),
+                created_at: platform::now(),
+                removed_at: None,
+            });
+            state.new_conversation_in_workspace(Some(id)).unwrap();
+            let mut thread = state.thread().unwrap().clone();
+            thread.pull_request = Some(PullRequestLink {
+                id: 3170,
+                url: "https://dev.azure.com/o/p/_git/r/pullrequest/3170".into(),
+                title: "Fix upload".into(),
+                state: PullRequestState::Active,
+                work_items: vec![2596],
+                archived_on_close: false,
+            });
+            let id = thread.id;
+            state.save_thread(thread);
+            cx.notify();
+            id
+        })
+    });
+    let draw = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update_window(fixture.window.into(), |_, window, cx| {
+                window.simulate_next_frame(cx);
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        }
+    };
+
+    cx.dispatch_action(fixture.window.into(), commands::ToggleReview);
+    until(cx, "failed review read", Duration::from_secs(10), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .review_state(conversation)
+            .is_some_and(|review| !review.loading && matches!(review.result, Some(Err(_))))
+    })
+    .await;
+    draw(cx);
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(visual.debug_bounds("review-sidebar").is_some());
+    assert!(visual.debug_bounds("review-error").is_some());
+    assert!(visual.debug_bounds("open-pull-request").is_some());
+
+    cx.update(|cx| {
+        fixture.state.update(cx, |state, cx| {
+            let review = state.pull_requests.reviews.get_mut(&conversation).unwrap();
+            let comment = |body: &str| ReviewComment {
+                id: 1,
+                author: "Reviewer".into(),
+                body: body.into(),
+                truncated: false,
+                published: "2026-10-20T10:00:00Z".into(),
+            };
+            review.result = Some(Ok(ReviewThreads {
+                threads: vec![
+                    ReviewThread {
+                        id: 11,
+                        status: ReviewStatus::Active,
+                        file: Some("/src/upload.rs".into()),
+                        line: Some(42),
+                        outdated: false,
+                        comments: vec![comment("Handle the empty upload")],
+                        total_comments: 3,
+                    },
+                    ReviewThread {
+                        id: 12,
+                        status: ReviewStatus::Fixed,
+                        file: None,
+                        line: None,
+                        outdated: false,
+                        comments: vec![comment("Looks good")],
+                        total_comments: 1,
+                    },
+                ],
+                truncated: false,
+            }));
+            cx.emit(crate::app::PresentationChange::Review(conversation));
+            cx.notify();
+        })
+    });
+    draw(cx);
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(visual.debug_bounds("review-error").is_none());
+    let open = visual.debug_bounds("review-thread-11").unwrap();
+    let resolved = visual.debug_bounds("review-thread-12").unwrap();
+    assert!(open.origin.y < resolved.origin.y, "open threads come first");
+
+    cx.dispatch_action(fixture.window.into(), commands::ToggleReview);
+    until(cx, "hidden review sidebar", Duration::from_secs(5), |cx| {
+        !fixture.state.read(cx).thread_sidebar_open(conversation)
+    })
+    .await;
+    draw(cx);
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(visual.debug_bounds("review-sidebar").is_none());
 }
 
 #[gpui_kit::test]

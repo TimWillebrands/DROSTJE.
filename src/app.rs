@@ -6,6 +6,7 @@ mod persistence;
 mod project_diff;
 mod shutdown;
 mod spaces;
+mod tracker;
 mod worktrees;
 use crate::harness::{
     self, CommandCatalog, ContentBlock, ContextUsage, ConversationCommand, ConversationEvent,
@@ -24,6 +25,7 @@ use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     path::PathBuf,
 };
+pub use tracker::{LinkStatus, ReviewState, tracker_error_text};
 use uuid::Uuid;
 pub use worktrees::{
     RemovalFailure, WorkingTree, WorktreeRequest, WorktreeRequestKind, WorktreeRequestStatus,
@@ -39,6 +41,8 @@ pub enum PresentationChange {
     Thread(ThreadId),
     Transcript(ThreadId),
     Diff(WorkingTree),
+    /// The review threads of a Conversation's pull request were (re)read.
+    Review(ThreadId),
     /// A worktree request changed status; the dialog that opened it reads the new state.
     WorktreeRequest(Uuid),
     /// The commit subject request changed status; the Commit dialog reads the new state.
@@ -301,7 +305,7 @@ impl Bootstrap {
 }
 
 fn executable_diagnostics(settings: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
-    ["nvim", "omp", "pi", "claude", "llama", "factory"]
+    ["nvim", "omp", "pi", "claude", "llama", "factory", "azdo"]
         .into_iter()
         .map(|name| {
             let explicit = settings
@@ -337,6 +341,8 @@ pub enum SidebarTab {
     /// Offered only once the Conversation's agent works with other agents.
     Agents,
     Browser,
+    /// Review threads of the pull request pinned to a worktree Conversation.
+    Review,
 }
 impl SidebarTab {
     /// The sidebar `(open, tab)` after asking for `requested`: a hidden sidebar or
@@ -432,6 +438,7 @@ pub struct AppState {
     pub shutdown_error: Option<String>,
     pub conversations: BTreeMap<ThreadId, ConversationSession>,
     pub project_diffs: ProjectDiffs,
+    pub pull_requests: tracker::PullRequests,
     pub drafts: HashMap<DraftKey, DraftSnapshot>,
     pub editor: Option<crate::neovim::NvimEditor>,
     pub editor_error: Option<String>,
@@ -656,6 +663,7 @@ impl AppState {
             registering: false,
             conversations: BTreeMap::new(),
             project_diffs: ProjectDiffs::default(),
+            pull_requests: tracker::PullRequests::default(),
             drafts: HashMap::new(),
             editor: None,
             editor_error: None,
@@ -682,6 +690,7 @@ impl AppState {
         };
         state.persist_space_session();
         state.reconcile_worktrees();
+        state.start_pull_request_polling(cx);
         state
     }
 
@@ -813,6 +822,11 @@ impl AppState {
                     self.active_threads.insert(thread_id);
                 } else {
                     self.active_threads.remove(&thread_id);
+                    // A pull request that closed during the turn archives now.
+                    if self.settle_closed_pull_requests() {
+                        cx.emit(PresentationChange::Projects);
+                        cx.notify();
+                    }
                 }
                 cx.emit(PresentationChange::Thread(thread_id));
                 return;
@@ -1084,6 +1098,7 @@ impl AppState {
             Some("output") => SidebarTab::Output,
             Some("agents") => SidebarTab::Agents,
             Some("browser") => SidebarTab::Browser,
+            Some("review") => SidebarTab::Review,
             _ => SidebarTab::Changes,
         }
     }
@@ -1135,6 +1150,7 @@ impl AppState {
                 SidebarTab::Output => tabs.insert(key, Value::String("output".into())),
                 SidebarTab::Agents => tabs.insert(key, Value::String("agents".into())),
                 SidebarTab::Browser => tabs.insert(key, Value::String("browser".into())),
+                SidebarTab::Review => tabs.insert(key, Value::String("review".into())),
             };
             self.set_setting("thread_sidebar_tab", Value::Object(tabs));
         }
@@ -1528,6 +1544,32 @@ impl AppState {
         );
         self.new_thread_with_harness(ThreadKind::Conversation, Some(harness))
     }
+    /// Starts a fresh Conversation in an explicit checkout; `None` means the project root,
+    /// regardless of the selected Conversation's worktree.
+    pub fn new_conversation_in_workspace(&mut self, worktree_id: Option<WorktreeId>) -> Result<()> {
+        if let Some(reason) = self.mutable_project_reason() {
+            anyhow::bail!(reason);
+        }
+        anyhow::ensure!(
+            !self.worktree_request_pending(),
+            "A worktree operation is in progress."
+        );
+        let project = self.project().context("Select a project")?.clone();
+        if let Some(id) = worktree_id {
+            let worktree = self.worktree(id).context("Worktree not found")?;
+            anyhow::ensure!(
+                worktree.project_id == project.id,
+                "This worktree belongs to another project."
+            );
+            anyhow::ensure!(worktree.is_live(), "This worktree was removed.");
+        }
+        let id = Uuid::new_v4();
+        let thread = self.build_conversation(&project, None, id, worktree_id);
+        self.save_thread(thread);
+        self.register_thread_membership(id, project.id, self.active_space)?;
+        self.select_thread(id);
+        Ok(())
+    }
     fn new_thread_with_harness(
         &mut self,
         kind: ThreadKind,
@@ -1595,6 +1637,7 @@ impl AppState {
                     effort: None,
                     permission_mode: None,
                     worktree_id: None,
+                    pull_request: None,
                     draft: String::new(),
                     attachments: Vec::new(),
                     submission: None,
@@ -1639,6 +1682,7 @@ impl AppState {
             effort: defaults.effort,
             permission_mode: defaults.permission_mode,
             worktree_id,
+            pull_request: None,
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,
@@ -1769,8 +1813,13 @@ mod tests {
 
     #[cfg(feature = "runtime-qa")]
     mod threads {
-        use crate::app::{AppState, Bootstrap};
-        use crate::model::{Project, ProjectDefaults, ThreadKind};
+        use crate::app::{
+            AppState, Bootstrap, ConversationSession, WorktreeRequest, WorktreeRequestKind,
+            WorktreeRequestStatus,
+        };
+        use crate::model::{
+            ImageAttachment, ModelKey, Project, ProjectDefaults, ThreadKind, Worktree,
+        };
         use crate::store::Store;
         use gpui_kit::{AppContext as _, Entity, TestAppContext};
         use std::{collections::BTreeMap, fs, path::PathBuf};
@@ -1816,6 +1865,22 @@ mod tests {
                 state.new_thread(ThreadKind::Conversation).unwrap();
                 state.selected_thread.unwrap()
             })
+        }
+
+        fn worktree(project_id: Uuid) -> Worktree {
+            let id = Uuid::new_v4();
+            Worktree {
+                id,
+                project_id,
+                path: std::env::temp_dir().join(id.to_string()),
+                codename: "quiet-forest".into(),
+                branch: "worktree-branch".into(),
+                base: "main".into(),
+                named: true,
+                created_by: Uuid::new_v4(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                removed_at: None,
+            }
         }
 
         /// Gives `id` the activity a sent prompt leaves behind.
@@ -1933,6 +1998,295 @@ mod tests {
                 assert_eq!(thread.harness, "claude-code");
                 assert_eq!(thread.effort.as_deref(), Some("high"));
                 assert_eq!(thread.permission_mode.as_deref(), Some("plan"));
+            });
+        }
+
+        #[gpui_kit::test]
+        fn explicit_project_root_does_not_inherit_the_selected_worktree(cx: &mut TestAppContext) {
+            let (_dir, state, project) = open(cx);
+            let source = new_conversation(&state, cx);
+            state.update(cx, |state, _| {
+                let workspace = worktree(project);
+                let workspace_id = workspace.id;
+                state.save_worktree(workspace);
+                let mut thread = state.thread().unwrap().clone();
+                thread.worktree_id = Some(workspace_id);
+                state.save_thread(thread);
+
+                state.new_thread(ThreadKind::Conversation).unwrap();
+                assert_eq!(state.thread().unwrap().worktree_id, Some(workspace_id));
+                state.select_thread(source);
+                state.new_conversation_in_workspace(None).unwrap();
+
+                let thread = state.thread().unwrap();
+                assert_ne!(thread.id, source);
+                assert_eq!(thread.project_id, project);
+                assert_eq!(thread.worktree_id, None);
+                assert!(state.thread_in_space(thread.id, state.active_space));
+                assert!(state.open_threads.contains(&thread.id));
+                assert_eq!(
+                    state
+                        .snapshot
+                        .threads
+                        .iter()
+                        .find(|t| t.id == source)
+                        .unwrap()
+                        .worktree_id,
+                    Some(workspace_id)
+                );
+            });
+        }
+
+        #[gpui_kit::test]
+        fn choosing_a_workspace_preserves_source_draft_session_and_defaults(
+            cx: &mut TestAppContext,
+        ) {
+            let (_dir, state, project) = open(cx);
+            let source = new_conversation(&state, cx);
+            state.update(cx, |state, _| {
+                let source_workspace = worktree(project);
+                let source_workspace_id = source_workspace.id;
+                state.save_worktree(source_workspace);
+                let target = worktree(project);
+                let target_id = target.id;
+                state.save_worktree(target);
+                let mut thread = state.thread().unwrap().clone();
+                thread.worktree_id = Some(source_workspace_id);
+                thread.harness = "claude-code".into();
+                thread.model = Some(ModelKey {
+                    provider: "anthropic".into(),
+                    id: "claude-opus".into(),
+                });
+                thread.effort = Some("high".into());
+                thread.permission_mode = Some("plan".into());
+                thread.session_ref = Some("existing-provider-session".into());
+                thread.draft = "Keep this unsent prompt".into();
+                thread.attachments.push(ImageAttachment {
+                    id: Uuid::new_v4(),
+                    path: PathBuf::from("/tmp/draft.png"),
+                    mime: "image/png".into(),
+                    width: 10,
+                    height: 20,
+                    original: None,
+                });
+                let original = serde_json::to_value(&thread).unwrap();
+                let model = thread.model.clone();
+                state.edit_thread(thread);
+                let session = ConversationSession::new(model.clone());
+                let generation = session.generation;
+                state.conversations.insert(source, session);
+
+                state
+                    .new_conversation_in_workspace(Some(target_id))
+                    .unwrap();
+
+                let thread = state.thread().unwrap();
+                assert_ne!(thread.id, source);
+                assert_eq!(thread.project_id, project);
+                assert_eq!(thread.worktree_id, Some(target_id));
+                assert_eq!(thread.kind, ThreadKind::Conversation);
+                assert_eq!(thread.harness, "claude-code");
+                assert_eq!(thread.model, model);
+                assert_eq!(thread.effort.as_deref(), Some("high"));
+                assert_eq!(thread.permission_mode.as_deref(), Some("plan"));
+                assert_eq!(thread.title, crate::titles::DEFAULT_CONVERSATION_TITLE);
+                assert!(thread.session_ref.is_none());
+                assert!(thread.draft.is_empty());
+                assert!(thread.attachments.is_empty());
+                assert!(thread.submission.is_none());
+                assert!(thread.queued.is_empty());
+                assert!(!thread.archived);
+                assert!(thread.factory.is_none());
+                assert_eq!(thread.created_at, thread.updated_at);
+                assert!(!state.conversations.contains_key(&thread.id));
+                assert_eq!(
+                    state.conversations.get(&source).unwrap().generation,
+                    generation
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        state
+                            .snapshot
+                            .threads
+                            .iter()
+                            .find(|t| t.id == source)
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    original
+                );
+            });
+        }
+
+        #[gpui_kit::test]
+        fn workspace_creation_without_a_source_uses_project_defaults(cx: &mut TestAppContext) {
+            let (_dir, state, project) = open(cx);
+            state.update(cx, |state, _| {
+                let defaults = &mut state
+                    .snapshot
+                    .projects
+                    .iter_mut()
+                    .find(|p| p.id == project)
+                    .unwrap()
+                    .defaults;
+                defaults.interactive_harness = "claude-code".into();
+                defaults.interactive_model = Some(ModelKey {
+                    provider: "anthropic".into(),
+                    id: "claude-opus".into(),
+                });
+                let model = defaults.interactive_model.clone();
+                state.new_conversation_in_workspace(None).unwrap();
+                let thread = state.thread().unwrap();
+                assert_eq!(thread.project_id, project);
+                assert_eq!(thread.worktree_id, None);
+                assert_eq!(thread.harness, "claude-code");
+                assert_eq!(thread.model, model);
+                assert_eq!(thread.effort, None);
+                assert_eq!(thread.permission_mode, None);
+            });
+        }
+
+        #[gpui_kit::test]
+        fn invalid_workspaces_do_not_create_or_select_a_thread(cx: &mut TestAppContext) {
+            let (_dir, state, project) = open(cx);
+            let source = new_conversation(&state, cx);
+            state.update(cx, |state, _| {
+                let mut removed = worktree(project);
+                removed.removed_at = Some("2026-02-01T00:00:00Z".into());
+                let removed_id = removed.id;
+                state.save_worktree(removed);
+                let foreign = worktree(Uuid::new_v4());
+                let foreign_id = foreign.id;
+                state.save_worktree(foreign);
+                let threads = serde_json::to_value(&state.snapshot.threads).unwrap();
+                let open = state.open_threads.clone();
+
+                for id in [Uuid::new_v4(), removed_id, foreign_id] {
+                    assert!(state.new_conversation_in_workspace(Some(id)).is_err());
+                    assert_eq!(state.selected_thread, Some(source));
+                    assert_eq!(state.open_threads, open);
+                    assert_eq!(
+                        serde_json::to_value(&state.snapshot.threads).unwrap(),
+                        threads
+                    );
+                }
+                state.worktree_request = Some(WorktreeRequest {
+                    id: Uuid::new_v4(),
+                    kind: WorktreeRequestKind::Remove {
+                        worktree: removed_id,
+                        force: false,
+                    },
+                    status: WorktreeRequestStatus::Pending,
+                });
+                assert!(state.new_conversation_in_workspace(None).is_err());
+                assert_eq!(state.selected_thread, Some(source));
+                assert_eq!(state.open_threads, open);
+                assert_eq!(
+                    serde_json::to_value(&state.snapshot.threads).unwrap(),
+                    threads
+                );
+            });
+        }
+
+        #[gpui_kit::test]
+        fn workspace_creation_rejects_immutable_or_missing_projects(cx: &mut TestAppContext) {
+            let (_dir, state, project) = open(cx);
+            state.update(cx, |state, _| {
+                state
+                    .snapshot
+                    .projects
+                    .iter_mut()
+                    .find(|p| p.id == project)
+                    .unwrap()
+                    .archived = true;
+                assert!(state.new_conversation_in_workspace(None).is_err());
+                state
+                    .snapshot
+                    .projects
+                    .iter_mut()
+                    .find(|p| p.id == project)
+                    .unwrap()
+                    .archived = false;
+                state.storage_error = Some("read-only test store".into());
+                assert!(state.new_conversation_in_workspace(None).is_err());
+                state.storage_error = None;
+                state.shutting_down = true;
+                assert!(state.new_conversation_in_workspace(None).is_err());
+                state.shutting_down = false;
+                state.selected_project = None;
+                assert!(state.new_conversation_in_workspace(None).is_err());
+                assert!(state.snapshot.threads.is_empty());
+                assert!(state.open_threads.is_empty());
+                assert_eq!(state.selected_thread, None);
+            });
+        }
+
+        #[gpui_kit::test]
+        fn closed_pull_requests_archive_their_conversation_once_it_is_idle(
+            cx: &mut TestAppContext,
+        ) {
+            use crate::app::{AppEvent, LinkStatus};
+            use crate::model::{PullRequestLink, PullRequestState};
+            let (_dir, state, project) = open(cx);
+            let id = new_conversation(&state, cx);
+            use_thread(&state, id, cx);
+            state.update(cx, |state, cx| {
+                let tree = worktree(project);
+                let tree_id = tree.id;
+                state.save_worktree(tree);
+                let mut thread = state.thread().unwrap().clone();
+                thread.worktree_id = Some(tree_id);
+                thread.pull_request = Some(PullRequestLink {
+                    id: 3170,
+                    url: "https://dev.azure.com/o/p/_git/r/pullrequest/3170".into(),
+                    title: "Fix upload".into(),
+                    state: PullRequestState::Completed,
+                    work_items: vec![2596],
+                    archived_on_close: false,
+                });
+                state.save_thread(thread);
+                let find = |state: &AppState| {
+                    state
+                        .snapshot
+                        .threads
+                        .iter()
+                        .find(|t| t.id == id)
+                        .unwrap()
+                        .clone()
+                };
+
+                // A running turn holds the archive back and says why.
+                state.active_threads.insert(id);
+                state.settle_closed_pull_requests();
+                assert!(!find(state).archived);
+                assert!(matches!(
+                    state.pull_request_status(id),
+                    Some(LinkStatus::ArchivePending(_))
+                ));
+
+                // The turn ends: the Conversation archives, naming the pull request.
+                state.receive(
+                    AppEvent::InteractiveActivity {
+                        thread_id: id,
+                        active: false,
+                    },
+                    cx,
+                );
+                let archived = find(state);
+                assert!(archived.archived);
+                assert!(archived.pull_request.unwrap().archived_on_close);
+                assert!(state.pull_request_status(id).is_none());
+                assert!(
+                    state
+                        .notices
+                        .iter()
+                        .any(|notice| notice.text.contains("pull request 3170 was completed"))
+                );
+
+                // Unarchived by the user, it stays.
+                state.unarchive_thread(id).unwrap();
+                state.settle_closed_pull_requests();
+                assert!(!find(state).archived);
             });
         }
     }

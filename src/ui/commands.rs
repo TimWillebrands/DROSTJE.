@@ -28,6 +28,7 @@ gpui_kit::actions!(
         NewPiConversation,
         NewClaudeCodeConversation,
         NewConversationInWorktree,
+        NewConversationInWorkspace,
         SwitchHarness,
         NewFactoryThread,
         NewTerminal,
@@ -70,6 +71,10 @@ gpui_kit::actions!(
         ToggleTaskList,
         ToggleBackgroundJobs,
         RefreshConversationDiff,
+        ToggleReview,
+        RefreshReview,
+        OpenPullRequest,
+        RefreshPullRequests,
         RestartEditor,
         CancelEditorCommand,
         CopyDraftRecovery,
@@ -121,6 +126,7 @@ pub enum Command {
     NewPiConversation,
     NewClaudeCodeConversation,
     NewConversationInWorktree,
+    NewConversationInWorkspace,
     SwitchHarness,
     NewFactoryThread,
     NewTerminal,
@@ -164,6 +170,10 @@ pub enum Command {
     ToggleTaskList,
     ToggleBackgroundJobs,
     RefreshConversationDiff,
+    ToggleReview,
+    RefreshReview,
+    OpenPullRequest,
+    RefreshPullRequests,
     CancelEditorCommand,
     CopyDraftRecovery,
     PasteImage,
@@ -173,7 +183,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 63] = [
+    pub const ALL: [Self; 68] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -187,6 +197,7 @@ impl Command {
         Self::NewPiConversation,
         Self::NewClaudeCodeConversation,
         Self::NewConversationInWorktree,
+        Self::NewConversationInWorkspace,
         Self::SwitchHarness,
         Self::NewFactoryThread,
         Self::NewTerminal,
@@ -229,6 +240,10 @@ impl Command {
         Self::ToggleTaskList,
         Self::ToggleBackgroundJobs,
         Self::RefreshConversationDiff,
+        Self::ToggleReview,
+        Self::RefreshReview,
+        Self::OpenPullRequest,
+        Self::RefreshPullRequests,
         Self::RestartEditor,
         Self::CancelEditorCommand,
         Self::CopyDraftRecovery,
@@ -254,6 +269,7 @@ impl Command {
             Self::NewPiConversation => "New Pi conversation",
             Self::NewClaudeCodeConversation => "New Claude Code conversation",
             Self::NewConversationInWorktree => "New conversation in new worktree…",
+            Self::NewConversationInWorkspace => "New conversation in workspace…",
             Self::SwitchHarness => "Switch harness…",
             Self::NewFactoryThread => "New Factory thread",
             Self::NewTerminal => "New terminal",
@@ -296,6 +312,10 @@ impl Command {
             Self::ToggleTaskList => "Toggle task list",
             Self::ToggleBackgroundJobs => "Toggle background jobs",
             Self::RefreshConversationDiff => "Refresh conversation changes",
+            Self::ToggleReview => "Toggle pull request review",
+            Self::RefreshReview => "Refresh pull request review",
+            Self::OpenPullRequest => "Open pull request in browser",
+            Self::RefreshPullRequests => "Refresh pull requests",
             Self::RestartEditor => "Restart Neovim editor",
             Self::CancelEditorCommand => "Cancel editor command",
             Self::CopyDraftRecovery => "Copy draft recovery",
@@ -322,6 +342,7 @@ impl Command {
             Self::NewPiConversation => Box::new(NewPiConversation),
             Self::NewClaudeCodeConversation => Box::new(NewClaudeCodeConversation),
             Self::NewConversationInWorktree => Box::new(NewConversationInWorktree),
+            Self::NewConversationInWorkspace => Box::new(NewConversationInWorkspace),
             Self::SwitchHarness => Box::new(SwitchHarness),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::NewTerminal => Box::new(NewTerminal),
@@ -365,6 +386,10 @@ impl Command {
             Self::ToggleTaskList => Box::new(ToggleTaskList),
             Self::ToggleBackgroundJobs => Box::new(ToggleBackgroundJobs),
             Self::RefreshConversationDiff => Box::new(RefreshConversationDiff),
+            Self::ToggleReview => Box::new(ToggleReview),
+            Self::RefreshReview => Box::new(RefreshReview),
+            Self::OpenPullRequest => Box::new(OpenPullRequest),
+            Self::RefreshPullRequests => Box::new(RefreshPullRequests),
             Self::CancelEditorCommand => Box::new(CancelEditorCommand),
             Self::CopyDraftRecovery => Box::new(CopyDraftRecovery),
             Self::PasteImage => Box::new(PasteImage),
@@ -432,7 +457,9 @@ impl Command {
             Self::RegenerateTitle => state.regenerate_title_reason(),
             Self::ArchiveThread => state.archive_thread_reason(),
             Self::UnarchiveThread => state.unarchive_thread_reason(),
-            Self::NewConversationInWorktree => state.create_worktree_reason(),
+            Self::NewConversationInWorktree | Self::NewConversationInWorkspace => {
+                state.create_worktree_reason()
+            }
             Self::SwitchHarness => state.switch_harness_reason(),
             Self::RemoveWorktree => state.remove_worktree_reason(),
             Self::SwitchBranch => state.switch_branch_reason(),
@@ -481,6 +508,10 @@ impl Command {
             {
                 Some("This conversation's agent has not worked with other agents yet.".into())
             }
+            Self::ToggleReview | Self::RefreshReview | Self::OpenPullRequest => {
+                state.pull_request_reason()
+            }
+            Self::RefreshPullRequests => state.refresh_pull_requests_reason(),
             Self::PasteImage => {
                 state
                     .mutable_project_reason()
@@ -1519,6 +1550,13 @@ impl Render for Palette {
                     cx,
                 )
             }))
+            .on_action(cx.listener(|this, _: &NewConversationInWorkspace, w, cx| {
+                this.run(
+                    PaletteTarget::Command(Command::NewConversationInWorkspace),
+                    w,
+                    cx,
+                )
+            }))
             .on_action(cx.listener(|this, _: &SwitchHarness, w, cx| {
                 this.run(PaletteTarget::Command(Command::SwitchHarness), w, cx)
             }))
@@ -1643,6 +1681,18 @@ impl Render for Palette {
                     w,
                     cx,
                 )
+            }))
+            .on_action(cx.listener(|this, _: &ToggleReview, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleReview), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RefreshReview, w, cx| {
+                this.run(PaletteTarget::Command(Command::RefreshReview), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenPullRequest, w, cx| {
+                this.run(PaletteTarget::Command(Command::OpenPullRequest), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RefreshPullRequests, w, cx| {
+                this.run(PaletteTarget::Command(Command::RefreshPullRequests), w, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleOutput, w, cx| {
                 this.run(PaletteTarget::Command(Command::ToggleOutput), w, cx)

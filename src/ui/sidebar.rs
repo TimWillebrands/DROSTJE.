@@ -10,7 +10,7 @@ use crate::{
     app::AppState,
     factory::{Liveness, ReportedState},
     harness::{ConversationState, TurnOutcome},
-    model::{Project, ProjectId, SpaceId, Thread, ThreadId, ThreadKind},
+    model::{Project, ProjectId, PullRequestLink, SpaceId, Thread, ThreadId, ThreadKind},
 };
 use gpui_kit::{
     assets::IconName as Lucide,
@@ -193,6 +193,31 @@ fn unix_seconds(timestamp: &str) -> Option<i64> {
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     let days = era * 146_097 + day_of_era - 719_468;
     Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// The tracker references of a thread row: its pull request as `!id` and work items as
+/// `#id`, at most two of them with the rest counted. A Factory thread names the work item it
+/// was launched from.
+fn tracker_reference(
+    pull_request: Option<&PullRequestLink>,
+    factory_work_item: Option<i32>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut work_items: Vec<String> = factory_work_item
+        .map(|id| format!("#{id}"))
+        .into_iter()
+        .collect();
+    if let Some(pr) = pull_request {
+        parts.push(format!("!{}", pr.id));
+        work_items.extend(pr.work_items.iter().map(|id| format!("#{id}")));
+    }
+    let extra = work_items.len().saturating_sub(2);
+    work_items.truncate(2);
+    parts.extend(work_items);
+    if extra > 0 {
+        parts.push(format!("+{extra}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// Compact age of a stored timestamp relative to `now` (Unix seconds): `now`,
@@ -763,9 +788,14 @@ fn render_list(
                 };
                 let worktree = state.thread_worktree(thread);
                 let tooltip = format!(
-                    "{kind}: {}{}{}",
+                    "{kind}: {}{}{}{}",
                     thread.title,
                     if thread.archived { " · Archived" } else { "" },
+                    thread
+                        .pull_request
+                        .as_ref()
+                        .map(|pr| format!(" · Pull request !{}: {}", pr.id, pr.title))
+                        .unwrap_or_default(),
                     match worktree {
                         Some(worktree) if worktree.is_live() => format!(
                             " · Worktree {} at {}",
@@ -814,6 +844,24 @@ fn render_list(
                                 .items_center()
                                 .child(Icon::new(Lucide::GitBranch).xsmall())
                                 .child(div().min_w_0().truncate().child(branch.to_owned())),
+                        );
+                    first_detail = false;
+                }
+                let work_item = state
+                    .snapshot
+                    .launches
+                    .iter()
+                    .find(|launch| launch.factory_thread_id == id)
+                    .and_then(|launch| launch.work_item_id);
+                if let Some(reference) = tracker_reference(thread.pull_request.as_ref(), work_item)
+                {
+                    details = details
+                        .when(!first_detail, |view| view.child(separator()))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .font_family(theme.mono_font_family.clone())
+                                .child(reference),
                         );
                     first_detail = false;
                 }
@@ -1393,6 +1441,7 @@ mod tests {
             effort: None,
             permission_mode: None,
             worktree_id: None,
+            pull_request: None,
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,
@@ -1566,6 +1615,36 @@ mod tests {
                 start + Duration::from_millis(80)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn tracker_reference_is_compact() {
+        use crate::model::{PullRequestLink, PullRequestState};
+        let pr = |work_items: Vec<u64>| PullRequestLink {
+            id: 3170,
+            url: String::new(),
+            title: String::new(),
+            state: PullRequestState::Active,
+            work_items,
+            archived_on_close: false,
+        };
+        assert_eq!(super::tracker_reference(None, None), None);
+        assert_eq!(
+            super::tracker_reference(None, Some(42)).as_deref(),
+            Some("#42")
+        );
+        assert_eq!(
+            super::tracker_reference(Some(&pr(vec![])), None).as_deref(),
+            Some("!3170")
+        );
+        assert_eq!(
+            super::tracker_reference(Some(&pr(vec![2596])), None).as_deref(),
+            Some("!3170 #2596")
+        );
+        assert_eq!(
+            super::tracker_reference(Some(&pr(vec![1, 2, 3, 4])), None).as_deref(),
+            Some("!3170 #1 #2 +2")
         );
     }
 

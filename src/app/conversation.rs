@@ -1436,6 +1436,7 @@ mod tests {
             effort: None,
             permission_mode: None,
             worktree_id: None,
+            pull_request: None,
             draft: String::new(),
             attachments: Vec::new(),
             submission: None,

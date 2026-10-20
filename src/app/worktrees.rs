@@ -614,6 +614,15 @@ impl AppState {
     /// closes without the thread being selected first (a neighbouring tab takes over only when
     /// it was the selected one), and it leaves Projects unless archived threads are shown.
     pub fn archive_thread(&mut self, id: ThreadId) -> Result<()> {
+        self.archive_thread_because(id, None)
+    }
+
+    /// `archive_thread`, with the `cause` the notice names when DROSTJE. archived on its own.
+    pub(super) fn archive_thread_because(
+        &mut self,
+        id: ThreadId,
+        cause: Option<&str>,
+    ) -> Result<()> {
         if let Some(reason) = self.archive_thread_reason_for(id) {
             anyhow::bail!(reason);
         }
@@ -634,9 +643,10 @@ impl AppState {
         let untouched = self.is_untouched(&thread);
         self.save_thread(thread);
         if !untouched && !self.show_archived {
+            let because = cause.map(|cause| format!(": {cause}")).unwrap_or_default();
             self.notice(
                 NoticeLevel::Info,
-                format!("Archived {title}. Show archived threads to unarchive it."),
+                format!("Archived {title}{because}. Show archived threads to unarchive it."),
             );
         }
         if let Some(worktree) = worktree

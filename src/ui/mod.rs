@@ -12,6 +12,7 @@ mod grain;
 mod job_notice;
 mod nvim;
 pub mod overlays;
+mod review;
 pub mod settings;
 pub mod sidebar;
 mod slash_commands;

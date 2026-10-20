@@ -853,6 +853,7 @@ mod tests {
             effort: None,
             permission_mode: None,
             worktree_id: None,
+            pull_request: None,
             draft: "Keep this unsent draft".into(),
             attachments: Vec::new(),
             submission: Some(json!({"recovery": "never replay"})),

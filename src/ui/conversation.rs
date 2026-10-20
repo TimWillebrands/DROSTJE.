@@ -3841,36 +3841,6 @@ fn render_content(
                 });
             }),
     );
-    // A Conversation in a worktree names it quietly: codename and branch in the mono font,
-    // the directory in the tooltip.
-    if let Some(worktree) = state.thread_worktree(thread) {
-        let tooltip = if worktree.is_live() {
-            format!("Worktree at {}", worktree.path.display())
-        } else {
-            format!("Worktree at {} was removed", worktree.path.display())
-        };
-        let label = format!(
-            "{} · {}",
-            worktree.codename,
-            state.worktree_branch_label(worktree)
-        );
-        leading = leading.child(
-            div()
-                .id("worktree-label")
-                .flex_shrink_0()
-                .max_w(rems(20.))
-                .truncate()
-                .text_xs()
-                .font_family(cx.theme().mono_font_family.clone())
-                .text_color(cx.theme().muted_foreground)
-                .child(if worktree.is_live() {
-                    label
-                } else {
-                    format!("{label} (removed)")
-                })
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)),
-        );
-    }
     // The harness status line trails the context actions, muted and truncated.
     leading = leading.child(
         div()
@@ -4048,7 +4018,7 @@ fn render_content(
     // A definite bounded height propagates through the inset wrapper so the editor shrinks,
     // rather than overflowing the actions or introducing a second transcript scroller.
     let preferred_height =
-        11. + if thread.attachments.is_empty() {
+        13. + if thread.attachments.is_empty() {
             0.
         } else {
             9.
@@ -4086,14 +4056,138 @@ fn render_content(
                     )
                 })
                 .child(
-                    content_column()
-                        .h_full()
-                        .min_h_0()
-                        .child(composer.h_full().child(controls)),
+                    content_column().h_full().min_h_0().child(
+                        composer
+                            .h_full()
+                            .child(controls)
+                            .child(workspace_controls(thread, state, owner, cx)),
+                    ),
                 )
                 .into_any_element(),
         ),
     )
+}
+
+/// Directory identity stays separate from model settings; choosing another directory starts
+/// a new session rather than rebinding the current Conversation's harness.
+fn workspace_controls(
+    thread: &crate::model::Thread,
+    state: &AppState,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> impl IntoElement {
+    let selected = state.selected_thread == Some(thread.id);
+    let worktree = state.thread_worktree(thread);
+    let label = match worktree {
+        Some(worktree) if worktree.is_live() => worktree.codename.clone(),
+        Some(worktree) => format!("{} (removed)", worktree.codename),
+        None => "Current checkout".to_owned(),
+    };
+    let path = state.working_tree_of(thread).map(|(_, path)| path);
+    let tooltip = match path {
+        Some(path) => format!(
+            "{}\nStart a new conversation in another workspace; this conversation stays here",
+            path.display()
+        ),
+        None => "Project directory unavailable".into(),
+    };
+    let branch = match worktree {
+        Some(worktree) => state.worktree_branch_label(worktree),
+        None => match state.repositories.get(&thread.project_id) {
+            Some(Ok(repository)) => repository
+                .branch
+                .clone()
+                .unwrap_or_else(|| "Detached HEAD".into()),
+            Some(Err(_)) => "Branch unavailable".into(),
+            None => "Reading branch…".into(),
+        },
+    };
+    let menu_owner = owner.clone();
+    let has_worktree = worktree.is_some();
+    h_flex()
+        .id("composer-workspace")
+        .flex_shrink_0()
+        .min_w_0()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .text_color(cx.theme().muted_foreground)
+        .child(
+            h_flex().flex_1().min_w_0().overflow_hidden().child(
+                Button::new("composer-workspace-picker")
+                    .small()
+                    .ghost()
+                    .icon(Lucide::Folder)
+                    .label(label)
+                    .dropdown_caret(true)
+                    .disabled(!selected)
+                    .tooltip(if selected {
+                        tooltip
+                    } else {
+                        "Select this conversation first".into()
+                    })
+                    .dropdown_menu(move |mut menu, _, cx| {
+                        let Some(owner) = menu_owner.upgrade() else {
+                            return menu;
+                        };
+                        let state = owner.read(cx).state.read(cx);
+                        for command in [
+                            Command::NewConversationInWorkspace,
+                            Command::NewConversationInWorktree,
+                            Command::RemoveWorktree,
+                        ]
+                        .into_iter()
+                        .filter(|command| *command != Command::RemoveWorktree || has_worktree)
+                        {
+                            let reason = command.disabled_reason(state);
+                            let label = match &reason {
+                                Some(reason) => format!("{} — {reason}", command.label()),
+                                None => command.label().to_owned(),
+                            };
+                            menu = menu.item(
+                                PopupMenuItem::new(label)
+                                    .action(command.action())
+                                    .disabled(reason.is_some()),
+                            );
+                        }
+                        menu
+                    }),
+            ),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .max_w(relative(0.5))
+                .overflow_hidden()
+                .font_family(cx.theme().mono_font_family.clone())
+                .child(
+                    button(
+                        "composer-branch-picker",
+                        Command::SwitchBranch,
+                        owner,
+                        state,
+                    )
+                    .label(branch)
+                    .icon(Lucide::GitBranch)
+                    .dropdown_caret(true)
+                    .disabled(!selected || Command::SwitchBranch.disabled_reason(state).is_some())
+                    .map(|button| {
+                        if !selected {
+                            button.tooltip("Select this conversation first")
+                        } else if Command::SwitchBranch.disabled_reason(state).is_none() {
+                            button.tooltip_with_action(
+                                Command::SwitchBranch.label(),
+                                &super::commands::SwitchBranch,
+                                Some("Workspace"),
+                            )
+                        } else {
+                            button
+                        }
+                    }),
+                ),
+        )
 }
 
 #[cfg(test)]
@@ -4621,6 +4715,7 @@ mod tests {
                 effort: None,
                 permission_mode: None,
                 worktree_id: None,
+                pull_request: None,
                 draft: String::new(),
                 attachments: Vec::new(),
                 submission: None,

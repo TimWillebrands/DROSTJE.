@@ -241,6 +241,8 @@ pub enum DialogKind {
     ArchiveProject(Uuid),
     /// A Conversation in a fresh worktree of this project, from a chosen base branch.
     NewWorktreeConversation(Uuid),
+    /// Start another Conversation in the project checkout or an existing live worktree.
+    NewWorkspaceConversation(Uuid),
     RemoveWorktree(Uuid),
     /// Check out another local branch, or a new one, in a Conversation's working tree.
     SwitchBranch(Uuid),
@@ -354,6 +356,52 @@ impl SurfaceContent {
                         .map(|t| t.title.clone())
                         .unwrap_or_default(),
                 ),
+                DialogKind::NewWorkspaceConversation(project) => {
+                    let root = state
+                        .snapshot
+                        .projects
+                        .iter()
+                        .find(|candidate| candidate.id == *project)
+                        .map(|project| project.root.display().to_string())
+                        .unwrap_or_default();
+                    let mut choices =
+                        vec![Choice::new("project", format!("Current checkout — {root}"))];
+                    choices.extend(
+                        state
+                            .snapshot
+                            .worktrees
+                            .iter()
+                            .filter(|worktree| {
+                                worktree.project_id == *project && worktree.is_live()
+                            })
+                            .map(|worktree| {
+                                Choice::new(
+                                    worktree.id.to_string(),
+                                    format!(
+                                        "{} · {} — {}",
+                                        worktree.codename,
+                                        state.worktree_branch_label(worktree),
+                                        worktree.path.display()
+                                    ),
+                                )
+                            }),
+                    );
+                    let selected = state
+                        .conversation_thread()
+                        .filter(|thread| thread.project_id == *project)
+                        .and_then(|thread| state.thread_worktree(thread))
+                        .filter(|worktree| worktree.is_live())
+                        .map(|worktree| worktree.id.to_string())
+                        .unwrap_or_else(|| "project".into());
+                    selects.push(select_field(
+                        "workspace",
+                        "Workspace",
+                        choices,
+                        &selected,
+                        window,
+                        cx,
+                    ));
+                }
                 DialogKind::NewWorktreeConversation(project) => {
                     let repository = state
                         .repositories
@@ -463,6 +511,10 @@ impl SurfaceContent {
                             "llama.cpp executable (blank: discover automatically)",
                         ),
                         ("factory", "Factory executable (blank: discover on PATH)"),
+                        (
+                            "azdo",
+                            "azdo executable for Azure DevOps (blank: discover on PATH)",
+                        ),
                     ] {
                         field(
                             key,
@@ -1063,6 +1115,22 @@ impl SurfaceContent {
                 thread.updated_at = platform::now();
                 state.save_thread(thread);
             }
+            DialogKind::NewWorkspaceConversation(project) => {
+                anyhow::ensure!(
+                    state.selected_project == Some(project),
+                    "Project selection changed; reopen New conversation in workspace."
+                );
+                let selected = self.value("workspace", cx);
+                let worktree = if selected == "project" {
+                    None
+                } else {
+                    Some(
+                        Uuid::parse_str(&selected)
+                            .map_err(|_| field_error("workspace", "Choose a workspace."))?,
+                    )
+                };
+                state.new_conversation_in_workspace(worktree)?;
+            }
             DialogKind::NewWorktreeConversation(project) => {
                 let base = self.value("base", cx);
                 if base.is_empty() {
@@ -1233,6 +1301,7 @@ impl SurfaceContent {
                         "claude": self.value("claude", cx),
                         "llama": self.value("llama", cx),
                         "factory": self.value("factory", cx),
+                        "azdo": self.value("azdo", cx),
                     }),
                 );
                 state.set_setting("factory_data_root", json!(root));
@@ -1267,6 +1336,7 @@ impl SurfaceContent {
             DialogKind::RenameThread(_) => "Rename thread",
             DialogKind::ArchiveProject(_) => "Archive project",
             DialogKind::NewWorktreeConversation(_) => "New conversation in new worktree",
+            DialogKind::NewWorkspaceConversation(_) => "New conversation in workspace",
             DialogKind::RemoveWorktree(_) => "Remove worktree",
             DialogKind::SwitchBranch(_) => "Switch branch",
             DialogKind::Commit(_) => "Commit changes",
@@ -1551,7 +1621,7 @@ impl SurfaceContent {
             );
         let tools = fields(
             "Tools",
-            &["nvim", "omp", "pi", "claude", "llama", "factory"],
+            &["nvim", "omp", "pi", "claude", "llama", "factory", "azdo"],
         )
         .description(
             "Tool installation and upgrades run only at your explicit request. DROSTJE. does not authenticate for you.",
@@ -1653,12 +1723,21 @@ impl SurfaceContent {
             ("claude", "Claude Code"),
             ("llama", "llama.cpp"),
             ("factory", "Factory"),
+            ("azdo", "Azure DevOps (azdo)"),
         ] {
             let status = state
                 .diagnostics
                 .get(name)
                 .cloned()
                 .unwrap_or_else(|| "Not inspected".into());
+            // A resolved azdo can still be signed out; that is a setup issue too.
+            let tracker_issue = (name == "azdo")
+                .then(|| state.tracker_setup_issue())
+                .flatten();
+            let status = match &tracker_issue {
+                Some(issue) => format!("{status}. {issue}"),
+                None => status,
+            };
             let install_pi =
                 name == "pi" && (state.installing_pi || status.starts_with("Unavailable:"));
             let install_reason = install_pi
@@ -1688,6 +1767,16 @@ impl SurfaceContent {
                                 .tooltip(tooltip)
                                 .on_click(move |_, window, cx| {
                                     window.dispatch_action(Box::new(super::commands::InstallPi), cx)
+                                })
+                        } else if tracker_issue.is_some() {
+                            Button::new("refresh-pull-requests")
+                                .small()
+                                .label("Check again")
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(super::commands::RefreshPullRequests),
+                                        cx,
+                                    )
                                 })
                         } else {
                             let owner = owner.clone();
@@ -1752,6 +1841,13 @@ impl SurfaceContent {
             }
             DialogKind::ArchiveProject(_) => {
                 body = body.child("Archive retains threads, drafts, sessions, and Factory history. It never deletes checkout, session, or Factory files. Archived history remains accessible from Projects.");
+            }
+            DialogKind::NewWorkspaceConversation(_) => {
+                body = body
+                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                        .child("Starts a new conversation in the selected directory. The current conversation, its draft, and its session stay where they are. Worktrees can be shared by several conversations."))
+                    .child(div().id("workspace-choice").test_support()
+                        .child(Form::new().child(self.form_field("workspace", readonly, cx))));
             }
             DialogKind::NewWorktreeConversation(project) => {
                 let pending = self.request.is_some();
@@ -2155,7 +2251,11 @@ fn footer(dialog: &SurfaceContent) -> AnyElement {
                     "Archive"
                 } else if matches!(dialog.kind, DialogKind::AddProject) {
                     "Add project"
-                } else if matches!(dialog.kind, DialogKind::NewWorktreeConversation(_)) {
+                } else if matches!(
+                    dialog.kind,
+                    DialogKind::NewWorktreeConversation(_)
+                        | DialogKind::NewWorkspaceConversation(_)
+                ) {
                     "Create conversation"
                 } else if matches!(dialog.kind, DialogKind::SwitchBranch(_)) {
                     "Switch"

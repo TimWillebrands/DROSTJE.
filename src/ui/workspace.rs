@@ -2448,6 +2448,7 @@ impl Workspace {
                 | Command::NewPiConversation
                 | Command::NewClaudeCodeConversation
                 | Command::NewConversationInWorktree
+                | Command::NewConversationInWorkspace
                 | Command::NewFactoryThread
                 | Command::NewTerminal
                 | Command::NewBrowser
@@ -2645,6 +2646,37 @@ impl Workspace {
                 });
                 None
             }
+            Command::ToggleReview => {
+                if let Some(id) = self.state.read(cx).conversation_thread().map(|t| t.id) {
+                    self.toggle_sidebar_tab(id, SidebarTab::Review, cx);
+                }
+                None
+            }
+            Command::RefreshReview => {
+                self.state.update(cx, |state, cx| {
+                    if let Some(id) = state.conversation_thread().map(|thread| thread.id) {
+                        state.refresh_reviews(id, cx);
+                    }
+                });
+                None
+            }
+            Command::RefreshPullRequests => {
+                self.state
+                    .update(cx, |state, cx| state.poll_pull_requests(cx));
+                None
+            }
+            Command::OpenPullRequest => {
+                if let Some(url) = self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .and_then(|thread| thread.pull_request.as_ref())
+                    .map(|pr| pr.url.clone())
+                {
+                    cx.open_url(&url);
+                }
+                None
+            }
             Command::AddProject => Some(DialogKind::AddProject),
             Command::RenameProject => self
                 .state
@@ -2666,6 +2698,11 @@ impl Workspace {
                 .read(cx)
                 .selected_project
                 .map(DialogKind::NewWorktreeConversation),
+            Command::NewConversationInWorkspace => self
+                .state
+                .read(cx)
+                .selected_project
+                .map(DialogKind::NewWorkspaceConversation),
             Command::SwitchHarness => {
                 self.open_harness_picker(window, cx);
                 None
@@ -3344,6 +3381,9 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &NewConversationInWorktree, w, cx| {
                     this.execute(Command::NewConversationInWorktree, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &NewConversationInWorkspace, w, cx| {
+                    this.execute(Command::NewConversationInWorkspace, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &SwitchHarness, w, cx| {
                     this.execute(Command::SwitchHarness, w, cx)
                 }))
@@ -3447,6 +3487,18 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &RefreshConversationDiff, w, cx| {
                     this.execute(Command::RefreshConversationDiff, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ToggleReview, w, cx| {
+                    this.execute(Command::ToggleReview, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RefreshReview, w, cx| {
+                    this.execute(Command::RefreshReview, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &OpenPullRequest, w, cx| {
+                    this.execute(Command::OpenPullRequest, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RefreshPullRequests, w, cx| {
+                    this.execute(Command::RefreshPullRequests, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &OpenPalette, w, cx| this.open_palette(w, cx)))
                 .on_action(cx.listener(|this, _: &FocusProjects, w, cx| {
@@ -3706,7 +3758,9 @@ impl WorkspacePanel {
             cx.subscribe(&state, |panel, _, event: &PresentationChange, cx| {
                 let affected = match (*event, panel.kind) {
                     (
-                        PresentationChange::Draft(id) | PresentationChange::Thread(id),
+                        PresentationChange::Draft(id)
+                        | PresentationChange::Thread(id)
+                        | PresentationChange::Review(id),
                         PanelKind::Thread(thread),
                     ) => id == thread,
                     (PresentationChange::Diff(key), PanelKind::Thread(thread)) => {

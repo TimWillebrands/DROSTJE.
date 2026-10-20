@@ -149,6 +149,8 @@ impl AppState {
         ids: impl IntoIterator<Item = ThreadId>,
         cx: &mut Context<Self>,
     ) {
+        let ids: Vec<ThreadId> = ids.into_iter().collect();
+        self.set_visible_reviews(&ids, cx);
         let mut interests: HashMap<WorkingTree, (PathBuf, HashSet<ThreadId>)> = HashMap::new();
         if !self.shutting_down {
             for id in ids {
