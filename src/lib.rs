@@ -4,6 +4,7 @@ pub mod browser;
 pub mod browser_tools;
 pub mod diff;
 pub mod factory;
+pub mod file_refs;
 pub mod harness;
 pub mod model;
 pub mod neovim;

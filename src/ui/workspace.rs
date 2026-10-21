@@ -1,5 +1,7 @@
 #[path = "workspace_browser.rs"]
 mod browser_workspace;
+#[path = "workspace_neovim.rs"]
+mod neovim_workspace;
 use super::browser::{BrowserPane, OpenBrowserUrl};
 use super::{
     activity,
@@ -7,7 +9,7 @@ use super::{
     conversation, factory,
     settings::{DialogKind, SurfaceContent, SurfaceOutcome},
     sidebar::{self, Row},
-    terminal::{TerminalId, TerminalPane},
+    terminal::{NeovimExited, NeovimTarget, TerminalId, TerminalPane},
     thread_sidebar,
     title_bar::{WorkspaceDockSkin, WorkspaceTitle},
 };
@@ -40,6 +42,7 @@ use serde_json::json;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
+    path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -142,6 +145,9 @@ struct TerminalTab {
     project: ProjectId,
     #[serde(default)]
     worktree: Option<WorktreeId>,
+    /// Set for a Neovim tab: it reopens Neovim on the same file.
+    #[serde(default)]
+    neovim: Option<NeovimTarget>,
 }
 fn terminal_tab(state: &PanelState) -> Option<TerminalTab> {
     match &state.info {
@@ -1209,33 +1215,42 @@ impl Workspace {
         if self.navigation_blocked(window, cx) {
             return;
         }
-        let Some(project) = self
-            .state
-            .read(cx)
-            .selected_project
-            .and_then(|id| {
-                self.state
-                    .read(cx)
-                    .snapshot
-                    .projects
-                    .iter()
-                    .find(|project| project.id == id)
-            })
-            .cloned()
-        else {
-            return;
-        };
-        // A terminal opened from a Conversation starts where that Conversation works.
-        let (root, worktree) = {
-            let state = self.state.read(cx);
+        if let Some((project, worktree, root)) = self.terminal_location(cx) {
+            self.add_terminal(project, worktree, root, None, window, cx);
+        }
+    }
+    /// Where a new terminal or Neovim tab starts: the selected project, or the worktree
+    /// of the selected Conversation when it works in one.
+    fn terminal_location(&self, cx: &App) -> Option<(ProjectId, Option<WorktreeId>, PathBuf)> {
+        let state = self.state.read(cx);
+        let project = state.selected_project.and_then(|id| {
             state
-                .conversation_thread()
-                .filter(|thread| thread.project_id == project.id)
-                .and_then(|thread| state.thread_worktree(thread))
-                .filter(|worktree| worktree.is_live())
-                .map(|worktree| (worktree.path.clone(), Some(worktree.id)))
-                .unwrap_or((project.root.clone(), None))
-        };
+                .snapshot
+                .projects
+                .iter()
+                .find(|project| project.id == id)
+        })?;
+        // A terminal opened from a Conversation starts where that Conversation works.
+        let (root, worktree) = state
+            .conversation_thread()
+            .filter(|thread| thread.project_id == project.id)
+            .and_then(|thread| state.thread_worktree(thread))
+            .filter(|worktree| worktree.is_live())
+            .map(|worktree| (worktree.path.clone(), Some(worktree.id)))
+            .unwrap_or((project.root.clone(), None));
+        Some((project.id, worktree, root))
+    }
+    /// Add a terminal tab beside the current thread tab and focus it. With `neovim`,
+    /// the tab runs the user's Neovim on that target instead of a shell.
+    fn add_terminal(
+        &mut self,
+        project: ProjectId,
+        worktree: Option<WorktreeId>,
+        root: PathBuf,
+        neovim: Option<NeovimTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = TerminalId::new();
         let owner = cx.entity().downgrade();
         let state = self.state.clone();
@@ -1245,10 +1260,16 @@ impl Workspace {
             .and_then(|panel| panel.read(cx).group.clone())
             .and_then(|group| group.upgrade())
             .map(|group| group.read(cx).node());
-        let pane = cx.new(|cx| TerminalPane::new(project.id, worktree, space, root, window, cx));
+        let setting = neovim_workspace::neovim_setting(self.state.read(cx));
+        let pane = cx.new(|cx| match neovim {
+            Some(target) => {
+                TerminalPane::neovim(project, worktree, space, root, target, setting, window, cx)
+            }
+            None => TerminalPane::new(project, worktree, space, root, window, cx),
+        });
         let panel = cx.new(|cx| {
             let mut panel = WorkspacePanel::new(PanelKind::Terminal(id), state, owner, window, cx);
-            panel.terminal = Some(pane);
+            panel.attach_terminal(id, pane, window, cx);
             panel
         });
         self.terminals.borrow_mut().insert(id, panel.clone());
@@ -1372,6 +1393,25 @@ impl Workspace {
             return;
         }
         self.terminal_confirmation = true;
+        let neovim = pane.read(cx).neovim_target().is_some();
+        let (description, ok_text) = match (neovim, restart) {
+            (true, restart) => (
+                "This stops Neovim. Changes it has not written are lost; other tabs are not affected.",
+                if restart {
+                    RESTART_NEOVIM_LABEL
+                } else {
+                    "Close Neovim"
+                },
+            ),
+            (false, true) => (
+                "This stops this terminal's shell and foreground jobs. Other terminals are not affected.",
+                "Restart terminal",
+            ),
+            (false, false) => (
+                "This stops this terminal's shell and foreground jobs. Other terminals are not affected.",
+                "Close terminal",
+            ),
+        };
         let title = format!(
             "{} {}?",
             if restart { "Restart" } else { "Close" },
@@ -1382,11 +1422,19 @@ impl Workspace {
             let confirm = owner.clone();
             let cancel = owner.clone();
             alert
-                .title(div().id("terminal-stop-confirmation").test_support().child(title.clone()))
-                .description("This stops this terminal's shell and foreground jobs. Other terminals are not affected.")
-                .button_props(DialogButtonProps::default()
-                    .ok_text(if restart { "Restart terminal" } else { "Close terminal" })
-                    .cancel_text("Cancel").show_cancel(true))
+                .title(
+                    div()
+                        .id("terminal-stop-confirmation")
+                        .test_support()
+                        .child(title.clone()),
+                )
+                .description(description)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(ok_text)
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
+                )
                 .on_ok(move |_, window, cx| {
                     let confirm = confirm.clone();
                     // Own close ordering: restore modal focus before replacing its terminal.
@@ -2451,6 +2499,8 @@ impl Workspace {
                 | Command::NewConversationInWorkspace
                 | Command::NewFactoryThread
                 | Command::NewTerminal
+                | Command::NewNeovim
+                | Command::OpenConversationFile
                 | Command::NewBrowser
                 | Command::RestartTerminal
         ) && self
@@ -2527,6 +2577,14 @@ impl Workspace {
             }
             Command::RestartTerminal => {
                 self.restart_terminal(window, cx);
+                None
+            }
+            Command::NewNeovim => {
+                self.new_neovim(window, cx);
+                None
+            }
+            Command::OpenConversationFile => {
+                self.open_conversation_files(window, cx);
                 None
             }
             Command::NewSpace => Some(DialogKind::NewSpace),
@@ -3304,6 +3362,17 @@ impl Render for Workspace {
                 .relative()
                 .bg(cx.theme().background)
                 .text_color(cx.theme().foreground)
+                .on_action(
+                    cx.listener(|this, _: &NewNeovim, w, cx| {
+                        this.execute(Command::NewNeovim, w, cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &OpenConversationFile, w, cx| {
+                    this.execute(Command::OpenConversationFile, w, cx)
+                }))
+                .on_action(cx.listener(|this, action: &OpenFileReference, w, cx| {
+                    this.open_file_reference(action.reference.clone(), action.thread, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &NewTerminal, w, cx| {
                     this.execute(Command::NewTerminal, w, cx)
                 }))
@@ -3705,7 +3774,20 @@ fn reopen_terminal(
             .map(|worktree| (space, worktree.path.clone(), Some(worktree.id)))
             .unwrap_or((space, project.root.clone(), None))
     };
-    let pane = cx.new(|cx| TerminalPane::new(tab.project, worktree, space, root, window, cx));
+    let setting = neovim_workspace::neovim_setting(state.read(cx));
+    let pane = cx.new(|cx| match tab.neovim {
+        Some(target) => TerminalPane::neovim(
+            tab.project,
+            worktree,
+            space,
+            root,
+            target,
+            setting,
+            window,
+            cx,
+        ),
+        None => TerminalPane::new(tab.project, worktree, space, root, window, cx),
+    });
     let panel = cx.new(|cx| {
         let mut panel = WorkspacePanel::new(
             PanelKind::Terminal(tab.terminal),
@@ -3714,7 +3796,7 @@ fn reopen_terminal(
             window,
             cx,
         );
-        panel.terminal = Some(pane);
+        panel.attach_terminal(tab.terminal, pane, window, cx);
         panel
     });
     terminals.borrow_mut().insert(tab.terminal, panel.clone());
@@ -3850,6 +3932,28 @@ impl WorkspacePanel {
             _subscriptions: subscriptions,
         }
     }
+    /// Give a Terminal panel its pane. A Neovim pane that exits closes its tab.
+    fn attach_terminal(
+        &mut self,
+        id: TerminalId,
+        pane: Entity<TerminalPane>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._subscriptions.push(cx.subscribe_in(
+            &pane,
+            window,
+            move |panel, _, _: &NeovimExited, window, cx| {
+                let owner = panel.workspace.clone();
+                // The pane's observer runs inside its own update; close afterwards.
+                window.defer(cx, move |window, cx| {
+                    let _ =
+                        owner.update(cx, |workspace, cx| workspace.neovim_exited(id, window, cx));
+                });
+            },
+        ));
+        self.terminal = Some(pane);
+    }
     fn panel_title(&self, cx: &App) -> String {
         match self.kind {
             PanelKind::Projects => "Projects".into(),
@@ -3861,14 +3965,25 @@ impl WorkspacePanel {
                 .filter(|title| !title.is_empty())
                 .unwrap_or_else(|| "Browser".into()),
             PanelKind::Terminal(_) => {
-                let (project, worktree) = self
+                let (project, worktree, neovim) = self
                     .terminal
                     .as_ref()
                     .map(|pane| {
                         let pane = pane.read(cx);
-                        (Some(pane.project_id), pane.worktree)
+                        (Some(pane.project_id), pane.worktree, pane.neovim_target())
                     })
-                    .unwrap_or((None, None));
+                    .unwrap_or((None, None, None));
+                if let Some(name) = neovim
+                    .and_then(|target| target.file.as_ref())
+                    .and_then(|file| file.file_name())
+                {
+                    return format!("Neovim — {}", name.to_string_lossy());
+                }
+                let kind = if neovim.is_some() {
+                    "Neovim"
+                } else {
+                    "Terminal"
+                };
                 let state = self.state.read(cx);
                 let name = state
                     .snapshot
@@ -3878,8 +3993,8 @@ impl WorkspacePanel {
                     .map(|project| project.name.as_str())
                     .unwrap_or("Project");
                 match worktree.and_then(|id| state.worktree(id)) {
-                    Some(worktree) => format!("Terminal — {name} · {}", worktree.codename),
-                    None => format!("Terminal — {name}"),
+                    Some(worktree) => format!("{kind} — {name} · {}", worktree.codename),
+                    None => format!("{kind} — {name}"),
                 }
             }
             PanelKind::Thread(id) => self
@@ -3963,6 +4078,7 @@ impl BasePanel for WorkspacePanel {
                 "terminal": id,
                 "project": pane.map(|pane| pane.project_id),
                 "worktree": pane.and_then(|pane| pane.worktree),
+                "neovim": pane.and_then(|pane| pane.neovim_target()),
             }));
         }
         if let PanelKind::Browser(id) = self.kind {
@@ -4141,8 +4257,22 @@ impl Panel for WorkspacePanel {
                         .on_click(owned(Command::NewTerminal)),
                 )
                 .item(
-                    PopupMenuItem::new(Command::RestartTerminal.label())
-                        .on_click(owned(Command::RestartTerminal)),
+                    PopupMenuItem::new(Command::NewNeovim.label())
+                        .on_click(owned(Command::NewNeovim)),
+                )
+                .item(
+                    PopupMenuItem::new(
+                        if self
+                            .terminal
+                            .as_ref()
+                            .is_some_and(|pane| pane.read(cx).neovim_target().is_some())
+                        {
+                            RESTART_NEOVIM_LABEL
+                        } else {
+                            Command::RestartTerminal.label()
+                        },
+                    )
+                    .on_click(owned(Command::RestartTerminal)),
                 )
                 .item(
                     PopupMenuItem::new(Command::CloseThread.label())
@@ -4708,6 +4838,47 @@ mod terminal_layout_tests {
         let saved = serde_json::to_value(saved).unwrap();
         assert_eq!(saved["center"]["children"][1], terminal);
         assert_eq!(saved["center"]["info"]["tabs"]["active_index"], json!(1));
+    }
+
+    #[test]
+    fn saving_keeps_neovim_tabs_with_their_file_and_line() {
+        let project = crate::model::ProjectId::new_v4();
+        let leaf = |neovim: serde_json::Value| {
+            json!({
+                "panel_name": "Terminal", "children": [],
+                "info": {"panel": {
+                    "terminal": uuid::Uuid::new_v4(), "project": project, "worktree": null,
+                    "neovim": neovim
+                }}
+            })
+        };
+        let layout: DockAreaState = serde_json::from_value(json!({
+            "version": LAYOUT_VERSION,
+            "center": {"panel_name": "TabPanel", "children": [
+                leaf(json!({"file": "/work/src/browser_tools.rs", "line": 149, "column": null})),
+                leaf(json!(null))
+            ], "info": {"tabs": {"active_index": 0}}},
+            "left_dock": {
+                "panel": {"panel_name": "TabPanel", "children": [
+                    {"panel_name": "Projects", "children": [], "info": {"panel": null}}
+                ], "info": {"tabs": {"active_index": 0}}},
+                "placement": "left", "size": 240., "open": true
+            }
+        }))
+        .unwrap();
+        let saved = durable_layout(layout);
+        validate_layout(&saved).unwrap();
+        let neovim = super::terminal_tab(&saved.center.children[0]).unwrap();
+        assert_eq!(
+            neovim.neovim,
+            Some(super::NeovimTarget {
+                file: Some("/work/src/browser_tools.rs".into()),
+                line: Some(149),
+                column: None,
+            })
+        );
+        let shell = super::terminal_tab(&saved.center.children[1]).unwrap();
+        assert_eq!((shell.project, shell.neovim), (project, None));
     }
 
     #[test]

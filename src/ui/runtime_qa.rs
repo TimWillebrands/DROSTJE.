@@ -3839,6 +3839,75 @@ async fn projects_selection_displays_the_threads_tab(cx: &mut TestAppContext) {
     quit(cx, &fixture).await;
 }
 
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; opens Conversation file references as Neovim tabs without a provider turn"]
+async fn conversation_file_references_open_neovim_tabs(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let thread = new_conversation(cx, &fixture).await;
+    let root = cx.read(|cx| fixture.state.read(cx).snapshot.projects[0].root.clone());
+    let open = |cx: &mut TestAppContext, path: &str, line| {
+        cx.dispatch_action(
+            fixture.window.into(),
+            commands::OpenFileReference {
+                reference: crate::file_refs::FileReference {
+                    path: path.into(),
+                    line,
+                    column: None,
+                },
+                thread: Some(thread),
+            },
+        );
+    };
+
+    // A relative path resolves against the Conversation's working tree, at its line.
+    open(cx, "notes.txt", Some(1));
+    until(cx, "Neovim tab opened", Duration::from_secs(10), |cx| {
+        fixture.workspace.read(cx).neovim_tabs(cx).len() == 1
+    })
+    .await;
+    let (title, target) = cx.read(|cx| fixture.workspace.read(cx).neovim_tabs(cx))[0].clone();
+    assert_eq!(title, "Neovim — notes.txt");
+    assert_eq!(
+        target.file.as_deref(),
+        Some(fs::canonicalize(root.join("notes.txt")).unwrap().as_path())
+    );
+    assert_eq!((target.line, target.column), (Some(1), None));
+    assert!(cx.read(|cx| fixture.workspace.read(cx).has_active_terminal(cx)));
+
+    // A missing file is a visible notice, never an empty tab.
+    let notices = cx.read(|cx| fixture.state.read(cx).notice_sequence);
+    open(cx, "missing/file.rs", Some(3));
+    until(cx, "missing file notice", Duration::from_secs(10), |cx| {
+        fixture.state.read(cx).notice_sequence > notices
+    })
+    .await;
+    assert!(cx.read(|cx| {
+        fixture.state.read(cx).notices.iter().any(|notice| {
+            notice.text.starts_with("Could not open missing/file.rs:3:")
+                && notice.text.ends_with("does not exist")
+        })
+    }));
+    assert_eq!(
+        cx.read(|cx| fixture.workspace.read(cx).neovim_tabs(cx).len()),
+        1
+    );
+
+    // The tab is saved with the layout, file and line included.
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, _, cx| workspace.flush_layout(cx),
+    );
+    fixture.store.flush().await.unwrap();
+    let snapshot = fixture.store.snapshot().await.unwrap();
+    assert!(
+        json!(snapshot.settings).to_string().contains("\"line\":1"),
+        "Neovim target is saved with the tab"
+    );
+    quit(cx, &fixture).await;
+}
+
 /// Terminal tab leaves in a layout as `(tab id, project)`.
 fn terminal_tabs(value: &serde_json::Value) -> Vec<(String, String)> {
     let mut tabs = Vec::new();

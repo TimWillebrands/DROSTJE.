@@ -8,6 +8,7 @@ use super::{
 };
 use crate::{
     app::{AppState, ConversationSession, ThreadActivity},
+    file_refs::{self, FileReference},
     harness::{
         ContentBlock, ContextUsage, LimitWindow, Message, UsageLimit, UserAnswer, UserRequest,
         UserRequestKind,
@@ -35,8 +36,8 @@ use gpui_kit::{
         spinner::Spinner,
         tag::Tag,
         text::{
-            MarkdownNode, MarkdownParseContext, MarkdownPlugin, TextView, TextViewState,
-            TextViewStyle, markdown_ast,
+            InlineElement, InlineRenderContext, MarkdownNode, MarkdownParseContext, MarkdownPlugin,
+            TextView, TextViewState, TextViewStyle, markdown_ast,
         },
         tooltip::Tooltip,
         v_flex,
@@ -130,7 +131,7 @@ impl TranscriptView {
             id,
             state,
             owner,
-            markdown: MarkdownStates::new(list.clone(), cx.entity_id()),
+            markdown: MarkdownStates::new(id, list.clone(), cx.entity_id()),
             list,
             generation: None,
             revision: 0,
@@ -886,6 +887,102 @@ impl MarkdownPlugin for InertResources {
         div().whitespace_normal().child(node.as_text().to_owned())
     }
 }
+/// Inline code that names a file (`src/app.rs:42`) opens it in Neovim at that line.
+/// Parsed from the Markdown tree, so code blocks and identifiers like `cx.notify` stay
+/// plain code; whether the file exists is checked only when it is opened.
+struct FileReferences {
+    thread: Option<ThreadId>,
+}
+const FILE_REFERENCE: &str = "drostje-file-reference";
+impl MarkdownPlugin for FileReferences {
+    fn name(&self) -> &str {
+        FILE_REFERENCE
+    }
+    fn parse(
+        &self,
+        node: &markdown_ast::Node,
+        _: &MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let markdown_ast::Node::InlineCode(code) = node else {
+            return None;
+        };
+        let reference = file_refs::parse(&code.value)?;
+        Some(
+            MarkdownNode::new(FILE_REFERENCE, reference)
+                .text(code.value.clone())
+                .markdown(format!("`{}`", code.value)),
+        )
+    }
+    fn render_inline(
+        &self,
+        node: &MarkdownNode,
+        context: &InlineRenderContext,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Option<InlineElement> {
+        let reference = node.data::<FileReference>()?.clone();
+        let thread = self.thread;
+        let offset = node.source_range().map_or(0, |range| range.start);
+        let tooltip: SharedString = match reference.line {
+            Some(line) => format!("Open in Neovim at line {line}").into(),
+            None => "Open in Neovim".into(),
+        };
+        Some(InlineElement::new(
+            Button::new(SharedString::from(format!("file-reference-{offset}")))
+                .link()
+                .tab_stop(false)
+                .label(node.as_text().to_owned())
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(context.font_size())
+                .h(context.line_height())
+                .debug_selector(|| "conversation-file-reference".into())
+                .tooltip(tooltip)
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    window.dispatch_action(
+                        Box::new(super::commands::OpenFileReference {
+                            reference: reference.clone(),
+                            thread,
+                        }),
+                        cx,
+                    );
+                }),
+        ))
+    }
+}
+
+/// Every file a Conversation displayed, in inline code or as a tool's file, most
+/// recent first and each once: the rows of "Open file from conversation…".
+pub(super) fn file_references(session: &ConversationSession) -> Vec<FileReference> {
+    let mut seen = std::collections::HashSet::new();
+    let mut references = Vec::new();
+    let tools = session
+        .tools
+        .values()
+        .filter_map(|tool| file_refs::tool_reference(&tool.name, &tool.input));
+    let messages = session.messages.iter().rev().flat_map(|message| {
+        let mut found = Vec::new();
+        for block in &message.content {
+            match block {
+                ContentBlock::Text(text) => found.extend(file_refs::inline_code_references(text)),
+                ContentBlock::ToolCall { name, input, .. } => {
+                    found.extend(file_refs::tool_reference(name, input))
+                }
+                ContentBlock::Thinking(_)
+                | ContentBlock::Image(_)
+                | ContentBlock::ImageError(_) => {}
+            }
+        }
+        found.into_iter().rev()
+    });
+    for reference in tools.chain(messages) {
+        if seen.insert(reference.label()) {
+            references.push(reference);
+        }
+    }
+    references
+}
+
 /// Transcript prose stays close to body size: headings step up modestly and
 /// paragraphs sit half a line apart, so a reply reads as a message, not a page.
 /// `body` is the size the text inherits, so prose type scales its headings too.
@@ -921,6 +1018,8 @@ const SYNC_PARSE_LIMIT: usize = 4 * 1024;
 /// would skip it. Here each text parses once, and a landing parse remeasures its row.
 #[derive(Clone)]
 pub struct MarkdownStates {
+    /// The Conversation whose working tree resolves file references in this text.
+    thread: ThreadId,
     list: ListState,
     view: EntityId,
     entries: Rc<RefCell<HashMap<ElementId, MarkdownEntry>>>,
@@ -936,8 +1035,9 @@ struct MarkdownEntry {
 }
 
 impl MarkdownStates {
-    fn new(list: ListState, view: EntityId) -> Self {
+    fn new(thread: ThreadId, list: ListState, view: EntityId) -> Self {
         Self {
+            thread,
             list,
             view,
             entries: Rc::default(),
@@ -1036,21 +1136,30 @@ struct TranscriptMarkdown {
 impl RenderOnce for TranscriptMarkdown {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let body = window.text_style().font_size.to_pixels(window.rem_size());
+        // Element-scoped text has no Conversation of its own: the selected one resolves it.
+        let thread = self.states.as_ref().map(|(states, _)| states.thread);
         match self.states {
             Some((states, row)) => TextView::new(&states.state(self.id, self.text, row, cx)),
             None => TextView::markdown(self.id, self.text),
         }
         .style(transcript_text_style(body))
         .plugin(InertResources)
+        .plugin(FileReferences { thread })
         .selectable(true)
-        .on_link_click(|url, event, window, cx| {
-            if !event.is_right_click()
-                && (url.starts_with("https://") || url.starts_with("http://"))
-            {
+        .on_link_click(move |url, event, window, cx| {
+            if event.is_right_click() {
+                return;
+            }
+            if url.starts_with("https://") || url.starts_with("http://") {
                 window.dispatch_action(
                     Box::new(super::browser::OpenBrowserUrl {
                         url: url.to_string(),
                     }),
+                    cx,
+                );
+            } else if let Some(reference) = file_refs::parse_link(url) {
+                window.dispatch_action(
+                    Box::new(super::commands::OpenFileReference { reference, thread }),
                     cx,
                 );
             }
@@ -1679,6 +1788,22 @@ fn tool_card(
     if intent.is_some() && expanded {
         header = header.child(div().flex_shrink_0().child(name.to_owned()));
     }
+    if let Some(reference) = file_refs::tool_reference(name, input) {
+        let thread = match markdown {
+            Markdown::Row(states, _) => Some(states.thread),
+            Markdown::Element => None,
+        };
+        header = header.child(
+            div()
+                .invisible()
+                .group_hover(group.clone(), |style| style.visible())
+                .child(open_file_button(
+                    format!("{key}:open-file"),
+                    reference,
+                    thread,
+                )),
+        );
+    }
     header = header.when_some(mark, |row, mark| row.child(mark));
     if has_detail && outcome != ToolOutcome::Failed {
         header = header.on_click(toggle(owner, key.clone())).child(
@@ -1751,6 +1876,28 @@ fn tool_card(
         card = card.child(detail);
     }
     card.into_any_element()
+}
+
+/// Opens the file a read, write or edit touched in Neovim. Shown on hover; the keyboard
+/// path is "Open file from conversation…", which lists the same files.
+fn open_file_button(id: String, reference: FileReference, thread: Option<ThreadId>) -> Button {
+    Button::new(SharedString::from(id))
+        .xsmall()
+        .ghost()
+        .cursor_default()
+        .tab_stop(false)
+        .icon(Lucide::FileCode)
+        .tooltip("Open in Neovim")
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            window.dispatch_action(
+                Box::new(super::commands::OpenFileReference {
+                    reference: reference.clone(),
+                    thread,
+                }),
+                cx,
+            );
+        })
 }
 
 /// A `todo` call whose result parsed: what changed, OMP's tally and the
@@ -4441,6 +4588,80 @@ mod tests {
 
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
+    fn inline_code_paths_open_in_neovim_and_identifiers_stay_code(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::{Markdown, markdown_text};
+        use crate::{file_refs::FileReference, ui::commands::OpenFileReference};
+        use gpui_kit::{
+            AppContext, Context, FocusHandle, InteractiveElement, IntoElement, ParentElement,
+            Render, Styled, Window, component::Root, div, test::TestWindowExt,
+        };
+
+        const TEXT: &str = "The integration lives in `src/browser_tools.rs:149-210`; \
+                            call `cx.notify` after `assets/browser-tools/tools.json` changes.";
+        struct Prose {
+            focus: FocusHandle,
+            opened: Vec<OpenFileReference>,
+        }
+        impl Render for Prose {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .track_focus(&self.focus)
+                    .on_action(cx.listener(|this, action: &OpenFileReference, _, _| {
+                        this.opened.push(action.clone())
+                    }))
+                    .child(markdown_text("prose", TEXT.into(), Markdown::Element))
+            }
+        }
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, None, cx);
+        });
+        let mut view = None;
+        let window = cx.add_window(|window, cx| {
+            let prose = cx.new(|cx| Prose {
+                focus: cx.focus_handle(),
+                opened: Vec::new(),
+            });
+            view = Some(prose.clone());
+            Root::new(prose, window, cx)
+        });
+        let view = view.unwrap();
+        let id = |code: &str| format!("file-reference-{}", TEXT.find(code).unwrap());
+        cx.update_window(window.into(), |_, window, cx| {
+            view.read(cx).focus.clone().focus(window, cx);
+            window.render_frame(cx);
+            assert!(window.try_find(id("`cx.notify`")).is_none());
+            window.click(id("`src/browser_tools.rs"), cx);
+            window.click(id("`assets/"), cx);
+        })
+        .unwrap();
+        let opened = cx.read(|cx| view.read(cx).opened.clone());
+        let reference = |path: &str, line| FileReference {
+            path: path.into(),
+            line,
+            column: None,
+        };
+        assert!(
+            opened
+                == [
+                    OpenFileReference {
+                        reference: reference("src/browser_tools.rs", Some(149)),
+                        thread: None,
+                    },
+                    OpenFileReference {
+                        reference: reference("assets/browser-tools/tools.json", None),
+                        thread: None,
+                    },
+                ]
+        );
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
     fn scrolling_across_long_markdown_lands_inside_it(cx: &mut gpui_kit::TestAppContext) {
         use super::{Markdown, MarkdownStates, SYNC_PARSE_LIMIT, markdown_text};
         use gpui_kit::{
@@ -4487,7 +4708,11 @@ mod tests {
             let rows = rows.clone();
             |window, cx| {
                 let view = cx.new(|cx| Rows {
-                    markdown: MarkdownStates::new(rows.clone(), cx.entity_id()),
+                    markdown: MarkdownStates::new(
+                        crate::model::ThreadId::nil(),
+                        rows.clone(),
+                        cx.entity_id(),
+                    ),
                     list: rows,
                     text,
                 });
