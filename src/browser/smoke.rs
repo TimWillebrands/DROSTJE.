@@ -507,6 +507,7 @@ fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
     real_diagnostics_and_document_metadata(&browser);
     real_webgpu_canvas_presents_its_render_pass(&browser);
     real_webgpu_canvas_survives_resizing_every_frame(&browser);
+    real_webgpu_releases_devices_of_documents_that_navigate_away(&browser);
     real_indexeddb_is_deleted_when_the_last_surface_on_its_origin_closes(&browser);
     browser.runtime.command(
         id,
@@ -604,7 +605,7 @@ fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
         browser.runtime.0.0.memory.lock().stopped
     });
     println!(
-        "In-process Servo proof: dedicated worker, HTML/CSS pixels, nested JS, click, Unicode text, key, wheel, resize, natural content-height opt-in/grow/shrink/width reflow/disable/resume/body fallback/navigation, WebGPU canvas presentation and per-frame resizing, IndexedDB deletion on last close, reload, back/forward, isolated WebViews, missing-file recovery, JS exception, close/reopen, cooperative shutdown"
+        "In-process Servo proof: dedicated worker, HTML/CSS pixels, nested JS, click, Unicode text, key, wheel, resize, natural content-height opt-in/grow/shrink/width reflow/disable/resume/body fallback/navigation, WebGPU canvas presentation, per-frame resizing and navigation, IndexedDB deletion on last close, reload, back/forward, isolated WebViews, missing-file recovery, JS exception, close/reopen, cooperative shutdown"
     );
 }
 
@@ -710,6 +711,73 @@ fn real_webgpu_canvas_survives_resizing_every_frame(browser: &Browser) {
         browser.snapshot(id);
         frames.as_f64().is_some_and(|frames| frames >= 200.0)
     });
+    browser.runtime.close(id);
+}
+
+fn real_webgpu_releases_devices_of_documents_that_navigate_away(browser: &Browser) {
+    // A navigated-away document's devices used to live until script collected
+    // them, which never happened. A process gets about ten devices; the next
+    // request failed and panicked the site's shared WebGPU thread, after which
+    // every document on the site waited forever for WebGPU.
+    let server = HttpFixture::start(
+        r#"<!doctype html><title>WebGPU navigation smoke</title><canvas width=64 height=64></canvas><script>
+        window.gpuFrames = 0;
+        (async () => {
+          const adapter = await navigator.gpu.requestAdapter();
+          const device = await adapter.requestDevice();
+          // Like PixiJS's support check plus renderer: two devices per document.
+          window.spare = await (await navigator.gpu.requestAdapter()).requestDevice();
+          const context = document.querySelector('canvas').getContext('webgpu');
+          context.configure({device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: 'opaque'});
+          const draw = () => {
+            device.pushErrorScope('validation');
+            const encoder = device.createCommandEncoder();
+            encoder.beginRenderPass({colorAttachments: [{view: context.getCurrentTexture().createView(),
+              clearValue: {r: 0.2, g: 0.4, b: 0.6, a: 1}, loadOp: 'clear', storeOp: 'store'}]}).end();
+            device.queue.submit([encoder.finish()]);
+            device.popErrorScope();
+            window.gpuFrames += 1;
+            requestAnimationFrame(draw);
+          };
+          requestAnimationFrame(draw);
+        })().catch(error => { window.gpuFrames = String(error); });
+        </script>"#,
+    );
+    let id = BrowserId::new_v4();
+    let rendering = |label: &str| {
+        browser.until(label, || {
+            if browser.snapshot(id).loading {
+                return false;
+            }
+            let frames = browser.evaluate(id, "window.gpuFrames");
+            assert!(
+                frames.is_number() || frames.is_null(),
+                "WebGPU page failed: {frames}"
+            );
+            frames.as_f64().is_some_and(|frames| frames >= 10.0)
+        });
+    };
+    browser.runtime.open(id, server.url.clone());
+    for _ in 0..12 {
+        rendering("WebGPU frames before leaving");
+        browser.runtime.command(
+            id,
+            BrowserCommand::Navigate {
+                url: format!("{}missing", server.url),
+            },
+        );
+        browser.until("same-site document without WebGPU", || {
+            let snapshot = browser.snapshot(id);
+            !snapshot.loading && snapshot.url.ends_with("/missing")
+        });
+        browser.runtime.command(
+            id,
+            BrowserCommand::Navigate {
+                url: server.url.clone(),
+            },
+        );
+    }
+    rendering("WebGPU frames after repeated navigation");
     browser.runtime.close(id);
 }
 

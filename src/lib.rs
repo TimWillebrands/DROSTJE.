@@ -22,7 +22,11 @@ use gpui_kit::{
 const APP_ASSETS: AllAssets = AllAssets;
 
 pub fn run() {
-    // First, while the process is single-threaded: agents must see the user's terminal PATH.
+    // Servo content processes re-execute this binary; they must not start the app.
+    if browser::serve_content_process() {
+        return;
+    }
+    // Next, while the process is single-threaded: agents must see the user's terminal PATH.
     if let Err(error) = platform::import_login_shell_environment() {
         eprintln!("Could not import the login shell environment: {error:#}");
     }

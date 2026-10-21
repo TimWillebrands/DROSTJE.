@@ -5,7 +5,7 @@
 use canvas_context::WebGpuExternalImageMap;
 pub use canvas_context::{ContextData, WebGpuExternalImages};
 use log::warn;
-use servo_base::generic_channel::{self, GenericReceiver};
+use servo_base::generic_channel::{self, GenericReceiver, GenericSender};
 use webgpu_traits::{WebGPU, WebGPUMsg};
 use wgpu_thread::WGPU;
 
@@ -28,15 +28,6 @@ pub fn start_webgpu_thread(
     if !pref!(dom_webgpu_enabled) {
         return None;
     }
-    let (sender, receiver) = match generic_channel::channel() {
-        Some(sender_and_receiver) => sender_and_receiver,
-        None => {
-            warn!("Failed to create sender and receiver for WGPU thread",);
-            return None;
-        },
-    };
-    let sender_clone = sender.clone();
-
     let (script_sender, script_recv) = match generic_channel::channel() {
         Some(sender_and_receiver) => sender_and_receiver,
         None => {
@@ -45,6 +36,35 @@ pub fn start_webgpu_thread(
         },
     };
 
+    let webgpu = start_webgpu_thread_for_document(
+        paint_api,
+        webrender_external_image_id_manager,
+        wgpu_image_map,
+        script_sender,
+    )?;
+    Some((webgpu, script_recv))
+}
+
+/// DROSTJE patch: a WebGPU thread with its own wgpu `Global` for one document.
+///
+/// Its event loop's documents share `script_sender`, whose receiver the
+/// constellation installs once per event loop. Exiting the thread drops the
+/// `Global`, releasing every GPU object the document created whether or not
+/// script ever collects them.
+pub fn start_webgpu_thread_for_document(
+    paint_api: CrossProcessPaintApi,
+    webrender_external_image_id_manager: WebRenderExternalImageIdManager,
+    wgpu_image_map: WebGpuExternalImageMap,
+    script_sender: GenericSender<WebGPUMsg>,
+) -> Option<WebGPU> {
+    if !pref!(dom_webgpu_enabled) {
+        return None;
+    }
+    let Some((sender, receiver)) = generic_channel::channel() else {
+        warn!("Failed to create sender and receiver for WGPU thread",);
+        return None;
+    };
+    let sender_clone = sender.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("WGPU".to_owned())
         .spawn(move || {
@@ -62,5 +82,5 @@ pub fn start_webgpu_thread(
         warn!("Failed to spawn WGPU thread ({})", e);
         return None;
     }
-    Some((WebGPU(sender), script_recv))
+    Some(WebGPU(sender))
 }

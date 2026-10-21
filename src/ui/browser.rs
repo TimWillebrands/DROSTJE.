@@ -805,7 +805,11 @@ impl Render for BrowserPane {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _, cx| {
                     this.pointer(event.position, event.button, false);
-                    cx.stop_propagation();
+                    // A dock drop target around this pane handles the release in the
+                    // bubble phase too; a dragged tab must still land on it.
+                    if !cx.has_active_drag() {
+                        cx.stop_propagation();
+                    }
                 }),
             )
             .on_mouse_up(
@@ -1100,5 +1104,97 @@ mod tests {
             navigation_url("example.org").unwrap(),
             "https://example.org/"
         );
+    }
+}
+
+#[cfg(all(test, feature = "runtime-qa"))]
+mod drop_tests {
+    use super::BrowserPane;
+    use crate::browser::{BrowserId, BrowserRuntime};
+    use gpui_kit::{
+        AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+        StatefulInteractiveElement, Styled, TestSupportExt, Window, component::Root, div, px,
+        test::TestWindowExt,
+    };
+
+    #[derive(Clone)]
+    struct Payload;
+    impl Render for Payload {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    struct DropZone {
+        pane: Entity<BrowserPane>,
+        dropped: bool,
+    }
+    impl Render for DropZone {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .id("drag-source")
+                        .test_support()
+                        .h(px(40.))
+                        .on_drag(Payload, |_, _, _, cx| cx.new(|_| Payload)),
+                )
+                .child(
+                    div()
+                        .id("drop-zone")
+                        .w(px(400.))
+                        .h(px(300.))
+                        .on_drop(cx.listener(|this, _: &Payload, _, _| this.dropped = true))
+                        .child(self.pane.clone()),
+                )
+        }
+    }
+
+    /// A dock tab dropped over a displayed browser reaches the tab group's drop
+    /// handler, which runs after the surface's own mouse-up in the bubble phase.
+    #[gpui_kit::test]
+    fn drags_dropped_on_the_web_surface_reach_the_drop_target(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, None, cx);
+        });
+        let runtime = BrowserRuntime::new();
+        // No engine worker: the pane keeps its session state without Servo.
+        runtime.shutdown();
+        let window = cx.add_window(|window, cx| {
+            let pane = cx.new(|cx| {
+                BrowserPane::new(
+                    BrowserId::new_v4(),
+                    "about:blank".into(),
+                    runtime,
+                    window,
+                    cx,
+                )
+            });
+            let zone = cx.new(|_| DropZone {
+                pane,
+                dropped: false,
+            });
+            Root::new(zone, window, cx)
+        });
+        cx.update_window(window.into(), |_, window, cx| {
+            window.drag_to("drag-source", "servo-surface", cx);
+        })
+        .unwrap();
+        let dropped = cx
+            .update_window(window.into(), |root, _, cx| {
+                root.downcast::<Root>()
+                    .unwrap()
+                    .read(cx)
+                    .view()
+                    .clone()
+                    .downcast::<DropZone>()
+                    .unwrap()
+                    .read(cx)
+                    .dropped
+            })
+            .unwrap();
+        assert!(dropped, "the browser surface swallowed the drop");
     }
 }

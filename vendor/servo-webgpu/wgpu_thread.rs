@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use log::{info, warn};
 use paint_api::{CrossProcessPaintApi, WebRenderExternalImageIdManager, WebRenderImageHandlerType};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::generic_channel::{GenericReceiver, GenericSender, GenericSharedMemory};
 use servo_base::id::PipelineId;
 use servo_config::pref;
@@ -23,7 +23,6 @@ use webgpu_traits::{
     TextureUsages, TextureViewDescriptor, WebGPU, WebGPUAdapter, WebGPUContextId, WebGPUDevice,
     WebGPUMsg, WebGPUQueue, WebGPURequest, id,
 };
-use webrender_api::ExternalImageId;
 use wgpu_core::resource::{BufferAccessResult, BufferMapOperation};
 use wgpu_types::error::WebGpuError;
 use wgpu_types::{
@@ -75,6 +74,10 @@ pub(crate) struct WGPU {
     pub(crate) wgpu_image_map: WebGpuExternalImageMap,
     /// Provides access to poller thread
     pub(crate) poller: Poller,
+    /// DROSTJE patch: canvas contexts this thread created and has not
+    /// destroyed. Their staging buffers hold `global` alive from the shared
+    /// image map, so exiting destroys them.
+    context_ids: FxHashSet<WebGPUContextId>,
 }
 
 impl WGPU {
@@ -135,6 +138,7 @@ impl WGPU {
             paint_api,
             webrender_external_image_id_manager,
             wgpu_image_map,
+            context_ids: Default::default(),
         }
     }
 
@@ -395,6 +399,7 @@ impl WGPU {
                         };
 
                         self.create_context(context_id, size, buffer_ids);
+                        self.context_ids.insert(context_id);
                     },
                     WebGPURequest::Present {
                         context_id,
@@ -428,9 +433,14 @@ impl WGPU {
                         self.maybe_dispatch_wgpu_error(device_id, error);
                     },
                     WebGPURequest::DestroyContext { context_id } => {
-                        self.destroy_context(context_id);
-                        self.webrender_external_image_id_manager
-                            .remove(&ExternalImageId(context_id.0));
+                        // DROSTJE patch: keep the id registered. Deleting the image
+                        // reaches WebRender later, and a frame built before that
+                        // still locks it; unknown ids panic the painter, while a
+                        // known id without context data locks as `Invalid`. Ids
+                        // are never reused, so the entry only costs its memory.
+                        if self.context_ids.remove(&context_id) {
+                            self.destroy_context(context_id);
+                        }
                     },
                     WebGPURequest::CreateTexture {
                         device_id,
@@ -474,6 +484,9 @@ impl WGPU {
                         global.texture_destroy(texture_id);
                     },
                     WebGPURequest::Exit(sender) => {
+                        for context_id in std::mem::take(&mut self.context_ids) {
+                            self.destroy_context(context_id);
+                        }
                         if let Err(e) = sender.send(()) {
                             warn!("Failed to send response to WebGPURequest::Exit ({})", e)
                         }
@@ -496,12 +509,14 @@ impl WGPU {
                     WebGPURequest::DropDevice(device_id) => {
                         let global = &self.global;
                         global.device_drop(device_id);
-                        let device_scope = self
-                            .devices
-                            .lock()
-                            .unwrap()
-                            .remove(&device_id)
-                            .expect("Device should not be dropped by this point");
+                        // DROSTJE patch: this thread is shared by every document of a
+                        // site; a late message for a gone device must not kill it.
+                        let Some(device_scope) =
+                            self.devices.lock().unwrap().remove(&device_id)
+                        else {
+                            warn!("DropDevice for unknown device {device_id:?}");
+                            continue;
+                        };
                         if let Err(e) = self.script_sender.send(WebGPUMsg::FreeDevice {
                             device_id,
                             pipeline_id: device_scope.pipeline_id,
@@ -594,13 +609,11 @@ impl WGPU {
                                         },
                                     };
                                     // make device lost by removing error scopes stack
-                                    let _ = devices
-                                        .lock()
-                                        .unwrap()
-                                        .get_mut(&device_id)
-                                        .expect("Device should not be dropped by this point")
-                                        .error_scope_stack
-                                        .take();
+                                    if let Some(device_scope) =
+                                        devices.lock().unwrap().get_mut(&device_id)
+                                    {
+                                        device_scope.error_scope_stack.take();
+                                    }
                                     if let Err(e) = script_sender.send(WebGPUMsg::DeviceLost {
                                         device,
                                         pipeline_id,
@@ -970,12 +983,12 @@ impl WGPU {
                     WebGPURequest::PushErrorScope { device_id, filter } => {
                         // <https://www.w3.org/TR/webgpu/#dom-gpudevice-pusherrorscope>
                         let mut devices = self.devices.lock().unwrap();
-                        let device_scope = devices
+                        if let Some(error_scope_stack) = devices
                             .get_mut(&device_id)
-                            .expect("Device should not be dropped by this point");
-                        if let Some(error_scope_stack) = &mut device_scope.error_scope_stack {
+                            .and_then(|device_scope| device_scope.error_scope_stack.as_mut())
+                        {
                             error_scope_stack.push(ErrorScope::new(filter));
-                        } // else device is lost
+                        } // else device is lost or gone
                     },
                     WebGPURequest::DispatchError { device_id, error } => {
                         self.dispatch_error(device_id, error);
@@ -986,11 +999,10 @@ impl WGPU {
                     } => {
                         // <https://www.w3.org/TR/webgpu/#dom-gpudevice-poperrorscope>
                         let mut devices = self.devices.lock().unwrap();
-                        let device_scope = devices
+                        let result = if let Some(error_scope_stack) = devices
                             .get_mut(&device_id)
-                            .expect("Device should not be dropped by this point");
-                        let result =
-                            if let Some(error_scope_stack) = &mut device_scope.error_scope_stack {
+                            .and_then(|device_scope| device_scope.error_scope_stack.as_mut())
+                        {
                                 if let Some(error_scope) = error_scope_stack.pop() {
                                     Ok(
                                         // TODO: Do actual selection instead of selecting first error
@@ -1257,9 +1269,8 @@ impl WGPU {
                 }
             }
         }
-        if let Err(e) = self.script_sender.send(WebGPUMsg::Exit) {
-            warn!("Failed to send WebGPUMsg::Exit to script ({})", e);
-        }
+        // DROSTJE patch: no `WebGPUMsg::Exit`. Script would close the port its
+        // event loop's other documents share; the constellation owns it.
     }
 
     #[inline]
@@ -1282,9 +1293,10 @@ impl WGPU {
     fn dispatch_error(&mut self, device_id: id::DeviceId, error: Error) {
         log::trace!("Dispatching error for device {:?}: {:?}", device_id, error);
         let mut devices = self.devices.lock().unwrap();
-        let device_scope = devices
-            .get_mut(&device_id)
-            .expect("Device should not be dropped by this point");
+        let Some(device_scope) = devices.get_mut(&device_id) else {
+            // DROSTJE patch: errors for a gone device have no one to report to.
+            return;
+        };
         if let Some(error_scope_stack) = &mut device_scope.error_scope_stack {
             if let Some(error_scope) = error_scope_stack
                 .iter_mut()
