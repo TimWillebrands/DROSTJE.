@@ -130,6 +130,15 @@ async fn open_fixture_with_editor(
     data: Option<PathBuf>,
     executable: Option<&str>,
 ) -> Fixture {
+    open_fixture_with_tools(cx, data, executable, None).await
+}
+
+async fn open_fixture_with_tools(
+    cx: &mut TestAppContext,
+    data: Option<PathBuf>,
+    executable: Option<&str>,
+    browser_tools: Option<crate::browser_tools::BrowserToolServer>,
+) -> Fixture {
     cx.dispatcher.allow_parking();
     let fixture = PathBuf::from(
         std::env::var_os("DROSTJE_RUNTIME_FIXTURE")
@@ -182,7 +191,7 @@ async fn open_fixture_with_editor(
         snapshot,
         diagnostics: BTreeMap::new(),
         repositories,
-        browser_tools: None,
+        browser_tools,
     };
     let mut view = None;
     let window = cx.add_window(|window, cx| {
@@ -540,19 +549,23 @@ async fn thread_sidebar_hover_actions_rename_and_archive_immediately(cx: &mut Te
     .unwrap();
 
     assert!(cx.read(|cx| {
-        fixture
-            .workspace
-            .read(cx)
-            .dialog
-            .as_ref()
-            .is_some_and(|dialog| matches!(dialog.read(cx).kind, crate::ui::settings::DialogKind::RenameThread(target) if target == id))
+        let workspace = fixture.workspace.read(cx);
+        workspace.dialog.is_none()
+            && workspace.inline_rename().is_some_and(|(target, _, _, _)| {
+                target == crate::ui::workspace::RenameTarget::Thread(id)
+            })
     }));
-    set_dialog(
+    update_workspace(
         cx,
         fixture.window,
         &fixture.workspace,
-        "name",
-        "Manually renamed",
+        |workspace, window, cx| {
+            let input = workspace.inline_rename().unwrap().2;
+            input.update(cx, |input, cx| {
+                input.set_value("Manually renamed".to_owned(), window, cx)
+            });
+            input.focus_handle(cx).focus(window, cx);
+        },
     );
     cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
     until(cx, "manual thread rename", Duration::from_secs(5), |cx| {
@@ -643,22 +656,149 @@ async fn thread_archive_action_guards_and_palette_are_immediate(cx: &mut TestApp
     });
     wait_for_saved_thread(cx, &fixture, id, |thread| thread.archived).await;
 
+    let project = cx.read(|cx| fixture.state.read(cx).project().unwrap().id);
     cx.dispatch_action(fixture.window.into(), commands::ArchiveProject);
-    assert!(cx.read(|cx| !fixture.state.read(cx).project().unwrap().archived));
-    assert!(cx.read(|cx| {
-        fixture
-            .workspace
-            .read(cx)
-            .dialog
-            .as_ref()
-            .is_some_and(|dialog| {
-                matches!(
-                    dialog.read(cx).kind,
-                    crate::ui::settings::DialogKind::ArchiveProject(_)
-                )
-            })
-    }));
-    cx.dispatch_action(fixture.window.into(), commands::Dismiss);
+    cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        assert_eq!(state.project().unwrap().id, project);
+        assert!(state.project().unwrap().archived);
+        assert!(!state.open_threads.contains(&id));
+        let workspace = fixture.workspace.read(cx);
+        assert!(workspace.dialog.is_none());
+    });
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("undo-project-archive", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let state = fixture.state.read(cx);
+        assert!(!state.project().unwrap().archived);
+        assert!(state.open_threads.contains(&id));
+        assert_eq!(state.selected_thread, Some(id));
+    });
+}
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; verifies nonblocking tool details navigation"]
+async fn tool_details_open_in_the_thread_inspector(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let thread = new_conversation(cx, &fixture).await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.tool_detail = Some((thread, "tool-call".to_owned()));
+            workspace.sync_detail_surface(window, cx);
+        },
+    );
+    cx.read(|cx| {
+        let workspace = fixture.workspace.read(cx);
+        assert!(workspace.dialog.is_none());
+        assert!(workspace.detail_surface.is_none());
+        let state = fixture.state.read(cx);
+        assert!(state.thread_sidebar_open(thread));
+        assert_eq!(
+            state.thread_sidebar_tab(thread),
+            crate::app::SidebarTab::Details
+        );
+    });
+    cx.dispatch_action(fixture.window.into(), commands::ToggleConversationDiffs);
+    assert!(!cx.read(|cx| fixture.state.read(cx).thread_sidebar_open(thread)));
+    quit(cx, &fixture).await;
+}
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; verifies inline requests do not open a modal"]
+async fn input_and_custom_answers_stay_inline_and_back_preserves_the_request(
+    cx: &mut TestAppContext,
+) {
+    use crate::harness::{UserRequest, UserRequestKind};
+
+    let fixture = open_fixture(cx, None).await;
+    let thread = new_conversation(cx, &fixture).await;
+    let input = UserRequest {
+        id: "input-request".into(),
+        kind: UserRequestKind::Input,
+        title: "Enter a value".into(),
+        options: Vec::new(),
+        text: "draft value".into(),
+        placeholder: Some("Value".into()),
+        deadline: None,
+    };
+    fixture.state.update(cx, |state, cx| {
+        state
+            .conversations
+            .get_mut(&thread)
+            .unwrap()
+            .requests
+            .insert(input.id.clone(), input.clone());
+        cx.notify();
+    });
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.open_extension(thread, input.clone(), window, cx),
+    );
+    cx.read(|cx| {
+        let workspace = fixture.workspace.read(cx);
+        let form = workspace.extension.as_ref().unwrap();
+        assert!(form.inline_answer);
+        assert_eq!(form.input.as_ref().unwrap().read(cx).value(), "draft value");
+        assert!(workspace.dialog.is_none());
+        assert!(workspace.detail_surface.is_none());
+    });
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.close_extension(false, window, cx),
+    );
+
+    let question = UserRequest {
+        id: "question-request".into(),
+        kind: UserRequestKind::Question,
+        title: "Choose a direction".into(),
+        options: vec![crate::harness::UserOption {
+            value: "Existing option".into(),
+            description: None,
+        }],
+        text: "Which direction?".into(),
+        placeholder: None,
+        deadline: None,
+    };
+    fixture.state.update(cx, |state, cx| {
+        state
+            .conversations
+            .get_mut(&thread)
+            .unwrap()
+            .requests
+            .insert(question.id.clone(), question.clone());
+        cx.notify();
+    });
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.open_custom_answer(thread, question.clone(), window, cx),
+    );
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, _, cx| workspace.back_from_custom_answer(thread, &question.id, cx),
+    );
+    cx.read(|cx| {
+        let workspace = fixture.workspace.read(cx);
+        assert!(workspace.extension.is_none());
+        assert!(workspace.dialog.is_none());
+        assert!(
+            fixture.state.read(cx).conversations[&thread]
+                .requests
+                .contains_key(&question.id)
+        );
+    });
     quit(cx, &fixture).await;
 }
 
@@ -1251,25 +1391,67 @@ async fn commit_dialog_commits_the_working_tree(cx: &mut TestAppContext) {
 
     cx.dispatch_action(fixture.window.into(), commands::CommitChanges);
     cx.run_until_parked();
-    // The dialog asks the local model for a subject; typed text is never replaced by it.
+    // The inline composer does not replace the Changes panel or open a modal.
     update_workspace(
         cx,
         fixture.window,
         &fixture.workspace,
         |workspace, window, cx| {
-            let dialog = workspace.dialog.as_ref().unwrap().read(cx);
+            let dialog = workspace.dialog.as_ref().unwrap().clone();
             assert!(matches!(
-                dialog.kind,
+                dialog.read(cx).kind,
                 crate::ui::settings::DialogKind::Commit(id) if id == conversation
             ));
-            let message = dialog.commit_message().unwrap();
+            assert!(!dialog.read(cx).hosted());
+            assert_eq!(
+                workspace.state.read(cx).thread_sidebar_tab(conversation),
+                crate::app::SidebarTab::Changes
+            );
+            let message = dialog.read(cx).commit_message().unwrap();
             message.update(cx, |message, cx| {
                 message.set_value("Record fixture notes", window, cx)
             });
             message.focus_handle(cx).focus(window, cx);
         },
     );
-    cx.run_until_parked();
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    assert!(
+        VisualTestContext::from_window(fixture.window.into(), cx)
+            .debug_bounds("commit-changes-panel")
+            .is_some()
+    );
+    cx.dispatch_action(fixture.window.into(), commands::Dismiss);
+    until(
+        cx,
+        "commit composer dismissed",
+        Duration::from_secs(5),
+        |cx| {
+            let workspace = fixture.workspace.read(cx);
+            workspace.commit_panel_thread.is_none()
+                && workspace.dialog.as_ref().is_some_and(|dialog| {
+                    dialog
+                        .read(cx)
+                        .commit_message()
+                        .is_some_and(|message| message.read(cx).value() == "Record fixture notes")
+                })
+        },
+    )
+    .await;
+    cx.dispatch_action(fixture.window.into(), commands::CommitChanges);
+    until(
+        cx,
+        "commit composer reopened",
+        Duration::from_secs(5),
+        |cx| fixture.workspace.read(cx).commit_panel_thread == Some(conversation),
+    )
+    .await;
     cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
     until(cx, "commit", Duration::from_secs(20), |cx| {
         fixture.workspace.read(cx).dialog.is_none()
@@ -2812,9 +2994,57 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     })
     .unwrap();
     cx.simulate_keystrokes(fixture.window.into(), "escape");
-    until(cx, "Settings dismissed", Duration::from_secs(5), |cx| {
-        fixture.workspace.read(cx).dialog.is_none()
-    })
+    until(
+        cx,
+        "Settings draft retained after dismissal",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| {
+                    !dialog.read(cx).hosted()
+                        && dialog.read(cx).error.is_some()
+                        && dialog.read(cx).value("factory_data_root", cx) == "relative/path"
+                })
+        },
+    )
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "secondary-,");
+    until(
+        cx,
+        "Settings draft reopened",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| {
+                    dialog.read(cx).hosted()
+                        && dialog.read(cx).error.is_some()
+                        && dialog.read(cx).value("factory_data_root", cx) == "relative/path"
+                })
+        },
+    )
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    until(
+        cx,
+        "Settings draft hidden again",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| !dialog.read(cx).hosted())
+        },
+    )
     .await;
 
     fixture.state.update(cx, |state, cx| {
@@ -2887,7 +3117,14 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         cx,
         "Settings appearance controls",
         Duration::from_secs(5),
-        |cx| fixture.workspace.read(cx).dialog.is_some(),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.read(cx).hosted())
+        },
     )
     .await;
     update_workspace(
@@ -2912,13 +3149,23 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     assert_eq!(cx.read(|cx| Theme::global(cx).mode), ThemeMode::Dark);
     cx.simulate_keystrokes(fixture.window.into(), "escape");
     until(cx, "appearance cancelled", Duration::from_secs(5), |cx| {
-        fixture.workspace.read(cx).dialog.is_none()
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.read(cx).hosted())
     })
     .await;
     assert_eq!(cx.read(|cx| Theme::global(cx).mode), ThemeMode::Dark);
     cx.simulate_keystrokes(fixture.window.into(), "secondary-,");
     until(cx, "Settings reopened", Duration::from_secs(5), |cx| {
-        fixture.workspace.read(cx).dialog.is_some()
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).hosted())
     })
     .await;
     update_workspace(
@@ -2926,17 +3173,21 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         fixture.window,
         &fixture.workspace,
         |workspace, window, cx| {
-            workspace
+            let select = workspace
                 .dialog
                 .as_ref()
                 .unwrap()
                 .read(cx)
                 .select("theme_mode")
                 .unwrap()
-                .clone()
-                .update(cx, |select, cx| {
-                    select.set_selected_value(&"light".to_owned(), window, cx)
-                });
+                .clone();
+            assert_eq!(
+                select.read(cx).selected_value().map(String::as_str),
+                Some("light")
+            );
+            select.update(cx, |select, cx| {
+                select.set_selected_value(&"light".to_owned(), window, cx)
+            });
         },
     );
     cx.run_until_parked();
@@ -4529,3 +4780,6 @@ async fn theme_editor_previews_cancels_and_saves_by_keyboard(cx: &mut TestAppCon
     assert_eq!(saved(cx).accent, None);
     quit(cx, &fixture).await;
 }
+
+#[path = "network_runtime_qa.rs"]
+mod network_runtime_qa;

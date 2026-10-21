@@ -222,8 +222,12 @@ impl Terminal {
         })
         .unwrap_or(TerminalStatus::Closed)
     }
-    pub fn is_alive(&self) -> bool {
-        self.status() == TerminalStatus::Running
+    pub fn needs_confirm_quit(&self) -> bool {
+        stop_needs_confirmation(
+            self.status(),
+            self.backend_error.is_some(),
+            self.with_surface(|surface| surface.needs_confirm_quit()),
+        )
     }
     pub fn backend_error(&self) -> Option<&str> {
         self.backend_error.as_deref()
@@ -591,7 +595,7 @@ impl EntityInputHandler for Terminal {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.visible || !self.is_alive() {
+        if !self.visible || self.status() != TerminalStatus::Running {
             return;
         }
         let text = if let Some(range) = range {
@@ -622,7 +626,7 @@ impl EntityInputHandler for Terminal {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.visible || !self.is_alive() {
+        if !self.visible || self.status() != TerminalStatus::Running {
             return;
         }
         let mut units: Vec<u16> = self.composition.encode_utf16().collect();
@@ -671,7 +675,7 @@ impl EntityInputHandler for Terminal {
         Some(self.selection.start)
     }
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
-        self.visible && self.is_alive()
+        self.visible && self.status() == TerminalStatus::Running
     }
 }
 
@@ -992,11 +996,55 @@ fn native_keycode(key: &str) -> Option<u32> {
     })
 }
 
+fn stop_needs_confirmation(
+    status: TerminalStatus,
+    backend_error: bool,
+    native_decision: Option<bool>,
+) -> bool {
+    match status {
+        TerminalStatus::Running => backend_error || native_decision.unwrap_or(true),
+        TerminalStatus::Exited | TerminalStatus::Closed => false,
+    }
+}
+
 #[cfg(test)]
 mod input_tests {
-    use super::native_text_key;
+    use super::{TerminalStatus, native_text_key, stop_needs_confirmation};
     use gpui_kit::Keystroke;
 
+    #[test]
+    fn terminal_stop_confirmation_warns_for_jobs_and_unknown_native_state() {
+        assert!(stop_needs_confirmation(
+            TerminalStatus::Running,
+            false,
+            Some(true)
+        ));
+        assert!(stop_needs_confirmation(
+            TerminalStatus::Running,
+            false,
+            None
+        ));
+        assert!(stop_needs_confirmation(
+            TerminalStatus::Running,
+            true,
+            Some(false)
+        ));
+        assert!(!stop_needs_confirmation(
+            TerminalStatus::Running,
+            false,
+            Some(false)
+        ));
+        assert!(!stop_needs_confirmation(
+            TerminalStatus::Exited,
+            true,
+            Some(true)
+        ));
+        assert!(!stop_needs_confirmation(
+            TerminalStatus::Closed,
+            false,
+            None
+        ));
+    }
     #[test]
     fn return_with_native_text_remains_a_terminal_key_not_a_paste() {
         let enter = Keystroke::parse("enter").unwrap().with_simulated_ime();

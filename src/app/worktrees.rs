@@ -94,6 +94,7 @@ impl AppState {
             self.snapshot.worktrees.push(worktree.clone());
         }
         self.enqueue(Write::Worktree(worktree));
+        self.sync_network();
     }
 
     /// A live thread is one that can still start work: neither it nor its project is archived.

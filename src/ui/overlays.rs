@@ -23,8 +23,9 @@ pub struct ExtensionForm {
     pub input: Option<Entity<InputState>>,
     error: Option<String>,
     submitting: bool,
-}
+    pub inline_answer: bool,
 
+}
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum SurfaceKey {
     Image(PathBuf),
@@ -76,7 +77,10 @@ impl Workspace {
         {
             return;
         }
-        self.dismiss(window, cx);
+        let inline_answer = request.kind == UserRequestKind::Input;
+        if !inline_answer {
+            self.dismiss(window, cx);
+        }
         let input = if request.kind == UserRequestKind::Input {
             Some(cx.new(|cx| {
                 let mut input = InputState::new(window, cx)
@@ -102,9 +106,12 @@ impl Workspace {
             input,
             error: None,
             submitting: false,
+            inline_answer,
         });
         // Open before focusing the input/editor so Root remembers the actual trigger.
-        self.sync_detail_surface(window, cx);
+        if !inline_answer {
+            self.sync_detail_surface(window, cx);
+        }
         self.sync_session(window, cx);
         if let Some(input) = self.extension.as_ref().and_then(|form| form.input.as_ref()) {
             input.focus_handle(cx).focus(window, cx);
@@ -117,18 +124,50 @@ impl Workspace {
     pub fn open_custom_answer(
         &mut self,
         thread: ThreadId,
-        mut request: UserRequest,
+        request: UserRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if request.kind != UserRequestKind::Question {
+        if request.kind != UserRequestKind::Question
+            || self.state.read(cx).shutting_down
+            || self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).has_composition())
+            || self.extension.is_some()
+            || !self
+                .state
+                .read(cx)
+                .conversations
+                .get(&thread)
+                .is_some_and(|session| session.requests.contains_key(&request.id))
+        {
             return;
         }
-        request.kind = UserRequestKind::Input;
-        request.title = "Custom answer".into();
-        request.text.clear();
-        request.placeholder = Some("Type an answer".into());
-        self.open_extension(thread, request, window, cx);
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Type an answer");
+            input.set_value("", window, cx);
+            input
+        });
+        self.extension = Some(ExtensionForm {
+            thread,
+            request,
+            input: Some(input.clone()),
+            error: None,
+            submitting: false,
+            inline_answer: true,
+        });
+        input.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn back_from_custom_answer(&mut self, thread: ThreadId, request_id: &str, cx: &mut Context<Self>) {
+        if self.extension.as_ref().is_some_and(|form| {
+            form.inline_answer && form.thread == thread && form.request.id == request_id
+        }) {
+            self.extension = None;
+            cx.notify();
+        }
     }
 
     pub fn close_extension(&mut self, cancel: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -259,37 +298,67 @@ impl Workspace {
             self.image_preview = None;
             self.tool_detail = None;
         }
-        // A clicked image replaces the details sheet which contained it.
-        if self.image_preview.is_some() {
-            self.tool_detail = None;
-        }
-        let key = match (&self.extension, &self.image_preview, &self.tool_detail) {
-            (Some(form), None, None) => {
+        // A preview temporarily replaces the inspector; keep its selected target so closing
+        // the preview can restore the same Details surface.
+        let key = if let Some(form) = &self.extension {
+            if form.inline_answer || self.image_preview.is_some() {
+                None
+            } else {
                 Some(SurfaceKey::Extension(form.thread, form.request.id.clone()))
             }
-            (None, Some(image), None) => Some(SurfaceKey::Image(image.path.clone())),
-            (None, None, Some((thread, tool))) => Some(SurfaceKey::Details(*thread, tool.clone())),
-            _ => None,
+        } else if let Some(image) = &self.image_preview {
+            Some(SurfaceKey::Image(image.path.clone()))
+        } else {
+            self.tool_detail
+                .as_ref()
+                .map(|(thread, tool)| SurfaceKey::Details(*thread, tool.clone()))
         };
-        if self.detail_surface == key {
+        if self.detail_surface == key && !matches!(key, Some(SurfaceKey::Details(..))) {
             return;
         }
+        let restore_details = self.image_preview.as_ref().and(self.tool_detail.clone());
         if !self.close_detail_surface(window, cx) {
             return;
+        }
+        if self.tool_detail.is_none() {
+            self.tool_detail = restore_details;
         }
         let Some(key) = key else {
             return;
         };
-        if self.state.read(cx).shutting_down {
+        if let SurfaceKey::Details(thread, _) = key {
+            if let Some(palette) = self.palette.take() {
+                palette.update(cx, |palette, cx| palette.dismiss(window, cx));
+            }
+            if let Some(dialog) = self.dialog.as_ref() {
+                let (kind, hosted) = {
+                    let dialog = dialog.read(cx);
+                    (dialog.kind.clone(), dialog.hosted())
+                };
+                if hosted {
+                    super::settings::close_surface(&kind, window, cx);
+                }
+            }
+            self.state.update(cx, |state, cx| {
+                state.show_thread_sidebar(thread, crate::app::SidebarTab::Details);
+                cx.emit(crate::app::PresentationChange::Thread(thread));
+            });
+            self.detail_surface = None;
+            cx.notify();
             return;
         }
         // Other application hosts must close before this one captures trigger focus.
         if let Some(palette) = self.palette.take() {
             palette.update(cx, |palette, cx| palette.dismiss(window, cx));
         }
-        if let Some(dialog) = self.dialog.take() {
-            let kind = dialog.read(cx).kind.clone();
-            super::settings::close_surface(&kind, window, cx);
+        if let Some(dialog) = self.dialog.as_ref() {
+            let (kind, hosted) = {
+                let dialog = dialog.read(cx);
+                (dialog.kind.clone(), dialog.hosted())
+            };
+            if hosted {
+                super::settings::close_surface(&kind, window, cx);
+            }
         }
         let workspace_entity = cx.entity();
         let owner = workspace_entity.downgrade();
@@ -421,7 +490,10 @@ impl Workspace {
         }
         self.detail_surface = None;
         match key {
-            SurfaceKey::Image(_) => self.image_preview = None,
+            SurfaceKey::Image(_) => {
+                self.image_preview = None;
+                self.sync_detail_surface(window, cx);
+            }
             SurfaceKey::Details(..) => self.tool_detail = None,
             SurfaceKey::Extension(..) => {
                 self.clear_extension(true, cx);
@@ -516,6 +588,21 @@ impl Render for DetailContent {
             SurfaceKey::Details(thread, tool) => self.details(workspace, *thread, tool, cx),
         }
     }
+}
+
+pub(super) fn render_details(
+    workspace: &Workspace,
+    thread_id: ThreadId,
+    tool_id: &str,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    DetailContent {
+        owner: owner.clone(),
+        key: SurfaceKey::Details(thread_id, tool_id.to_owned()),
+        _subscriptions: Vec::new(),
+    }
+    .details(workspace, thread_id, tool_id, cx)
 }
 
 impl DetailContent {

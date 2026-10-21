@@ -5,11 +5,13 @@ pub(super) struct Shutdown {
     sessions: Vec<(bool, async_channel::Sender<ConversationCommand>)>,
     drains: Vec<async_channel::Receiver<()>>,
     writes: async_channel::Sender<Write>,
+    network: Option<super::network::NetworkDrain>,
 }
 
 impl Shutdown {
     pub(super) fn new(state: &mut AppState) -> Self {
         state.commit_all_thread_edits();
+        state.sync_network();
         Self {
             editor: state.editor.clone(),
             sessions: state
@@ -28,6 +30,7 @@ impl Shutdown {
                 .filter_map(|session| session.finished.clone())
                 .collect(),
             writes: state.writes.clone(),
+            network: state.network.drain(),
         }
     }
 
@@ -43,6 +46,10 @@ impl Shutdown {
         for drain in self.drains {
             let _ = drain.recv().await;
         }
+        let network_drained = match self.network {
+            Some(network) => network.wait().await,
+            None => Ok(()),
+        };
         let (reply, result) = async_channel::bounded(1);
         let flushed = match self.writes.send(Write::Flush(reply)).await {
             Ok(()) => result
@@ -52,6 +59,7 @@ impl Shutdown {
                 .and_then(|result| result.map_err(anyhow::Error::msg)),
             Err(error) => Err(anyhow::anyhow!("Storage writer unavailable: {error}")),
         };
+        let flushed = network_drained.and(flushed);
         if let Err(error) = flushed {
             if !allow_data_loss {
                 if let Some(editor) = &self.editor

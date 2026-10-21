@@ -70,6 +70,11 @@ gpui_kit::actions!(
         ToggleOutput,
         ToggleConversationDiffs,
         ToggleAgents,
+        JoinSpaceNetwork,
+        LeaveSpaceNetwork,
+        ShowNetworkMembers,
+        ShowNetworkMessages,
+        ShowThreadAgents,
         ToggleTaskList,
         ToggleBackgroundJobs,
         RefreshConversationDiff,
@@ -183,6 +188,11 @@ pub enum Command {
     RestartEditor,
     ToggleConversationDiffs,
     ToggleAgents,
+    JoinSpaceNetwork,
+    LeaveSpaceNetwork,
+    ShowNetworkMembers,
+    ShowNetworkMessages,
+    ShowThreadAgents,
     ToggleTaskList,
     ToggleBackgroundJobs,
     RefreshConversationDiff,
@@ -199,7 +209,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 70] = [
+    pub const ALL: [Self; 75] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -255,6 +265,11 @@ impl Command {
         Self::ToggleOutput,
         Self::ToggleConversationDiffs,
         Self::ToggleAgents,
+        Self::JoinSpaceNetwork,
+        Self::LeaveSpaceNetwork,
+        Self::ShowNetworkMembers,
+        Self::ShowNetworkMessages,
+        Self::ShowThreadAgents,
         Self::ToggleTaskList,
         Self::ToggleBackgroundJobs,
         Self::RefreshConversationDiff,
@@ -304,7 +319,7 @@ impl Command {
             Self::WidenSidebar => "Widen thread sidebar",
             Self::NarrowSidebar => "Narrow thread sidebar",
             Self::RenameProject => "Rename project…",
-            Self::ArchiveProject => "Archive project…",
+            Self::ArchiveProject => "Archive project",
             Self::RenameThread => "Rename thread…",
             Self::RegenerateTitle => "Regenerate conversation title",
             Self::ArchiveThread => "Archive thread",
@@ -329,6 +344,11 @@ impl Command {
             Self::ToggleOutput => "Toggle output",
             Self::ToggleConversationDiffs => "Toggle conversation changes",
             Self::ToggleAgents => "Toggle agents",
+            Self::JoinSpaceNetwork => "Join network",
+            Self::LeaveSpaceNetwork => "Leave network",
+            Self::ShowNetworkMembers => "Show network members",
+            Self::ShowNetworkMessages => "Show network messages",
+            Self::ShowThreadAgents => "Show Thread agent activity",
             Self::ToggleTaskList => "Toggle task list",
             Self::ToggleBackgroundJobs => "Toggle background jobs",
             Self::RefreshConversationDiff => "Refresh conversation changes",
@@ -405,6 +425,11 @@ impl Command {
             Self::RestartEditor => Box::new(RestartEditor),
             Self::ToggleConversationDiffs => Box::new(ToggleConversationDiffs),
             Self::ToggleAgents => Box::new(ToggleAgents),
+            Self::JoinSpaceNetwork => Box::new(JoinSpaceNetwork),
+            Self::LeaveSpaceNetwork => Box::new(LeaveSpaceNetwork),
+            Self::ShowNetworkMembers => Box::new(ShowNetworkMembers),
+            Self::ShowNetworkMessages => Box::new(ShowNetworkMessages),
+            Self::ShowThreadAgents => Box::new(ShowThreadAgents),
             Self::ToggleTaskList => Box::new(ToggleTaskList),
             Self::ToggleBackgroundJobs => Box::new(ToggleBackgroundJobs),
             Self::RefreshConversationDiff => Box::new(RefreshConversationDiff),
@@ -516,6 +541,9 @@ impl Command {
             | Self::OpenConversationFile
             | Self::ToggleBrowser
             | Self::ToggleAgents
+            | Self::ShowNetworkMembers
+            | Self::ShowNetworkMessages
+            | Self::ShowThreadAgents
             | Self::ToggleTaskList
             | Self::ToggleBackgroundJobs
             | Self::RefreshConversationDiff
@@ -523,14 +551,20 @@ impl Command {
             {
                 Some("Select a conversation first.".into())
             }
-            Self::ToggleAgents
-                if state
-                    .conversation_thread()
-                    .and_then(|thread| state.conversations.get(&thread.id))
-                    .is_none_or(|session| super::agents::coordination_calls(session) == 0) =>
-            {
-                Some("This conversation's agent has not worked with other agents yet.".into())
-            }
+            Self::JoinSpaceNetwork | Self::LeaveSpaceNetwork => match state.conversation_thread() {
+                None => Some("Select a Conversation first".into()),
+                Some(thread) => state.network_membership_reason(thread.id).or_else(|| {
+                    match (self, state.network_joined(thread.id)) {
+                        (Self::JoinSpaceNetwork, true) => {
+                            Some("This agent has already joined the Space network".into())
+                        }
+                        (Self::LeaveSpaceNetwork, false) => {
+                            Some("This agent has not joined the Space network".into())
+                        }
+                        _ => None,
+                    }
+                }),
+            },
             Self::ToggleReview | Self::RefreshReview | Self::OpenPullRequest => {
                 state.pull_request_reason()
             }
@@ -789,6 +823,11 @@ pub fn bind_keys(cx: &mut App) {
             Some("ProjectSearch && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new("enter", OpenSelection, list),
+        KeyBinding::new("escape", Dismiss, Some("Network && !Command && !PopupMenu && !Sheet && !Dialog")),
+        KeyBinding::new("h", Dismiss, Some("Network && !Command && !PopupMenu && !Sheet && !Dialog")),
+        KeyBinding::new("left", Dismiss, Some("Network && !Command && !PopupMenu && !Sheet && !Dialog")),
+        KeyBinding::new("l", OpenSelection, Some("Network && !Command && !PopupMenu && !Sheet && !Dialog")),
+        KeyBinding::new("right", OpenSelection, Some("Network && !Command && !PopupMenu && !Sheet && !Dialog")),
         KeyBinding::new("j", SelectNext, thread),
         KeyBinding::new("down", SelectNext, thread),
         KeyBinding::new("k", SelectPrevious, thread),
@@ -1790,6 +1829,24 @@ impl Render for Palette {
                     w,
                     cx,
                 )
+            }))
+            .on_action(cx.listener(|this, _: &ToggleAgents, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleAgents), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &JoinSpaceNetwork, w, cx| {
+                this.run(PaletteTarget::Command(Command::JoinSpaceNetwork), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &LeaveSpaceNetwork, w, cx| {
+                this.run(PaletteTarget::Command(Command::LeaveSpaceNetwork), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowNetworkMembers, w, cx| {
+                this.run(PaletteTarget::Command(Command::ShowNetworkMembers), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowNetworkMessages, w, cx| {
+                this.run(PaletteTarget::Command(Command::ShowNetworkMessages), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowThreadAgents, w, cx| {
+                this.run(PaletteTarget::Command(Command::ShowThreadAgents), w, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleTaskList, w, cx| {
                 this.run(PaletteTarget::Command(Command::ToggleTaskList), w, cx)

@@ -1462,11 +1462,12 @@ impl Workspace {
         if self.state.read(cx).shutting_down || self.quit_requested {
             return;
         }
-        // Quit is one modal layer, never a second dialog over a picker or form.
-        self.dismiss(window, cx);
+        // Do not stack quit confirmation over a native dialog or sheet.
         if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
             return;
         }
+        // Keep workspace-owned forms and pickers intact until Quit is accepted. In
+        // particular, a cancelled window-close must leave the user's task recoverable.
         self.quit_requested = true;
         let state = self.state.read(cx);
         let allow_data_loss = state.storage_error.is_some() || state.shutdown_error.is_some();
@@ -1475,6 +1476,7 @@ impl Workspace {
             && !allow_data_loss
             && !self.has_running_terminals(cx)
         {
+            self.dismiss(window, cx);
             self.begin_orderly_quit(false, window, cx);
             return;
         }
@@ -1502,9 +1504,12 @@ impl Workspace {
                 .on_ok(move |_, window, cx| {
                     let confirm = confirm.clone();
                     window.defer(cx, move |window, cx| {
+                        // Close the quit alert before dismissing the retained workspace
+                        // surface; this avoids closing the same modal layer twice.
                         window.close_dialog(cx);
                         let _ = confirm.update(cx, |workspace, cx| {
                             workspace.quit_requested = true;
+                            workspace.dismiss(window, cx);
                             workspace.begin_orderly_quit(allow_data_loss, window, cx);
                         });
                     });
@@ -1518,5 +1523,59 @@ impl Workspace {
                     true
                 })
         });
+    }
+}
+
+#[cfg(all(test, feature = "runtime-qa"))]
+mod quit_tests {
+    use crate::{app::AppState, model::WorkspaceSnapshot, ui::workspace::Workspace};
+    use uuid::Uuid;
+
+    #[gpui_kit::test]
+    fn cancelling_quit_keeps_the_open_palette(cx: &mut gpui_kit::TestAppContext) {
+        use gpui_kit::{AppContext, component::Root};
+
+        let data_dir = std::env::temp_dir().join(format!("drostje-quit-qa-{}", Uuid::new_v4()));
+        std::fs::create_dir(&data_dir).unwrap();
+        let store = crate::store::Store::open(data_dir.clone()).unwrap();
+        let bootstrap = crate::app::Bootstrap {
+            data_dir: data_dir.clone(),
+            store,
+            snapshot: WorkspaceSnapshot::default(),
+            diagnostics: Default::default(),
+            repositories: Default::default(),
+            browser_tools: None,
+        };
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::ui::theme::initialize(None, Some(&data_dir), cx);
+        });
+
+        let mut workspace = None;
+        let window = cx.add_window(|window, cx| {
+            let state = cx.new(|cx| AppState::new(bootstrap, cx));
+            let view = cx.new(|cx| Workspace::new(state.clone(), window, cx));
+            let palette =
+                super::super::commands::Palette::open(view.downgrade(), state.clone(), window, cx);
+            state.update(cx, |state, _| {
+                state.active_threads.insert(Uuid::new_v4());
+            });
+            view.update(cx, |workspace, _| workspace.palette = Some(palette));
+            workspace = Some(view.clone());
+            let root = cx.new(|_| super::super::workspace::WorkspaceRoot { workspace: view });
+            Root::new(root, window, cx)
+        });
+        let workspace = workspace.unwrap();
+
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.quit_review(window, cx));
+        })
+        .unwrap();
+        assert!(cx.read(|cx| workspace.read(cx).palette.is_some()));
+
+        cx.simulate_keystrokes(window.into(), "escape");
+        cx.run_until_parked();
+        assert!(cx.read(|cx| workspace.read(cx).palette.is_some()));
+        assert!(!cx.read(|cx| workspace.read(cx).quit_requested));
     }
 }

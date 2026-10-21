@@ -37,6 +37,20 @@ use std::{
 /// the same inset `TitleBar` reserves for them.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
 
+fn inline_editor(input: &Entity<InputState>, error: Option<String>, cx: &App) -> AnyElement {
+    v_flex()
+        .min_w_0()
+        .child(Input::new(input).small().appearance(false))
+        .when_some(error, |view, error| {
+            view.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().danger)
+                    .child(error),
+            )
+        })
+        .into_any_element()
+}
 /// Minimum net travel on release; crossing it while touching never commits.
 const SPACE_SWIPE_DISTANCE: f32 = 80.;
 /// Platforms without touch phases use an idle gap as release.
@@ -354,8 +368,9 @@ fn row_menu(
         return menu;
     };
     match row {
-        Row::Project(_) => {
+        Row::Project(project) => {
             let state = workspace.read(cx).state.read(cx);
+            let rename_owner = owner.clone();
             menu.item(command_item(
                 "New OMP conversation",
                 Command::NewOmpConversation,
@@ -387,18 +402,36 @@ fn row_menu(
                 state,
             ))
             .separator()
-            .item(command_item(
-                "Rename project…",
-                Command::RenameProject,
-                state,
-            ))
+            .item(
+                PopupMenuItem::new(Command::RenameProject.label())
+                    .action(Command::RenameProject.action())
+                    .disabled(
+                        state.mutable_project_reason().is_some()
+                            || state
+                                .snapshot
+                                .projects
+                                .iter()
+                                .find(|candidate| candidate.id == project)
+                                .is_none_or(|project| project.archived),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let _ = rename_owner.update(cx, |workspace, cx| {
+                            workspace.start_rename(
+                                super::workspace::RenameTarget::Project(project),
+                                super::workspace::RenameSurface::Header,
+                                window,
+                                cx,
+                            )
+                        });
+                    }),
+            )
             .item(command_item(
                 Command::MoveProjectToSpace.label(),
                 Command::MoveProjectToSpace,
                 state,
             ))
             .item(command_item(
-                "Archive project…",
+                Command::ArchiveProject.label(),
                 Command::ArchiveProject,
                 state,
             ))
@@ -535,6 +568,7 @@ fn render_list(
         ..
     } = presentation;
     let theme = cx.theme();
+    let rename = owner.upgrade().and_then(|workspace| workspace.read(cx).inline_rename());
     let active = space == state.active_space;
     let session = state.space_session(space);
     let collapsed_projects = if active {
@@ -619,6 +653,13 @@ fn render_list(
                     project.name,
                     if project.archived { " · Archived" } else { "" }
                 );
+                let project_title = if let Some((super::workspace::RenameTarget::Project(target), super::workspace::RenameSurface::Header, input, error)) = &rename
+                    && *target == id
+                {
+                    inline_editor(input, error.clone(), cx)
+                } else {
+                    div().child(title.clone()).into_any_element()
+                };
                 let tooltip = error
                     .map(|error| format!("{} — Root unavailable: {error}", project.name))
                     .unwrap_or_else(|| title.clone());
@@ -660,7 +701,7 @@ fn render_list(
                                     h_flex()
                                         .gap_1()
                                         .items_center()
-                                        .child(div().flex_1().min_w_0().truncate().child(title))
+                                        .child(div().flex_1().min_w_0().truncate().child(project_title))
                                         .when(error.is_some(), |view| {
                                             view.child(
                                                 Icon::new(IconName::TriangleAlert)
@@ -916,15 +957,18 @@ fn render_list(
                                                 icon.small().text_color(theme.muted_foreground),
                                             ),
                                         )
-                                        .child(div().flex_1().min_w_0().truncate().when(untouched, |label| {
-                                            label.italic().text_color(theme.muted_foreground)
-                                        }).map(|label| {
-                                            match state.is_titling(id) {
-                                                true => label
-                                                    .child(ShimmerText::new(thread.title.clone())),
+                                        .child(if let Some((super::workspace::RenameTarget::Thread(target), super::workspace::RenameSurface::Sidebar, input, error)) = &rename
+                                            && *target == id
+                                        {
+                                            inline_editor(input, error.clone(), cx)
+                                        } else {
+                                            div().flex_1().min_w_0().truncate().when(untouched, |label| {
+                                                label.italic().text_color(theme.muted_foreground)
+                                            }).map(|label| match state.is_titling(id) {
+                                                true => label.child(ShimmerText::new(thread.title.clone())),
                                                 false => label.child(thread.title.clone()),
-                                            }
-                                        }))
+                                            }).into_any_element()
+                                        })
                                         // Pointer shortcuts only: the context menu and palette
                                         // carry the same commands. The lane keeps its width so
                                         // long titles do not jump when the pointer enters; the
@@ -1107,6 +1151,7 @@ pub(super) fn render(
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
+    let rename = owner.upgrade().and_then(|workspace| workspace.read(cx).inline_rename());
     let query = search.read(cx).value();
     let slide = presentation.slide;
     let list = render_list(
@@ -1137,6 +1182,17 @@ pub(super) fn render(
     let search_owner = owner.clone();
     let search_next_owner = owner.clone();
     let space_menu_owner = owner.clone();
+    let space_title = match &rename {
+        Some((super::workspace::RenameTarget::Space(id), super::workspace::RenameSurface::Header, input, error)) if *id == state.active_space =>
+            inline_editor(input, error.clone(), cx),
+        _ => super::commands::button("space-switcher", Command::SwitchSpace, owner, state)
+            .label(state.active_space_name().to_owned())
+            .icon(IconName::ChevronDown)
+            .flex_1()
+            .min_w_0()
+            .debug_selector(|| "space-switcher".to_owned())
+            .into_any_element(),
+    };
     let swipe_owner = owner.clone();
     v_flex()
         .size_full()
@@ -1210,14 +1266,7 @@ pub(super) fn render(
                 .gap_1()
                 .p_2()
                 .items_center()
-                .child(
-                    super::commands::button("space-switcher", Command::SwitchSpace, owner, state)
-                        .label(state.active_space_name().to_owned())
-                        .icon(IconName::ChevronDown)
-                        .flex_1()
-                        .min_w_0()
-                        .debug_selector(|| "space-switcher".to_owned()),
-                )
+                .child(space_title)
                 .child(
                     super::commands::button("new-space", Command::NewSpace, owner, state)
                         .label("")

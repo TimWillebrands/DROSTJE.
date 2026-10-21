@@ -521,6 +521,16 @@ impl Workspace {
             return;
         }
         let result: Result<Value, String> = match operation {
+            BrowserToolOperation::Network {
+                token,
+                action,
+                cancelled,
+            } => {
+                self.state.update(cx, |state, _| {
+                    state.network_tool(thread, token, action, cancelled, reply)
+                });
+                return;
+            }
             BrowserToolOperation::ShowArtifact { path, title } => {
                 match url::Url::from_file_path(&path) {
                     Ok(url) => {

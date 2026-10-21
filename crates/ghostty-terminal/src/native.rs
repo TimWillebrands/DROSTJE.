@@ -239,6 +239,7 @@ mod platform {
         ) -> *mut RawSurface;
         fn gpui_ghostty_surface_free(surface: *mut RawSurface);
         fn gpui_ghostty_surface_tick(surface: *mut RawSurface);
+        fn gpui_ghostty_surface_needs_confirm_quit(surface: *const RawSurface) -> bool;
         fn gpui_ghostty_surface_is_alive(surface: *const RawSurface) -> bool;
         fn gpui_ghostty_surface_snapshot(
             surface: *mut RawSurface,
@@ -357,6 +358,10 @@ mod platform {
         pub fn is_alive(&self) -> bool {
             // SAFETY: `raw` remains valid for this value's lifetime.
             unsafe { gpui_ghostty_surface_is_alive(self.raw.as_ptr()) }
+        }
+        pub fn needs_confirm_quit(&self) -> bool {
+            // SAFETY: `raw` remains valid for this value's lifetime.
+            unsafe { gpui_ghostty_surface_needs_confirm_quit(self.raw.as_ptr()) }
         }
 
         pub fn snapshot(&mut self) -> Result<Option<NativeSnapshot>, String> {

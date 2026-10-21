@@ -223,6 +223,11 @@ bool gpui_ghostty_surface_is_alive(const gpui_ghostty_surface *state) {
     return state != NULL && state->surface != NULL && !ghostty_surface_process_exited(state->surface);
 }
 
+bool gpui_ghostty_surface_needs_confirm_quit(const gpui_ghostty_surface *state) {
+    return state == NULL || state->surface == NULL ||
+        ghostty_surface_needs_confirm_quit(state->surface);
+}
+
 bool gpui_ghostty_surface_snapshot(
     gpui_ghostty_surface *state,
     uint8_t **pixels,

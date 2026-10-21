@@ -6,6 +6,7 @@
 
 use super::{
     commands::{Command, button},
+    settings::{self, DialogKind},
     theme,
     workspace::Workspace,
 };
@@ -93,6 +94,16 @@ pub(super) fn render(
         None if loading => "Loading changes…".into_any_element(),
         None => "Changes not loaded".into_any_element(),
     };
+    let commit_panel = owner.upgrade().and_then(|workspace| {
+        let workspace = workspace.read(cx);
+        if workspace.commit_panel_thread != Some(id) {
+            return None;
+        }
+        let dialog = workspace.dialog.clone()?;
+        let matches_thread =
+            matches!(dialog.read(cx).kind, DialogKind::Commit(thread) if thread == id);
+        matches_thread.then(|| settings::render_commit_panel(dialog, cx))
+    });
     let content = match result {
         Some(Ok(diff)) if diff.rows.rows.is_empty() => div()
             .flex_1()
@@ -175,6 +186,7 @@ pub(super) fn render(
                         .debug_selector(|| "commit-changes".into()),
                 ),
         )
+        .when_some(commit_panel, |view, panel| view.child(panel))
         .child(content)
         .into_any_element()
 }

@@ -31,6 +31,7 @@ unsafe extern "C" {
     ) -> *mut RawSurface;
     fn gpui_ghostty_surface_linux_free(surface: *mut RawSurface);
     fn gpui_ghostty_surface_linux_tick(surface: *mut RawSurface);
+    fn gpui_ghostty_surface_linux_needs_confirm_quit(surface: *const RawSurface) -> bool;
     fn gpui_ghostty_surface_linux_is_alive(surface: *const RawSurface) -> bool;
     fn gpui_ghostty_surface_linux_snapshot(
         surface: *mut RawSurface,
@@ -197,6 +198,10 @@ impl NativeSurface {
     pub fn is_alive(&self) -> bool {
         // SAFETY: This surface owns the live adapter handle until Drop.
         unsafe { gpui_ghostty_surface_linux_is_alive(self.raw.as_ptr()) }
+    }
+    pub fn needs_confirm_quit(&self) -> bool {
+        // SAFETY: This surface owns the live adapter handle until Drop.
+        unsafe { gpui_ghostty_surface_linux_needs_confirm_quit(self.raw.as_ptr()) }
     }
 
     pub fn snapshot(&mut self) -> Result<Option<NativeSnapshot>, String> {

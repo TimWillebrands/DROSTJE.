@@ -270,6 +270,11 @@ bool gpui_ghostty_surface_linux_is_alive(const gpui_ghostty_surface *state) {
     return state != NULL && state->surface != NULL && !ghostty_surface_process_exited(state->surface);
 }
 
+bool gpui_ghostty_surface_linux_needs_confirm_quit(const gpui_ghostty_surface *state) {
+    return state == NULL || state->surface == NULL ||
+        ghostty_surface_needs_confirm_quit(state->surface);
+}
+
 void gpui_ghostty_surface_linux_preedit(gpui_ghostty_surface *state, const char *text, size_t length) {
     if (state != NULL && state->surface != NULL) ghostty_surface_preedit(state->surface, text, length);
 }

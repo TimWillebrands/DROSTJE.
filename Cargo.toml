@@ -41,6 +41,11 @@ harness = false
 required-features = ["runtime-qa"]
 
 [[test]]
+name = "job_notices"
+harness = false
+required-features = ["runtime-qa"]
+
+[[test]]
 name = "servo_rendering"
 harness = false
 required-features = ["runtime-qa"]

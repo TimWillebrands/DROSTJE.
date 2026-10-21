@@ -27,6 +27,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         collapsible::Collapsible,
         h_flex,
+        input::Input,
         label::Label,
         menu::{DropdownMenu, PopupMenuItem},
         progress::ProgressCircle,
@@ -2613,7 +2614,12 @@ fn message(
                         ));
                     }
                 }
-                None => body = body.child(block(item, identity, owner, markdown, cx)),
+                None => {
+                    body = body.child(match job_notice::system_notice_body(text) {
+                        Some(text) => system_notice(identity, text, owner, markdown, cx),
+                        None => block(item, identity, owner, markdown, cx),
+                    });
+                }
             },
             ContentBlock::Text(_) if message.role == "assistant" => {
                 body = body.child(prose(block(item, identity, owner, markdown, cx), cx));
@@ -2841,6 +2847,56 @@ fn sticky_dock(
     Some(inset(dock))
 }
 
+/// Unrecognised notices remain inspectable, without exposing transport markup
+/// or pretending that a new harness format is a completed background job.
+fn system_notice(
+    key: String,
+    text: &str,
+    owner: &WeakEntity<Workspace>,
+    markdown: Markdown,
+    cx: &App,
+) -> AnyElement {
+    let open = is_expanded(owner, &key, cx);
+    let mut card = v_flex()
+        .id(SharedString::from(format!("{key}:notice")))
+        .test_support()
+        .w_full()
+        .min_w_0()
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .py_1()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(Icon::new(Lucide::Info).xsmall())
+                .child(div().flex_1().child("System notice"))
+                .child(disclosure(
+                    key.clone(),
+                    open,
+                    owner,
+                    if open { "Hide notice" } else { "Show notice" },
+                )),
+        );
+    if open {
+        card = card.child(
+            div()
+                .id(SharedString::from(format!("{key}:notice-body")))
+                .test_support()
+                .min_w_0()
+                .px_3()
+                .py_2()
+                .border_1()
+                .border_color(cx.theme().border)
+                .rounded(cx.theme().radius)
+                .child(guarded_text(key.clone(), text, owner, cx, || {
+                    code_block(format!("{key}:text"), text, "text", markdown).into_any_element()
+                })),
+        );
+    }
+    card.into_any_element()
+}
+
 /// One finished background job from a `<system-notice>`: a task agent's report
 /// or a shell command's output. A structured report opens by default; raw
 /// output folds behind the disclosure like any tool result.
@@ -2854,19 +2910,18 @@ fn job_card(
     let structured = matches!(job.output, JobOutput::Structured(_));
     let has_output = !matches!(job.output, JobOutput::Empty);
     let open = has_output && (structured != is_expanded(owner, &key, cx));
-    let status: Option<AnyElement> = job.status.as_deref().map(|status| {
-        let lowered = status.to_ascii_lowercase();
-        let tag = if lowered == "completed" {
-            Tag::success()
-        } else if lowered.contains("fail") || lowered.contains("error") {
-            Tag::danger()
-        } else {
-            Tag::secondary()
-        };
-        tag.small().child(status.to_owned()).into_any_element()
-    });
+    let status = job.status.as_deref().unwrap_or("Finished");
+    let tag = if status.eq_ignore_ascii_case("failed") || status.eq_ignore_ascii_case("error") {
+        Tag::danger()
+    } else {
+        Tag::secondary()
+    }
+    .outline()
+    .small()
+    .child(status.to_owned());
     let mut header = h_flex()
         .id(SharedString::from(format!("{key}:header")))
+        .test_support()
         .w_full()
         .items_center()
         .gap_2()
@@ -2883,10 +2938,16 @@ fn job_card(
         )
         .child(
             div()
-                .flex_1()
-                .min_w_0()
+                .flex_shrink_0()
+                .max_w(relative(0.4))
                 .truncate()
                 .child(format!("Background job {}", job.id)),
+        )
+        .child(
+            mono(cx)
+                .flex_1()
+                .truncate()
+                .when_some(job.label.as_ref(), |label, text| label.child(text.clone())),
         );
     for detail in [job.agent.as_deref(), job.duration.as_deref()]
         .into_iter()
@@ -2897,7 +2958,7 @@ fn job_card(
     if !has_output {
         header = header.child(div().flex_shrink_0().child("No output"));
     }
-    header = header.when_some(status, |row, status| row.child(status));
+    header = header.child(tag);
     if has_output {
         header = header
             .on_click(toggle(owner, key.clone()))
@@ -2910,11 +2971,16 @@ fn job_card(
     }
     let mut card = v_flex()
         .id(SharedString::from(format!("{key}:card")))
+        .test_support()
         .w_full()
         .min_w_0()
         .child(header);
     if open {
         let mut output = v_flex()
+            .id(SharedString::from(format!("{key}:body")))
+            .test_support()
+            .w_full()
+            .min_w_0()
             .gap_2()
             .mb_1()
             .px_3()
@@ -2922,6 +2988,9 @@ fn job_card(
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius);
+        if let Some(label) = &job.label {
+            output = output.child(mono(cx).child(label.clone()));
+        }
         if let Some(full) = &job.full_output {
             output = output.child(
                 div()
@@ -3091,6 +3160,11 @@ fn request_card(
                 .child(request.text.clone()),
         );
     }
+    let inline_answer = owner.upgrade().is_some_and(|workspace| {
+        workspace.read(cx).extension.as_ref().is_some_and(|form| {
+            form.inline_answer && form.thread == id && form.request.id == request.id
+        })
+    });
     let mut choices = v_flex()
         .id(SharedString::from(format!(
             "request-{}-choices",
@@ -3125,20 +3199,22 @@ fn request_card(
             }
         }
         UserRequestKind::Input | UserRequestKind::Editor => {
-            let owner = owner.clone();
-            let request = request.clone();
-            choices = choices.child(
-                Button::new(SharedString::from(format!("answer-{}", request.id)))
-                    .small()
-                    .outline()
-                    .w_full()
-                    .label("Answer…")
-                    .on_click(move |_, window, cx| {
-                        let _ = owner.update(cx, |workspace, cx| {
-                            workspace.open_extension(id, request.clone(), window, cx)
-                        });
-                    }),
-            );
+            if !inline_answer {
+                let owner = owner.clone();
+                let request = request.clone();
+                choices = choices.child(
+                    Button::new(SharedString::from(format!("answer-{}", request.id)))
+                        .small()
+                        .outline()
+                        .w_full()
+                        .label("Answer…")
+                        .on_click(move |_, window, cx| {
+                            let _ = owner.update(cx, |workspace, cx| {
+                                workspace.open_extension(id, request.clone(), window, cx)
+                            });
+                        }),
+                );
+            }
         }
     }
     for (index, (label, description, answer)) in answers.into_iter().enumerate() {
@@ -3161,6 +3237,7 @@ fn request_card(
             .child(label)
             .on_click(move |_, _, cx| {
                 let _ = owner.update(cx, |workspace, cx| {
+                    workspace.back_from_custom_answer(id, &request_id, cx);
                     workspace.state.update(cx, |state, cx| {
                         state.respond(id, request_id.clone(), answer.clone());
                         cx.notify();
@@ -3170,7 +3247,86 @@ fn request_card(
         );
     }
     card = card.child(choices);
-    if request.kind == UserRequestKind::Question {
+    if inline_answer
+        && matches!(
+            request.kind,
+            UserRequestKind::Question | UserRequestKind::Input
+        )
+    {
+        if let Some(input) = owner
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).extension.as_ref()?.input.clone())
+        {
+            let submit = owner.clone();
+            let back = owner.clone();
+            let request_id = request.id.clone();
+            card = card.child(
+                v_flex()
+                    .id(SharedString::from(format!(
+                        "request-{}-inline-editor",
+                        request.id
+                    )))
+                    .key_context("DrostjeForm InlineRequestAnswer")
+                    .on_action(move |_: &super::commands::Dismiss, _, cx| {
+                        cx.stop_propagation();
+                        let _ = back.update(cx, |workspace, cx| {
+                            workspace.back_from_custom_answer(id, &request_id, cx)
+                        });
+                    })
+                    .on_action(move |_: &super::commands::Confirm, window, cx| {
+                        cx.stop_propagation();
+                        let _ = submit
+                            .update(cx, |workspace, cx| workspace.confirm_extension(window, cx));
+                    })
+                    .gap_2()
+                    .child(div().key_context("NativeInput").child(Input::new(&input)))
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "request-{}-back",
+                                    request.id
+                                )))
+                                .small()
+                                .ghost()
+                                .label(if request.kind == UserRequestKind::Input {
+                                    "Back to request"
+                                } else {
+                                    "Back to choices"
+                                })
+                                .on_click({
+                                    let owner = owner.clone();
+                                    let request_id = request.id.clone();
+                                    move |_, _, cx| {
+                                        let _ = owner.update(cx, |workspace, cx| {
+                                            workspace.back_from_custom_answer(id, &request_id, cx)
+                                        });
+                                    }
+                                }),
+                            )
+                            .child(
+                                Button::new(SharedString::from(format!(
+                                    "request-{}-send",
+                                    request.id
+                                )))
+                                .small()
+                                .primary()
+                                .label("Send answer")
+                                .on_click({
+                                    let owner = owner.clone();
+                                    move |_, window, cx| {
+                                        let _ = owner.update(cx, |workspace, cx| {
+                                            workspace.confirm_extension(window, cx)
+                                        });
+                                    }
+                                }),
+                            ),
+                    ),
+            );
+        }
+    } else if request.kind == UserRequestKind::Question {
         let custom = owner.clone();
         let request = request.clone();
         card = card.child(
@@ -3194,16 +3350,22 @@ fn request_card(
                 .small()
                 .ghost()
                 .label("Cancel")
-                .on_click(move |_, _, cx| {
+                .on_click(move |_, window, cx| {
                     let _ = cancel.update(cx, |workspace, cx| {
-                        workspace.state.update(cx, |state, cx| {
-                            state.respond(
-                                id,
-                                request_id.clone(),
-                                UserAnswer::Cancelled { timed_out: false },
-                            );
-                            cx.notify();
-                        })
+                        if workspace.extension.as_ref().is_some_and(|form| {
+                            form.inline_answer && form.thread == id && form.request.id == request_id
+                        }) {
+                            workspace.close_extension(true, window, cx);
+                        } else {
+                            workspace.state.update(cx, |state, cx| {
+                                state.respond(
+                                    id,
+                                    request_id.clone(),
+                                    UserAnswer::Cancelled { timed_out: false },
+                                );
+                                cx.notify();
+                            })
+                        }
                     });
                 }),
         ),
@@ -3307,9 +3469,10 @@ pub(super) fn render(
     owner: &WeakEntity<Workspace>,
     scroll: &ScrollHandle,
     transcript: &Entity<TranscriptView>,
+    network: Option<&Entity<super::network::NetworkPanel>>,
     cx: &App,
 ) -> AnyElement {
-    render_content(state, id, owner, scroll, transcript, cx)
+    render_content(state, id, owner, scroll, transcript, network, cx)
 }
 
 /// The Conversation frame: history and the thread sidebar share a row, the
@@ -3538,10 +3701,11 @@ fn render_content(
     owner: &WeakEntity<Workspace>,
     output_scroll: &ScrollHandle,
     transcript: &Entity<TranscriptView>,
+    network: Option<&Entity<super::network::NetworkPanel>>,
     cx: &App,
 ) -> AnyElement {
     let drop_owner = owner.clone();
-    let sidebar = super::thread_sidebar::render(state, id, true, owner, output_scroll, cx);
+    let sidebar = super::thread_sidebar::render(state, id, true, owner, output_scroll, network, cx);
     let layout = super::thread_sidebar::SidebarLayout::new(state, id, owner, cx);
     let root = v_flex()
         .id(SharedString::from(format!("conversation-view-{id}")))
@@ -4829,7 +4993,7 @@ mod tests {
         };
         use gpui_kit::{
             AppContext, Context, IntoElement, ParentElement, Render, Styled, VisualTestContext,
-            WeakEntity, Window, component::Root, test::TestWindowExt,
+            WeakEntity, Window, component::Root,
         };
 
         struct TimelineHarness;
@@ -4923,7 +5087,7 @@ mod tests {
         use crate::model::{QueuedMessage, Thread, ThreadKind};
         use gpui_kit::{
             AppContext, Context, IntoElement, ParentElement, Render, Styled, VisualTestContext,
-            WeakEntity, Window, component::Root, test::TestWindowExt,
+            WeakEntity, Window, component::Root,
         };
         use uuid::Uuid;
 

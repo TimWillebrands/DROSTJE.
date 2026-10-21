@@ -2,6 +2,8 @@ mod activity;
 mod commit;
 mod conversation;
 mod factory;
+mod network;
+pub use network::NetworkState;
 mod persistence;
 mod project_diff;
 mod shutdown;
@@ -338,11 +340,13 @@ enum Write {
 pub enum SidebarTab {
     Changes,
     Output,
-    /// Offered only once the Conversation's agent works with other agents.
+    /// Space network membership and the Conversation's local agent activity.
     Agents,
     Browser,
     /// Review threads of the pull request pinned to a worktree Conversation.
     Review,
+    /// Inspector for the selected thread or tool call.
+    Details,
 }
 impl SidebarTab {
     /// The sidebar `(open, tab)` after asking for `requested`: a hidden sidebar or
@@ -417,6 +421,7 @@ pub struct AppState {
     pub repositories: BTreeMap<ProjectId, Result<platform::RepositoryInfo, String>>,
     pub diagnostics: BTreeMap<String, String>,
     pub browser_tools: Option<crate::browser_tools::BrowserToolServer>,
+    pub network: NetworkState,
     /// Models the title providers have locally; `None` until first inspected.
     pub title_models: Option<crate::titles::InstalledModels>,
     /// The inspection in flight; results of earlier ones are dropped.
@@ -652,6 +657,7 @@ impl AppState {
             repositories,
             diagnostics,
             browser_tools,
+            network: NetworkState::default(),
             title_models: None,
             title_models_request: None,
             notice_sequence: notices.len() as u64,
@@ -691,6 +697,7 @@ impl AppState {
         state.persist_space_session();
         state.reconcile_worktrees();
         state.start_pull_request_polling(cx);
+        state.start_network(cx);
         state
     }
 
@@ -858,6 +865,7 @@ impl AppState {
                     }
                     (None, Err(_)) => {}
                 }
+                self.sync_network();
                 cx.emit(PresentationChange::Projects);
                 cx.emit(PresentationChange::Thread(id));
                 return;
@@ -972,6 +980,7 @@ impl AppState {
             self.snapshot.projects.push(project.clone());
         }
         self.enqueue(Write::Project(project));
+        self.sync_network();
         if is_new {
             self.register_project_membership(id, space).0
         } else {
@@ -989,6 +998,7 @@ impl AppState {
             self.snapshot.threads.push(thread.clone());
         }
         self.enqueue(Write::Thread(Box::new(thread), None));
+        self.sync_network();
     }
 
     /// Typing changes memory only: no timer, write request, or save notification.
@@ -1099,6 +1109,7 @@ impl AppState {
             Some("agents") => SidebarTab::Agents,
             Some("browser") => SidebarTab::Browser,
             Some("review") => SidebarTab::Review,
+            Some("details") => SidebarTab::Details,
             _ => SidebarTab::Changes,
         }
     }
@@ -1151,6 +1162,7 @@ impl AppState {
                 SidebarTab::Agents => tabs.insert(key, Value::String("agents".into())),
                 SidebarTab::Browser => tabs.insert(key, Value::String("browser".into())),
                 SidebarTab::Review => tabs.insert(key, Value::String("review".into())),
+                SidebarTab::Details => tabs.insert(key, Value::String("details".into())),
             };
             self.set_setting("thread_sidebar_tab", Value::Object(tabs));
         }
@@ -1290,6 +1302,23 @@ impl AppState {
         } else {
             None
         }
+    }
+    pub fn unarchive_project(&mut self, id: ProjectId) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.shutting_down, "Application is shutting down");
+        if let Some(error) = &self.storage_error {
+            anyhow::bail!("Storage is read-only: {error}");
+        }
+        let mut project = self
+            .snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Project is unavailable"))?;
+        anyhow::ensure!(project.archived, "Project is not archived.");
+        project.archived = false;
+        self.save_project(project);
+        Ok(())
     }
     pub fn rename_thread_reason(&self) -> Option<String> {
         let Some(thread) = self.thread() else {
@@ -1516,6 +1545,7 @@ impl AppState {
             }
         }
         self.persist_space_session();
+        self.sync_network();
     }
     /// Closes every open tab of `project`, committing their drafts.
     pub fn close_project_threads(&mut self, project: ProjectId) {
@@ -1967,6 +1997,19 @@ mod tests {
                 state.archive_thread(current).unwrap();
                 assert_eq!(state.selected_thread, None);
                 assert!(state.open_threads.is_empty());
+            });
+        }
+        #[gpui_kit::test]
+        fn undoing_project_archive_restores_its_read_only_state(cx: &mut TestAppContext) {
+            let (_dir, state, project) = open(cx);
+            state.update(cx, |state, _| {
+                let mut archived = state.project().unwrap().clone();
+                archived.archived = true;
+                state.save_project(archived);
+                assert!(state.project().unwrap().archived);
+                state.unarchive_project(project).unwrap();
+                assert!(!state.project().unwrap().archived);
+                assert!(state.unarchive_project(project).is_err());
             });
         }
 

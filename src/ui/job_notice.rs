@@ -6,8 +6,8 @@
 //! have completed.` and then carries either raw shell output or one
 //! `<task-result …>` block per job with an `<output>` or truncated `<preview>`.
 //! Lines addressed to the model (`X is now idle — message it via hub`, job
-//! separators, structured-output hints) are not part of any job. Text that does
-//! not fit this shape parses to `None` and renders as it did before.
+//! separators, structured-output hints) are not part of any job. Unrecognised or
+//! incomplete formats return `None` so the UI can retain them in a generic notice.
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,7 +21,9 @@ pub struct JobResult {
     pub id: String,
     /// Agent kind for task jobs (`task`, `scout`, …); `None` for shell jobs.
     pub agent: Option<String>,
-    /// OMP's own status word, untouched; `None` for shell jobs.
+    /// Command or name supplied by a batched notice's job separator.
+    pub label: Option<String>,
+    /// Explicit task status or shell exit status; completion alone is not success.
     pub status: Option<String>,
     pub duration: Option<String>,
     pub output: JobOutput,
@@ -32,79 +34,226 @@ pub struct JobResult {
 pub struct JobNotice {
     pub jobs: Vec<JobResult>,
 }
+/// Strip exactly one complete notice wrapper for native and generic UI rendering.
+pub fn system_notice_body(text: &str) -> Option<&str> {
+    let body = text
+        .trim()
+        .strip_prefix("<system-notice>")?
+        .strip_suffix("</system-notice>")?;
+    if body.contains("<system-notice>") || body.contains("</system-notice>") {
+        return None;
+    }
+    Some(body.trim())
+}
+
 impl JobNotice {
     pub fn parse(text: &str) -> Option<Self> {
-        let body = text
-            .trim()
-            .strip_prefix("<system-notice>")?
-            .strip_suffix("</system-notice>")?
-            .trim_matches('\n');
+        let body = system_notice_body(text)?;
         let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
-        let single = first
-            .strip_prefix("Background job ")
-            .and_then(|line| line.split_once(" has completed."))
-            .map(|(id, _)| id.trim());
-        let multi = first.contains(" background jobs have completed.");
-        if single.is_none() && !multi {
+        let (single, count) = if let Some(rest) = first.strip_prefix("Background job ") {
+            let (id, tail) = rest.split_once(" has completed.")?;
+            if !valid_id(id) || !matches!(tail, "" | " Resume your work using the result below.") {
+                return None;
+            }
+            (Some(id), 1)
+        } else {
+            let (count, tail) = first.split_once(" background jobs have completed.")?;
+            if !matches!(tail, "" | " Resume your work using the results below.") {
+                return None;
+            }
+            (None, count.parse::<usize>().ok()?)
+        };
+        if count == 0 {
             return None;
         }
-        let mut jobs = Vec::new();
-        let mut cursor = rest;
-        while let Some(start) = cursor.find("<task-result ") {
-            let Some(end) = cursor[start..].find("</task-result>") else {
-                break;
-            };
-            if let Some(job) = parse_task_result(&cursor[start..start + end]) {
+
+        // Only whole lines outside task results can delimit jobs. In particular,
+        // commands may contain arbitrary parentheses and Unicode.
+        let mut separators = Vec::new();
+        let mut offset = 0;
+        let mut in_task = false;
+        for line in rest.split_inclusive('\n') {
+            let line_body = line.trim_end_matches(['\r', '\n']);
+            if !in_task && line_body.starts_with("── Job ") {
+                let (id, label) = job_separator(line_body)?;
+                separators.push((offset, offset + line.len(), id, label));
+            }
+            if line_body.starts_with("<task-result ") {
+                in_task = true;
+            }
+            if in_task && line_body.contains("</task-result>") {
+                in_task = false;
+            }
+            offset += line.len();
+        }
+
+        let jobs = if separators.is_empty() {
+            let content = rest.trim_matches(['\r', '\n']);
+            if content.starts_with("<task-result") {
+                parse_task_sequence(content)?
+            } else {
+                let id = single?;
+                if content.contains("<task-result") || content.contains("</task-result>") {
+                    return None;
+                }
+                vec![parse_shell_result(id, None, content)]
+            }
+        } else {
+            if !rest[..separators[0].0].trim().is_empty() {
+                return None;
+            }
+            let mut jobs = Vec::with_capacity(separators.len());
+            for (index, &(_, start, id, label)) in separators.iter().enumerate() {
+                let end = separators
+                    .get(index + 1)
+                    .map_or(rest.len(), |separator| separator.0);
+                let content = rest[start..end].trim_matches(['\r', '\n']);
+                let mut job = if content.starts_with("<task-result") {
+                    let mut parsed = parse_task_sequence(content)?;
+                    if parsed.len() != 1 || parsed[0].id != id {
+                        return None;
+                    }
+                    parsed.remove(0)
+                } else {
+                    if content.contains("<task-result") || content.contains("</task-result>") {
+                        return None;
+                    }
+                    parse_shell_result(id, None, content)
+                };
+                job.label = Some(label.to_owned());
                 jobs.push(job);
             }
-            cursor = &cursor[start + end + "</task-result>".len()..];
+            jobs
+        };
+        if jobs.len() != count
+            || single.is_some_and(|id| jobs[0].id != id)
+            || jobs
+                .iter()
+                .enumerate()
+                .any(|(index, job)| jobs[..index].iter().any(|other| other.id == job.id))
+        {
+            return None;
         }
-        if jobs.is_empty() {
-            let id = single?;
-            let output = rest.trim_matches('\n');
-            jobs.push(JobResult {
-                id: id.to_owned(),
-                agent: None,
-                status: None,
-                duration: None,
-                output: if output.is_empty() {
-                    JobOutput::Empty
-                } else {
-                    JobOutput::Text(output.to_owned())
-                },
-                full_output: None,
-            });
-        }
-        Some(JobNotice { jobs })
+        Some(Self { jobs })
     }
 }
-/// `block` starts at `<task-result ` and ends just before `</task-result>`.
-fn parse_task_result(block: &str) -> Option<JobResult> {
-    let (head, inner) = block.split_once('>')?;
-    let attribute = |name: &str| attribute(head, name);
-    let id = attribute("id")?;
-    let (output, full_output) = if let Some(output) = between(inner, "<output>", "</output>") {
-        (output, None)
-    } else if let Some(start) = inner.find("<preview") {
-        let tail = &inner[start..];
-        let (head, rest) = tail.split_once('>')?;
-        let preview = rest.split_once("</preview>").map_or(rest, |(body, _)| body);
-        (preview, attribute_in(head, "full-output"))
-    } else {
-        ("", None)
-    };
-    let output = output.trim_matches('\n');
-    let output = if output.is_empty() {
+
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && !id.chars().any(char::is_whitespace)
+}
+
+fn job_separator(line: &str) -> Option<(&str, &str)> {
+    let (id, label) = line
+        .strip_prefix("── Job ")?
+        .strip_suffix(") ──")?
+        .split_once(" (")?;
+    valid_id(id).then_some((id, label))
+}
+
+fn parse_shell_result(id: &str, label: Option<String>, output: &str) -> JobResult {
+    let mut status = None;
+    for line in output.lines() {
+        if let Some(code) = line
+            .strip_prefix("Command exited with code ")
+            .and_then(|code| code.parse::<i32>().ok())
+        {
+            // A reported failure must not be overwritten by later success text.
+            if code != 0 {
+                status = Some("failed".to_owned());
+                break;
+            }
+            status = Some("completed".to_owned());
+        }
+    }
+    let duration = output.lines().rev().find_map(|line| {
+        let seconds = line.strip_prefix("Wall time: ")?.strip_suffix(" seconds")?;
+        let value = seconds.parse::<f64>().ok()?;
+        (value.is_finite() && value >= 0.0).then(|| format!("{seconds}s"))
+    });
+    JobResult {
+        id: id.to_owned(),
+        agent: None,
+        label,
+        status,
+        duration,
+        output: text_output(output),
+        full_output: None,
+    }
+}
+
+fn text_output(output: &str) -> JobOutput {
+    if output.is_empty() {
         JobOutput::Empty
     } else {
-        match serde_json::from_str::<Value>(output) {
-            Ok(value @ (Value::Object(_) | Value::Array(_))) => JobOutput::Structured(value),
-            _ => JobOutput::Text(output.to_owned()),
+        JobOutput::Text(output.to_owned())
+    }
+}
+
+/// Consume all task blocks and only the known model-directed lines around them.
+/// Any unrecognized fragment rejects the entire notice instead of losing a job.
+fn parse_task_sequence(mut text: &str) -> Option<Vec<JobResult>> {
+    let mut jobs = Vec::new();
+    while !text.trim().is_empty() {
+        text = text.trim_start();
+        if text.starts_with("<task-result ") {
+            let (block, tail) = text.split_once("</task-result>")?;
+            jobs.push(parse_task_result(block)?);
+            text = tail;
+        } else {
+            let (line, tail) = text.split_once('\n').unwrap_or((text, ""));
+            let idle = jobs.iter().any(|job: &JobResult| {
+                line.strip_prefix(job.id.as_str())
+                    .is_some_and(|tail| tail.starts_with(" is now idle — message it via "))
+            });
+            if !idle && !line.starts_with("Structured output: ") {
+                return None;
+            }
+            text = tail;
         }
+    }
+    (!jobs.is_empty()).then_some(jobs)
+}
+
+/// `block` starts at `<task-result ` and ends just before `</task-result>`.
+fn parse_task_result(block: &str) -> Option<JobResult> {
+    let (head, mut inner) = block.split_once('>')?;
+    let attribute = |name: &str| attribute(head, name);
+    let id = attribute("id")?;
+    if !valid_id(&id) {
+        return None;
+    }
+    inner = inner.trim();
+    if let Some(meta) = inner.strip_prefix("<meta ") {
+        let (_, rest) = meta.split_once("/>")?;
+        inner = rest.trim();
+    }
+    let (output, full_output) = if let Some(rest) = inner.strip_prefix("<output>") {
+        let (output, tail) = rest.split_once("</output>")?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        (output, None)
+    } else if inner.starts_with("<preview") {
+        let (head, rest) = inner.split_once('>')?;
+        let (preview, tail) = rest.split_once("</preview>")?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        (preview, attribute_in(head, "full-output"))
+    } else if inner.is_empty() {
+        ("", None)
+    } else {
+        return None;
+    };
+    let output = output.trim_matches('\n');
+    let output = match serde_json::from_str::<Value>(output) {
+        Ok(value @ (Value::Object(_) | Value::Array(_))) => JobOutput::Structured(value),
+        _ => text_output(output),
     };
     Some(JobResult {
         id,
         agent: attribute("agent"),
+        label: None,
         status: attribute("status"),
         duration: attribute("duration"),
         output,
@@ -202,15 +351,12 @@ fn attribute_in(head: &str, name: &str) -> Option<String> {
     let (value, _) = rest.split_once('"')?;
     (!value.is_empty()).then(|| value.to_owned())
 }
-fn between<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
-    let (_, rest) = text.split_once(open)?;
-    let (inner, _) = rest.split_once(close)?;
-    Some(inner)
-}
 
 #[cfg(test)]
 mod tests {
-    use super::{JobKind, JobNotice, JobOutput, JobStart, job_starts, settled_job_ids};
+    use super::{
+        JobKind, JobNotice, JobOutput, JobStart, job_starts, settled_job_ids, system_notice_body,
+    };
     use serde_json::{Value, json};
 
     #[test]
@@ -271,6 +417,7 @@ mod tests {
         let job = &notice.jobs[0];
         assert_eq!(job.id, "EditorRendering");
         assert_eq!(job.agent.as_deref(), Some("task"));
+        assert_eq!(job.label, None);
         assert_eq!(job.status.as_deref(), Some("completed"));
         assert_eq!(job.duration.as_deref(), Some("8m19s"));
         assert_eq!(job.full_output, None);
@@ -289,7 +436,9 @@ mod tests {
         let job = &notice.jobs[0];
         assert_eq!(job.id, "bg_2");
         assert_eq!(job.agent, None);
-        assert_eq!(job.status, None);
+        assert_eq!(job.label, None);
+        assert_eq!(job.status.as_deref(), Some("failed"));
+        assert_eq!(job.duration.as_deref(), Some("2.40s"));
         assert_eq!(
             job.output,
             JobOutput::Text(
@@ -314,8 +463,175 @@ mod tests {
         let notice = JobNotice::parse(text).unwrap();
         let ids: Vec<_> = notice.jobs.iter().map(|job| job.id.as_str()).collect();
         assert_eq!(ids, ["BackendLint", "SurfaceLint"]);
+        assert_eq!(notice.jobs[0].label.as_deref(), Some("BackendLint"));
         assert_eq!(notice.jobs[1].status.as_deref(), Some("failed"));
         assert_eq!(notice.jobs[1].output, JobOutput::Empty);
+    }
+
+    #[test]
+    fn batched_shell_jobs_keep_every_output_and_command() {
+        let command = format!(
+            "env CARGO_TARGET_DIR=/tmp/drost cargo run --example space_network_smoke -- {}",
+            "長い command (outer (inner)) → output ".repeat(20)
+        );
+        let command = command.trim_end();
+        let first_output =
+            "warning: Unicode Δ kept\n[raw output: artifact://53]\nWall time: 40.52 seconds";
+        let second_output =
+            "cargo test: 1 passed; 0 failed\n[raw output: artifact://54]\nWall time: 20.23 seconds";
+        let text = format!(
+            "<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_16 ({command}) ──\n{first_output}\n── Job bg_17 (rustfmt src/ui.rs && env cargo test) ──\n{second_output}\n</system-notice>"
+        );
+        let notice = JobNotice::parse(&text).unwrap();
+        assert_eq!(notice.jobs.len(), 2);
+        let first = &notice.jobs[0];
+        assert_eq!(first.id, "bg_16");
+        assert_eq!(first.label.as_deref(), Some(command));
+        assert_eq!(first.agent, None);
+        assert_eq!(first.status, None);
+        assert_eq!(first.duration.as_deref(), Some("40.52s"));
+        assert_eq!(first.output, JobOutput::Text(first_output.into()));
+        let second = &notice.jobs[1];
+        assert_eq!(second.id, "bg_17");
+        assert_eq!(
+            second.label.as_deref(),
+            Some("rustfmt src/ui.rs && env cargo test")
+        );
+        assert_eq!(second.status, None);
+        assert_eq!(second.duration.as_deref(), Some("20.23s"));
+        assert_eq!(second.output, JobOutput::Text(second_output.into()));
+    }
+
+    #[test]
+    fn mixed_task_and_shell_batches_parse_in_either_order() {
+        let task = "── Job Audit (Review (UI)) ──\n<task-result id=\"Audit\" agent=\"reviewer\" status=\"completed\" duration=\"1m\">\n<preview full-output=\"agent://Audit\">\nReview Δ\n── Job fake (inside task output) ──\n</preview>\n</task-result>\n\nAudit is now idle — message it via `hub` to follow up\nStructured output: schema valid; full payload at agent://Audit";
+        let shell = "── Job bg_8 (cargo check) ──\nerror: compilation failed\nCommand exited with code 101\nWall time: 1.5 seconds";
+        for (first, second, task_index, shell_index) in [(task, shell, 0, 1), (shell, task, 1, 0)] {
+            let text = format!(
+                "<system-notice>\n2 background jobs have completed.\n{first}\n{second}\n</system-notice>"
+            );
+            let notice = JobNotice::parse(&text).unwrap();
+            assert_eq!(notice.jobs.len(), 2);
+            let task = &notice.jobs[task_index];
+            assert_eq!(task.id, "Audit");
+            assert_eq!(task.agent.as_deref(), Some("reviewer"));
+            assert_eq!(task.label.as_deref(), Some("Review (UI)"));
+            assert_eq!(task.status.as_deref(), Some("completed"));
+            assert_eq!(task.full_output.as_deref(), Some("agent://Audit"));
+            assert_eq!(
+                task.output,
+                JobOutput::Text("Review Δ\n── Job fake (inside task output) ──".into())
+            );
+            let shell = &notice.jobs[shell_index];
+            assert_eq!(shell.id, "bg_8");
+            assert_eq!(shell.label.as_deref(), Some("cargo check"));
+            assert_eq!(shell.status.as_deref(), Some("failed"));
+            assert_eq!(shell.duration.as_deref(), Some("1.5s"));
+            assert_eq!(
+                shell.output,
+                JobOutput::Text(
+                    "error: compilation failed\nCommand exited with code 101\nWall time: 1.5 seconds"
+                        .into()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn shell_status_requires_an_explicit_exit_code() {
+        for (output, expected) in [
+            ("error: not an exit status", None),
+            ("test result: ok. 1 passed", None),
+            ("Command exited with code unknown", None),
+            ("Command exited with code 0", Some("completed")),
+            ("Command exited with code 1", Some("failed")),
+            ("Command exited with code -9", Some("failed")),
+        ] {
+            let text = format!(
+                "<system-notice>\nBackground job bg_1 has completed.\n{output}\n</system-notice>"
+            );
+            let notice = JobNotice::parse(&text).unwrap();
+            let job = &notice.jobs[0];
+            assert_eq!(job.status.as_deref(), expected);
+            assert_eq!(job.duration, None);
+            assert_eq!(job.output, JobOutput::Text(output.into()));
+        }
+    }
+
+    #[test]
+    fn inline_separator_text_is_shell_output_not_another_job() {
+        let output = "printed ── Job fake (not a delimiter) ── inline\n  indented ── Job fake2 (also output) ──\nWall time: 0.25 seconds";
+        let text = format!(
+            "<system-notice>\nBackground job bg_1 has completed.\n{output}\n</system-notice>"
+        );
+        let notice = JobNotice::parse(&text).unwrap();
+        assert_eq!(notice.jobs.len(), 1);
+        assert_eq!(notice.jobs[0].id, "bg_1");
+        assert_eq!(notice.jobs[0].output, JobOutput::Text(output.into()));
+    }
+
+    #[test]
+    fn task_batches_without_separators_preserve_all_results() {
+        let text = "<system-notice>\n2 background jobs have completed.\n<task-result id=\"A\" agent=\"task\"><output>{\"ok\":true}</output></task-result>\n<task-result id=\"B\" agent=\"scout\"><output>[1,2]</output></task-result>\n</system-notice>";
+        let notice = JobNotice::parse(text).unwrap();
+        assert_eq!(notice.jobs.len(), 2);
+        assert_eq!(notice.jobs[0].label, None);
+        assert_eq!(notice.jobs[1].label, None);
+        assert_eq!(
+            notice.jobs[0].output,
+            JobOutput::Structured(json!({"ok": true}))
+        );
+        assert_eq!(notice.jobs[1].output, JobOutput::Structured(json!([1, 2])));
+    }
+
+    #[test]
+    fn malformed_batches_fall_back_instead_of_dropping_parts() {
+        let valid_task =
+            "<task-result id=\"Audit\" agent=\"task\"><output>kept</output></task-result>";
+        for body in [
+            format!("2 background jobs have completed.\n{valid_task}"),
+            format!("2 background jobs have completed.\n{valid_task}\n<task-result id=\"Broken\"><output>unfinished"),
+            format!("2 background jobs have completed.\n{valid_task}\n<task-result agent=\"task\"><output>missing id</output></task-result>"),
+            format!("2 background jobs have completed.\n{valid_task}\n<task-result id=\"Broken\"><preview>missing close</task-result>"),
+            format!("2 background jobs have completed.\n{valid_task}\n<task-result id=\"Broken\"><output>missing close</task-result>"),
+            format!("2 background jobs have completed.\n{valid_task}\nunknown text\n<task-result id=\"B\"><output>kept</output></task-result>"),
+            format!("2 background jobs have completed.\n── Job Other (Audit) ──\n{valid_task}\n── Job bg_1 (true) ──\noutput"),
+            "2 background jobs have completed.\n── Job bg_1 (true) ──\nfirst\n── Job bg_2 missing label ──\nsecond".into(),
+            "2 background jobs have completed.\n── Job bg_1 (true) ──\nfirst\n── Job bg_1 (false) ──\nsecond".into(),
+            "2 background jobs have completed.\nunassigned output\n── Job bg_1 (true) ──\nfirst\n── Job bg_2 (false) ──\nsecond".into(),
+            "Background job bg_1 has completed.\n── Job bg_2 (true) ──\nwrong id".into(),
+            "not-a-count background jobs have completed.\n── Job bg_1 (true) ──\noutput".into(),
+        ] {
+            let text = format!("<system-notice>\n{body}\n</system-notice>");
+            assert_eq!(JobNotice::parse(&text), None, "{body}");
+            assert_eq!(system_notice_body(&text), Some(body.as_str()));
+        }
+    }
+
+    #[test]
+    fn notice_wrapper_requires_one_complete_outer_wrapper() {
+        assert_eq!(
+            system_notice_body(" \n<system-notice>\n unknown body \n</system-notice>\t"),
+            Some("unknown body")
+        );
+        assert_eq!(
+            system_notice_body("<system-notice></system-notice>"),
+            Some("")
+        );
+        for text in [
+            "raw",
+            "<system-notice>missing close",
+            "missing open</system-notice>",
+            "prefix<system-notice>body</system-notice>",
+            "<system-notice>body</system-notice>suffix",
+            "<system-notice>a</system-notice><system-notice>b</system-notice>",
+            "<system-notice><system-notice>nested</system-notice></system-notice>",
+            "<system-notice extra=\"attribute\">body</system-notice>",
+            "<system-reminder>body</system-reminder>",
+        ] {
+            assert_eq!(system_notice_body(text), None, "{text}");
+            assert_eq!(JobNotice::parse(text), None, "{text}");
+        }
     }
 
     #[test]

@@ -29,7 +29,7 @@ use gpui_kit::{
             PanelStyle, TabGroup, panel_handle, register_panel,
         },
         h_flex,
-        input::{InputEvent, InputState},
+        input::{Input, InputEvent, InputState},
         menu::{PopupMenu, PopupMenuItem},
         notification::Notification,
         shimmer::ShimmerText,
@@ -58,6 +58,7 @@ pub(super) enum Motion {
 
 /// Share of the viewport one page motion covers, so a line of context survives the jump.
 pub(super) const PAGE_SHARE: f32 = 0.9;
+struct WorktreeProgressNotice;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
@@ -79,6 +80,26 @@ pub enum PanelKind {
     Terminal(TerminalId),
     Browser(crate::browser::BrowserId),
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RenameTarget {
+    Project(ProjectId),
+    Space(SpaceId),
+    Thread(ThreadId),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RenameSurface {
+    Sidebar,
+    Tab,
+    Header,
+}
+
+struct InlineRename {
+    target: RenameTarget,
+    surface: RenameSurface,
+    input: Entity<InputState>,
+    error: Option<String>,
+}
+
 impl PanelKind {
     pub fn region(self) -> Region {
         match self {
@@ -260,6 +281,7 @@ pub struct Workspace {
     active_terminal: Option<TerminalId>,
     space_terminals: BTreeMap<SpaceId, TerminalId>,
     terminal_confirmation: bool,
+    inline_rename: Option<InlineRename>,
     welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>>,
     /// While a layout is loaded or reset, panel callbacks must not touch thread state.
     rebuilding: bool,
@@ -275,6 +297,7 @@ pub struct Workspace {
     thread_search: Entity<InputState>,
     pub palette: Option<Entity<Palette>>,
     pub dialog: Option<Entity<SurfaceContent>>,
+    pub(super) commit_panel_thread: Option<ThreadId>,
     pub(super) theme_editor: Option<Entity<super::theme_editor::ThemeEditor>>,
     /// When to open each Conversation's Agents tab.
     agent_activity: BTreeMap<ThreadId, super::agents::Follow>,
@@ -416,6 +439,7 @@ impl Workspace {
             space_swipe_idle: None,
             space_direction: None,
             thread_search,
+            inline_rename: None,
             model_picker: None,
             effort_picker: None,
             permission_mode_picker: None,
@@ -424,6 +448,7 @@ impl Workspace {
             detail_surface: None,
             palette: None,
             dialog: None,
+            commit_panel_thread: None,
             theme_editor: None,
             agent_activity: BTreeMap::new(),
             layout_save: None,
@@ -1392,8 +1417,16 @@ impl Workspace {
             self.finish_terminal_stop(id, restart, window, cx);
             return;
         }
-        self.terminal_confirmation = true;
         let neovim = pane.read(cx).neovim_target().is_some();
+        let needs_confirmation = pane
+            .read(cx)
+            .native()
+            .is_none_or(|native| native.read(cx).needs_confirm_quit());
+        if !neovim && !needs_confirmation {
+            self.finish_terminal_stop(id, restart, window, cx);
+            return;
+        }
+        self.terminal_confirmation = true;
         let (description, ok_text) = match (neovim, restart) {
             (true, restart) => (
                 "This stops Neovim. Changes it has not written are lost; other tabs are not affected.",
@@ -2201,21 +2234,171 @@ impl Workspace {
             cx.notify();
         });
     }
-    /// Rename `id` from Projects or its tab without opening or selecting it.
     pub(super) fn rename_thread(
         &mut self,
         id: ThreadId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(reason) = self.state.read(cx).rename_thread_reason_for(id) {
+        self.start_rename(RenameTarget::Thread(id), RenameSurface::Sidebar, window, cx);
+    }
+    pub(super) fn start_rename(
+        &mut self,
+        target: RenameTarget,
+        surface: RenameSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.read(cx);
+        let (name, reason) = match target {
+            RenameTarget::Project(id) => {
+                let project = state
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.id == id);
+                (
+                    project.map(|project| project.name.clone()),
+                    state.mutable_project_reason().or_else(|| {
+                        project
+                            .filter(|project| project.archived)
+                            .map(|_| "Archived projects are read-only.".into())
+                    }),
+                )
+            }
+            RenameTarget::Space(id) => (
+                state
+                    .spaces
+                    .iter()
+                    .find(|space| space.id == id)
+                    .map(|space| space.name.clone()),
+                state.space_mutation_reason(),
+            ),
+            RenameTarget::Thread(id) => (
+                state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == id)
+                    .map(|thread| thread.title.clone()),
+                state.rename_thread_reason_for(id),
+            ),
+        };
+        if let Some(reason) = reason {
             self.state.update(cx, |state, cx| {
-                state.notice(crate::app::NoticeLevel::Warning, reason);
+                state.notice(NoticeLevel::Warning, reason);
                 cx.notify();
             });
             return;
         }
-        self.open_dialog(DialogKind::RenameThread(id), window, cx);
+        let Some(name) = name else { return };
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_value(name, window, cx);
+            input
+        });
+        self._subscriptions.push(cx.subscribe_in(
+            &input,
+            window,
+            |workspace, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    workspace.commit_rename(window, cx);
+                }
+            },
+        ));
+        input.update(cx, |input, cx| input.focus(window, cx));
+        input.update(cx, |input, cx| input.select_all(window, cx));
+        self.inline_rename = Some(InlineRename {
+            target,
+            surface,
+            input,
+            error: None,
+        });
+        cx.notify();
+    }
+    pub(super) fn inline_rename(
+        &self,
+    ) -> Option<(
+        RenameTarget,
+        RenameSurface,
+        Entity<InputState>,
+        Option<String>,
+    )> {
+        self.inline_rename.as_ref().map(|rename| {
+            (
+                rename.target,
+                rename.surface,
+                rename.input.clone(),
+                rename.error.clone(),
+            )
+        })
+    }
+    pub(super) fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.inline_rename.take().is_some() {
+            cx.notify();
+        }
+    }
+    pub(super) fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.as_ref() else {
+            return;
+        };
+        let target = rename.target;
+        let value = rename.input.read(cx).value().to_string();
+        let result = self.state.update(cx, |state, cx| -> anyhow::Result<()> {
+            anyhow::ensure!(state.storage_error.is_none(), "Storage is not writable");
+            anyhow::ensure!(!value.trim().is_empty(), "Name cannot be blank");
+            match target {
+                RenameTarget::Project(id) => {
+                    if let Some(reason) = state.mutable_project_reason() {
+                        anyhow::bail!(reason);
+                    }
+                    let mut project = state
+                        .snapshot
+                        .projects
+                        .iter()
+                        .find(|project| project.id == id)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("Project is unavailable"))?;
+                    anyhow::ensure!(!project.archived, "Archived projects are read-only.");
+                    project.name = value;
+                    state.save_project(project);
+                }
+                RenameTarget::Space(id) => {
+                    if let Some(reason) = state.space_mutation_reason() {
+                        anyhow::bail!(reason);
+                    }
+                    state.rename_space(id, &value)?;
+                }
+                RenameTarget::Thread(id) => {
+                    if let Some(reason) = state.rename_thread_reason_for(id) {
+                        anyhow::bail!(reason);
+                    }
+                    let mut thread = state
+                        .snapshot
+                        .threads
+                        .iter()
+                        .find(|thread| thread.id == id)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("Thread is unavailable"))?;
+                    thread.title = value;
+                    thread.updated_at = crate::platform::now();
+                    state.save_thread(thread);
+                }
+            }
+            anyhow::ensure!(state.storage_error.is_none(), "Could not save the new name");
+            cx.notify();
+            Ok(())
+        });
+        match result {
+            Ok(()) => self.inline_rename = None,
+            Err(error) => {
+                if let Some(rename) = self.inline_rename.as_mut() {
+                    rename.error = Some(format!("{error:#}"));
+                    rename.input.update(cx, |input, cx| input.focus(window, cx));
+                }
+            }
+        }
+        cx.notify();
     }
     /// Show `tab` in a thread's sidebar (tab click, Focus output).
     pub(super) fn show_sidebar_tab(
@@ -2237,6 +2420,23 @@ impl Workspace {
         if let Some(panel) = panel {
             self.focus_panel(panel, window, cx);
         }
+        if tab == SidebarTab::Agents
+            && let Some(network) = self.network_sidebar(id, cx)
+        {
+            let focus = network.focus_handle(cx);
+            focus.focus(window, cx);
+        }
+    }
+
+    pub(super) fn network_sidebar(
+        &self,
+        id: ThreadId,
+        cx: &App,
+    ) -> Option<Entity<super::network::NetworkPanel>> {
+        self.threads
+            .borrow()
+            .get(&id)
+            .and_then(|panel| panel.read(cx).network.clone())
     }
     /// Open a Conversation's Agents tab when its running turn starts working with other
     /// agents (see `agents::Follow`). Focus stays where it is.
@@ -2253,6 +2453,9 @@ impl Workspace {
             .or_insert_with(|| super::agents::Follow::new(count))
             .observe(count, running);
         if open {
+            if let Some(network) = self.network_sidebar(id, cx) {
+                network.update(cx, |network, cx| network.follow_thread_activity(cx));
+            }
             self.state.update(cx, |state, cx| {
                 state.show_thread_sidebar(id, SidebarTab::Agents);
                 cx.emit(PresentationChange::Thread(id));
@@ -2588,7 +2791,11 @@ impl Workspace {
                 None
             }
             Command::NewSpace => Some(DialogKind::NewSpace),
-            Command::RenameSpace => Some(DialogKind::RenameSpace(self.state.read(cx).active_space)),
+            Command::RenameSpace => {
+                let id = self.state.read(cx).active_space;
+                self.start_rename(RenameTarget::Space(id), RenameSurface::Header, window, cx);
+                None
+            }
             Command::DeleteSpace => Some(DialogKind::DeleteSpace(self.state.read(cx).active_space)),
             Command::SwitchSpace | Command::MoveProjectToSpace => {
                 self.open_space_picker(command == Command::MoveProjectToSpace, window, cx);
@@ -2673,13 +2880,53 @@ impl Workspace {
             }
             Command::ToggleConversationDiffs => {
                 if let Some(id) = self.state.read(cx).conversation_thread().map(|t| t.id) {
-                    self.toggle_sidebar_tab(id, SidebarTab::Changes, cx);
+                    let tab = if self.state.read(cx).thread_sidebar_tab(id) == SidebarTab::Details {
+                        SidebarTab::Details
+                    } else {
+                        SidebarTab::Changes
+                    };
+                    self.toggle_sidebar_tab(id, tab, cx);
                 }
                 None
             }
             Command::ToggleAgents => {
                 if let Some(id) = self.state.read(cx).conversation_thread().map(|t| t.id) {
                     self.toggle_sidebar_tab(id, SidebarTab::Agents, cx);
+                }
+                None
+            }
+            Command::ShowNetworkMembers
+            | Command::ShowNetworkMessages
+            | Command::ShowThreadAgents => {
+                let id = self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .map(|thread| thread.id);
+                if let Some(id) = id {
+                    self.show_sidebar_tab(id, SidebarTab::Agents, window, cx);
+                    if let Some(network) = self.network_sidebar(id, cx) {
+                        let view = match command {
+                            Command::ShowNetworkMembers => super::network::View::Members,
+                            Command::ShowNetworkMessages => super::network::View::Messages,
+                            _ => super::network::View::Thread,
+                        };
+                        network.update(cx, |network, cx| network.show_view(view, window, cx));
+                    }
+                }
+                None
+            }
+            Command::JoinSpaceNetwork | Command::LeaveSpaceNetwork => {
+                let thread = self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .map(|thread| thread.id);
+                if let Some(id) = thread {
+                    self.state.update(cx, |state, cx| {
+                        state.set_network_joined(id, command == Command::JoinSpaceNetwork, cx);
+                        state.show_thread_sidebar(id, SidebarTab::Agents);
+                    });
                 }
                 None
             }
@@ -2735,22 +2982,26 @@ impl Workspace {
                 }
                 None
             }
-            Command::AddProject => Some(DialogKind::AddProject),
-            Command::RenameProject => self
-                .state
-                .read(cx)
-                .selected_project
-                .map(DialogKind::RenameProject),
-            Command::ArchiveProject => self
-                .state
-                .read(cx)
-                .selected_project
-                .map(DialogKind::ArchiveProject),
-            Command::RenameThread => self
-                .state
-                .read(cx)
-                .selected_thread
-                .map(DialogKind::RenameThread),
+            Command::AddProject => {
+                self.add_project(window, cx);
+                None
+            }
+            Command::RenameProject => {
+                if let Some(id) = self.state.read(cx).selected_project {
+                    self.start_rename(RenameTarget::Project(id), RenameSurface::Header, window, cx);
+                }
+                None
+            }
+            Command::ArchiveProject => {
+                self.archive_project(window, cx);
+                None
+            }
+            Command::RenameThread => {
+                if let Some(id) = self.state.read(cx).selected_thread {
+                    self.start_rename(RenameTarget::Thread(id), RenameSurface::Tab, window, cx);
+                }
+                None
+            }
             Command::NewConversationInWorktree => self
                 .state
                 .read(cx)
@@ -2776,11 +3027,10 @@ impl Workspace {
                 .read(cx)
                 .conversation_thread()
                 .map(|thread| DialogKind::SwitchBranch(thread.id)),
-            Command::CommitChanges => self
-                .state
-                .read(cx)
-                .conversation_thread()
-                .map(|thread| DialogKind::Commit(thread.id)),
+            Command::CommitChanges => {
+                self.open_commit_panel(window, cx);
+                None
+            }
             Command::ArchiveThread => {
                 if self.extension.is_some()
                     || self
@@ -2925,6 +3175,182 @@ impl Workspace {
         }
         cx.notify();
     }
+    fn add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if Command::AddProject
+            .disabled_reason(self.state.read(cx))
+            .is_some()
+        {
+            return;
+        }
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add Project".into()),
+        });
+        cx.spawn_in(window, async move |workspace, window| {
+            let result = picked.await;
+            let _ = workspace.update_in(window, |workspace, _window, cx| match result {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        workspace.state.update(cx, |state, cx| {
+                            state.register_project(path);
+                            cx.notify();
+                        });
+                    }
+                }
+                Ok(Ok(None)) => {}
+                other => workspace.state.update(cx, |state, cx| {
+                    state.notice(
+                        NoticeLevel::Warning,
+                        format!("Folder picker failed: {other:?}"),
+                    );
+                    cx.notify();
+                }),
+            });
+        })
+        .detach();
+    }
+
+    fn open_commit_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id)
+        else {
+            return;
+        };
+        self.dismiss(window, cx);
+        let kind = DialogKind::Commit(thread);
+        let retained = self
+            .dialog
+            .as_ref()
+            .filter(|dialog| dialog.read(cx).kind == kind)
+            .cloned();
+        let new_surface = retained.is_none();
+        let state = self.state.clone();
+        let owner = cx.entity().downgrade();
+        let dialog = retained
+            .unwrap_or_else(|| cx.new(|cx| SurfaceContent::new(kind, state, owner, window, cx)));
+        if new_surface {
+            dialog.update(cx, |dialog, cx| dialog.write_commit_subject(cx));
+        }
+        self.commit_panel_thread = Some(thread);
+        self.show_sidebar_tab(thread, SidebarTab::Changes, window, cx);
+        dialog.update(cx, |dialog, cx| dialog.focus_commit_message(window, cx));
+        self.dialog = Some(dialog);
+        cx.notify();
+    }
+
+    fn archive_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(id) = state.selected_project else {
+            return;
+        };
+        if let Some(reason) = state.archive_project_reason() {
+            self.state.update(cx, |state, cx| {
+                state.notice(NoticeLevel::Warning, reason);
+                cx.notify();
+            });
+            return;
+        }
+        let Some(mut project) = state
+            .snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        let project_name = project.name.clone();
+        let open_threads = state
+            .open_threads
+            .iter()
+            .copied()
+            .filter(|thread_id| {
+                state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .any(|thread| thread.id == *thread_id && thread.project_id == id)
+            })
+            .collect::<Vec<_>>();
+        let selected_thread = state
+            .selected_thread
+            .filter(|thread_id| open_threads.contains(thread_id));
+        let previous_project = self.state.read(cx).selected_project;
+        self.state.update(cx, |state, cx| {
+            state.close_project_threads(id);
+            project.archived = true;
+            state.save_project(project);
+            cx.notify();
+        });
+        self.sync_thread_panels(window, cx);
+        let owner = cx.entity().downgrade();
+        window.push_notification(
+            Notification::success(format!("Archived {project_name}")).action(move |_, _, cx| {
+                let owner = owner.clone();
+                let open_threads = open_threads.clone();
+                let notification = cx.entity().downgrade();
+                Button::new("undo-project-archive")
+                    .small()
+                    .label("Undo")
+                    .on_click(move |_, window, cx| {
+                        let restored = owner
+                            .update(cx, |workspace, cx| {
+                                workspace.undo_project_archive(
+                                    id,
+                                    open_threads.clone(),
+                                    selected_thread,
+                                    previous_project,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .is_ok_and(|restored| restored);
+                        if restored {
+                            let _ = notification
+                                .update(cx, |notification, cx| notification.dismiss(window, cx));
+                        }
+                    })
+            }),
+            cx,
+        );
+    }
+
+    fn undo_project_archive(
+        &mut self,
+        id: ProjectId,
+        open_threads: Vec<ThreadId>,
+        selected_thread: Option<ThreadId>,
+        previous_project: Option<ProjectId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let restored = self.state.update(cx, |state, cx| {
+            if let Err(error) = state.unarchive_project(id) {
+                state.notice(NoticeLevel::Warning, format!("{error:#}"));
+                return false;
+            }
+            for thread in &open_threads {
+                state.select_thread(*thread);
+            }
+            if let Some(selected) = selected_thread {
+                state.select_thread(selected);
+            } else {
+                state.select_terminal_project(previous_project.unwrap_or(id));
+            }
+            cx.notify();
+            true
+        });
+        if restored {
+            self.sync_thread_panels(window, cx);
+        }
+        restored
+    }
+
     fn open_dialog(&mut self, kind: DialogKind, window: &mut Window, cx: &mut Context<Self>) {
         if self.extension.is_some()
             || self.state.read(cx).shutting_down
@@ -2936,19 +3362,23 @@ impl Workspace {
             return;
         }
         self.dismiss(window, cx);
-        if self.detail_surface.is_some()
-            || self.dialog.is_some()
-            || self.palette.is_some()
-            || self.theme_editor.is_some()
-        {
+        if self.detail_surface.is_some() || self.palette.is_some() || self.theme_editor.is_some() {
             return;
         }
+        let retained = self
+            .dialog
+            .as_ref()
+            .filter(|dialog| dialog.read(cx).kind == kind)
+            .cloned();
+        let new_surface = retained.is_none();
         let state = self.state.clone();
         let owner = cx.entity().downgrade();
         let commit = matches!(kind, DialogKind::Commit(_));
-        let dialog = cx.new(|cx| SurfaceContent::new(kind, state, owner, window, cx));
-        // The subject is ready to edit by the time the message is read, when a model answers.
-        if commit {
+        let dialog = retained
+            .unwrap_or_else(|| cx.new(|cx| SurfaceContent::new(kind, state, owner, window, cx)));
+        // Generate only for a new form. Reopening a retained commit draft must not
+        // replace a message the user already wrote.
+        if commit && new_surface {
             dialog.update(cx, |dialog, cx| dialog.write_commit_subject(cx));
         }
         self.dialog = Some(dialog);
@@ -2974,15 +3404,30 @@ impl Workspace {
         }
         self.image_preview = None;
         self.tool_detail = None;
+        self.commit_panel_thread = None;
         if let Some(palette) = self.palette.take() {
             palette.update(cx, |palette, cx| palette.dismiss(window, cx));
         }
         if let Some(editor) = self.theme_editor.take() {
             editor.update(cx, |editor, cx| editor.dismiss(window, cx));
         }
-        if let Some(dialog) = self.dialog.take() {
-            let kind = dialog.read(cx).kind.clone();
-            super::settings::close_surface(&kind, window, cx);
+        if let Some(dialog) = self.dialog.as_ref() {
+            let (kind, hosted, request) = {
+                let dialog = dialog.read(cx);
+                (dialog.kind.clone(), dialog.hosted(), dialog.request)
+            };
+            if hosted {
+                super::settings::close_surface(&kind, window, cx);
+            }
+            if let Some(request) = request {
+                window.push_notification(
+                    Notification::new()
+                        .id1::<WorktreeProgressNotice>(request.to_string())
+                        .message("Git operation continues in the background")
+                        .autohide(false),
+                    cx,
+                );
+            }
         }
         cx.notify();
     }
@@ -2991,12 +3436,11 @@ impl Workspace {
             self.confirm_extension(window, cx);
             return;
         }
-        let Some(dialog) = self.dialog.take() else {
+        let Some(dialog) = self.dialog.as_ref().cloned() else {
             return;
         };
         // A request already running owns the dialog until it settles.
         if dialog.read(cx).request.is_some() {
-            self.dialog = Some(dialog);
             return;
         }
         if matches!(
@@ -3007,7 +3451,6 @@ impl Workspace {
             dialog.update(cx, |dialog, cx| {
                 dialog.set_error(&anyhow::anyhow!(reason), cx)
             });
-            self.dialog = Some(dialog);
             return;
         }
         let result = self.state.update(cx, |state, cx| {
@@ -3030,49 +3473,89 @@ impl Workspace {
         });
         match result {
             Ok(None) => {
-                let kind = dialog.read(cx).kind.clone();
-                super::settings::close_surface(&kind, window, cx);
-                cx.notify();
+                let (kind, id, hosted) = {
+                    let dialog = dialog.read(cx);
+                    (dialog.kind.clone(), dialog.surface_id(), dialog.hosted())
+                };
+                if hosted {
+                    super::settings::close_surface(&kind, window, cx);
+                }
+                if matches!(kind, DialogKind::Commit(_)) {
+                    self.commit_panel_thread = None;
+                }
+                super::settings::discard_surface(&cx.entity().downgrade(), id, cx);
             }
             Ok(Some(request)) => {
                 dialog.update(cx, |dialog, cx| dialog.begin_request(request, cx));
-                self.dialog = Some(dialog);
             }
             Err(error) => {
                 dialog.update(cx, |dialog, cx| dialog.set_error(&error, cx));
-                self.dialog = Some(dialog);
             }
         }
+        cx.notify();
     }
-    /// Closes the dialog that started `request` once the App layer reports it done; failures
-    /// stay in the dialog, which shows them next to the form.
+    /// Closes or reports the result of a worktree request outside a dismissed form.
     fn settle_worktree_dialog(
         &mut self,
         request: uuid::Uuid,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let done = self
+        let status = self
+            .state
+            .read(cx)
+            .worktree_request
+            .as_ref()
+            .filter(|pending| pending.id == request)
+            .map(|pending| pending.status.clone());
+        let Some(status) = status else {
+            return;
+        };
+        let dialog = self
             .dialog
             .as_ref()
-            .is_some_and(|dialog| dialog.read(cx).request == Some(request))
-            && self
-                .state
-                .read(cx)
-                .worktree_request
-                .as_ref()
-                .is_some_and(|pending| {
-                    pending.id == request
-                        && matches!(pending.status, crate::app::WorktreeRequestStatus::Done(_))
-                });
-        if !done {
-            return;
+            .filter(|dialog| dialog.read(cx).last_request() == Some(request))
+            .cloned();
+        let hosted = dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).hosted());
+        match status {
+            crate::app::WorktreeRequestStatus::Done(_) => {
+                if let Some(dialog) = dialog {
+                    let (kind, id, hosted) = {
+                        let dialog = dialog.read(cx);
+                        (dialog.kind.clone(), dialog.surface_id(), dialog.hosted())
+                    };
+                    if hosted {
+                        super::settings::close_surface(&kind, window, cx);
+                    }
+                    if matches!(kind, DialogKind::Commit(_)) {
+                        self.commit_panel_thread = None;
+                    }
+                    super::settings::discard_surface(&cx.entity().downgrade(), id, cx);
+                }
+                if !hosted {
+                    window.push_notification(
+                        Notification::success("Git operation completed")
+                            .id1::<WorktreeProgressNotice>(request.to_string()),
+                        cx,
+                    );
+                } else {
+                    self.focus_region(Region::Thread, window, cx);
+                }
+            }
+            crate::app::WorktreeRequestStatus::Failed(error)
+            | crate::app::WorktreeRequestStatus::Refused(error) => {
+                if !hosted {
+                    window.push_notification(
+                        Notification::error(format!("Git operation failed: {error}"))
+                            .id1::<WorktreeProgressNotice>(request.to_string()),
+                        cx,
+                    );
+                }
+            }
+            crate::app::WorktreeRequestStatus::Pending => {}
         }
-        if let Some(dialog) = self.dialog.take() {
-            let kind = dialog.read(cx).kind.clone();
-            super::settings::close_surface(&kind, window, cx);
-        }
-        self.focus_region(Region::Thread, window, cx);
         cx.notify();
     }
     pub(super) fn set_sidebar_row_hovered(
@@ -3512,6 +3995,21 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &ToggleAgents, w, cx| {
                     this.execute(Command::ToggleAgents, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &JoinSpaceNetwork, w, cx| {
+                    this.execute(Command::JoinSpaceNetwork, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowNetworkMembers, w, cx| {
+                    this.execute(Command::ShowNetworkMembers, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowNetworkMessages, w, cx| {
+                    this.execute(Command::ShowNetworkMessages, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowThreadAgents, w, cx| {
+                    this.execute(Command::ShowThreadAgents, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &LeaveSpaceNetwork, w, cx| {
+                    this.execute(Command::LeaveSpaceNetwork, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &CustomizeTheme, w, cx| {
                     this.execute(Command::CustomizeTheme, w, cx)
                 }))
@@ -3640,7 +4138,13 @@ impl Render for Workspace {
                         cx.notify();
                     });
                 }))
-                .on_action(cx.listener(|this, _: &Dismiss, w, cx| this.dismiss(w, cx)))
+                .on_action(cx.listener(|this, _: &Dismiss, w, cx| {
+                    if this.inline_rename.is_some() {
+                        this.cancel_rename(cx);
+                    } else {
+                        this.dismiss(w, cx);
+                    }
+                }))
                 .on_action(cx.listener(|this, _: &Confirm, w, cx| this.confirm_dialog(w, cx)))
                 .on_action(cx.listener(|this, _: &Quit, w, cx| this.quit_review(w, cx)))
                 .on_action(cx.listener(|this, _: &ToggleProjects, w, cx| {
@@ -3814,6 +4318,7 @@ pub struct WorkspacePanel {
     group: Option<WeakEntity<TabGroup>>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     transcript: Option<Entity<conversation::TranscriptView>>,
+    network: Option<Entity<super::network::NetworkPanel>>,
     terminal: Option<Entity<TerminalPane>>,
     browser: Option<Entity<BrowserPane>>,
     _subscriptions: Vec<Subscription>,
@@ -3879,6 +4384,12 @@ impl WorkspacePanel {
                 }
                 _ => None,
             };
+        let network = match (kind, transcript.is_some()) {
+            (PanelKind::Thread(id), true) => Some(cx.new(|cx| {
+                super::network::NetworkPanel::new(id, state.clone(), workspace.clone(), window, cx)
+            })),
+            _ => None,
+        };
         if let PanelKind::Thread(id) = kind {
             // Focus, however it arrived (click, tab, Ctrl-W), is what selects a thread.
             let owner = workspace.clone();
@@ -3927,6 +4438,7 @@ impl WorkspacePanel {
             group: None,
             bounds: Rc::new(Cell::new(None)),
             transcript,
+            network,
             terminal: None,
             browser: None,
             _subscriptions: subscriptions,
@@ -4164,6 +4676,15 @@ impl Panel for WorkspacePanel {
         let titling = state.is_titling(id);
         let group = SharedString::from(format!("thread-tab-{id}"));
         let (middle, close) = (self.workspace.clone(), self.workspace.clone());
+        let rename_input = self.workspace.upgrade().and_then(|workspace| {
+            workspace
+                .read(cx)
+                .inline_rename()
+                .and_then(|(target, surface, input, _)| {
+                    (target == RenameTarget::Thread(id) && surface == RenameSurface::Tab)
+                        .then_some(input)
+                })
+        });
         let selector = group.clone();
         h_flex()
             .id(group.clone())
@@ -4186,9 +4707,10 @@ impl Panel for WorkspacePanel {
                 activity,
                 cx,
             ))
-            .map(|tab| match titling {
-                true => tab.child(ShimmerText::new(title)),
-                false => tab.child(title),
+            .map(|tab| match rename_input {
+                Some(input) => tab.child(Input::new(&input).small().appearance(false)),
+                None if titling => tab.child(ShimmerText::new(title)),
+                None => tab.child(title),
             })
             .child(
                 div()
@@ -4303,7 +4825,12 @@ impl Panel for WorkspacePanel {
                         .action(Command::RenameThread.action())
                         .disabled(state.rename_thread_reason_for(id).is_some())
                         .on_click(targeted(|workspace, id, window, cx| {
-                            workspace.rename_thread(id, window, cx)
+                            workspace.start_rename(
+                                RenameTarget::Thread(id),
+                                RenameSurface::Tab,
+                                window,
+                                cx,
+                            )
                         })),
                 )
                 .map(|menu| {
@@ -4441,6 +4968,7 @@ impl Render for WorkspacePanel {
                                     &self.workspace,
                                     &self.output_scroll,
                                     transcript,
+                                    self.network.as_ref(),
                                     cx,
                                 )
                             } else {
@@ -4481,6 +5009,7 @@ impl Render for WorkspacePanel {
                                     false,
                                     &self.workspace,
                                     &self.output_scroll,
+                                    None,
                                     cx,
                                 ),
                             )

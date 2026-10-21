@@ -633,6 +633,10 @@ impl AppState {
         self.space_state.threads.get(&id) == Some(&space)
     }
 
+    pub fn thread_space(&self, id: ThreadId) -> Option<SpaceId> {
+        self.space_state.threads.get(&id).copied()
+    }
+
     /// Borrow an inactive Space's presentation without activating its editors or layout.
     pub(crate) fn space_session(&self, space: SpaceId) -> Option<&SpaceSession> {
         self.space_state.sessions.get(&space)
@@ -720,6 +724,7 @@ impl AppState {
         self.write_spaces(serde_json::to_value(&spaces)?)?;
         self.space_state = spaces;
         self.apply_space_projection();
+        self.sync_network();
         Ok(result)
     }
 

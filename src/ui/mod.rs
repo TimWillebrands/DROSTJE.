@@ -10,6 +10,7 @@ pub mod factory;
 pub mod factory_form;
 mod grain;
 mod job_notice;
+mod network;
 mod nvim;
 pub mod overlays;
 mod review;

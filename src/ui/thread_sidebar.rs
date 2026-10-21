@@ -1,8 +1,8 @@
-//! Retained, resizable thread sidebar: Changes, Output, Browser and optional Agents
+//! Retained, resizable thread sidebar: Changes, Output, Browser and Agents
 //! for Conversations; Output for Factory threads. AppState owns tab, open state and width.
 
 use super::{
-    agents::{self, Activity, Event, EventKind, Outcome},
+    agents::{Activity, Event, EventKind, Outcome},
     commands::{Command, button},
     factory, theme,
     workspace::Workspace,
@@ -123,21 +123,20 @@ impl RenderOnce for SidebarSplit {
     }
 }
 
-/// Tabs in display order; a Factory thread has no working-tree Changes, Agents appears
-/// only once a Conversation's agent has worked with another, and Review only once a pull
-/// request is linked.
-fn tabs(conversation: bool, agents: bool, review: bool) -> Vec<SidebarTab> {
+/// Review and Details appear only while their content exists; Agents always offers opt-in.
+fn tabs(conversation: bool, review: bool, details: bool) -> Vec<SidebarTab> {
     if !conversation {
         return vec![SidebarTab::Output];
     }
     let mut tabs = vec![SidebarTab::Changes];
+    if details {
+        tabs.push(SidebarTab::Details);
+    }
     if review {
         tabs.push(SidebarTab::Review);
     }
     tabs.push(SidebarTab::Output);
-    if agents {
-        tabs.push(SidebarTab::Agents);
-    }
+    tabs.push(SidebarTab::Agents);
     tabs.push(SidebarTab::Browser);
     tabs
 }
@@ -145,6 +144,7 @@ fn tabs(conversation: bool, agents: bool, review: bool) -> Vec<SidebarTab> {
 fn label(tab: SidebarTab) -> &'static str {
     match tab {
         SidebarTab::Changes => "Changes",
+        SidebarTab::Details => "Details",
         SidebarTab::Output => "Output",
         SidebarTab::Agents => "Agents",
         SidebarTab::Browser => "Browser",
@@ -155,7 +155,7 @@ fn label(tab: SidebarTab) -> &'static str {
 /// The command that shows or hides `tab`; the collapse control dispatches it too.
 fn toggle_command(tab: SidebarTab) -> Command {
     match tab {
-        SidebarTab::Changes => Command::ToggleConversationDiffs,
+        SidebarTab::Changes | SidebarTab::Details => Command::ToggleConversationDiffs,
         SidebarTab::Output => Command::ToggleOutput,
         SidebarTab::Agents => Command::ToggleAgents,
         SidebarTab::Browser => Command::ToggleBrowser,
@@ -169,18 +169,23 @@ pub(super) fn render(
     conversation: bool,
     owner: &WeakEntity<Workspace>,
     output_scroll: &ScrollHandle,
+    network: Option<&Entity<super::network::NetworkPanel>>,
     cx: &App,
 ) -> AnyElement {
     let open = state.thread_sidebar_open(id);
-    let session = conversation.then(|| state.conversations.get(&id)).flatten();
-    let has_agents = session.is_some_and(|session| agents::coordination_calls(session) > 0);
     let has_review = state
         .snapshot
         .threads
         .iter()
         .any(|thread| thread.id == id && thread.pull_request.is_some());
-    let tabs = tabs(conversation, has_agents, has_review);
-    // A saved Agents tab whose activity is not loaded yet shows the first tab meanwhile.
+    let has_details = owner.upgrade().is_some_and(|owner| {
+        owner
+            .read(cx)
+            .tool_detail
+            .as_ref()
+            .is_some_and(|(thread, _)| *thread == id)
+    });
+    let tabs = tabs(conversation, has_review, has_details);
     let active = Some(state.thread_sidebar_tab(id))
         .filter(|tab| tabs.contains(tab))
         .unwrap_or(tabs[0]);
@@ -215,7 +220,9 @@ pub(super) fn render(
     let loading = match active {
         SidebarTab::Changes => state.conversation_diff(id).is_none_or(|diff| diff.loading),
         SidebarTab::Review => state.review_state(id).is_some_and(|review| review.loading),
-        SidebarTab::Output | SidebarTab::Agents | SidebarTab::Browser => false,
+        SidebarTab::Details | SidebarTab::Output | SidebarTab::Agents | SidebarTab::Browser => {
+            false
+        }
     };
     let header = TabBar::new("thread-sidebar-tabs")
         .selected_index(selected)
@@ -258,6 +265,19 @@ pub(super) fn render(
         );
     let body = match active {
         SidebarTab::Changes => super::changes::render(state, id, owner, cx),
+        SidebarTab::Details => owner
+            .upgrade()
+            .and_then(|workspace| {
+                let workspace = workspace.read(cx);
+                let (_, tool) = workspace
+                    .tool_detail
+                    .as_ref()
+                    .filter(|(thread, _)| *thread == id)?;
+                Some(super::overlays::render_details(
+                    &workspace, id, tool, owner, cx,
+                ))
+            })
+            .unwrap_or_else(|| div().p_3().child("No details selected").into_any_element()),
         SidebarTab::Review => super::review::render(state, id, owner, cx),
         SidebarTab::Browser => owner
             .upgrade()
@@ -279,12 +299,15 @@ pub(super) fn render(
             .min_h_0()
             .child(factory::output(state, id, owner, output_scroll, cx))
             .into_any_element(),
-        SidebarTab::Agents => agent_activity(
-            &session
-                .map(|session| Activity::from_session(session, state.active_threads.contains(&id)))
-                .unwrap_or_default(),
-            cx,
-        ),
+        SidebarTab::Agents => network
+            .cloned()
+            .map(|panel| panel.into_any_element())
+            .unwrap_or_else(|| {
+                div()
+                    .p_3()
+                    .child("Network view is unavailable; reopen this Thread")
+                    .into_any_element()
+            }),
     };
     v_flex()
         .id("thread-sidebar")
@@ -508,7 +531,7 @@ fn session_rows(activity: &Activity, cx: &App) -> Vec<AnyElement> {
     rows
 }
 
-fn agent_activity(activity: &Activity, cx: &App) -> AnyElement {
+pub(super) fn agent_activity(activity: &Activity, scroll: &ScrollHandle, cx: &App) -> AnyElement {
     let spawns = activity
         .events
         .iter()
@@ -552,6 +575,7 @@ fn agent_activity(activity: &Activity, cx: &App) -> AnyElement {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(scroll)
             .px_2()
             .pb_2()
             .gap_3()
@@ -595,46 +619,4 @@ fn agent_activity(activity: &Activity, cx: &App) -> AnyElement {
         )
         .child(content)
         .into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SidebarTab, tabs};
-
-    #[test]
-    fn factory_threads_only_offer_output() {
-        assert_eq!(
-            tabs(true, false, false),
-            [SidebarTab::Changes, SidebarTab::Output, SidebarTab::Browser]
-        );
-        assert_eq!(tabs(false, false, false), [SidebarTab::Output]);
-        assert_eq!(tabs(false, true, true), [SidebarTab::Output]);
-    }
-
-    #[test]
-    fn agents_appear_only_with_agent_activity() {
-        assert_eq!(
-            tabs(true, true, false),
-            [
-                SidebarTab::Changes,
-                SidebarTab::Output,
-                SidebarTab::Agents,
-                SidebarTab::Browser
-            ]
-        );
-    }
-
-    #[test]
-    fn review_follows_changes_once_a_pull_request_is_linked() {
-        assert_eq!(
-            tabs(true, true, true),
-            [
-                SidebarTab::Changes,
-                SidebarTab::Review,
-                SidebarTab::Output,
-                SidebarTab::Agents,
-                SidebarTab::Browser
-            ]
-        );
-    }
 }

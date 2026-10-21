@@ -39,6 +39,7 @@ impl AppState {
         session.finished = Some(drain);
         let generation = session.generation;
         self.conversations.insert(id, session);
+        self.sync_network();
         let saved = self.persist_thread(thread.clone());
         let sender = self.events.clone();
         let executables = self.snapshot.settings.get("executables").cloned();
@@ -48,6 +49,7 @@ impl AppState {
                 .map(|server| crate::browser_tools::BrowserToolConfig {
                     endpoint: server.endpoint(),
                     thread: id,
+                    network_token: generation,
                 });
         let session_dir = self
             .data_dir
@@ -921,6 +923,13 @@ impl AppState {
                 | ConversationEvent::TurnSettled { .. }
                 | ConversationEvent::Failed { .. }
         );
+        let network_changed = matches!(
+            &event,
+            ConversationEvent::Ready { .. }
+                | ConversationEvent::StateChanged(_)
+                | ConversationEvent::TitleChanged(_)
+                | ConversationEvent::Failed { .. }
+        );
         let presentation = match &event {
             ConversationEvent::HistoryReset
             | ConversationEvent::History { .. }
@@ -1269,6 +1278,9 @@ impl AppState {
             }
         }
         self.conversations.insert(id, session);
+        if network_changed {
+            self.sync_network();
+        }
         if refresh_diff {
             self.queue_conversation_diff(id, cx);
         }

@@ -230,15 +230,13 @@ fn chosen_llama_model(selected: String, reference: String) -> anyhow::Result<Str
     Ok(reference)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DialogKind {
-    AddProject,
     NewSpace,
     RenameSpace(Uuid),
     DeleteSpace(Uuid),
     RenameProject(Uuid),
     RenameThread(Uuid),
-    ArchiveProject(Uuid),
     /// A Conversation in a fresh worktree of this project, from a chosen base branch.
     NewWorktreeConversation(Uuid),
     /// Start another Conversation in the project checkout or an existing live worktree.
@@ -282,6 +280,8 @@ pub struct SurfaceContent {
     error_field: Option<&'static str>,
     /// The worktree request this dialog started and is waiting for.
     pub request: Option<Uuid>,
+    /// The latest request this form owns, including a settled request whose error is shown.
+    last_request: Option<Uuid>,
     /// Removal was refused for uncommitted changes; the next confirm discards them.
     force: bool,
     selects: Vec<SelectField>,
@@ -322,7 +322,6 @@ impl SurfaceContent {
                 });
             };
             match &kind {
-                DialogKind::AddProject => field("path", "Existing Git working tree", String::new()),
                 DialogKind::NewSpace => field("name", "Space name", String::new()),
                 DialogKind::RenameSpace(id) => field(
                     "name",
@@ -838,6 +837,7 @@ impl SurfaceContent {
             error,
             error_field: None,
             request: None,
+            last_request: None,
             force: false,
             selects,
             title_models,
@@ -852,10 +852,22 @@ impl SurfaceContent {
         }
     }
 
+    pub(super) fn surface_id(&self) -> Uuid {
+        self.surface_id
+    }
+    pub(super) fn hosted(&self) -> bool {
+        self.hosted
+    }
+
+    pub(super) fn last_request(&self) -> Option<Uuid> {
+        self.last_request
+    }
+
     /// Marks the request this dialog is waiting for; the confirm control is disabled until
     /// the App layer reports how it ended.
     pub fn begin_request(&mut self, request: Uuid, cx: &mut Context<Self>) {
         self.request = Some(request);
+        self.last_request = Some(request);
         self.error = None;
         self.error_field = None;
         cx.notify();
@@ -865,6 +877,11 @@ impl SurfaceContent {
     #[cfg(all(test, feature = "runtime-qa"))]
     pub(crate) fn commit_message(&self) -> Option<Entity<TextareaState>> {
         self.commit.as_ref().map(|commit| commit.message.clone())
+    }
+    pub fn focus_commit_message(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(commit) = &self.commit {
+            commit.message.focus_handle(cx).focus(window, cx);
+        }
     }
 
     /// Asks the local model for a subject for the Commit dialog's changes.
@@ -984,46 +1001,6 @@ impl SurfaceContent {
         }
     }
 
-    fn pick_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(input) = self
-            .fields
-            .iter()
-            .find(|field| field.key == "path")
-            .map(|field| field.input.clone())
-        else {
-            return;
-        };
-        let previous = input.read(cx).value();
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Add Project".into()),
-        });
-        cx.spawn_in(window, async move |surface, window| {
-            let result = picked.await;
-            let _ = surface.update_in(window, |surface, window, cx| {
-                if input.read(cx).value() != previous {
-                    return;
-                }
-                match result {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.into_iter().next() {
-                            input.update(cx, |input, cx| {
-                                input.set_value(path.to_string_lossy().into_owned(), window, cx)
-                            });
-                        }
-                    }
-                    Ok(Ok(None)) => {}
-                    other => surface.set_error(
-                        &field_error("path", format!("Folder picker failed: {other:?}")),
-                        cx,
-                    ),
-                }
-            });
-        })
-        .detach();
-    }
     pub(super) fn value(&self, key: &str, cx: &App) -> String {
         if let Some(select) = self.select(key) {
             return select
@@ -1063,25 +1040,6 @@ impl SurfaceContent {
             }
             DialogKind::RenameSpace(id) => state.rename_space(id, &self.value("name", cx))?,
             DialogKind::DeleteSpace(id) => return Ok(SurfaceOutcome::DeleteSpace(id)),
-            DialogKind::AddProject => {
-                let path = self.value("path", cx);
-                if path.is_empty() {
-                    return Err(field_error(
-                        "path",
-                        "Choose or enter an existing Git working tree.",
-                    ));
-                }
-                let path = if let Some(suffix) = path.strip_prefix("~/") {
-                    PathBuf::from(
-                        std::env::var_os("HOME")
-                            .ok_or_else(|| anyhow::anyhow!("HOME is unavailable"))?,
-                    )
-                    .join(suffix)
-                } else {
-                    PathBuf::from(path)
-                };
-                state.register_project(path);
-            }
             DialogKind::RenameProject(id) => {
                 let name = self.value("name", cx);
                 if name.is_empty() {
@@ -1178,24 +1136,6 @@ impl SurfaceContent {
                 return state
                     .commit_changes(thread, &message)
                     .map(SurfaceOutcome::Pending);
-            }
-            DialogKind::ArchiveProject(id) => {
-                anyhow::ensure!(
-                    state.selected_project == Some(id),
-                    "Project selection changed; open Archive project again."
-                );
-                if let Some(reason) = state.archive_project_reason() {
-                    anyhow::bail!(reason);
-                }
-                let mut project = state
-                    .project()
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("Select a project"))?;
-                // Archiving says the project no longer matters: its tabs close and it leaves
-                // Projects unless archived items are shown.
-                state.close_project_threads(project.id);
-                project.archived = true;
-                state.save_project(project);
             }
 
             DialogKind::Settings(project_id) => {
@@ -1328,13 +1268,11 @@ impl SurfaceContent {
     }
     fn title(&self) -> &'static str {
         match self.kind {
-            DialogKind::AddProject => "Add project",
             DialogKind::NewSpace => "New space",
             DialogKind::RenameSpace(_) => "Rename space",
             DialogKind::DeleteSpace(_) => "Delete space",
             DialogKind::RenameProject(_) => "Rename project",
             DialogKind::RenameThread(_) => "Rename thread",
-            DialogKind::ArchiveProject(_) => "Archive project",
             DialogKind::NewWorktreeConversation(_) => "New conversation in new worktree",
             DialogKind::NewWorkspaceConversation(_) => "New conversation in workspace",
             DialogKind::RemoveWorktree(_) => "Remove worktree",
@@ -1828,20 +1766,6 @@ impl SurfaceContent {
             DialogKind::Settings(project_id) => {
                 return self.settings_body(project_id, state, owner, cx);
             }
-            DialogKind::AddProject => {
-                let owner = owner.clone();
-                body = body
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                        .child("Register a working tree. DROSTJE. does not clone, modify, or delete its files."))
-                    .child(Form::new().child(self.form_field("path", readonly, cx)))
-                    .child(Button::new("choose-project-folder").small().disabled(readonly)
-                        .label("Choose folder…").on_click(move |_, window, cx| {
-                            let _ = owner.update(cx, |surface, cx| surface.pick_folder(window, cx));
-                        }));
-            }
-            DialogKind::ArchiveProject(_) => {
-                body = body.child("Archive retains threads, drafts, sessions, and Factory history. It never deletes checkout, session, or Factory files. Archived history remains accessible from Projects.");
-            }
             DialogKind::NewWorkspaceConversation(_) => {
                 body = body
                     .child(div().text_sm().text_color(cx.theme().muted_foreground)
@@ -2193,8 +2117,26 @@ impl Render for SurfaceContent {
                 confirm_surface(&owner, id, window, cx);
             })
             .child(self.body(self.state.read(cx), &surface, cx))
+            .when(matches!(self.kind, DialogKind::Commit(_)), |view| {
+                view.child(footer(self))
+            })
             .into_any_element()
     }
+}
+
+/// Renders a retained Commit surface inline, including its existing message body and actions.
+pub(super) fn render_commit_panel(content: Entity<SurfaceContent>, cx: &App) -> AnyElement {
+    v_flex()
+        .id("commit-changes-panel")
+        .w_full()
+        .flex_shrink_0()
+        .gap_3()
+        .p_3()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius)
+        .child(content)
+        .into_any_element()
 }
 
 struct SurfaceFooter {
@@ -2215,7 +2157,6 @@ fn footer(dialog: &SurfaceContent) -> AnyElement {
     let readonly = dialog.presentation.readonly;
     let pending = dialog.request.is_some();
     let id = dialog.surface_id;
-    let archive = matches!(dialog.kind, DialogKind::ArchiveProject(_));
     let cancel = dialog.owner.clone();
     let confirm = dialog.owner.clone();
     h_flex()
@@ -2247,10 +2188,6 @@ fn footer(dialog: &SurfaceContent) -> AnyElement {
                     "Delete space"
                 } else if matches!(dialog.kind, DialogKind::NewSpace) {
                     "Create space"
-                } else if archive {
-                    "Archive"
-                } else if matches!(dialog.kind, DialogKind::AddProject) {
-                    "Add project"
                 } else if matches!(
                     dialog.kind,
                     DialogKind::NewWorktreeConversation(_)
@@ -2289,7 +2226,22 @@ fn confirm_surface(owner: &WeakEntity<Workspace>, id: Uuid, window: &mut Window,
     });
 }
 
-fn clear_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
+/// Closing a layer hides it; the Workspace retains this entity as the draft owner.
+fn unhost_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
+    let _ = owner.update(cx, |workspace, cx| {
+        if let Some(dialog) = workspace
+            .dialog
+            .as_ref()
+            .filter(|dialog| dialog.read(cx).surface_id == id)
+        {
+            dialog.update(cx, |dialog, _| dialog.hosted = false);
+            cx.notify();
+        }
+    });
+}
+
+/// Successful actions discard the retained draft instead of reopening it later.
+pub(super) fn discard_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
     let _ = owner.update(cx, |workspace, cx| {
         if workspace
             .dialog
@@ -2338,12 +2290,10 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                                 .cached(StyleRefinement::default().size_full()),
                         )
                         .footer(footer.clone())
-                        .on_close(move |_, _, cx| clear_surface(&close, id, cx))
+                        .on_close(move |_, _, cx| unhost_surface(&close, id, cx))
                 });
             }
-            DialogKind::DeleteSpace(_)
-            | DialogKind::ArchiveProject(_)
-            | DialogKind::RemoveWorktree(_) => {
+            DialogKind::DeleteSpace(_) | DialogKind::RemoveWorktree(_) => {
                 window.open_alert_dialog(cx, move |alert, window, _| {
                     let close = host_owner.clone();
                     let confirm = host_owner.clone();
@@ -2356,7 +2306,7 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                             confirm_surface(&confirm, id, window, cx);
                             false
                         })
-                        .on_close(move |_, _, cx| clear_surface(&close, id, cx))
+                        .on_close(move |_, _, cx| unhost_surface(&close, id, cx))
                 });
             }
             _ => {
@@ -2372,7 +2322,7 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
                             confirm_surface(&confirm, id, window, cx);
                             false
                         })
-                        .on_close(move |_, _, cx| clear_surface(&close, id, cx))
+                        .on_close(move |_, _, cx| unhost_surface(&close, id, cx))
                 });
             }
         }

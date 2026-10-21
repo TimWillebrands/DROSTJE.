@@ -8,6 +8,7 @@ pub mod file_refs;
 pub mod harness;
 pub mod model;
 pub mod neovim;
+pub mod network;
 pub mod platform;
 pub mod store;
 pub mod titles;

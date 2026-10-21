@@ -3,7 +3,7 @@ use super::{
     theme,
 };
 use crate::model::{ProjectId, SpaceId, WorktreeId};
-use ghostty_terminal::{Terminal, TerminalOptions};
+use ghostty_terminal::{Terminal, TerminalOptions, TerminalStatus};
 use gpui_kit::{
     component::{ActiveTheme, alert::Alert, button::Button, h_flex, v_flex},
     prelude::FluentBuilder,
@@ -313,7 +313,7 @@ impl TerminalPane {
                 self.native_subscription =
                     Some(cx.observe_in(&native, window, |pane, native, window, cx| {
                         let terminal = native.read(cx);
-                        let exited = !terminal.is_alive();
+                        let exited = terminal.status() != TerminalStatus::Running;
                         if (exited || terminal.backend_error().is_some())
                             && terminal.focus_handle(cx).is_focused(window)
                         {
@@ -342,7 +342,7 @@ impl TerminalPane {
     pub fn is_alive(&self, cx: &App) -> bool {
         self.native
             .as_ref()
-            .is_some_and(|native| native.read(cx).is_alive())
+            .is_some_and(|native| native.read(cx).status() == TerminalStatus::Running)
     }
     #[cfg(all(test, feature = "runtime-qa"))]
     pub(super) fn error(&self) -> Option<&str> {
@@ -359,7 +359,7 @@ impl TerminalPane {
     }
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(native) = &self.native
-            && native.read(cx).is_alive()
+            && native.read(cx).status() == TerminalStatus::Running
         {
             native.update(cx, |terminal, cx| terminal.focus(window, cx));
         } else {
@@ -436,7 +436,7 @@ impl Render for TerminalPane {
             )
             .into_any_element()
         } else if let Some(native) = &self.native
-            && native.read(cx).is_alive()
+            && native.read(cx).status() == TerminalStatus::Running
         {
             native.clone().into_any_element()
         } else {

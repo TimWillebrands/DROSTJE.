@@ -5,24 +5,39 @@ const tools = JSON.parse(readFileSync(new URL("./tools.json", import.meta.url), 
 export function registerBrowserTools(api, schema) {
   const endpoint = process.env.DROSTJE_BROWSER_ENDPOINT;
   const thread = process.env.DROSTJE_BROWSER_THREAD;
+  const networkToken = process.env.DROSTJE_NETWORK_TOKEN;
   if (!endpoint || !thread) {
     throw new Error("DROSTJE browser tools require a configured endpoint and thread ID");
   }
   for (const tool of tools) {
     api.registerTool({
       name: tool.name,
-      label: tool.name === "browser" ? "DROSTJE Browser" : "Show Artifact",
+      label: tool.name === "browser" ? "DROSTJE Browser" : tool.name === "network" ? "Space network" : "Show Artifact",
       description: tool.description,
       parameters: schema(tool.inputSchema),
       // OMP otherwise defers discovery of new names until a tool search.
       loadMode: "essential",
       async execute(_toolCallId, args, signal, _onUpdate, ctx) {
-        const timeout = AbortSignal.timeout(35_000);
+        if (tool.name === "network" && !networkToken) {
+          throw new Error("Space network requires a live runtime capability");
+        }
+        // wait belongs to the current turn and is bounded by harness interruption,
+        // not the ordinary transport deadline. Never automatically retry a wait.
+        const timeout = tool.name === "network" && args.action === "wait"
+          ? undefined
+          : AbortSignal.timeout(35_000);
+        const requestSignal = signal && timeout ? AbortSignal.any([signal, timeout]) : signal || timeout;
         const response = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ thread, name: tool.name, arguments: args, cwd: ctx.cwd }),
-          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+          body: JSON.stringify({
+            thread,
+            name: tool.name,
+            arguments: args,
+            cwd: ctx.cwd,
+            ...(tool.name === "network" ? { network_token: networkToken } : {}),
+          }),
+          signal: requestSignal,
         });
         const body = await response.json();
         if (!response.ok || typeof body.error === "string") {
