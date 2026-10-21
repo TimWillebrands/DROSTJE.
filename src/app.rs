@@ -62,6 +62,8 @@ pub struct ConversationSession {
     pub commands: Option<async_channel::Sender<ConversationCommand>>,
     finished: Option<async_channel::Receiver<()>>,
     pub persisted: bool,
+    pub peer_delivery: bool,
+    pub peer_delivery_reason: Option<String>,
     pub models: Vec<ModelChoice>,
     pub model: Option<ModelKey>,
     /// Slash commands the harness offers for prompt text.
@@ -108,6 +110,8 @@ impl ConversationSession {
             state: ConversationState::Starting,
             commands: None,
             persisted: false,
+            peer_delivery: false,
+            peer_delivery_reason: None,
             models: Vec::new(),
             model,
             slash_commands: CommandCatalog::Loading,
@@ -707,6 +711,8 @@ impl AppState {
                 self.pending_writes = self.pending_writes.saturating_sub(1);
                 if let Err(error) = result {
                     self.storage_error = Some(error.clone());
+                    self.pause_all_network_delivery();
+                    self.sync_network();
                     self.notice(NoticeLevel::Error, error);
                     cx.notify();
                 } else {
@@ -716,6 +722,8 @@ impl AppState {
             }
             AppEvent::StorageFailed(error) => {
                 self.storage_error = Some(error.clone());
+                self.pause_all_network_delivery();
+                self.sync_network();
                 self.notice(NoticeLevel::Error, error);
             }
             AppEvent::RepositoryChecked(id, info) => {
@@ -886,6 +894,9 @@ impl AppState {
                             | ConversationEvent::SubmissionAccepted { .. }
                             | ConversationEvent::TurnSettled { .. }
                             | ConversationEvent::Failed { .. }
+                            | ConversationEvent::PeerDeliveryAvailable { .. }
+                            | ConversationEvent::PeerDelivery { .. }
+                            | ConversationEvent::PeerTurnStarted { .. }
                     );
                     let was_running = self.active_threads.contains(&id);
                     self.receive_conversation(id, event, cx);
@@ -949,6 +960,8 @@ impl AppState {
             }
             Err(error) => {
                 self.storage_error = Some(error.to_string());
+                self.pause_all_network_delivery();
+                self.sync_network();
                 false
             }
         }
@@ -1518,6 +1531,7 @@ impl AppState {
         if !self.thread_in_active_space(id) {
             return;
         }
+        self.pause_network_delivery(id);
         self.commit_thread_edits(id);
         let closed_ix = self.open_threads.iter().position(|open| *open == id);
         if let Some(ix) = closed_ix {
@@ -2001,6 +2015,7 @@ mod tests {
         }
         #[gpui_kit::test]
         fn undoing_project_archive_restores_its_read_only_state(cx: &mut TestAppContext) {
+            cx.dispatcher.allow_parking();
             let (_dir, state, project) = open(cx);
             state.update(cx, |state, _| {
                 let mut archived = state.project().unwrap().clone();

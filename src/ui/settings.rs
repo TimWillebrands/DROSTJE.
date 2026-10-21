@@ -3,7 +3,6 @@ use crate::{
     app::{AppState, CommitSubjectStatus, PresentationChange, WorktreeRequestStatus},
     harness,
     model::ModelKey,
-    platform,
     titles::{self, InstalledModels},
 };
 use gpui_kit::{
@@ -233,10 +232,7 @@ fn chosen_llama_model(selected: String, reference: String) -> anyhow::Result<Str
 #[derive(Clone, PartialEq, Eq)]
 pub enum DialogKind {
     NewSpace,
-    RenameSpace(Uuid),
     DeleteSpace(Uuid),
-    RenameProject(Uuid),
-    RenameThread(Uuid),
     /// A Conversation in a fresh worktree of this project, from a chosen base branch.
     NewWorktreeConversation(Uuid),
     /// Start another Conversation in the project checkout or an existing live worktree.
@@ -323,38 +319,6 @@ impl SurfaceContent {
             };
             match &kind {
                 DialogKind::NewSpace => field("name", "Space name", String::new()),
-                DialogKind::RenameSpace(id) => field(
-                    "name",
-                    "Space name",
-                    state
-                        .spaces
-                        .iter()
-                        .find(|space| space.id == *id)
-                        .map(|space| space.name.clone())
-                        .unwrap_or_default(),
-                ),
-                DialogKind::RenameProject(id) => field(
-                    "name",
-                    "Project name",
-                    state
-                        .snapshot
-                        .projects
-                        .iter()
-                        .find(|p| p.id == *id)
-                        .map(|p| p.name.clone())
-                        .unwrap_or_default(),
-                ),
-                DialogKind::RenameThread(id) => field(
-                    "name",
-                    "Thread title",
-                    state
-                        .snapshot
-                        .threads
-                        .iter()
-                        .find(|t| t.id == *id)
-                        .map(|t| t.title.clone())
-                        .unwrap_or_default(),
-                ),
                 DialogKind::NewWorkspaceConversation(project) => {
                     let root = state
                         .snapshot
@@ -858,6 +822,10 @@ impl SurfaceContent {
     pub(super) fn hosted(&self) -> bool {
         self.hosted
     }
+    pub(super) fn unhost(&mut self, cx: &mut Context<Self>) {
+        self.hosted = false;
+        cx.notify();
+    }
 
     pub(super) fn last_request(&self) -> Option<Uuid> {
         self.last_request
@@ -1038,41 +1006,7 @@ impl SurfaceContent {
                     .create_space(&self.value("name", cx))
                     .map(SurfaceOutcome::SpaceCreated);
             }
-            DialogKind::RenameSpace(id) => state.rename_space(id, &self.value("name", cx))?,
             DialogKind::DeleteSpace(id) => return Ok(SurfaceOutcome::DeleteSpace(id)),
-            DialogKind::RenameProject(id) => {
-                let name = self.value("name", cx);
-                if name.is_empty() {
-                    return Err(field_error("name", "Project name cannot be blank."));
-                }
-                let mut project = state
-                    .snapshot
-                    .projects
-                    .iter()
-                    .find(|p| p.id == id)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("Project is unavailable"))?;
-                anyhow::ensure!(!project.archived, "Archived projects are read-only.");
-                project.name = name;
-                state.save_project(project);
-            }
-            DialogKind::RenameThread(id) => {
-                let title = self.value("name", cx);
-                if title.is_empty() {
-                    return Err(field_error("name", "Thread title cannot be blank."));
-                }
-                let mut thread = state
-                    .snapshot
-                    .threads
-                    .iter()
-                    .find(|t| t.id == id)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("Thread is unavailable"))?;
-                anyhow::ensure!(!thread.archived, "Archived threads are read-only.");
-                thread.title = title;
-                thread.updated_at = platform::now();
-                state.save_thread(thread);
-            }
             DialogKind::NewWorkspaceConversation(project) => {
                 anyhow::ensure!(
                     state.selected_project == Some(project),
@@ -1269,10 +1203,7 @@ impl SurfaceContent {
     fn title(&self) -> &'static str {
         match self.kind {
             DialogKind::NewSpace => "New space",
-            DialogKind::RenameSpace(_) => "Rename space",
             DialogKind::DeleteSpace(_) => "Delete space",
-            DialogKind::RenameProject(_) => "Rename project",
-            DialogKind::RenameThread(_) => "Rename thread",
             DialogKind::NewWorktreeConversation(_) => "New conversation in new worktree",
             DialogKind::NewWorkspaceConversation(_) => "New conversation in workspace",
             DialogKind::RemoveWorktree(_) => "Remove worktree",
@@ -1328,13 +1259,14 @@ impl SurfaceContent {
     }
 
     fn field_content(&self, key: &str, readonly: bool, cx: &App) -> (&'static str, AnyElement) {
-        let (label, control) =
+        let (label, control, field_key) =
             if let Some(field) = self.selects.iter().find(|field| field.key == key) {
                 (
                     field.label,
                     Select::new(&field.state)
                         .disabled(readonly)
                         .into_any_element(),
+                    field.key,
                 )
             } else {
                 let field = self
@@ -1347,6 +1279,7 @@ impl SurfaceContent {
                     Input::new(&field.input)
                         .disabled(readonly)
                         .into_any_element(),
+                    field.key,
                 )
             };
         let warning = match key {
@@ -1407,6 +1340,8 @@ impl SurfaceContent {
         (
             label,
             v_flex()
+                .id(field_key)
+                .test_support()
                 .key_context("NativeInput")
                 .w_full()
                 .gap_1()
@@ -1997,10 +1932,7 @@ impl SurfaceContent {
                     )
                 });
             }
-            DialogKind::NewSpace
-            | DialogKind::RenameSpace(_)
-            | DialogKind::RenameProject(_)
-            | DialogKind::RenameThread(_) => {
+            DialogKind::NewSpace => {
                 body = body.child(Form::new().child(self.form_field("name", readonly, cx)));
             }
             DialogKind::DeleteSpace(id) => {
@@ -2013,7 +1945,7 @@ impl SurfaceContent {
                 body = body.child(format!("Delete “{name}”? All its projects and threads move to Default. No projects, threads, drafts, or running agents are deleted."));
             }
         }
-        body.when(self.error_field.is_none(), |view| {
+        body.when(self.error_field.is_none() && !matches!(self.kind, DialogKind::Commit(_)), |view| {
             view.when_some(self.error.clone(), |view, error| {
                 view.child(Alert::error("form-validation", error).small())
             })
@@ -2106,7 +2038,18 @@ impl Render for SurfaceContent {
         let surface = cx.entity().downgrade();
         let owner = self.owner.clone();
         let id = self.surface_id;
-        div()
+        let body = self.body(self.state.read(cx), &surface, cx);
+        let body = if matches!(self.kind, DialogKind::Commit(_)) {
+            div()
+                .id("commit-fields")
+                .max_h(rems(17.))
+                .overflow_y_scroll()
+                .child(body)
+                .into_any_element()
+        } else {
+            body
+        };
+        v_flex()
             .w_full()
             .when(matches!(self.kind, DialogKind::Settings(_)), |view| {
                 view.size_full().min_h_0().min_w_0().overflow_hidden()
@@ -2116,7 +2059,17 @@ impl Render for SurfaceContent {
                 cx.stop_propagation();
                 confirm_surface(&owner, id, window, cx);
             })
-            .child(self.body(self.state.read(cx), &surface, cx))
+            .when(matches!(self.kind, DialogKind::Commit(_)), |view| {
+                view.when_some(self.error.clone(), |view, error| {
+                    view.child(
+                        div()
+                            .id("commit-validation")
+                            .test_support()
+                            .child(Alert::error("commit-validation-alert", error).small()),
+                    )
+                })
+            })
+            .child(body)
             .when(matches!(self.kind, DialogKind::Commit(_)), |view| {
                 view.child(footer(self))
             })
@@ -2128,6 +2081,8 @@ impl Render for SurfaceContent {
 pub(super) fn render_commit_panel(content: Entity<SurfaceContent>, cx: &App) -> AnyElement {
     v_flex()
         .id("commit-changes-panel")
+        .debug_selector(|| "commit-changes-panel".into())
+        .test_support()
         .w_full()
         .flex_shrink_0()
         .gap_3()
@@ -2166,7 +2121,13 @@ fn footer(dialog: &SurfaceContent) -> AnyElement {
         .child(
             Button::new("dialog-cancel")
                 .ghost()
-                .label("Cancel")
+                .label(
+                    if matches!(dialog.kind, DialogKind::Settings(_) | DialogKind::Commit(_)) {
+                        "Close"
+                    } else {
+                        "Cancel"
+                    },
+                )
                 .on_click(move |_, window, cx| {
                     let _ = cancel.update(cx, |workspace, cx| {
                         if workspace
@@ -2240,24 +2201,13 @@ fn unhost_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
     });
 }
 
-/// Successful actions discard the retained draft instead of reopening it later.
-pub(super) fn discard_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
-    let _ = owner.update(cx, |workspace, cx| {
-        if workspace
-            .dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.read(cx).surface_id == id)
-        {
-            workspace.dialog = None;
-            cx.notify();
-        }
-    });
-}
-
 /// The Root captures trigger focus and owns trapping, dismissal, and one focus restoration.
 pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |window, cx| {
         let Ok(Some(content)) = owner.update(cx, |workspace, cx| {
+            if workspace.quit_requested {
+                return None;
+            }
             workspace
                 .dialog
                 .as_ref()
@@ -2329,14 +2279,22 @@ pub(super) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx
         window.on_next_frame(move |window, cx| {
             let Some(owner) = owner.upgrade() else { return };
             let workspace = owner.read(cx);
-            let Some(dialog) = workspace
-                .dialog
-                .as_ref()
-                .filter(|dialog| dialog.read(cx).surface_id == id)
-            else {
+            if workspace.quit_requested {
+                return;
+            }
+            let Some(dialog) = workspace.dialog.as_ref().filter(|dialog| {
+                let dialog = dialog.read(cx);
+                dialog.surface_id == id && dialog.hosted
+            }) else {
                 return;
             };
             let dialog = dialog.read(cx);
+            if matches!(dialog.kind, DialogKind::Settings(_)) {
+                // Settings retains its search and selected group. A saved field can
+                // be virtualized away; focus the first mounted control instead.
+                window.focus_next(cx);
+                return;
+            }
             let focus = if let Some(select) = dialog
                 .select("theme_mode")
                 .or_else(|| dialog.select("branch"))

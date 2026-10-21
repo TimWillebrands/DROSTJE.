@@ -24,6 +24,48 @@ impl ClipboardContent {
     }
 }
 
+/// The kit theme as Neovim sees it: packed 24-bit RGB, already flattened onto the
+/// editor background, plus whether the theme is dark. `bridge.lua` maps every
+/// highlight group the editor can show onto these roles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct NvimTheme {
+    pub dark: bool,
+    pub foreground: u32,
+    pub background: u32,
+    pub muted: u32,
+    pub surface: u32,
+    pub border: u32,
+    pub selection: u32,
+    pub caret: u32,
+    pub accent: u32,
+    pub popover: u32,
+    pub popover_foreground: u32,
+    pub success: u32,
+    pub warning: u32,
+    pub danger: u32,
+    pub info: u32,
+}
+impl NvimTheme {
+    pub fn colors(&self) -> [(&'static str, u32); 14] {
+        [
+            ("foreground", self.foreground),
+            ("background", self.background),
+            ("muted", self.muted),
+            ("surface", self.surface),
+            ("border", self.border),
+            ("selection", self.selection),
+            ("caret", self.caret),
+            ("accent", self.accent),
+            ("popover", self.popover),
+            ("popover_foreground", self.popover_foreground),
+            ("success", self.success),
+            ("warning", self.warning),
+            ("danger", self.danger),
+            ("info", self.info),
+        ]
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NvimConfig {
     pub executable: PathBuf,
@@ -51,6 +93,9 @@ pub enum NvimEvent {
     CompositionCommitted,
     CompositionRejected(String),
     InputRejected(String),
+    /// The user quit the way Vim quits (`:q`, `:wq`, `ZZ`…). Neovim and the draft stay;
+    /// the editor gives up focus instead.
+    Leave,
     Failed(String),
     Ready,
 }
@@ -70,13 +115,7 @@ pub enum NvimCommand {
         cols: u32,
         rows: u32,
     },
-    /// Packed 24-bit RGB colors from the current kit theme.
-    Theme {
-        foreground: u32,
-        background: u32,
-        selection: u32,
-        caret: u32,
-    },
+    Theme(NvimTheme),
     Focus(bool),
     SetComposition(bool),
     Replace {

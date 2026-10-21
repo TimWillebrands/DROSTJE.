@@ -3,15 +3,35 @@
 //! --test neovim_runtime -- --ignored --nocapture.
 use drostje::model::DraftKey;
 use drostje::neovim::{
-    ClipboardContent, NvimCommand, NvimConfig, NvimEditor, NvimEvent, grid::GridSnapshot,
+    ClipboardContent, NvimCommand, NvimConfig, NvimEditor, NvimEvent, NvimTheme, grid::GridSnapshot,
 };
 use parking_lot::Mutex;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
+/// Every role distinct, so a group drawn from the wrong role is visible.
+const LIGHT: NvimTheme = NvimTheme {
+    dark: false,
+    foreground: 0x172135,
+    background: 0xe7edf5,
+    muted: 0x6b7385,
+    surface: 0xdde4ee,
+    border: 0xc3ccd9,
+    selection: 0xb2c6df,
+    caret: 0x285daa,
+    accent: 0x1f4f99,
+    popover: 0xf4f7fb,
+    popover_foreground: 0x101827,
+    success: 0x2e7d4f,
+    warning: 0x9a6a00,
+    danger: 0xb3261e,
+    info: 0x0b6e99,
+};
+
 struct Runtime {
     editor: NvimEditor,
     grid: Arc<Mutex<Option<Arc<GridSnapshot>>>>,
+    leaves: Arc<Mutex<usize>>,
     clipboard: Arc<Mutex<ClipboardContent>>,
     diagnostics: Arc<Mutex<Vec<String>>>,
     directory: PathBuf,
@@ -32,6 +52,8 @@ impl Runtime {
             regtype: "v".into(),
         }));
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let leaves = Arc::new(Mutex::new(0));
+        let observed_leaves = leaves.clone();
         let events = editor.events.clone();
         let observed_grid = grid.clone();
         let native_clipboard = clipboard.clone();
@@ -44,6 +66,7 @@ impl Runtime {
                         let _ = reply.try_send(Ok(native_clipboard.lock().clone()));
                     }
                     NvimEvent::ClipboardSet(content) => *native_clipboard.lock() = content,
+                    NvimEvent::Leave => *observed_leaves.lock() += 1,
                     NvimEvent::Failed(error)
                     | NvimEvent::InputRejected(error)
                     | NvimEvent::CompositionRejected(error) => {
@@ -56,6 +79,7 @@ impl Runtime {
         Self {
             editor,
             grid,
+            leaves,
             clipboard,
             diagnostics,
             directory,
@@ -76,6 +100,14 @@ impl Runtime {
             .send(NvimCommand::Input(keys.into()))
             .await
             .unwrap();
+    }
+    /// Waits until the latest grid satisfies `check`.
+    async fn grid_until(&self, what: &str, check: impl Fn(&GridSnapshot) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !self.grid.lock().as_deref().is_some_and(&check) {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            smol::Timer::after(Duration::from_millis(5)).await;
+        }
     }
     async fn close(self) {
         self.editor.persistence_barrier().await.unwrap();
@@ -379,12 +411,7 @@ fn theme_updates_follow_serialized_input_and_survive_restart() {
         runtime
             .editor
             .commands
-            .send(NvimCommand::Theme {
-                foreground: 0x172135,
-                background: 0xe7edf5,
-                selection: 0xb2c6df,
-                caret: 0x285daa,
-            })
+            .send(NvimCommand::Theme(LIGHT))
             .await
             .unwrap();
         let saved = runtime.editor.snapshot(key.clone()).await.unwrap();
@@ -426,12 +453,7 @@ fn focus_resize_and_theme_wait_out_an_unfinished_key_sequence() {
         for command in [
             NvimCommand::Focus(false),
             NvimCommand::Resize { cols: 40, rows: 6 },
-            NvimCommand::Theme {
-                foreground: 0x172135,
-                background: 0xe7edf5,
-                selection: 0xb2c6df,
-                caret: 0x285daa,
-            },
+            NvimCommand::Theme(LIGHT),
             NvimCommand::Focus(true),
         ] {
             runtime.editor.commands.send(command).await.unwrap();
@@ -499,6 +521,102 @@ fn persistence_barrier_freezes_every_draft_until_explicit_resume() {
             runtime.editor.snapshot(second).await.unwrap().text,
             "second! resumed"
         );
+        runtime.close().await;
+    });
+}
+
+/// Foreground of the first cell showing `text`, through its highlight.
+fn foreground_of(grid: &GridSnapshot, text: &str) -> Option<u32> {
+    grid.rows
+        .iter()
+        .flat_map(|row| row.iter())
+        .find_map(|cell| {
+            (cell.text == text).then(|| {
+                grid.highlights
+                    .get(&cell.hl_id)
+                    .and_then(|highlight| highlight.foreground)
+                    .unwrap_or(grid.default_fg)
+            })
+        })
+}
+
+fn row_text(grid: &GridSnapshot, row: usize) -> String {
+    grid.rows[row]
+        .iter()
+        .map(|cell| cell.text.as_str())
+        .collect()
+}
+
+#[test]
+#[ignore = "requires a real Neovim executable; spawns disposable isolated processes"]
+fn vim_write_and_quit_commands_keep_neovim_and_the_draft() {
+    smol::block_on(async {
+        let runtime = Runtime::start().await;
+        let key = runtime.draft("keep me").await;
+        for (ix, keys) in [
+            ":q<CR>", ":wq<CR>", ":x<CR>", ":qa!<CR>", "ZZ", "ZQ", "<C-w>q",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            runtime.keys(keys).await;
+            // The snapshot round trip orders every earlier key and notification.
+            let snapshot = runtime.editor.snapshot(key.clone()).await.unwrap();
+            assert_eq!(snapshot.text, "keep me", "{keys} changed the draft");
+            assert_eq!(*runtime.leaves.lock(), ix + 1, "{keys} did not leave");
+        }
+        // A split closes like Vim's would; only the last window leaves the editor.
+        runtime.keys(":split<CR>:wq<CR>").await;
+        runtime.editor.snapshot(key.clone()).await.unwrap();
+        assert_eq!(*runtime.leaves.lock(), 7);
+        runtime.keys(":w<CR>").await;
+        runtime.editor.snapshot(key.clone()).await.unwrap();
+        runtime
+            .grid_until("`:w` did not explain draft saving", |grid| {
+                row_text(grid, grid.rows.len() - 1).starts_with("Drafts save automatically")
+            })
+            .await;
+        runtime.keys(":bd<CR>").await;
+        assert_eq!(
+            runtime.editor.snapshot(key.clone()).await.unwrap().text,
+            "keep me"
+        );
+        assert_eq!(*runtime.leaves.lock(), 7);
+        // Other commands still run.
+        runtime.keys(":s/keep/kept/<CR>").await;
+        assert_eq!(runtime.editor.snapshot(key).await.unwrap().text, "kept me");
+        assert!(runtime.diagnostics.lock().is_empty());
+        runtime.close().await;
+    });
+}
+
+#[test]
+#[ignore = "requires a real Neovim executable; spawns disposable isolated processes"]
+fn theme_colors_every_visible_group() {
+    smol::block_on(async {
+        let runtime = Runtime::start().await;
+        let key = runtime.draft("themed").await;
+        runtime
+            .editor
+            .commands
+            .send(NvimCommand::Theme(LIGHT))
+            .await
+            .unwrap();
+        runtime
+            .grid_until("end-of-buffer filler was not themed", |grid| {
+                grid.default_bg == LIGHT.background
+                    && foreground_of(grid, "~") == Some(LIGHT.muted)
+            })
+            .await;
+        // Typed only after the theme's redraw, which would clear the message.
+        runtime.keys(":bd<CR>").await;
+        runtime.editor.snapshot(key).await.unwrap();
+        runtime
+            .grid_until("the error message was not themed", |grid| {
+                foreground_of(grid, "A") == Some(LIGHT.danger)
+            })
+            .await;
+        assert!(runtime.diagnostics.lock().is_empty());
         runtime.close().await;
     });
 }

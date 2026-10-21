@@ -62,6 +62,14 @@ fn set_dialog(
     key: &str,
     value: &str,
 ) {
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
     update_workspace(cx, window, workspace, |workspace, window, cx| {
         let field = workspace
             .dialog
@@ -206,14 +214,11 @@ async fn open_fixture_with_tools(
     cx.run_until_parked();
     if cx.read(|cx| state.read(cx).snapshot.projects.is_empty()) {
         cx.dispatch_action(window.into(), commands::AddProject);
-        set_dialog(
-            cx,
-            window,
-            &workspace,
-            "path",
-            &repository.root.to_string_lossy(),
-        );
-        cx.simulate_keystrokes(window.into(), "secondary-enter");
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.directories && !options.files && !options.multiple);
+            Some(vec![repository.root.clone()])
+        });
         until(cx, "project registration", Duration::from_secs(10), |cx| {
             state.read(cx).snapshot.projects.len() == 1
         })
@@ -555,6 +560,35 @@ async fn thread_sidebar_hover_actions_rename_and_archive_immediately(cx: &mut Te
                 target == crate::ui::workspace::RenameTarget::Thread(id)
             })
     }));
+    let original_title = cx.read(|cx| fixture.state.read(cx).thread().unwrap().title.clone());
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace
+                .inline_rename()
+                .unwrap()
+                .2
+                .update(cx, |input, cx| {
+                    input.set_value("Discarded rename".to_owned(), window, cx);
+                });
+        },
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert!(fixture.workspace.read(cx).inline_rename().is_none());
+        assert_eq!(
+            fixture.state.read(cx).thread().unwrap().title,
+            original_title
+        );
+    });
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.hover(row.clone(), cx);
+        window.click(rename.clone(), cx);
+    })
+    .unwrap();
     update_workspace(
         cx,
         fixture.window,
@@ -591,12 +625,15 @@ async fn thread_sidebar_hover_actions_rename_and_archive_immediately(cx: &mut Te
     assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
     cx.read(|cx| {
         let state = fixture.state.read(cx);
-        let thread = state.thread().unwrap();
-        assert_eq!(state.selected_thread, Some(id));
+        let thread = state
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .unwrap();
         assert!(thread.archived, "one click archives without confirmation");
         assert_eq!(thread.title, "Manually renamed");
         assert_eq!(thread.draft, "keep");
-        assert!(state.show_archived, "archived history remains accessible");
     });
     assert_eq!(
         update_workspace(
@@ -620,6 +657,12 @@ async fn thread_sidebar_hover_actions_rename_and_archive_immediately(cx: &mut Te
 async fn thread_archive_action_guards_and_palette_are_immediate(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let id = new_conversation(cx, &fixture).await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.focus_region(Region::Thread, window, cx),
+    );
     fixture.state.update(cx, |state, cx| {
         state.active_threads.insert(id);
         cx.notify();
@@ -651,21 +694,77 @@ async fn thread_archive_action_guards_and_palette_are_immediate(cx: &mut TestApp
         assert!(workspace.palette.is_none());
         assert!(workspace.dialog.is_none());
         let state = fixture.state.read(cx);
-        assert_eq!(state.selected_thread, Some(id));
-        assert!(state.thread().unwrap().archived);
+        assert!(
+            state
+                .snapshot
+                .threads
+                .iter()
+                .any(|thread| thread.id == id && thread.archived)
+        );
     });
     wait_for_saved_thread(cx, &fixture, id, |thread| thread.archived).await;
 
+    let second = new_conversation(cx, &fixture).await;
+    fixture.state.update(cx, |state, cx| {
+        state.select_thread(id);
+        cx.notify();
+    });
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace.focus_region(Region::Projects, window, cx);
+        },
+    );
+    settle_frames(cx, &fixture);
+    let tabs = cx.read(|cx| fixture.state.read(cx).open_threads.clone());
     let project = cx.read(|cx| fixture.state.read(cx).project().unwrap().id);
-    cx.dispatch_action(fixture.window.into(), commands::ArchiveProject);
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        Root::update(window, cx, |root, window, cx| {
+            root.clear_notifications(window, cx)
+        });
+    })
+    .unwrap();
+    open_palette(cx, &fixture).await;
+    cx.simulate_keystrokes(
+        fixture.window.into(),
+        "a r c h i v e space p r o j e c t enter",
+    );
+    cx.run_until_parked();
     cx.read(|cx| {
         let state = fixture.state.read(cx);
         assert_eq!(state.project().unwrap().id, project);
         assert!(state.project().unwrap().archived);
         assert!(!state.open_threads.contains(&id));
+        assert!(!state.open_threads.contains(&second));
         let workspace = fixture.workspace.read(cx);
         assert!(workspace.dialog.is_none());
     });
+    settle_frames(cx, &fixture);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut previous = None;
+    let mut stable_frames = 0;
+    while stable_frames < 3 {
+        cx.run_until_parked();
+        let bounds = cx
+            .update_window(fixture.window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.find("undo-project-archive").bounds()
+            })
+            .unwrap();
+        stable_frames = if previous == Some(bounds) {
+            stable_frames + 1
+        } else {
+            0
+        };
+        previous = Some(bounds);
+        assert!(
+            Instant::now() < deadline,
+            "Undo notification did not settle"
+        );
+        smol::Timer::after(Duration::from_millis(20)).await;
+    }
     cx.update_window(fixture.window.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click("undo-project-archive", cx);
@@ -675,9 +774,10 @@ async fn thread_archive_action_guards_and_palette_are_immediate(cx: &mut TestApp
     cx.read(|cx| {
         let state = fixture.state.read(cx);
         assert!(!state.project().unwrap().archived);
-        assert!(state.open_threads.contains(&id));
+        assert_eq!(state.open_threads, tabs, "Undo restores every project tab");
         assert_eq!(state.selected_thread, Some(id));
     });
+    quit(cx, &fixture).await;
 }
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; verifies nonblocking tool details navigation"]
@@ -689,8 +789,7 @@ async fn tool_details_open_in_the_thread_inspector(cx: &mut TestAppContext) {
         fixture.window,
         &fixture.workspace,
         |workspace, window, cx| {
-            workspace.tool_detail = Some((thread, "tool-call".to_owned()));
-            workspace.sync_detail_surface(window, cx);
+            workspace.open_details(thread, "tool-call".to_owned(), window, cx);
         },
     );
     cx.read(|cx| {
@@ -787,7 +886,7 @@ async fn input_and_custom_answers_stay_inline_and_back_preserves_the_request(
         cx,
         fixture.window,
         &fixture.workspace,
-        |workspace, _, cx| workspace.back_from_custom_answer(thread, &question.id, cx),
+        |workspace, window, cx| workspace.back_from_custom_answer(thread, &question.id, window, cx),
     );
     cx.read(|cx| {
         let workspace = fixture.workspace.read(cx);
@@ -797,6 +896,136 @@ async fn input_and_custom_answers_stay_inline_and_back_preserves_the_request(
             fixture.state.read(cx).conversations[&thread]
                 .requests
                 .contains_key(&question.id)
+        );
+    });
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; retained drafts and inline answers never block the palette"]
+async fn palette_opens_over_retained_drafts_and_inline_answers(cx: &mut TestAppContext) {
+    use crate::harness::{UserRequest, UserRequestKind};
+
+    let fixture = open_fixture(cx, None).await;
+    let thread = new_conversation(cx, &fixture).await;
+    let hosted = |cx: &mut TestAppContext| {
+        cx.read(|cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .map(|dialog| dialog.read(cx).hosted())
+        })
+    };
+    let close_palette = async |cx: &mut TestAppContext| {
+        cx.simulate_keystrokes(fixture.window.into(), "escape");
+        until(cx, "palette closed", Duration::from_secs(5), |cx| {
+            fixture.workspace.read(cx).palette.is_none()
+        })
+        .await;
+    };
+
+    // A Settings draft hidden with Escape stays retained without blocking the palette.
+    cx.dispatch_action(fixture.window.into(), commands::Settings);
+    until(cx, "Settings opened", Duration::from_secs(5), |cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).hosted())
+    })
+    .await;
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    until(cx, "Settings draft hidden", Duration::from_secs(5), |cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.read(cx).hosted())
+    })
+    .await;
+    open_palette(cx, &fixture).await;
+    close_palette(cx).await;
+
+    // A hosted surface closed by the Workspace itself is unhosted, not left blocking.
+    cx.dispatch_action(fixture.window.into(), commands::Settings);
+    until(cx, "Settings reopened", Duration::from_secs(5), |cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).hosted())
+    })
+    .await;
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.dismiss(window, cx),
+    );
+    cx.run_until_parked();
+    assert_eq!(hosted(cx), Some(false));
+    open_palette(cx, &fixture).await;
+    close_palette(cx).await;
+
+    // An inline answer is Conversation content: the palette opens over it and keeps it.
+    let input = UserRequest {
+        id: "palette-input-request".into(),
+        kind: UserRequestKind::Input,
+        title: "Enter a value".into(),
+        options: Vec::new(),
+        text: "typed answer".into(),
+        placeholder: None,
+        deadline: None,
+    };
+    fixture.state.update(cx, |state, cx| {
+        state
+            .conversations
+            .get_mut(&thread)
+            .unwrap()
+            .requests
+            .insert(input.id.clone(), input.clone());
+        cx.notify();
+    });
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.open_extension(thread, input.clone(), window, cx),
+    );
+    assert!(cx.read(|cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .extension
+            .as_ref()
+            .is_some_and(|form| form.inline_answer)
+    }));
+    cx.dispatch_action(fixture.window.into(), commands::OpenPalette);
+    until(
+        cx,
+        "palette over inline answer",
+        Duration::from_secs(5),
+        |cx| fixture.workspace.read(cx).palette.is_some(),
+    )
+    .await;
+    close_palette(cx).await;
+    cx.read(|cx| {
+        let form = fixture.workspace.read(cx).extension.as_ref().unwrap();
+        assert_eq!(form.request.id, input.id);
+        assert_eq!(
+            form.input.as_ref().unwrap().read(cx).value(),
+            "typed answer"
+        );
+        assert!(
+            fixture.state.read(cx).conversations[&thread]
+                .requests
+                .contains_key(&input.id),
+            "opening the palette must not cancel the agent's request"
         );
     });
     quit(cx, &fixture).await;
@@ -1033,10 +1262,24 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
     })
     .unwrap();
     cx.run_until_parked();
-    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_some()));
+    assert!(cx.read(|cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).hosted())
+    }));
     cx.simulate_keystrokes(fixture.window.into(), "escape");
     cx.run_until_parked();
-    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
+    assert!(cx.read(|cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.read(cx).hosted())
+    }));
 
     // Switching to a new branch from HEAD settles the title rename and updates the label.
     cx.dispatch_action(fixture.window.into(), commands::SwitchBranch);
@@ -1358,7 +1601,7 @@ async fn conversation_diff_sidebar_tracks_working_tree(cx: &mut TestAppContext) 
 
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; commits in the fixture repository and rewinds it, no provider turn"]
-async fn commit_dialog_commits_the_working_tree(cx: &mut TestAppContext) {
+async fn commit_panel_commits_the_working_tree(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let conversation = new_conversation(cx, &fixture).await;
     let root = cx.read(|cx| fixture.state.read(cx).project().unwrap().root.clone());
@@ -1388,6 +1631,33 @@ async fn commit_dialog_commits_the_working_tree(cx: &mut TestAppContext) {
     let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
     assert!(visual.debug_bounds("conversation-diff-patch").is_some());
     assert!(visual.debug_bounds("commit-changes").is_some());
+    cx.dispatch_action(fixture.window.into(), commands::Settings);
+    until(cx, "Settings draft opened", Duration::from_secs(5), |cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).hosted())
+    })
+    .await;
+    set_dialog(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        "nvim",
+        "retained-editor",
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    until(cx, "Settings draft hidden", Duration::from_secs(5), |cx| {
+        fixture
+            .workspace
+            .read(cx)
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| !dialog.read(cx).hosted())
+    })
+    .await;
 
     cx.dispatch_action(fixture.window.into(), commands::CommitChanges);
     cx.run_until_parked();
@@ -1403,6 +1673,7 @@ async fn commit_dialog_commits_the_working_tree(cx: &mut TestAppContext) {
                 crate::ui::settings::DialogKind::Commit(id) if id == conversation
             ));
             assert!(!dialog.read(cx).hosted());
+            assert_eq!(workspace.commit_panel_thread, Some(conversation));
             assert_eq!(
                 workspace.state.read(cx).thread_sidebar_tab(conversation),
                 crate::app::SidebarTab::Changes
@@ -1436,11 +1707,49 @@ async fn commit_dialog_commits_the_working_tree(cx: &mut TestAppContext) {
             let workspace = fixture.workspace.read(cx);
             workspace.commit_panel_thread.is_none()
                 && workspace.dialog.as_ref().is_some_and(|dialog| {
-                    dialog
-                        .read(cx)
-                        .commit_message()
-                        .is_some_and(|message| message.read(cx).value() == "Record fixture notes")
+                    let dialog = dialog.read(cx);
+                    !dialog.hosted()
+                        && dialog.commit_message().is_some_and(|message| {
+                            message.read(cx).value() == "Record fixture notes"
+                        })
                 })
+        },
+    )
+    .await;
+    cx.dispatch_action(fixture.window.into(), commands::Settings);
+    until(
+        cx,
+        "Settings draft survives the commit panel",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| {
+                    let dialog = dialog.read(cx);
+                    dialog.hosted() && dialog.value("nvim", cx) == "retained-editor"
+                })
+        },
+    )
+    .await;
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    until(
+        cx,
+        "Settings draft hidden again",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .dialog
+                .as_ref()
+                .is_some_and(|dialog| !dialog.read(cx).hosted())
         },
     )
     .await;
@@ -1449,7 +1758,17 @@ async fn commit_dialog_commits_the_working_tree(cx: &mut TestAppContext) {
         cx,
         "commit composer reopened",
         Duration::from_secs(5),
-        |cx| fixture.workspace.read(cx).commit_panel_thread == Some(conversation),
+        |cx| {
+            let workspace = fixture.workspace.read(cx);
+            workspace.commit_panel_thread == Some(conversation)
+                && workspace.dialog.as_ref().is_some_and(|dialog| {
+                    let dialog = dialog.read(cx);
+                    !dialog.hosted()
+                        && dialog.commit_message().is_some_and(|message| {
+                            message.read(cx).value() == "Record fixture notes"
+                        })
+                })
+        },
     )
     .await;
     cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
@@ -1473,6 +1792,162 @@ async fn commit_dialog_commits_the_working_tree(cx: &mut TestAppContext) {
     );
 
     platform::git(&root, &["reset", "--hard", &head]).unwrap();
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; real Git failure after closing Commit, no provider turn"]
+async fn dismissed_commit_reports_git_failure_and_retains_the_form(cx: &mut TestAppContext) {
+    struct RestoreFiles {
+        notes: PathBuf,
+        original: Vec<u8>,
+        index_lock: PathBuf,
+    }
+    impl Drop for RestoreFiles {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.notes, &self.original);
+            let _ = fs::remove_file(&self.index_lock);
+        }
+    }
+
+    let fixture = open_fixture(cx, None).await;
+    let conversation = new_conversation(cx, &fixture).await;
+    let root = cx.read(|cx| fixture.state.read(cx).project().unwrap().root.clone());
+    let head = platform::git(&root, &["rev-parse", "HEAD"]).unwrap();
+    let notes = root.join("notes.txt");
+    let original = fs::read(&notes).unwrap();
+    let index_lock = PathBuf::from(
+        platform::git(
+            &root,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index.lock",
+            ],
+        )
+        .unwrap(),
+    );
+    // Git refuses its real index lock before staging or committing anything.
+    // Never overwrite a lock belonging to another process.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&index_lock)
+        .unwrap();
+    let restore = RestoreFiles {
+        notes,
+        original,
+        index_lock,
+    };
+    fs::write(&restore.notes, "pending commit\n").unwrap();
+    cx.dispatch_action(fixture.window.into(), commands::RefreshConversationDiff);
+    until(cx, "commit failure diff", Duration::from_secs(5), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .conversation_diff(conversation)
+            .and_then(|diff| diff.result.as_ref())
+            .is_some_and(|result| result.as_ref().is_ok_and(|diff| diff.changed_files == 1))
+    })
+    .await;
+
+    open_palette(cx, &fixture).await;
+    cx.simulate_keystrokes(
+        fixture.window.into(),
+        "c o m m i t space c h a n g e s enter",
+    );
+    cx.run_until_parked();
+    let form = cx.read(|cx| fixture.workspace.read(cx).dialog.as_ref().unwrap().clone());
+    update_workspace(cx, fixture.window, &fixture.workspace, |_, window, cx| {
+        let message = form.read(cx).commit_message().unwrap();
+        message.update(cx, |message, cx| {
+            message.set_value("Keep this failed commit draft", window, cx)
+        });
+        message.focus_handle(cx).focus(window, cx);
+    });
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        Root::update(window, cx, |root, window, cx| {
+            root.clear_notifications(window, cx);
+        });
+    })
+    .unwrap();
+    settle_frames(cx, &fixture);
+
+    // Both native button clicks happen in one update: even an immediate Git
+    // refusal cannot be delivered back to the UI before the form is closed.
+    let (request, progress) = cx
+        .update_window(fixture.window.into(), |_, window, cx| {
+            window.click("dialog-confirm", cx);
+            let request = form.read(cx).request.expect("real Git request started");
+            window.render_frame(cx);
+            window.click("dialog-cancel", cx);
+            assert!(fixture.workspace.read(cx).commit_panel_thread.is_none());
+            assert_eq!(form.read(cx).request, Some(request));
+            window.render_frame(cx);
+            assert!(window.try_find("commit-changes-panel").is_none());
+            assert!(
+                window.find("notification").visible(),
+                "background progress is visible"
+            );
+            let notifications = Root::read(window, cx).notification.read(cx).notifications();
+            assert_eq!(notifications.len(), 1, "closing shows one progress toast");
+            (request, notifications[0].clone())
+        })
+        .unwrap();
+
+    until(cx, "dismissed Git failure", Duration::from_secs(10), |cx| {
+        fixture.state.read(cx).worktree_request.as_ref().is_some_and(|pending| {
+            pending.id == request
+                && matches!(&pending.status, crate::app::WorktreeRequestStatus::Failed(error) if error.contains("index.lock"))
+        }) && form.read(cx).request.is_none()
+            && form.read(cx).error.as_ref().is_some_and(|error| error.contains("index.lock"))
+    })
+    .await;
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("commit-changes-panel").is_none());
+        let notifications = Root::read(window, cx).notification.read(cx).notifications();
+        assert_eq!(notifications.len(), 1, "the outcome replaces progress");
+        assert_ne!(
+            notifications[0], progress,
+            "a settled outcome replaces the progress entity"
+        );
+        assert!(
+            window.find("notification").visible(),
+            "dismissed failure stays visible"
+        );
+    })
+    .unwrap();
+
+    cx.dispatch_action(fixture.window.into(), commands::CommitChanges);
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let workspace = fixture.workspace.read(cx);
+        assert_eq!(workspace.commit_panel_thread, Some(conversation));
+        assert_eq!(workspace.dialog.as_ref(), Some(&form));
+        let form = form.read(cx);
+        assert!(
+            form.error
+                .as_ref()
+                .is_some_and(|error| error.contains("index.lock"))
+        );
+        assert_eq!(
+            form.commit_message().unwrap().read(cx).value(),
+            "Keep this failed commit draft"
+        );
+    });
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("commit-changes-panel").visible());
+        assert!(
+            window.find("commit-validation").visible(),
+            "the retained Git error is painted"
+        );
+    })
+    .unwrap();
+    assert_eq!(platform::git(&root, &["rev-parse", "HEAD"]).unwrap(), head);
+    drop(restore);
     quit(cx, &fixture).await;
 }
 
@@ -2883,12 +3358,18 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
     .await;
     let factory = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
     cx.dispatch_action(fixture.window.into(), commands::RenameThread);
-    set_dialog(
+    update_workspace(
         cx,
         fixture.window,
         &fixture.workspace,
-        "name",
-        "Factory needle",
+        |workspace, window, cx| {
+            let (target, _, input, _) = workspace.inline_rename().unwrap();
+            assert_eq!(target, crate::ui::workspace::RenameTarget::Thread(factory));
+            input.update(cx, |input, cx| {
+                input.set_value("Factory needle".to_owned(), window, cx)
+            });
+            input.focus_handle(cx).focus(window, cx);
+        },
     );
     cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
     update_workspace(
@@ -2955,7 +3436,7 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         cx.read(|cx| fixture.state.read(cx).snapshot.settings["factory_data_root"].clone());
     cx.update_window(fixture.window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.within("settings-sidebar").click("0-0-2", cx);
+        window.within("settings-sidebar").click("0-0-3", cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -2966,7 +3447,11 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         "factory_data_root",
         "relative/path",
     );
-    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("dialog-confirm", cx);
+    })
+    .unwrap();
     until(
         cx,
         "Settings validation retains input",
@@ -2993,7 +3478,10 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     })
     .unwrap();
-    cx.simulate_keystrokes(fixture.window.into(), "escape");
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.click("dialog-cancel", cx);
+    })
+    .unwrap();
     until(
         cx,
         "Settings draft retained after dismissal",
@@ -3132,6 +3620,20 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         fixture.window,
         &fixture.workspace,
         |workspace, window, cx| {
+            let root = workspace
+                .dialog
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .fields
+                .iter()
+                .find(|field| field.key == "factory_data_root")
+                .unwrap()
+                .input
+                .clone();
+            root.update(cx, |input, cx| {
+                input.set_value(saved_root.as_str().unwrap().to_owned(), window, cx);
+            });
             workspace
                 .dialog
                 .as_ref()
@@ -3637,14 +4139,11 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
     // Re-adding a registered working tree attaches it to this Space instead of
     // leaving the empty Space without a usable project.
     cx.dispatch_action(fixture.window.into(), commands::AddProject);
-    set_dialog(
-        cx,
-        fixture.window,
-        &fixture.workspace,
-        "path",
-        &project_root.to_string_lossy(),
-    );
-    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    assert!(cx.did_prompt_for_paths());
+    cx.simulate_path_prompt_response(|options| {
+        assert!(options.directories && !options.files && !options.multiple);
+        Some(vec![project_root.clone()])
+    });
     until(
         cx,
         "existing project added to second space",
@@ -3734,12 +4233,18 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
     }
 
     cx.dispatch_action(fixture.window.into(), commands::RenameSpace);
-    set_dialog(
+    update_workspace(
         cx,
         fixture.window,
         &fixture.workspace,
-        "name",
-        "Investigation",
+        |workspace, window, cx| {
+            let (target, _, input, _) = workspace.inline_rename().unwrap();
+            assert_eq!(target, crate::ui::workspace::RenameTarget::Space(research));
+            input.update(cx, |input, cx| {
+                input.set_value("Investigation".to_owned(), window, cx)
+            });
+            input.focus_handle(cx).focus(window, cx);
+        },
     );
     cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
     until(cx, "space renamed", Duration::from_secs(5), |cx| {

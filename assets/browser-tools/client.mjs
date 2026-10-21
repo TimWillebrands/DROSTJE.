@@ -21,12 +21,8 @@ export function registerBrowserTools(api, schema) {
         if (tool.name === "network" && !networkToken) {
           throw new Error("Space network requires a live runtime capability");
         }
-        // wait belongs to the current turn and is bounded by harness interruption,
-        // not the ordinary transport deadline. Never automatically retry a wait.
-        const timeout = tool.name === "network" && args.action === "wait"
-          ? undefined
-          : AbortSignal.timeout(35_000);
-        const requestSignal = signal && timeout ? AbortSignal.any([signal, timeout]) : signal || timeout;
+        const timeout = AbortSignal.timeout(35_000);
+        const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
         const response = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },

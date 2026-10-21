@@ -72,6 +72,7 @@ gpui_kit::actions!(
         ToggleAgents,
         JoinSpaceNetwork,
         LeaveSpaceNetwork,
+        ResumeNetworkDelivery,
         ShowNetworkMembers,
         ShowNetworkMessages,
         ShowThreadAgents,
@@ -190,6 +191,7 @@ pub enum Command {
     ToggleAgents,
     JoinSpaceNetwork,
     LeaveSpaceNetwork,
+    ResumeNetworkDelivery,
     ShowNetworkMembers,
     ShowNetworkMessages,
     ShowThreadAgents,
@@ -209,7 +211,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 75] = [
+    pub const ALL: [Self; 76] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -267,6 +269,7 @@ impl Command {
         Self::ToggleAgents,
         Self::JoinSpaceNetwork,
         Self::LeaveSpaceNetwork,
+        Self::ResumeNetworkDelivery,
         Self::ShowNetworkMembers,
         Self::ShowNetworkMessages,
         Self::ShowThreadAgents,
@@ -344,8 +347,9 @@ impl Command {
             Self::ToggleOutput => "Toggle output",
             Self::ToggleConversationDiffs => "Toggle conversation changes",
             Self::ToggleAgents => "Toggle agents",
-            Self::JoinSpaceNetwork => "Join network",
+            Self::JoinSpaceNetwork => "Join network (allow automatic paid turns)",
             Self::LeaveSpaceNetwork => "Leave network",
+            Self::ResumeNetworkDelivery => "Resume network delivery (allow automatic paid turns)",
             Self::ShowNetworkMembers => "Show network members",
             Self::ShowNetworkMessages => "Show network messages",
             Self::ShowThreadAgents => "Show Thread agent activity",
@@ -427,6 +431,7 @@ impl Command {
             Self::ToggleAgents => Box::new(ToggleAgents),
             Self::JoinSpaceNetwork => Box::new(JoinSpaceNetwork),
             Self::LeaveSpaceNetwork => Box::new(LeaveSpaceNetwork),
+            Self::ResumeNetworkDelivery => Box::new(ResumeNetworkDelivery),
             Self::ShowNetworkMembers => Box::new(ShowNetworkMembers),
             Self::ShowNetworkMessages => Box::new(ShowNetworkMessages),
             Self::ShowThreadAgents => Box::new(ShowThreadAgents),
@@ -551,20 +556,22 @@ impl Command {
             {
                 Some("Select a conversation first.".into())
             }
-            Self::JoinSpaceNetwork | Self::LeaveSpaceNetwork => match state.conversation_thread() {
-                None => Some("Select a Conversation first".into()),
-                Some(thread) => state.network_membership_reason(thread.id).or_else(|| {
-                    match (self, state.network_joined(thread.id)) {
-                        (Self::JoinSpaceNetwork, true) => {
-                            Some("This agent has already joined the Space network".into())
+            Self::JoinSpaceNetwork | Self::LeaveSpaceNetwork | Self::ResumeNetworkDelivery => {
+                match state.conversation_thread() {
+                    None => Some("Select a Conversation first".into()),
+                    Some(thread) => match self {
+                        Self::JoinSpaceNetwork => state.network_join_reason(thread.id),
+                        Self::ResumeNetworkDelivery => state.network_resume_reason(thread.id),
+                        Self::LeaveSpaceNetwork => {
+                            state.network_membership_reason(thread.id).or_else(|| {
+                                (!state.network_joined(thread.id))
+                                    .then(|| "This agent has not joined the Space network".into())
+                            })
                         }
-                        (Self::LeaveSpaceNetwork, false) => {
-                            Some("This agent has not joined the Space network".into())
-                        }
-                        _ => None,
-                    }
-                }),
-            },
+                        _ => unreachable!(),
+                    },
+                }
+            }
             Self::ToggleReview | Self::RefreshReview | Self::OpenPullRequest => {
                 state.pull_request_reason()
             }
@@ -898,6 +905,8 @@ pub fn bind_keys(cx: &mut App) {
             Confirm,
             Some("Input && PromptEditor && DrostjeForm && !Command && !PopupMenu"),
         ),
+        KeyBinding::new("escape", Dismiss, Some("InlineRename > Input")),
+        KeyBinding::new("secondary-enter", Confirm, Some("InlineRename > Input")),
         // A multi-line message takes Return as a newline; Cmd-Return still confirms.
         KeyBinding::new(
             "secondary-enter",
@@ -950,6 +959,7 @@ pub struct Palette {
     owner: WeakEntity<Workspace>,
     state: Entity<AppState>,
     closed: bool,
+    hosted: bool,
     spaces: Option<SpacePicker>,
     /// The Conversation whose harness commands this palette lists instead of the app's.
     slash_commands: Option<Uuid>,
@@ -1060,6 +1070,7 @@ impl Palette {
                 owner,
                 state,
                 closed: false,
+                hosted: false,
                 spaces,
                 slash_commands,
                 harnesses,
@@ -1067,8 +1078,22 @@ impl Palette {
                 _subscriptions: subscriptions,
             }
         });
-        let content = palette.clone();
-        let close_owner = palette.downgrade();
+        palette.update(cx, |palette, cx| palette.reopen(window, cx));
+        palette
+    }
+
+    pub(super) fn hosted(&self) -> bool {
+        self.hosted
+    }
+
+    /// Rehost the retained picker, including its query, selection and scroll state.
+    pub(super) fn reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closed || self.hosted {
+            return;
+        }
+        self.hosted = true;
+        let content = cx.entity();
+        let close_owner = content.downgrade();
         // Dialog's pixel-only width API is resolved at the window/rem boundary.
         let width =
             (window.rem_size() * 40.).min(window.viewport_size().width - window.rem_size() * 2.);
@@ -1083,13 +1108,29 @@ impl Palette {
                     let _ = close_owner.update(cx, |palette, cx| palette.cleanup(cx));
                 })
         });
-        let focus_owner = palette.downgrade();
+        let focus_owner = cx.entity().downgrade();
+        let host_focus = window.focused(cx);
         window.on_next_frame(move |window, cx| {
             if let Some(palette) = focus_owner.upgrade() {
-                palette.read(cx).command.focus_handle(cx).focus(window, cx);
+                let palette = palette.read(cx);
+                if palette.hosted
+                    && !palette.closed
+                    && host_focus
+                        .as_ref()
+                        .is_some_and(|focus| focus.contains_focused(window, cx))
+                {
+                    palette.command.focus_handle(cx).focus(window, cx);
+                }
             }
         });
-        palette
+    }
+
+    /// Hide only the host; cancellation of Quit must retain the live picker.
+    pub(super) fn suspend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.hosted {
+            self.hosted = false;
+            window.close_dialog(cx);
+        }
     }
 
     /// Workspace takes its retained palette before asking the native host to close.
@@ -1097,15 +1138,16 @@ impl Palette {
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.closed {
             self.closed = true;
-            window.close_dialog(cx);
+            self.suspend(window, cx);
         }
     }
 
     fn cleanup(&mut self, cx: &mut Context<Self>) {
-        if self.closed {
+        if self.closed || !self.hosted {
             return;
         }
         self.closed = true;
+        self.hosted = false;
         let id = cx.entity().entity_id();
         let _ = self.owner.update(cx, |workspace, cx| {
             if workspace
@@ -1121,7 +1163,7 @@ impl Palette {
 
     fn run(&mut self, target: PaletteTarget, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        if self.closed || self.state.read(cx).shutting_down {
+        if self.closed || !self.hosted || self.state.read(cx).shutting_down {
             return;
         }
         if let PaletteTarget::Command(command) = target
@@ -1134,6 +1176,7 @@ impl Palette {
             return;
         }
         self.closed = true;
+        self.hosted = false;
         let id = cx.entity().entity_id();
         let _ = self.owner.update(cx, |workspace, cx| {
             if !workspace
@@ -1199,7 +1242,7 @@ impl Palette {
     }
 
     fn run_space(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.closed {
+        if self.closed || !self.hosted {
             return;
         }
         let Some(picker) = &self.spaces else { return };
@@ -1208,6 +1251,7 @@ impl Palette {
         };
         let project = picker.project;
         self.closed = true;
+        self.hosted = false;
         let id = cx.entity().entity_id();
         let _ = self.owner.update(cx, |workspace, cx| {
             if !workspace
@@ -1241,10 +1285,11 @@ impl Palette {
         ) else {
             return;
         };
-        if self.closed {
+        if self.closed || !self.hosted {
             return;
         }
         self.closed = true;
+        self.hosted = false;
         let id = cx.entity().entity_id();
         let _ = self.owner.update(cx, |workspace, cx| {
             if !workspace
@@ -1270,10 +1315,11 @@ impl Palette {
         let Some(thread) = self.slash_commands else {
             return;
         };
-        if self.closed {
+        if self.closed || !self.hosted {
             return;
         }
         self.closed = true;
+        self.hosted = false;
         let id = cx.entity().entity_id();
         let _ = self.owner.update(cx, |workspace, cx| {
             if !workspace
@@ -1298,10 +1344,11 @@ impl Palette {
         else {
             return;
         };
-        if self.closed {
+        if self.closed || !self.hosted {
             return;
         }
         self.closed = true;
+        self.hosted = false;
         let id = cx.entity().entity_id();
         let _ = self.owner.update(cx, |workspace, cx| {
             if !workspace
@@ -1838,6 +1885,13 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &LeaveSpaceNetwork, w, cx| {
                 this.run(PaletteTarget::Command(Command::LeaveSpaceNetwork), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResumeNetworkDelivery, w, cx| {
+                this.run(
+                    PaletteTarget::Command(Command::ResumeNetworkDelivery),
+                    w,
+                    cx,
+                )
             }))
             .on_action(cx.listener(|this, _: &ShowNetworkMembers, w, cx| {
                 this.run(PaletteTarget::Command(Command::ShowNetworkMembers), w, cx)

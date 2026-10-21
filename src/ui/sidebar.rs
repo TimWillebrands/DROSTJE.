@@ -37,17 +37,28 @@ use std::{
 /// the same inset `TitleBar` reserves for them.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
 
-fn inline_editor(input: &Entity<InputState>, error: Option<String>, cx: &App) -> AnyElement {
+pub(super) fn inline_editor(
+    input: &Entity<InputState>,
+    error: Option<String>,
+    owner: &WeakEntity<Workspace>,
+    cx: &App,
+) -> AnyElement {
+    let cancel = owner.clone();
+    let confirm = owner.clone();
     v_flex()
+        .key_context("InlineRename NativeInput")
+        .on_action(move |_: &Dismiss, window, cx| {
+            cx.stop_propagation();
+            let _ = cancel.update(cx, |workspace, cx| workspace.cancel_rename(window, cx));
+        })
+        .on_action(move |_: &super::commands::Confirm, window, cx| {
+            cx.stop_propagation();
+            let _ = confirm.update(cx, |workspace, cx| workspace.commit_rename(window, cx));
+        })
         .min_w_0()
         .child(Input::new(input).small().appearance(false))
         .when_some(error, |view, error| {
-            view.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .child(error),
-            )
+            view.child(div().text_xs().text_color(cx.theme().danger).child(error))
         })
         .into_any_element()
 }
@@ -568,7 +579,9 @@ fn render_list(
         ..
     } = presentation;
     let theme = cx.theme();
-    let rename = owner.upgrade().and_then(|workspace| workspace.read(cx).inline_rename());
+    let rename = owner
+        .upgrade()
+        .and_then(|workspace| workspace.read(cx).inline_rename());
     let active = space == state.active_space;
     let session = state.space_session(space);
     let collapsed_projects = if active {
@@ -653,10 +666,15 @@ fn render_list(
                     project.name,
                     if project.archived { " · Archived" } else { "" }
                 );
-                let project_title = if let Some((super::workspace::RenameTarget::Project(target), super::workspace::RenameSurface::Header, input, error)) = &rename
+                let project_title = if let Some((
+                    super::workspace::RenameTarget::Project(target),
+                    super::workspace::RenameSurface::Header,
+                    input,
+                    error,
+                )) = &rename
                     && *target == id
                 {
-                    inline_editor(input, error.clone(), cx)
+                    inline_editor(input, error.clone(), owner, cx)
                 } else {
                     div().child(title.clone()).into_any_element()
                 };
@@ -701,7 +719,13 @@ fn render_list(
                                     h_flex()
                                         .gap_1()
                                         .items_center()
-                                        .child(div().flex_1().min_w_0().truncate().child(project_title))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(project_title),
+                                        )
                                         .when(error.is_some(), |view| {
                                             view.child(
                                                 Icon::new(IconName::TriangleAlert)
@@ -960,7 +984,7 @@ fn render_list(
                                         .child(if let Some((super::workspace::RenameTarget::Thread(target), super::workspace::RenameSurface::Sidebar, input, error)) = &rename
                                             && *target == id
                                         {
-                                            inline_editor(input, error.clone(), cx)
+                                            inline_editor(input, error.clone(), owner, cx)
                                         } else {
                                             div().flex_1().min_w_0().truncate().when(untouched, |label| {
                                                 label.italic().text_color(theme.muted_foreground)
@@ -1151,7 +1175,9 @@ pub(super) fn render(
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
-    let rename = owner.upgrade().and_then(|workspace| workspace.read(cx).inline_rename());
+    let rename = owner
+        .upgrade()
+        .and_then(|workspace| workspace.read(cx).inline_rename());
     let query = search.read(cx).value();
     let slide = presentation.slide;
     let list = render_list(
@@ -1183,8 +1209,12 @@ pub(super) fn render(
     let search_next_owner = owner.clone();
     let space_menu_owner = owner.clone();
     let space_title = match &rename {
-        Some((super::workspace::RenameTarget::Space(id), super::workspace::RenameSurface::Header, input, error)) if *id == state.active_space =>
-            inline_editor(input, error.clone(), cx),
+        Some((
+            super::workspace::RenameTarget::Space(id),
+            super::workspace::RenameSurface::Header,
+            input,
+            error,
+        )) if *id == state.active_space => inline_editor(input, error.clone(), owner, cx),
         _ => super::commands::button("space-switcher", Command::SwitchSpace, owner, state)
             .label(state.active_space_name().to_owned())
             .icon(IconName::ChevronDown)

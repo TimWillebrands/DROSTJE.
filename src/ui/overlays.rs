@@ -21,17 +21,15 @@ pub struct ExtensionForm {
     pub thread: ThreadId,
     pub request: UserRequest,
     pub input: Option<Entity<InputState>>,
-    error: Option<String>,
-    submitting: bool,
+    pub(super) error: Option<String>,
+    pub(super) submitting: bool,
     pub inline_answer: bool,
-
+    return_focus: Option<FocusHandle>,
 }
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum SurfaceKey {
     Image(PathBuf),
     Extension(ThreadId, String),
-    // An empty tool id identifies the thread's details.
-    Details(ThreadId, String),
 }
 
 struct DetailContent {
@@ -107,6 +105,7 @@ impl Workspace {
             error: None,
             submitting: false,
             inline_answer,
+            return_focus: window.focused(cx),
         });
         // Open before focusing the input/editor so Root remembers the actual trigger.
         if !inline_answer {
@@ -156,16 +155,32 @@ impl Workspace {
             error: None,
             submitting: false,
             inline_answer: true,
+            return_focus: window.focused(cx),
         });
         input.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    pub fn back_from_custom_answer(&mut self, thread: ThreadId, request_id: &str, cx: &mut Context<Self>) {
-        if self.extension.as_ref().is_some_and(|form| {
-            form.inline_answer && form.thread == thread && form.request.id == request_id
-        }) {
-            self.extension = None;
+    pub fn back_from_custom_answer(
+        &mut self,
+        thread: ThreadId,
+        request_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.extension_busy(cx)
+            && self.extension.as_ref().is_some_and(|form| {
+                form.inline_answer && form.thread == thread && form.request.id == request_id
+            })
+        {
+            let focus = self
+                .extension
+                .as_ref()
+                .and_then(|form| form.return_focus.clone());
+            self.clear_extension(false, cx);
+            if let Some(focus) = focus {
+                focus.focus(window, cx);
+            }
             cx.notify();
         }
     }
@@ -230,6 +245,7 @@ impl Workspace {
         }
         let result = editor.update(cx, |editor, cx| editor.snapshot(&key, window, cx));
         form.submitting = true;
+        form.error = None;
         cx.notify();
         cx.spawn_in(window, async move |workspace, window| {
             let result = result.await;
@@ -284,69 +300,66 @@ impl Workspace {
         {
             return false;
         }
-        match self.detail_surface.take() {
-            Some(SurfaceKey::Details(..)) => window.close_sheet(cx),
-            Some(_) => window.close_dialog(cx),
-            None => {}
+        if self.detail_surface.take().is_some() {
+            window.close_dialog(cx);
         }
         true
     }
 
-    pub(super) fn sync_detail_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // An outstanding answer is exclusive; detail actions cannot abandon its input.
-        if self.extension.is_some() {
-            self.image_preview = None;
-            self.tool_detail = None;
-        }
-        // A preview temporarily replaces the inspector; keep its selected target so closing
-        // the preview can restore the same Details surface.
-        let key = if let Some(form) = &self.extension {
-            if form.inline_answer || self.image_preview.is_some() {
-                None
-            } else {
-                Some(SurfaceKey::Extension(form.thread, form.request.id.clone()))
-            }
-        } else if let Some(image) = &self.image_preview {
-            Some(SurfaceKey::Image(image.path.clone()))
-        } else {
-            self.tool_detail
-                .as_ref()
-                .map(|(thread, tool)| SurfaceKey::Details(*thread, tool.clone()))
-        };
-        if self.detail_surface == key && !matches!(key, Some(SurfaceKey::Details(..))) {
+    pub(super) fn open_details(
+        &mut self,
+        thread: ThreadId,
+        tool: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .extension
+            .as_ref()
+            .is_some_and(|form| !form.inline_answer)
+            || !self.close_detail_surface(window, cx)
+        {
             return;
         }
-        let restore_details = self.image_preview.as_ref().and(self.tool_detail.clone());
+        self.image_preview = None;
+        self.tool_detail = Some((thread, tool));
+        if let Some(palette) = self.palette.take() {
+            palette.update(cx, |palette, cx| palette.dismiss(window, cx));
+        }
+        if let Some(dialog) = self.dialog.as_ref() {
+            let (kind, hosted) = {
+                let dialog = dialog.read(cx);
+                (dialog.kind.clone(), dialog.hosted())
+            };
+            if hosted {
+                dialog.update(cx, |dialog, cx| dialog.unhost(cx));
+                super::settings::close_surface(&kind, window, cx);
+            }
+        }
+        self.state.update(cx, |state, cx| {
+            state.show_thread_sidebar(thread, crate::app::SidebarTab::Details);
+            cx.emit(crate::app::PresentationChange::Thread(thread));
+        });
+        cx.notify();
+    }
+
+    pub(super) fn sync_detail_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = if let Some(form) = self.extension.as_ref().filter(|form| !form.inline_answer) {
+            Some(SurfaceKey::Extension(form.thread, form.request.id.clone()))
+        } else {
+            self.image_preview
+                .as_ref()
+                .map(|image| SurfaceKey::Image(image.path.clone()))
+        };
+        if self.detail_surface == key {
+            return;
+        }
         if !self.close_detail_surface(window, cx) {
             return;
-        }
-        if self.tool_detail.is_none() {
-            self.tool_detail = restore_details;
         }
         let Some(key) = key else {
             return;
         };
-        if let SurfaceKey::Details(thread, _) = key {
-            if let Some(palette) = self.palette.take() {
-                palette.update(cx, |palette, cx| palette.dismiss(window, cx));
-            }
-            if let Some(dialog) = self.dialog.as_ref() {
-                let (kind, hosted) = {
-                    let dialog = dialog.read(cx);
-                    (dialog.kind.clone(), dialog.hosted())
-                };
-                if hosted {
-                    super::settings::close_surface(&kind, window, cx);
-                }
-            }
-            self.state.update(cx, |state, cx| {
-                state.show_thread_sidebar(thread, crate::app::SidebarTab::Details);
-                cx.emit(crate::app::PresentationChange::Thread(thread));
-            });
-            self.detail_surface = None;
-            cx.notify();
-            return;
-        }
         // Other application hosts must close before this one captures trigger focus.
         if let Some(palette) = self.palette.take() {
             palette.update(cx, |palette, cx| palette.dismiss(window, cx));
@@ -357,6 +370,7 @@ impl Workspace {
                 (dialog.kind.clone(), dialog.hosted())
             };
             if hosted {
+                dialog.update(cx, |dialog, cx| dialog.unhost(cx));
                 super::settings::close_surface(&kind, window, cx);
             }
         }
@@ -373,9 +387,7 @@ impl Workspace {
                     &state,
                     |content, _, change: &crate::app::PresentationChange, cx| {
                         let thread = match &content.key {
-                            SurfaceKey::Extension(thread, _) | SurfaceKey::Details(thread, _) => {
-                                Some(*thread)
-                            }
+                            SurfaceKey::Extension(thread, _) => Some(*thread),
                             SurfaceKey::Image(_) => None,
                         };
                         if matches!(change, crate::app::PresentationChange::Thread(id)
@@ -389,98 +401,84 @@ impl Workspace {
             ],
         });
         self.detail_surface = Some(key.clone());
-        match key {
-            SurfaceKey::Details(..) => {
-                window.open_sheet(cx, move |sheet, window, cx| {
-                    let close = owner.clone();
-                    let key = content.read(cx).key.clone();
-                    let width = (window.rem_size() * 42.).min(window.viewport_size().width);
-                    sheet
-                        .title("Details")
-                        .size(width)
-                        .child(content.clone())
-                        .on_close(move |_, window, cx| {
-                            let _ = close.update(cx, |workspace, cx| {
-                                workspace.detail_closed(&key, window, cx)
-                            });
-                        })
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let key = content.read(cx).key.clone();
+            let cancel = owner.clone();
+            let close = owner.clone();
+            let current = owner.upgrade();
+            let workspace = current.as_ref().map(|owner| owner.read(cx));
+            let extension = workspace
+                .and_then(|workspace| workspace.extension.as_ref())
+                .filter(|form| {
+                    matches!(&key, SurfaceKey::Extension(thread, request)
+                    if form.thread == *thread && form.request.id == *request)
                 });
-            }
-            _ => {
-                window.open_dialog(cx, move |dialog, window, cx| {
-                    let key = content.read(cx).key.clone();
-                    let cancel = owner.clone();
-                    let close = owner.clone();
-                    let current = owner.upgrade();
-                    let workspace = current.as_ref().map(|owner| owner.read(cx));
-                    let extension = workspace.and_then(|workspace| workspace.extension.as_ref());
-                    let title = extension
-                        .map(|form| form.request.title.clone())
-                        .unwrap_or_else(|| "Image preview".into());
-                    let preferred = if extension.is_some() { 46. } else { 64. };
-                    let width = (window.rem_size() * preferred)
-                        .min(window.viewport_size().width - window.rem_size() * 2.);
-                    let mut dialog = dialog.title(title).width(width).child(content.clone());
-                    if extension.is_some() {
-                        let answer = owner.clone();
-                        let answer_key = key.clone();
-                        dialog = dialog.on_ok(move |_, window, cx| {
-                            let _ = answer.update(cx, |workspace, cx| {
-                                if workspace.detail_surface.as_ref() == Some(&answer_key) {
-                                    workspace.confirm_extension(window, cx);
-                                }
-                            });
-                            false
-                        });
-                        let busy = workspace.is_some_and(|workspace| workspace.extension_busy(cx));
-                        let confirm = owner.clone();
-                        let cancel_button = owner.clone();
-                        dialog = dialog.overlay_closable(false).footer(
-                            h_flex()
-                                .justify_end()
-                                .gap_2()
-                                .child(
-                                    Button::new("cancel-extension")
-                                        .label("Cancel")
-                                        .disabled(busy)
-                                        .on_click(move |_, window, cx| {
-                                            let _ = cancel_button.update(cx, |workspace, cx| {
-                                                workspace.close_extension(true, window, cx)
-                                            });
-                                        }),
+            let title = extension
+                .map(|form| form.request.title.clone())
+                .unwrap_or_else(|| "Image preview".into());
+            let preferred = if extension.is_some() { 46. } else { 64. };
+            let width = (window.rem_size() * preferred)
+                .min(window.viewport_size().width - window.rem_size() * 2.);
+            let mut dialog = dialog.title(title).width(width).child(content.clone());
+            if extension.is_some() {
+                let answer = owner.clone();
+                let answer_key = key.clone();
+                dialog = dialog.on_ok(move |_, window, cx| {
+                    let _ = answer.update(cx, |workspace, cx| {
+                        if workspace.detail_surface.as_ref() == Some(&answer_key) {
+                            workspace.confirm_extension(window, cx);
+                        }
+                    });
+                    false
+                });
+                let busy = workspace.is_some_and(|workspace| workspace.extension_busy(cx));
+                let confirm = owner.clone();
+                let cancel_button = owner.clone();
+                dialog = dialog.overlay_closable(false).footer(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("cancel-extension")
+                                .label("Cancel")
+                                .disabled(busy)
+                                .on_click(move |_, window, cx| {
+                                    let _ = cancel_button.update(cx, |workspace, cx| {
+                                        workspace.close_extension(true, window, cx)
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("confirm-extension")
+                                .primary()
+                                .label("Send answer")
+                                .loading(extension.is_some_and(|form| form.submitting))
+                                .disabled(
+                                    busy || workspace.is_some_and(|workspace| {
+                                        workspace.editor_override.is_some()
+                                            && workspace.editor.is_none()
+                                    }),
                                 )
-                                .child(
-                                    Button::new("confirm-extension")
-                                        .primary()
-                                        .label("Send answer")
-                                        .disabled(
-                                            busy || workspace.is_some_and(|workspace| {
-                                                workspace.editor_override.is_some()
-                                                    && workspace.editor.is_none()
-                                            }),
-                                        )
-                                        .on_click(move |_, window, cx| {
-                                            let _ = confirm.update(cx, |workspace, cx| {
-                                                workspace.confirm_extension(window, cx)
-                                            });
-                                        }),
-                                ),
-                        );
-                    }
-                    dialog
-                        .on_cancel(move |_, _, cx| {
-                            cancel
-                                .upgrade()
-                                .is_none_or(|owner| !owner.read(cx).extension_busy(cx))
-                        })
-                        .on_close(move |_, window, cx| {
-                            let _ = close.update(cx, |workspace, cx| {
-                                workspace.detail_closed(&key, window, cx)
-                            });
-                        })
-                });
+                                .on_click(move |_, window, cx| {
+                                    let _ = confirm.update(cx, |workspace, cx| {
+                                        workspace.confirm_extension(window, cx)
+                                    });
+                                }),
+                        ),
+                );
             }
-        }
+            dialog
+                .on_cancel(move |_, _, cx| {
+                    cancel
+                        .upgrade()
+                        .is_none_or(|owner| !owner.read(cx).extension_busy(cx))
+                })
+                .on_close(move |_, window, cx| {
+                    let _ = close.update(cx, |workspace, cx| {
+                        workspace.detail_closed(&key, window, cx)
+                    });
+                })
+        });
     }
 
     // Native user dismissal already pops/restores focus: do application cleanup only.
@@ -494,9 +492,8 @@ impl Workspace {
                 self.image_preview = None;
                 self.sync_detail_surface(window, cx);
             }
-            SurfaceKey::Details(..) => self.tool_detail = None,
             SurfaceKey::Extension(..) => {
-                self.clear_extension(true, cx);
+                self.clear_extension(false, cx);
                 self.sync_session(window, cx);
             }
         }
@@ -585,7 +582,6 @@ impl Render for DetailContent {
                 }
                 body.into_any_element()
             }
-            SurfaceKey::Details(thread, tool) => self.details(workspace, *thread, tool, cx),
         }
     }
 }
@@ -597,20 +593,15 @@ pub(super) fn render_details(
     owner: &WeakEntity<Workspace>,
     cx: &App,
 ) -> AnyElement {
-    DetailContent {
-        owner: owner.clone(),
-        key: SurfaceKey::Details(thread_id, tool_id.to_owned()),
-        _subscriptions: Vec::new(),
-    }
-    .details(workspace, thread_id, tool_id, cx)
+    DetailContent::details(workspace, thread_id, tool_id, owner, cx)
 }
 
 impl DetailContent {
     fn details(
-        &self,
         workspace: &Workspace,
         thread_id: ThreadId,
         tool_id: &str,
+        owner: &WeakEntity<Workspace>,
         cx: &App,
     ) -> AnyElement {
         let state = workspace.state.read(cx);
@@ -685,7 +676,7 @@ impl DetailContent {
                 body = body.child(super::conversation::block(
                     block,
                     format!("tool:{thread_id}:{tool_id}:{index}"),
-                    &self.owner,
+                    owner,
                     super::conversation::Markdown::Element,
                     cx,
                 ));
@@ -697,7 +688,14 @@ impl DetailContent {
                 } else {
                     String::new()
                 };
-                body = body.child(self.disclosure(workspace, identity, "Raw tool data", text, cx));
+                body = body.child(Self::disclosure(
+                    workspace,
+                    identity,
+                    "Raw tool data",
+                    text,
+                    owner,
+                    cx,
+                ));
             }
             return body.into_any_element();
         }
@@ -728,7 +726,7 @@ impl DetailContent {
         for (index, (url, instructions)) in session.links.iter().enumerate() {
             if url.starts_with("https://") || url.starts_with("http://") {
                 let url = url.clone();
-                let owner = self.owner.clone();
+                let owner = owner.clone();
                 body = body.child(
                     Button::new(("session-link", index))
                         .ghost()
@@ -744,7 +742,7 @@ impl DetailContent {
             }
         }
         for (index, tool) in session.tools.values().enumerate() {
-            let owner = self.owner.clone();
+            let owner = owner.clone();
             let tool_id = tool.id.clone();
             let summary = super::conversation::tool_summary(&tool.name, &tool.input);
             body = body.child(
@@ -767,9 +765,7 @@ impl DetailContent {
                     })
                     .on_click(move |_, window, cx| {
                         let _ = owner.update(cx, |workspace, cx| {
-                            workspace.tool_detail = Some((thread_id, tool_id.clone()));
-                            workspace.sync_detail_surface(window, cx);
-                            cx.notify();
+                            workspace.open_details(thread_id, tool_id.clone(), window, cx);
                         });
                     }),
             );
@@ -786,11 +782,12 @@ impl DetailContent {
             } else {
                 String::new()
             };
-            body = body.child(self.disclosure(
+            body = body.child(Self::disclosure(
                 workspace,
                 identity,
                 "Raw diagnostics / unknown data",
                 diagnostics,
+                owner,
                 cx,
             ));
         }
@@ -798,15 +795,15 @@ impl DetailContent {
     }
 
     fn disclosure(
-        &self,
         workspace: &Workspace,
         identity: String,
         label: &str,
         text: String,
+        owner: &WeakEntity<Workspace>,
         cx: &App,
     ) -> AnyElement {
         let expanded = workspace.expanded.contains(&identity);
-        let owner = self.owner.clone();
+        let owner = owner.clone();
         v_flex()
             .gap_2()
             .child(

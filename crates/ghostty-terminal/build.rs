@@ -29,6 +29,7 @@ const LINUX_GHOSTTY_BUILD_OPTIONS: &[&str] = &["-Drenderer=opengl", "-Dcpu=basel
 fn main() {
     println!("cargo:rerun-if-changed=shim/ghostty_surface.m");
     println!("cargo:rerun-if-changed=shim/ghostty_surface_linux.c");
+    println!("cargo:rerun-if-changed=shim/process_activity.h");
     println!("cargo:rerun-if-changed=vendor/ghostty");
     println!("cargo:rerun-if-env-changed=GHOSTTY_NATIVE_CACHE_DIR");
     println!("cargo:rerun-if-env-changed=GHOSTTY_ZIG_PACKAGE_CACHE_DIR");

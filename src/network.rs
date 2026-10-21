@@ -1,9 +1,8 @@
-//! Durable, opt-in messaging between Conversations in the same Space.
+//! Durable, explicitly authorized peer delivery within a Space.
 //!
-//! Runtime capabilities never enter the persisted snapshot. The actor serializes
-//! authorization and mutations; only a successful Store commit publishes state.
-//! Waits are runtime-only notifications: the actor remains available for sends,
-//! and callers must explicitly retrieve mail with inbox after being notified.
+//! Runtime capabilities never enter the saved snapshot. Claims commit before the
+//! host receives them; uncertain attempts are never retried. A receipt denotes
+//! native queue acceptance, not that a model read or acted on a message.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -21,11 +20,9 @@ pub const MAX_MEMBERS: usize = 256;
 pub const MAX_MESSAGES: usize = 256;
 pub const MAX_PENDING: usize = 1024;
 pub const MAX_PENDING_PER_RECIPIENT: usize = 128;
-pub const MAX_WAITERS: usize = 32;
+pub const MAX_BATCH_BYTES: usize = 64 * 1024;
 const MAX_CONTEXT_BYTES: usize = 8192;
-// Leave transport-envelope headroom under the tool bridge's 1 MiB limit.
 const MAX_RESPONSE_BYTES: usize = 384 * 1024;
-const MAX_INBOX_BYTES: usize = 256 * 1024;
 
 type Reply<T> = Sender<Result<T>>;
 
@@ -45,6 +42,9 @@ pub struct Peer {
     pub status: String,
     pub token: Option<Uuid>,
     pub eligible: bool,
+    pub delivery_enabled: bool,
+    /// Temporary readiness, independent of consent or runtime authorization.
+    pub can_receive: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,9 +52,6 @@ pub struct Peer {
 pub struct NetworkSnapshot {
     pub members: Vec<Member>,
     pub messages: Vec<NetworkMessage>,
-    /// Runtime-only parked calls; waiting never acknowledges mailbox contents.
-    #[serde(skip)]
-    pub waiting: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -70,6 +67,10 @@ pub struct Member {
     pub harness: String,
     pub status: String,
     pub online: bool,
+    #[serde(default)]
+    pub automatic: bool,
+    #[serde(default)]
+    pub delivery_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,11 +91,37 @@ pub struct NetworkMessage {
 pub struct Delivery {
     pub recipient: Uuid,
     pub recipient_name: String,
-    pub retrieved: bool,
-    /// A terminal, non-retrieved delivery, e.g. "left", "moved", "unavailable".
-    /// Closing is distinct from retrieval and prevents leave/rejoin redelivery.
+    pub state: DeliveryState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closed: Option<String>,
+    pub attempt: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DeliveryState {
+    Queued,
+    Delivering,
+    Delivered,
+    Failed { reason: String },
+    Unknown { reason: String },
+    Closed { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryBatch {
+    pub attempt: Uuid,
+    pub recipient: Uuid,
+    pub messages: Vec<NetworkMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    Delivered,
+    Failed(String),
+    Unknown(String),
+    /// The host has not issued any native write; retry only when readiness changes.
+    Deferred,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,49 +130,62 @@ pub enum Action {
     Members,
     Send { recipient: Uuid, body: String },
     Broadcast { body: String },
-    Inbox,
-    Wait,
 }
 
 enum Command {
     Sync(Vec<Peer>, Reply<()>),
     SetJoined(Uuid, bool, Reply<()>),
     Barrier(Reply<()>),
-    Call(Uuid, Action, Receiver<()>, Reply<Value>),
-    CancelWait { thread: Uuid, id: Uuid },
+    Call(Uuid, Action, Reply<Value>),
+    Claim(Uuid, Reply<Option<DeliveryBatch>>),
+    Finish(Uuid, DeliveryOutcome, Reply<()>),
 }
 
 impl Network {
     pub fn start(store: Store, saved: Option<&Value>) -> Result<(Self, Receiver<NetworkSnapshot>)> {
-        let mut snapshot: NetworkSnapshot = match saved {
-            Some(value) => serde_json::from_value(value.clone()).context("Read Space network")?,
+        let mut snapshot = match saved {
+            Some(value) => read_saved(value)?,
             None => NetworkSnapshot::default(),
         };
         validate_snapshot(&snapshot).context("Invalid saved Space network")?;
-        // A persisted online bit is not proof of a runtime in this process.
         for member in &mut snapshot.members {
             member.online = false;
+            member.delivery_enabled = false;
             member.status = "Offline".into();
         }
+        for delivery in snapshot
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.deliveries)
+        {
+            if delivery.state == DeliveryState::Delivering {
+                delivery.state = DeliveryState::Unknown {
+                    reason: "Application restarted before delivery receipt".into(),
+                };
+            }
+        }
         snapshot.error = None;
+        let startup_write = saved
+            .map(|value| serde_json::to_value(&snapshot).map(|normalized| normalized != *value))
+            .transpose()?
+            .unwrap_or(false);
         let (commands, requests) = async_channel::bounded(64);
-        // Coalesce complete snapshots instead of retaining an unbounded UI backlog.
         let (updates, receiver) = async_channel::bounded(1);
         let pending_updates = receiver.clone();
-        updates
-            .try_send(snapshot.clone())
-            .map_err(|_| anyhow!("Initialize Space network snapshot channel"))?;
-        let (cancellations, cancelled) = async_channel::unbounded();
+        // Migration must commit before publication or processing any command.
+        if !startup_write {
+            updates
+                .try_send(snapshot.clone())
+                .map_err(|_| anyhow!("Initialize Space network snapshot channel"))?;
+        }
         let actor = Actor {
             store,
             snapshot,
             peers: BTreeMap::new(),
             updates,
             pending_updates,
-            waits: BTreeMap::new(),
-            cancellations,
         };
-        smol::spawn(actor.run(requests, cancelled)).detach();
+        smol::spawn(actor.run(requests, startup_write)).detach();
         Ok((Self { commands }, receiver))
     }
 
@@ -153,42 +193,31 @@ impl Network {
         self.request(|reply| Command::Sync(peers, reply)).await
     }
 
+    /// Explicit Join or Resume records consent, including for legacy members.
     pub async fn set_joined(&self, thread: Uuid, joined: bool) -> Result<()> {
         self.request(|reply| Command::SetJoined(thread, joined, reply))
             .await
     }
 
-    /// Finish processing earlier commands without waiting for parked calls.
     pub async fn flush(&self) -> Result<()> {
         self.request(Command::Barrier).await
     }
 
-    /// Enqueue in actor order without waiting for a parked call to complete.
-    pub async fn begin_call(
-        &self,
-        token: Uuid,
-        action: Action,
-        cancelled: Receiver<()>,
-    ) -> Result<Receiver<Result<Value>>> {
-        let (reply, response) = async_channel::bounded(1);
-        self.commands
-            .send(Command::Call(token, action, cancelled, reply))
+    pub async fn call(&self, token: Uuid, action: Action) -> Result<Value> {
+        self.request(|reply| Command::Call(token, action, reply))
             .await
-            .map_err(|_| anyhow!("Space network is unavailable"))?;
-        Ok(response)
     }
 
-    pub async fn call(&self, token: Uuid, action: Action) -> Result<Value> {
-        // Keep the sender alive until completion. Dropping this future closes the
-        // channel, including while begin_call is waiting for queue capacity.
-        let (cancellation, cancelled) = async_channel::bounded(1);
-        let response = self.begin_call(token, action, cancelled).await?;
-        let result = response
-            .recv()
+    /// Lease queued mail to an authorized runtime, durably before return.
+    pub async fn claim(&self, token: Uuid) -> Result<Option<DeliveryBatch>> {
+        self.request(|reply| Command::Claim(token, reply)).await
+    }
+
+    /// Host-only receipt. Only confirmed acceptance may resolve Unknown later;
+    /// final outcomes and unrelated attempts are never overwritten.
+    pub async fn finish(&self, attempt: Uuid, outcome: DeliveryOutcome) -> Result<()> {
+        self.request(|reply| Command::Finish(attempt, outcome, reply))
             .await
-            .map_err(|_| anyhow!("Space network stopped before replying"))?;
-        drop(cancellation);
-        result
     }
 
     async fn request<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T> {
@@ -210,36 +239,26 @@ struct Actor {
     peers: BTreeMap<Uuid, Peer>,
     updates: Sender<NetworkSnapshot>,
     pending_updates: Receiver<NetworkSnapshot>,
-    waits: BTreeMap<Uuid, PendingWait>,
-    cancellations: Sender<Command>,
-}
-
-struct PendingWait {
-    id: Uuid,
-    token: Uuid,
-    cancelled: Receiver<()>,
-    reply: Reply<Value>,
-    // Dropping a completed/cancelled waiter also cancels its closure watcher.
-    _watch: smol::Task<()>,
 }
 
 impl Actor {
-    async fn run(mut self, requests: Receiver<Command>, cancelled: Receiver<Command>) {
-        loop {
-            // Cancellation has its own queue so watchers neither keep the public
-            // command channel alive nor compete with sends for bounded capacity.
-            let command = smol::future::or(cancelled.recv(), requests.recv()).await;
-            let Ok(command) = command else {
-                self.cancel_all("Space network shut down");
-                break;
+    async fn run(mut self, requests: Receiver<Command>, startup_write: bool) {
+        if startup_write {
+            // commit skips equal snapshots, so migration writes directly.
+            let result = match serde_json::to_value(&self.snapshot) {
+                Ok(value) => self.store.set_setting(SETTING.into(), value).await,
+                Err(error) => Err(error.into()),
             };
+            if let Err(error) = result {
+                self.disable(&error);
+            } else {
+                self.publish();
+            }
+        }
+        while let Ok(command) = requests.recv().await {
             match command {
                 Command::Sync(peers, reply) => {
-                    let result = self.sync(peers).await;
-                    if result.is_err() {
-                        self.cancel_all("Space network context synchronization failed");
-                    }
-                    let _ = reply.try_send(result);
+                    let _ = reply.try_send(self.sync(peers).await);
                 }
                 Command::SetJoined(thread, joined, reply) => {
                     let _ = reply.try_send(self.set_joined(thread, joined).await);
@@ -247,147 +266,20 @@ impl Actor {
                 Command::Barrier(reply) => {
                     let _ = reply.try_send(self.healthy());
                 }
-                Command::Call(token, Action::Wait, cancelled, reply) => {
-                    self.begin_wait(token, cancelled, reply);
+                Command::Call(token, action, reply) => {
+                    let _ = reply.try_send(self.call(token, action).await);
                 }
-                Command::Call(token, action, cancelled, reply) => {
-                    let result = if cancelled.is_closed() {
-                        Err(anyhow!("Space network call cancelled"))
-                    } else {
-                        self.call(token, action).await
-                    };
-                    let _ = reply.try_send(result);
+                Command::Claim(token, reply) => {
+                    let _ = reply.try_send(self.claim(token).await);
                 }
-                Command::CancelWait { thread, id } => {
-                    if self.waits.get(&thread).is_some_and(|wait| wait.id == id) {
-                        self.finish_wait(thread, Err(anyhow!("Space network wait cancelled")));
-                        self.publish();
-                    }
+                Command::Finish(attempt, outcome, reply) => {
+                    let _ = reply.try_send(self.finish(attempt, outcome).await);
                 }
             }
         }
-    }
-
-    fn begin_wait(&mut self, token: Uuid, cancelled: Receiver<()>, reply: Reply<Value>) {
-        let prepare = || -> Result<(Uuid, usize)> {
-            ensure!(!cancelled.is_closed(), "Space network wait cancelled");
-            let caller = self.caller(token)?;
-            ensure!(
-                !self.waits.contains_key(&caller.thread),
-                "Conversation already has a live Space network wait"
-            );
-            let pending = pending_count(&self.snapshot, caller);
-            ensure!(
-                pending > 0 || self.waits.len() < MAX_WAITERS,
-                "Space network wait capacity reached ({MAX_WAITERS})"
-            );
-            Ok((caller.thread, pending))
-        };
-        let (thread, pending) = match prepare() {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = reply.try_send(Err(error));
-                return;
-            }
-        };
-        if pending > 0 {
-            let result = if cancelled.is_closed() {
-                Err(anyhow!("Space network wait cancelled"))
-            } else {
-                Ok(json!({"ready": true, "pending": pending}))
-            };
-            let _ = reply.try_send(result);
-            return;
-        }
-        let id = Uuid::new_v4();
-        let watch_cancelled = cancelled.clone();
-        let cancellations = self.cancellations.clone();
-        let watch = smol::spawn(async move {
-            let _ = watch_cancelled.recv().await;
-            let _ = cancellations.try_send(Command::CancelWait { thread, id });
-        });
-        self.waits.insert(
-            thread,
-            PendingWait {
-                id,
-                token,
-                cancelled,
-                reply,
-                _watch: watch,
-            },
-        );
-        self.snapshot.waiting = self.waits.keys().copied().collect();
-        self.publish();
-    }
-
-    fn finish_wait(&mut self, thread: Uuid, result: Result<Value>) {
-        if let Some(wait) = self.waits.remove(&thread) {
-            let result = if result.is_ok() && wait.cancelled.is_closed() {
-                Err(anyhow!("Space network wait cancelled"))
-            } else {
-                result
-            };
-            let _ = wait.reply.try_send(result);
-            self.snapshot.waiting.retain(|waiting| *waiting != thread);
-        }
-    }
-
-    fn cancel_all(&mut self, reason: &str) {
-        if self.waits.is_empty() {
-            return;
-        }
-        for (_, wait) in std::mem::take(&mut self.waits) {
-            let _ = wait.reply.try_send(Err(anyhow!("{reason}")));
-        }
-        self.snapshot.waiting.clear();
-        self.publish();
-    }
-
-    fn cancel_invalid_waits(&mut self) {
-        let invalid = self
-            .waits
-            .iter()
-            .filter_map(|(thread, wait)| {
-                (wait.cancelled.is_closed() || self.caller(wait.token).is_err()).then_some(*thread)
-            })
-            .collect::<Vec<_>>();
-        if invalid.is_empty() {
-            return;
-        }
-        for thread in invalid {
-            self.finish_wait(
-                thread,
-                Err(anyhow!("Space network wait cancelled: runtime unavailable")),
-            );
-        }
-        self.publish();
-    }
-
-    fn wake_waits(&mut self) {
-        // Cancellation is checked again after Store I/O, even if its watcher
-        // command is still queued. Never wake an expired runtime capability.
-        self.cancel_invalid_waits();
-        let ready = self
-            .waits
-            .iter()
-            .filter_map(|(thread, wait)| {
-                let caller = self.caller(wait.token).ok()?;
-                let pending = pending_count(&self.snapshot, caller);
-                (pending > 0).then_some((*thread, pending))
-            })
-            .collect::<Vec<_>>();
-        if ready.is_empty() {
-            return;
-        }
-        for (thread, pending) in ready {
-            self.finish_wait(thread, Ok(json!({"ready": true, "pending": pending})));
-        }
-        self.publish();
     }
 
     fn publish(&self) {
-        // There is only one producer. The consumer may race this drain, but cannot
-        // fill the slot, so the following try_send always has room.
         let _ = self.pending_updates.try_recv();
         let _ = self.updates.try_send(self.snapshot.clone());
     }
@@ -399,6 +291,18 @@ impl Actor {
         Ok(())
     }
 
+    fn disable(&mut self, error: &anyhow::Error) {
+        self.peers.clear();
+        for member in &mut self.snapshot.members {
+            member.online = false;
+            member.delivery_enabled = false;
+        }
+        self.snapshot.error = Some(format!(
+            "{error:#}. Restore writable storage, then reopen the application"
+        ));
+        self.publish();
+    }
+
     async fn commit(&mut self, next: NetworkSnapshot) -> Result<()> {
         self.healthy()?;
         if next == self.snapshot {
@@ -406,17 +310,7 @@ impl Actor {
         }
         let value = serde_json::to_value(&next).context("Encode Space network")?;
         if let Err(error) = self.store.set_setting(SETTING.into(), value).await {
-            // Keep the last committed history, revoke every capability, and do not
-            // pretend a failed invalidation or acknowledgement was durable.
-            self.peers.clear();
-            for member in &mut self.snapshot.members {
-                member.online = false;
-            }
-            self.snapshot.error = Some(format!(
-                "{error:#}. Restore writable storage, then reopen the application"
-            ));
-            self.cancel_all("Space network wait cancelled after persistence failure");
-            self.publish();
+            self.disable(&error);
             return Err(error.context("Persist Space network; network disabled"));
         }
         self.snapshot = next;
@@ -425,56 +319,78 @@ impl Actor {
     }
 
     async fn sync(&mut self, peers: Vec<Peer>) -> Result<()> {
-        // Revoke the old context before validation or awaiting any Store I/O.
-        // In particular, a failed move/archive write cannot leave an old token live.
-        self.peers.clear();
+        // Revoke the old context before validation or Store I/O.
+        let previous = std::mem::take(&mut self.peers);
         self.healthy()?;
-        let mut tokens = HashSet::new();
-        let mut contexts = BTreeMap::new();
-        for peer in peers {
-            validate_context(
-                &peer.title,
-                &peer.project,
-                &peer.worktree,
-                &peer.harness,
-                &peer.status,
-            )?;
-            if let Some(token) = peer.token {
+        let contexts = (|| -> Result<BTreeMap<Uuid, Peer>> {
+            let mut tokens = HashSet::new();
+            let mut contexts = BTreeMap::new();
+            for peer in peers {
+                validate_context(
+                    &peer.title,
+                    &peer.project,
+                    &peer.worktree,
+                    &peer.harness,
+                    &peer.status,
+                )?;
+                if let Some(token) = peer.token {
+                    ensure!(
+                        tokens.insert(token),
+                        "Duplicate Space network runtime capability"
+                    );
+                }
                 ensure!(
-                    tokens.insert(token),
-                    "Duplicate Space network runtime capability"
+                    contexts.insert(peer.thread, peer).is_none(),
+                    "Duplicate Space network thread context"
                 );
             }
-            let thread = peer.thread;
-            ensure!(
-                contexts.insert(thread, peer).is_none(),
-                "Duplicate Space network thread context"
-            );
-        }
-        self.peers = contexts;
-        self.cancel_invalid_waits();
+            Ok(contexts)
+        })();
+        let contexts = match contexts {
+            Ok(contexts) => contexts,
+            Err(error) => {
+                let mut next = self.snapshot.clone();
+                for member in &mut next.members {
+                    member.online = false;
+                    member.delivery_enabled = false;
+                    revoke_attempts(
+                        &mut next.messages,
+                        member.thread,
+                        "Runtime context invalidated",
+                    );
+                }
+                self.commit(next).await?;
+                return Err(error);
+            }
+        };
         let membership_changed = self.snapshot.members.iter().any(|member| {
-            self.peers
+            contexts
                 .get(&member.thread)
                 .is_none_or(|peer| !peer.eligible || peer.space != member.space)
         });
-        if !membership_changed {
-            // Presence is runtime state. Do not copy or rewrite mailbox history on
-            // every tool request or busy/idle transition.
+        let revoked_attempt = self
+            .snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.deliveries)
+            .any(|delivery| {
+                delivery.state == DeliveryState::Delivering
+                    && contexts.get(&delivery.recipient).is_none_or(|peer| {
+                        peer.token.is_none()
+                            || !peer.delivery_enabled
+                            || previous
+                                .get(&delivery.recipient)
+                                .is_none_or(|old| old.token != peer.token)
+                    })
+            });
+        if !membership_changed && !revoked_attempt {
+            // Presence is runtime state. Busy/idle/readiness syncs must not copy
+            // or rewrite durable mailbox history.
             let mut changed = false;
             for member in &mut self.snapshot.members {
-                if let Some(peer) = self.peers.get(&member.thread)
-                    && (member.title != peer.title
-                        || member.project != peer.project
-                        || member.worktree != peer.worktree
-                        || member.harness != peer.harness
-                        || member.status != peer.status
-                        || member.online != peer.token.is_some())
-                {
-                    *member = Member::from(peer);
-                    changed = true;
-                }
+                changed |= member.refresh(&contexts[&member.thread]);
             }
+            self.peers = contexts;
             if changed {
                 self.publish();
             }
@@ -482,28 +398,40 @@ impl Actor {
         }
         let mut next = self.snapshot.clone();
         next.members.retain_mut(|member| {
-            let reason = match self.peers.get(&member.thread) {
-                Some(peer) if peer.eligible && peer.space == member.space => {
-                    *member = Member::from(peer);
-                    return true;
+            let peer = match contexts.get(&member.thread) {
+                Some(peer) if peer.eligible && peer.space == member.space => peer,
+                Some(peer) if peer.space != member.space => {
+                    close_deliveries(&mut next.messages, member.thread, "moved");
+                    return false;
                 }
-                Some(peer) if peer.space != member.space => "moved",
-                _ => "unavailable",
+                _ => {
+                    close_deliveries(&mut next.messages, member.thread, "unavailable");
+                    return false;
+                }
             };
-            close_deliveries(&mut next.messages, member.thread, reason);
-            false
+            // Temporary readiness never revokes a native receipt in flight.
+            if peer.token.is_none()
+                || !peer.delivery_enabled
+                || previous
+                    .get(&member.thread)
+                    .is_none_or(|old| old.token != peer.token)
+            {
+                revoke_attempts(
+                    &mut next.messages,
+                    member.thread,
+                    "Runtime authorization revoked",
+                );
+            }
+            member.refresh(peer);
+            true
         });
-        self.commit(next).await
+        self.commit(next).await?;
+        self.peers = contexts;
+        Ok(())
     }
 
     async fn set_joined(&mut self, thread: Uuid, joined: bool) -> Result<()> {
         self.healthy()?;
-        if !joined {
-            self.finish_wait(
-                thread,
-                Err(anyhow!("Space network wait cancelled: Conversation left")),
-            );
-        }
         let mut next = self.snapshot.clone();
         if joined {
             let peer = self
@@ -514,15 +442,24 @@ impl Actor {
                 peer.eligible,
                 "Only eligible Conversations may join the Space network"
             );
-            if next.members.iter().any(|member| member.thread == thread) {
-                return Ok(());
+            if let Some(member) = next
+                .members
+                .iter_mut()
+                .find(|member| member.thread == thread)
+            {
+                member.automatic = true;
+                member.refresh(peer);
+            } else {
+                ensure!(
+                    next.members.len() < MAX_MEMBERS,
+                    "Space network member capacity reached ({MAX_MEMBERS})"
+                );
+                let mut member = Member::from(peer);
+                member.automatic = true;
+                member.refresh(peer);
+                next.members.push(member);
+                next.members.sort_by_key(|member| member.thread);
             }
-            ensure!(
-                next.members.len() < MAX_MEMBERS,
-                "Space network member capacity reached ({MAX_MEMBERS})"
-            );
-            next.members.push(Member::from(peer));
-            next.members.sort_by_key(|member| member.thread);
         } else {
             next.members.retain(|member| member.thread != thread);
             close_deliveries(&mut next.messages, thread, "left");
@@ -575,46 +512,116 @@ impl Actor {
                 );
                 self.send(sender, recipients, body, true).await
             }
-            Action::Inbox => {
-                let caller = caller.clone();
-                let mut messages = pending_inbox(&self.snapshot, &caller)?;
-                if messages.is_empty() {
-                    return Ok(json!({"messages": [], "remaining": 0}));
-                }
-                let remaining = self
-                    .snapshot
-                    .messages
-                    .iter()
-                    .filter(|message| message.space == caller.space)
-                    .filter(|message| {
-                        message.deliveries.iter().any(|delivery| {
-                            delivery.recipient == caller.thread && delivery.pending()
-                        })
-                    })
-                    .count()
-                    - messages.len();
-                let ids = messages
-                    .iter()
-                    .map(|message| message.id)
-                    .collect::<HashSet<_>>();
-                let mut next = self.snapshot.clone();
-                for message in &mut next.messages {
-                    if message.space == caller.space && ids.contains(&message.id) {
-                        for delivery in &mut message.deliveries {
-                            if delivery.recipient == caller.thread && delivery.pending() {
-                                delivery.retrieved = true;
-                            }
-                        }
+        }
+    }
+
+    async fn claim(&mut self, token: Uuid) -> Result<Option<DeliveryBatch>> {
+        let caller = self.caller(token)?;
+        let peer = &self.peers[&caller.thread];
+        if !caller.automatic || !peer.delivery_enabled || !peer.can_receive {
+            return Ok(None);
+        }
+        if self
+            .snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.deliveries)
+            .any(|delivery| {
+                delivery.recipient == caller.thread && delivery.state == DeliveryState::Delivering
+            })
+        {
+            return Ok(None);
+        }
+        let mut batch = DeliveryBatch {
+            attempt: Uuid::new_v4(),
+            recipient: caller.thread,
+            messages: Vec::new(),
+        };
+        let mut bytes = encoded_len(&batch)?;
+        for message in self
+            .snapshot
+            .messages
+            .iter()
+            .filter(|message| message.space == caller.space)
+        {
+            let Some(delivery) = message.deliveries.iter().find(|delivery| {
+                delivery.recipient == caller.thread && delivery.state == DeliveryState::Queued
+            }) else {
+                continue;
+            };
+            let mut message = recipient_message(message, delivery);
+            message.deliveries[0].state = DeliveryState::Delivering;
+            message.deliveries[0].attempt = Some(batch.attempt);
+            let size = encoded_len(&message)? + usize::from(!batch.messages.is_empty());
+            // The batching target is not a new per-message size limit. A single
+            // legacy envelope remains bounded by the body/context/response caps.
+            if bytes + size > MAX_BATCH_BYTES && !batch.messages.is_empty() {
+                break;
+            }
+            bytes += size;
+            batch.messages.push(message);
+        }
+        if batch.messages.is_empty() {
+            return Ok(None);
+        }
+        let ids = batch
+            .messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<HashSet<_>>();
+        let mut next = self.snapshot.clone();
+        for message in &mut next.messages {
+            if ids.contains(&message.id) {
+                for delivery in &mut message.deliveries {
+                    if delivery.recipient == batch.recipient {
+                        delivery.state = DeliveryState::Delivering;
+                        delivery.attempt = Some(batch.attempt);
                     }
                 }
-                self.commit(next).await?;
-                for message in &mut messages {
-                    message.deliveries[0].retrieved = true;
-                }
-                Ok(json!({"messages": messages, "remaining": remaining}))
             }
-            Action::Wait => unreachable!("Wait is parked by the actor command dispatcher"),
         }
+        self.commit(next).await?;
+        Ok(Some(batch))
+    }
+
+    async fn finish(&mut self, attempt: Uuid, outcome: DeliveryOutcome) -> Result<()> {
+        self.healthy()?;
+        let state = match outcome {
+            DeliveryOutcome::Delivered => DeliveryState::Delivered,
+            DeliveryOutcome::Deferred => DeliveryState::Queued,
+            DeliveryOutcome::Failed(reason) => {
+                ensure!(
+                    reason.len() <= MAX_CONTEXT_BYTES,
+                    "Delivery reason exceeds {MAX_CONTEXT_BYTES} bytes"
+                );
+                DeliveryState::Failed { reason }
+            }
+            DeliveryOutcome::Unknown(reason) => {
+                ensure!(
+                    reason.len() <= MAX_CONTEXT_BYTES,
+                    "Delivery reason exceeds {MAX_CONTEXT_BYTES} bytes"
+                );
+                DeliveryState::Unknown { reason }
+            }
+        };
+        let mut next = self.snapshot.clone();
+        for delivery in next
+            .messages
+            .iter_mut()
+            .flat_map(|message| &mut message.deliveries)
+        {
+            if delivery.attempt == Some(attempt)
+                && (delivery.state == DeliveryState::Delivering
+                    || (matches!(delivery.state, DeliveryState::Unknown { .. })
+                        && state == DeliveryState::Delivered))
+            {
+                delivery.state = state.clone();
+                if state == DeliveryState::Queued {
+                    delivery.attempt = None;
+                }
+            }
+        }
+        self.commit(next).await
     }
 
     async fn send(
@@ -647,7 +654,7 @@ impl Actor {
             ensure!(
                 per_recipient.get(&recipient.thread).copied().unwrap_or(0)
                     < MAX_PENDING_PER_RECIPIENT,
-                "Pending inbox capacity reached for {} ({MAX_PENDING_PER_RECIPIENT})",
+                "Pending delivery capacity reached for {} ({MAX_PENDING_PER_RECIPIENT})",
                 recipient.title
             );
         }
@@ -658,7 +665,7 @@ impl Actor {
                 .iter()
                 .position(|message| !message.deliveries.iter().any(Delivery::pending))
                 .context(
-                    "Space network history capacity reached; retrieve pending messages first",
+                    "Space network history capacity reached; pending deliveries must finish first",
                 )?;
             next.messages.remove(index);
         }
@@ -675,15 +682,14 @@ impl Actor {
                 .map(|recipient| Delivery {
                     recipient: recipient.thread,
                     recipient_name: recipient.title,
-                    retrieved: false,
-                    closed: None,
+                    state: DeliveryState::Queued,
+                    attempt: None,
                 })
                 .collect(),
         };
         let response = bounded_response(json!({"message": &message}))?;
         next.messages.push(message);
         self.commit(next).await?;
-        self.wake_waits();
         Ok(response)
     }
 }
@@ -699,13 +705,54 @@ impl From<&Peer> for Member {
             harness: peer.harness.clone(),
             status: peer.status.clone(),
             online: peer.token.is_some(),
+            automatic: false,
+            delivery_enabled: false,
         }
     }
 }
 
+impl Member {
+    fn refresh(&mut self, peer: &Peer) -> bool {
+        let online = peer.token.is_some();
+        let enabled = self.automatic && peer.delivery_enabled && online;
+        let mut changed = self.online != online || self.delivery_enabled != enabled;
+        for (value, current) in [
+            (&mut self.title, &peer.title),
+            (&mut self.project, &peer.project),
+            (&mut self.worktree, &peer.worktree),
+            (&mut self.harness, &peer.harness),
+            (&mut self.status, &peer.status),
+        ] {
+            if *value != *current {
+                value.clone_from(current);
+                changed = true;
+            }
+        }
+        self.online = online;
+        self.delivery_enabled = enabled;
+        changed
+    }
+}
+
 impl Delivery {
-    fn pending(&self) -> bool {
-        !self.retrieved && self.closed.is_none()
+    pub fn pending(&self) -> bool {
+        matches!(
+            self.state,
+            DeliveryState::Queued | DeliveryState::Delivering
+        )
+    }
+}
+
+fn revoke_attempts(messages: &mut [NetworkMessage], thread: Uuid, reason: &str) {
+    for delivery in messages
+        .iter_mut()
+        .flat_map(|message| &mut message.deliveries)
+    {
+        if delivery.recipient == thread && delivery.state == DeliveryState::Delivering {
+            delivery.state = DeliveryState::Unknown {
+                reason: reason.into(),
+            };
+        }
     }
 }
 
@@ -714,68 +761,97 @@ fn close_deliveries(messages: &mut [NetworkMessage], thread: Uuid, reason: &str)
         .iter_mut()
         .flat_map(|message| &mut message.deliveries)
     {
-        if delivery.recipient == thread && delivery.pending() {
-            delivery.closed = Some(reason.into());
+        if delivery.recipient == thread {
+            delivery.state = match delivery.state {
+                DeliveryState::Queued => DeliveryState::Closed {
+                    reason: reason.into(),
+                },
+                DeliveryState::Delivering => DeliveryState::Unknown {
+                    reason: reason.into(),
+                },
+                _ => continue,
+            };
         }
     }
 }
 
-fn pending_count(snapshot: &NetworkSnapshot, caller: &Member) -> usize {
-    snapshot
-        .messages
-        .iter()
-        .filter(|message| message.space == caller.space)
-        .filter(|message| {
-            message
-                .deliveries
-                .iter()
-                .any(|delivery| delivery.recipient == caller.thread && delivery.pending())
-        })
-        .count()
+fn recipient_message(message: &NetworkMessage, delivery: &Delivery) -> NetworkMessage {
+    NetworkMessage {
+        id: message.id,
+        space: message.space,
+        sender: message.sender,
+        sender_name: message.sender_name.clone(),
+        body: message.body.clone(),
+        broadcast: message.broadcast,
+        created_at: message.created_at.clone(),
+        deliveries: vec![delivery.clone()],
+    }
 }
 
-fn pending_inbox(snapshot: &NetworkSnapshot, caller: &Member) -> Result<Vec<NetworkMessage>> {
-    let mut messages = Vec::new();
-    let mut bytes = b"{\"messages\":[],\"remaining\":256}".len();
-    for message in snapshot
-        .messages
-        .iter()
-        .filter(|message| message.space == caller.space)
-    {
-        let Some(delivery) = message
-            .deliveries
-            .iter()
-            .find(|delivery| delivery.recipient == caller.thread && delivery.pending())
-        else {
-            continue;
-        };
-        let message = NetworkMessage {
-            id: message.id,
-            space: message.space,
-            sender: message.sender,
-            sender_name: message.sender_name.clone(),
-            body: message.body.clone(),
-            broadcast: message.broadcast,
-            created_at: message.created_at.clone(),
-            deliveries: vec![delivery.clone()],
-        };
-        let size = serde_json::to_vec(&message)?.len() + usize::from(!messages.is_empty());
-        if bytes + size > MAX_INBOX_BYTES {
-            ensure!(
-                !messages.is_empty(),
-                "A network message exceeds the inbox response limit"
-            );
-            break;
+/// One-time conversion, not a second serde/tool API. Reject mixed dispositions
+/// rather than guessing which representation is authoritative.
+fn read_saved(saved: &Value) -> Result<NetworkSnapshot> {
+    let mut value = saved.clone();
+    if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if let Some(deliveries) = message.get_mut("deliveries").and_then(Value::as_array_mut) {
+                for delivery in deliveries {
+                    let fields = delivery.as_object_mut().context("Invalid saved delivery")?;
+                    if fields.contains_key("state") {
+                        ensure!(
+                            !fields.contains_key("retrieved") && !fields.contains_key("closed"),
+                            "Mixed saved delivery formats"
+                        );
+                        continue;
+                    }
+                    ensure!(
+                        !fields.contains_key("attempt"),
+                        "Legacy delivery has an attempt"
+                    );
+                    let retrieved = fields
+                        .remove("retrieved")
+                        .context("Saved delivery has no state")?
+                        .as_bool()
+                        .context("Invalid legacy retrieval flag")?;
+                    let closed = fields.remove("closed");
+                    let state = match closed {
+                        Some(Value::String(reason)) => {
+                            ensure!(!retrieved, "Conflicting legacy delivery dispositions");
+                            DeliveryState::Closed { reason }
+                        }
+                        Some(Value::Null) | None if retrieved => DeliveryState::Delivered,
+                        Some(Value::Null) | None => DeliveryState::Queued,
+                        _ => bail!("Invalid legacy delivery disposition"),
+                    };
+                    fields.insert("state".into(), serde_json::to_value(state)?);
+                }
+            }
         }
-        bytes += size;
-        messages.push(message);
     }
-    Ok(messages)
+    serde_json::from_value(value).context("Read Space network")
+}
+
+// Count escaped JSON bytes without allocating a temporary serialization buffer.
+fn encoded_len(value: &impl Serialize) -> Result<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 fn bounded_response(response: Value) -> Result<Value> {
     ensure!(
-        serde_json::to_vec(&response)?.len() <= MAX_RESPONSE_BYTES,
+        encoded_len(&response)? <= MAX_RESPONSE_BYTES,
         "Space network response exceeds {MAX_RESPONSE_BYTES} bytes; inspect activity in the sidebar"
     );
     Ok(response)
@@ -832,6 +908,8 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
     let mut ids = HashSet::new();
     let mut pending = 0;
     let mut per_recipient = HashMap::<Uuid, usize>::new();
+    let mut attempts = HashMap::<Uuid, Uuid>::new();
+    let mut in_flight = HashMap::<Uuid, Uuid>::new();
     for message in &snapshot.messages {
         ensure!(ids.insert(message.id), "Duplicate saved message");
         validate_body(&message.body)?;
@@ -857,12 +935,49 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
                 delivery.recipient_name.len() <= MAX_CONTEXT_BYTES,
                 "Oversized saved recipient name"
             );
-            if let Some(reason) = &delivery.closed {
+            match &delivery.state {
+                DeliveryState::Queued | DeliveryState::Closed { .. } => {
+                    ensure!(
+                        delivery.attempt.is_none(),
+                        "Unclaimed saved delivery has an attempt"
+                    );
+                }
+                DeliveryState::Delivering
+                | DeliveryState::Failed { .. }
+                | DeliveryState::Unknown { .. } => {
+                    ensure!(
+                        delivery.attempt.is_some(),
+                        "Saved delivery is missing its attempt"
+                    );
+                }
+                DeliveryState::Delivered => {}
+            }
+            match &delivery.state {
+                DeliveryState::Failed { reason }
+                | DeliveryState::Unknown { reason }
+                | DeliveryState::Closed { reason } => {
+                    ensure!(
+                        reason.len() <= MAX_CONTEXT_BYTES,
+                        "Oversized saved delivery reason"
+                    );
+                }
+                _ => {}
+            }
+            if let Some(attempt) = delivery.attempt {
                 ensure!(
-                    !delivery.retrieved
-                        && matches!(reason.as_str(), "left" | "moved" | "unavailable"),
-                    "Invalid saved delivery disposition"
+                    attempts
+                        .insert(attempt, delivery.recipient)
+                        .is_none_or(|recipient| recipient == delivery.recipient),
+                    "Saved attempt belongs to multiple recipients"
                 );
+                if delivery.state == DeliveryState::Delivering {
+                    ensure!(
+                        in_flight
+                            .insert(delivery.recipient, attempt)
+                            .is_none_or(|old| old == attempt),
+                        "Recipient has multiple saved in-flight batches"
+                    );
+                }
             }
             if delivery.pending() {
                 ensure!(
@@ -874,7 +989,7 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
                 *count += 1;
                 ensure!(
                     *count <= MAX_PENDING_PER_RECIPIENT,
-                    "Saved inbox exceeds capacity"
+                    "Saved pending deliveries exceed capacity"
                 );
             }
         }
@@ -977,18 +1092,6 @@ mod tests {
                 .unwrap();
             serde_json::from_value(response["message"]["id"].clone()).unwrap()
         }
-
-        async fn park(&self, caller: &Peer) -> (Sender<()>, Receiver<Result<Value>>) {
-            let (cancellation, cancelled) = async_channel::bounded(1);
-            let response = self
-                .network
-                .begin_call(token(caller), Action::Wait, cancelled)
-                .await
-                .unwrap();
-            within(self.network.flush()).await.unwrap();
-            assert!(response.is_empty(), "empty mailboxes must park");
-            (cancellation, response)
-        }
     }
 
     fn peer(space: Uuid, name: &str) -> Peer {
@@ -1002,15 +1105,13 @@ mod tests {
             status: "idle".into(),
             token: Some(Uuid::new_v4()),
             eligible: true,
+            delivery_enabled: true,
+            can_receive: true,
         }
     }
 
     fn token(peer: &Peer) -> Uuid {
         peer.token.unwrap()
-    }
-
-    fn messages(response: &Value) -> Vec<NetworkMessage> {
-        serde_json::from_value(response["messages"].clone()).unwrap()
     }
 
     async fn within<T>(future: impl Future<Output = T>) -> T {
@@ -1019,12 +1120,6 @@ mod tests {
             panic!("Space network operation did not complete");
         })
         .await
-    }
-
-    async fn wait_result(response: &Receiver<Result<Value>>) -> Result<Value> {
-        within(response.recv())
-            .await
-            .expect("actor must reply, not drop the wait")
     }
 
     fn reopen(path: &Path) -> Store {
@@ -1046,382 +1141,13 @@ mod tests {
     }
 
     #[test]
-    fn wait_reports_queued_mail_repeatedly_without_retrieval() {
-        smol::block_on(async {
-            let fixture = Fixture::new();
-            let a = peer(Uuid::new_v4(), "Alice");
-            let b = peer(a.space, "Bob");
-            assert!(
-                fixture
-                    .network
-                    .call(Uuid::new_v4(), Action::Wait)
-                    .await
-                    .is_err()
-            );
-            fixture
-                .network
-                .sync(vec![a.clone(), b.clone()])
-                .await
-                .unwrap();
-            assert!(
-                fixture.network.call(token(&b), Action::Wait).await.is_err(),
-                "a runtime capability alone must not bypass user opt-in"
-            );
-            fixture.join(&[a.clone(), b.clone()]).await;
-            let first = fixture.send(&a, &b, "first").await;
-            let second = fixture.send(&a, &b, "second").await;
-            let before = fixture.saved().await;
-            for _ in 0..2 {
-                assert_eq!(
-                    within(fixture.network.call(token(&b), Action::Wait))
-                        .await
-                        .unwrap(),
-                    json!({"ready": true, "pending": 2})
-                );
-                assert_eq!(fixture.saved().await, before);
-            }
-            let inbox = messages(
-                &fixture
-                    .network
-                    .call(token(&b), Action::Inbox)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(
-                inbox.iter().map(|message| message.id).collect::<Vec<_>>(),
-                vec![first, second]
-            );
-            assert!(
-                fixture
-                    .saved()
-                    .await
-                    .messages
-                    .iter()
-                    .all(|message| message.deliveries[0].retrieved)
-            );
-        });
-    }
-
-    #[test]
-    fn parked_direct_and_broadcast_waits_do_not_block_sends_or_acknowledge() {
-        smol::block_on(async {
-            let fixture = Fixture::new();
-            let a = peer(Uuid::new_v4(), "Alice");
-            let b = peer(a.space, "Bob");
-            let c = peer(a.space, "Carol");
-            fixture.join(&[a.clone(), b.clone(), c.clone()]).await;
-            let (_cancel_b, response_b) = fixture.park(&b).await;
-            fixture
-                .network
-                .sync(vec![a.clone(), b.clone(), c.clone()])
-                .await
-                .unwrap();
-            assert!(
-                response_b.is_empty(),
-                "equal sync must not cancel a live wait"
-            );
-            assert_eq!(fixture.updates.try_recv().unwrap().waiting, vec![b.thread]);
-            assert!(fixture.saved().await.waiting.is_empty());
-            let direct = within(fixture.send(&a, &b, "direct")).await;
-            assert_eq!(
-                wait_result(&response_b).await.unwrap(),
-                json!({"ready": true, "pending": 1})
-            );
-            assert!(fixture.updates.try_recv().unwrap().waiting.is_empty());
-            assert!(!fixture.saved().await.messages[0].deliveries[0].retrieved);
-            assert_eq!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .unwrap()
-                )[0]
-                .id,
-                direct
-            );
-
-            let (_cancel_b, response_b) = fixture.park(&b).await;
-            let (_cancel_c, response_c) = fixture.park(&c).await;
-            within(fixture.network.call(
-                token(&a),
-                Action::Broadcast {
-                    body: "everyone".into(),
-                },
-            ))
-            .await
-            .unwrap();
-            for response in [&response_b, &response_c] {
-                assert_eq!(
-                    wait_result(response).await.unwrap(),
-                    json!({"ready": true, "pending": 1})
-                );
-            }
-            let saved = fixture.saved().await;
-            assert!(saved.messages[1].broadcast);
-            assert!(saved.messages[1].deliveries.iter().all(Delivery::pending));
-            assert!(fixture.updates.try_recv().unwrap().waiting.is_empty());
-        });
-    }
-
-    #[test]
-    fn transport_cancellation_cannot_consume_mail_or_cancel_a_replacement_wait() {
-        smol::block_on(async {
-            let fixture = Fixture::new();
-            let a = peer(Uuid::new_v4(), "Alice");
-            let b = peer(a.space, "Bob");
-            fixture.join(&[a.clone(), b.clone()]).await;
-            let (cancel, response) = fixture.park(&b).await;
-            drop(cancel);
-            // Cancellation can race the send or its Store commit; either way it
-            // wins over notification and never touches the queued delivery.
-            let sent = within(fixture.send(&a, &b, "survives cancellation")).await;
-            assert!(wait_result(&response).await.is_err());
-            within(fixture.network.flush()).await.unwrap();
-            assert!(fixture.updates.try_recv().unwrap().waiting.is_empty());
-            let saved = fixture.saved().await;
-            assert_eq!(saved.messages[0].id, sent);
-            assert!(saved.messages[0].deliveries[0].pending());
-            assert_eq!(
-                fixture.network.call(token(&b), Action::Wait).await.unwrap(),
-                json!({"ready": true, "pending": 1})
-            );
-            assert_eq!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .unwrap()
-                )[0]
-                .id,
-                sent
-            );
-
-            let (cancel, response) = fixture.park(&b).await;
-            drop(cancel);
-            assert!(wait_result(&response).await.is_err());
-            let (_cancel, replacement) = fixture.park(&b).await;
-            within(fixture.send(&a, &b, "replacement runtime wait")).await;
-            assert_eq!(
-                wait_result(&replacement).await.unwrap(),
-                json!({"ready": true, "pending": 1})
-            );
-        });
-    }
-
-    #[test]
-    fn dropping_call_future_closes_cancellation_and_removes_waiting_presentation() {
-        smol::block_on(async {
-            let fixture = Fixture::new();
-            let a = peer(Uuid::new_v4(), "Alice");
-            let b = peer(a.space, "Bob");
-            fixture.join(&[a.clone(), b.clone()]).await;
-            let _ = fixture.updates.try_recv();
-            let network = fixture.network.clone();
-            let capability = token(&b);
-            let call = smol::spawn(async move { network.call(capability, Action::Wait).await });
-            let parked = within(fixture.updates.recv()).await.unwrap();
-            assert_eq!(parked.waiting, vec![b.thread]);
-            assert!(call.cancel().await.is_none(), "wait must still be parked");
-            let cancelled = within(fixture.updates.recv()).await.unwrap();
-            assert!(cancelled.waiting.is_empty());
-            let sent = fixture.send(&a, &b, "not consumed by dropped caller").await;
-            assert!(fixture.saved().await.messages[0].deliveries[0].pending());
-            assert_eq!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .unwrap()
-                )[0]
-                .id,
-                sent
-            );
-        });
-    }
-
-    #[test]
-    fn waits_are_cancelled_on_leave_rotation_offline_move_archive_and_invalid_sync() {
-        smol::block_on(async {
-            for operation in [
-                "leave", "rotate", "offline", "move", "archive", "missing", "invalid",
-            ] {
-                let fixture = Fixture::new();
-                let a = peer(Uuid::new_v4(), "Alice");
-                let mut b = peer(a.space, "Bob");
-                fixture.join(&[a.clone(), b.clone()]).await;
-                let (_cancel, response) = fixture.park(&b).await;
-                match operation {
-                    "leave" => fixture.network.set_joined(b.thread, false).await.unwrap(),
-                    "missing" => fixture.network.sync(vec![a.clone()]).await.unwrap(),
-                    "invalid" => {
-                        assert!(
-                            fixture
-                                .network
-                                .sync(vec![a.clone(), b.clone(), b.clone()])
-                                .await
-                                .is_err()
-                        );
-                    }
-                    _ => {
-                        match operation {
-                            "rotate" => b.token = Some(Uuid::new_v4()),
-                            "offline" => b.token = None,
-                            "move" => b.space = Uuid::new_v4(),
-                            "archive" => b.eligible = false,
-                            _ => unreachable!(),
-                        }
-                        fixture
-                            .network
-                            .sync(vec![a.clone(), b.clone()])
-                            .await
-                            .unwrap();
-                    }
-                }
-                assert!(wait_result(&response).await.is_err(), "{operation}");
-                assert!(
-                    fixture.updates.try_recv().unwrap().waiting.is_empty(),
-                    "{operation}"
-                );
-                if operation == "rotate" {
-                    fixture.send(&a, &b, "new token owns queued mail").await;
-                    assert_eq!(
-                        fixture.network.call(token(&b), Action::Wait).await.unwrap(),
-                        json!({"ready": true, "pending": 1})
-                    );
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn failed_store_commit_cancels_all_waits_without_notifying_unaccepted_mail() {
-        smol::block_on(async {
-            let fixture = Fixture::new();
-            let a = peer(Uuid::new_v4(), "Alice");
-            let b = peer(a.space, "Bob");
-            fixture.join(&[a.clone(), b.clone()]).await;
-            let (_cancel_a, response_a) = fixture.park(&a).await;
-            let (_cancel_b, response_b) = fixture.park(&b).await;
-            let before = fixture.saved().await;
-            let blocker =
-                rusqlite::Connection::open(fixture.directory.0.join("drostje.sqlite3")).unwrap();
-            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-            assert!(
-                within(fixture.network.call(
-                    token(&a),
-                    Action::Send {
-                        recipient: b.thread,
-                        body: "must not notify".into(),
-                    }
-                ))
-                .await
-                .is_err()
-            );
-            assert!(wait_result(&response_a).await.is_err());
-            assert!(wait_result(&response_b).await.is_err());
-            let failed = fixture.updates.try_recv().unwrap();
-            assert!(failed.waiting.is_empty());
-            assert!(failed.error.is_some());
-            assert_eq!(fixture.saved().await, before);
-            assert!(fixture.network.flush().await.is_err());
-            blocker.execute_batch("ROLLBACK").unwrap();
-        });
-    }
-
-    #[test]
-    fn waits_reject_duplicates_and_bound_parked_capacity_without_blocking_sends() {
-        smol::block_on(async {
-            let fixture = Fixture::new();
-            let space = Uuid::new_v4();
-            let peers = (0..MAX_WAITERS + 2)
-                .map(|index| peer(space, &format!("peer {index}")))
-                .collect::<Vec<_>>();
-            fixture.join(&peers).await;
-            let mut waits = Vec::new();
-            for peer in peers.iter().take(MAX_WAITERS) {
-                waits.push(fixture.park(peer).await);
-            }
-            assert!(
-                within(fixture.network.call(token(&peers[0]), Action::Wait))
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("already")
-            );
-            assert!(
-                within(
-                    fixture
-                        .network
-                        .call(token(&peers[MAX_WAITERS]), Action::Wait)
-                )
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("capacity")
-            );
-            within(fixture.send(&peers[MAX_WAITERS + 1], &peers[0], "capacity release")).await;
-            assert!(wait_result(&waits[0].1).await.is_ok());
-            let (_cancel, response) = fixture.park(&peers[MAX_WAITERS]).await;
-            within(fixture.send(&peers[MAX_WAITERS + 1], &peers[MAX_WAITERS], "new slot")).await;
-            assert!(wait_result(&response).await.is_ok());
-        });
-    }
-
-    #[test]
-    fn shutdown_cancels_parked_waits_and_real_store_restart_never_restores_them() {
-        smol::block_on(async {
-            let fixture = Fixture::new();
-            let a = peer(Uuid::new_v4(), "Alice");
-            let b = peer(a.space, "Bob");
-            fixture.join(&[a.clone(), b.clone()]).await;
-            fixture
-                .send(&b, &a, "durable but unrelated to Bob's wait")
-                .await;
-            let (_cancel, response) = fixture.park(&b).await;
-            assert_eq!(fixture.updates.try_recv().unwrap().waiting, vec![b.thread]);
-            fixture.store.flush().await.unwrap();
-            let Fixture {
-                network,
-                updates,
-                store,
-                directory,
-            } = fixture;
-            drop(network);
-            assert!(wait_result(&response).await.is_err());
-            drop(updates);
-            drop(store);
-
-            let store = reopen(&directory.0);
-            let workspace = store.snapshot().await.unwrap();
-            let (network, updates) =
-                Network::start(store.clone(), workspace.settings.get(SETTING)).unwrap();
-            let restarted = updates.try_recv().unwrap();
-            assert!(restarted.waiting.is_empty());
-            assert_eq!(restarted.messages.len(), 1);
-            assert!(restarted.messages[0].deliveries[0].pending());
-            assert!(network.call(token(&b), Action::Wait).await.is_err());
-            network.sync(vec![a.clone(), b.clone()]).await.unwrap();
-            assert_eq!(
-                network.call(token(&a), Action::Wait).await.unwrap(),
-                json!({"ready": true, "pending": 1})
-            );
-            drop(network);
-            drop(updates);
-            drop(store);
-        });
-    }
-
-    #[test]
-    fn requires_user_opt_in_and_runtime_capability_and_isolates_spaces() {
+    fn requires_explicit_membership_current_capability_and_same_space() {
         smol::block_on(async {
             let fixture = Fixture::new();
             let a = peer(Uuid::new_v4(), "Alice");
             let b = peer(a.space, "Bob");
             let c = peer(Uuid::new_v4(), "Carol");
-            let mut factory = peer(a.space, "Factory attempt");
+            let mut factory = peer(a.space, "Factory");
             factory.eligible = false;
             fixture
                 .network
@@ -1435,6 +1161,7 @@ mod tests {
                     .await
                     .is_err()
             );
+            assert!(fixture.network.claim(token(&a)).await.is_err());
             assert!(
                 fixture
                     .network
@@ -1442,10 +1169,10 @@ mod tests {
                     .await
                     .is_err()
             );
-            for member in [&a, &b, &c] {
+            for joined in [&a, &b, &c] {
                 fixture
                     .network
-                    .set_joined(member.thread, true)
+                    .set_joined(joined.thread, true)
                     .await
                     .unwrap();
             }
@@ -1456,14 +1183,19 @@ mod tests {
                     .await
                     .is_err()
             );
-            let visible = fixture
+            assert!(fixture.network.claim(Uuid::new_v4()).await.is_err());
+            let response = fixture
                 .network
                 .call(token(&a), Action::Members)
                 .await
                 .unwrap();
-            let visible: Vec<Member> = serde_json::from_value(visible["members"].clone()).unwrap();
-            assert_eq!(visible.len(), 2);
-            assert!(visible.iter().all(|member| member.space == a.space));
+            let members: Vec<Member> = serde_json::from_value(response["members"].clone()).unwrap();
+            assert_eq!(members.len(), 2);
+            assert!(
+                members
+                    .iter()
+                    .all(|member| member.space == a.space && member.automatic)
+            );
             assert!(
                 fixture
                     .network
@@ -1477,65 +1209,240 @@ mod tests {
                     .await
                     .is_err()
             );
-            fixture.send(&a, &b, "  untrusted peer content  ").await;
-            assert!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&a), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .is_empty()
-            );
-            assert!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&c), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .is_empty()
-            );
-            let inbox = messages(
-                &fixture
-                    .network
-                    .call(token(&b), Action::Inbox)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(inbox.len(), 1);
-            assert_eq!(inbox[0].sender, a.thread);
-            assert_eq!(inbox[0].body, "untrusted peer content");
-            assert!(inbox[0].deliveries[0].retrieved);
-            assert!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .is_empty()
-            );
-            let saved = fixture.saved().await;
-            assert!(saved.messages[0].deliveries[0].retrieved);
-            let encoded = serde_json::to_string(&saved).unwrap();
-            for member in [&a, &b, &c] {
-                assert!(!encoded.contains(&token(member).to_string()));
+            fixture.send(&a, &b, "  untrusted peer context  ").await;
+            assert!(fixture.network.claim(token(&a)).await.unwrap().is_none());
+            assert!(fixture.network.claim(token(&c)).await.unwrap().is_none());
+            let batch = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            assert_eq!(batch.messages[0].body, "untrusted peer context");
+            assert_eq!(batch.messages[0].sender, a.thread);
+            let encoded = serde_json::to_string(&fixture.saved().await).unwrap();
+            for peer in [&a, &b, &c] {
+                assert!(!encoded.contains(&token(peer).to_string()));
             }
             assert!(
-                serde_json::from_value::<Action>(json!({
-                    "action": "send", "recipient": b.thread, "body": "spoof", "sender": c.thread,
-                }))
-                .is_err()
+                !serde_json::to_string(&batch)
+                    .unwrap()
+                    .contains(&token(&b).to_string())
+            );
+            for action in [
+                json!({"action": "inbox"}),
+                json!({"action": "wait"}),
+                json!({"action": "send", "recipient": b.thread, "body": "spoof", "sender": c.thread}),
+                json!({"action": "send", "recipient": b.thread}),
+            ] {
+                assert!(serde_json::from_value::<Action>(action).is_err());
+            }
+        });
+    }
+
+    #[test]
+    fn legacy_opt_in_migrates_durably_without_authorizing_automatic_delivery() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), "Alice");
+            let b = peer(a.space, "Bob");
+            fixture.join(&[a.clone(), b.clone()]).await;
+            let mut ids = Vec::new();
+            for body in ["already retrieved", "closed", "queued"] {
+                ids.push(fixture.send(&a, &b, body).await);
+            }
+            let mut legacy = serde_json::to_value(fixture.saved().await).unwrap();
+            for member in legacy["members"].as_array_mut().unwrap() {
+                member.as_object_mut().unwrap().remove("automatic");
+                member.as_object_mut().unwrap().remove("delivery_enabled");
+            }
+            for (index, message) in legacy["messages"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                let delivery = message["deliveries"][0].as_object_mut().unwrap();
+                delivery.remove("state");
+                delivery.insert("retrieved".into(), json!(index == 0));
+                delivery.insert(
+                    "closed".into(),
+                    if index == 1 {
+                        json!("left")
+                    } else {
+                        Value::Null
+                    },
+                );
+            }
+            let Fixture {
+                network,
+                updates,
+                store,
+                directory: _directory,
+            } = fixture;
+            drop(network);
+            drop(updates);
+            store
+                .set_setting(SETTING.into(), legacy.clone())
+                .await
+                .unwrap();
+            let (network, updates) = Network::start(store.clone(), Some(&legacy)).unwrap();
+            network.flush().await.unwrap();
+            let migrated = updates.recv().await.unwrap();
+            assert!(
+                migrated
+                    .members
+                    .iter()
+                    .all(|member| !member.automatic && !member.delivery_enabled && !member.online)
+            );
+            assert_eq!(
+                migrated
+                    .messages
+                    .iter()
+                    .map(|message| message.id)
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(
+                migrated.messages[0].deliveries[0].state,
+                DeliveryState::Delivered
+            );
+            assert_eq!(
+                migrated.messages[1].deliveries[0].state,
+                DeliveryState::Closed {
+                    reason: "left".into()
+                }
+            );
+            assert_eq!(
+                migrated.messages[2].deliveries[0].state,
+                DeliveryState::Queued
+            );
+            let saved = store.snapshot().await.unwrap().settings[SETTING].clone();
+            assert_eq!(saved, serde_json::to_value(&migrated).unwrap());
+            for message in saved["messages"].as_array().unwrap() {
+                assert!(message["deliveries"][0].get("retrieved").is_none());
+                assert!(message["deliveries"][0].get("closed").is_none());
+            }
+            assert!(network.claim(token(&b)).await.is_err());
+            network.sync(vec![a, b.clone()]).await.unwrap();
+            assert!(network.claim(token(&b)).await.unwrap().is_none());
+            network.set_joined(b.thread, true).await.unwrap();
+            let batch = network.claim(token(&b)).await.unwrap().unwrap();
+            assert_eq!(batch.messages.len(), 1);
+            assert_eq!(batch.messages[0].id, ids[2]);
+            let saved: NetworkSnapshot =
+                serde_json::from_value(store.snapshot().await.unwrap().settings[SETTING].clone())
+                    .unwrap();
+            assert!(
+                saved
+                    .members
+                    .iter()
+                    .find(|member| member.thread == b.thread)
+                    .unwrap()
+                    .automatic
             );
         });
     }
 
     #[test]
-    fn offline_queue_and_rotated_tokens_preserve_names_and_equal_sync_is_quiet() {
+    fn claim_is_committed_before_return_and_only_one_batch_can_be_in_flight() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), "Alice");
+            let b = peer(a.space, "Bob");
+            fixture.join(&[a.clone(), b.clone()]).await;
+            let first = fixture.send(&a, &b, "first").await;
+            let second = fixture.send(&a, &b, "second").await;
+            let blocker =
+                rusqlite::Connection::open(fixture.directory.0.join("drostje.sqlite3")).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (reply, response) = async_channel::bounded(1);
+            let network = fixture.network.clone();
+            let capability = token(&b);
+            smol::spawn(async move {
+                let _ = reply.send(network.claim(capability).await).await;
+            })
+            .detach();
+            smol::Timer::after(Duration::from_millis(20)).await;
+            assert!(
+                response.is_empty(),
+                "host must not receive an uncommitted claim"
+            );
+            blocker.execute_batch("ROLLBACK").unwrap();
+            let batch = within(response.recv()).await.unwrap().unwrap().unwrap();
+            assert_eq!(batch.recipient, b.thread);
+            assert_eq!(
+                batch
+                    .messages
+                    .iter()
+                    .map(|message| message.id)
+                    .collect::<Vec<_>>(),
+                vec![first, second]
+            );
+            let saved = fixture.saved().await;
+            for message in &saved.messages {
+                assert_eq!(message.deliveries[0].state, DeliveryState::Delivering);
+                assert_eq!(message.deliveries[0].attempt, Some(batch.attempt));
+            }
+            fixture.send(&a, &b, "next batch").await;
+            assert!(fixture.network.claim(token(&b)).await.unwrap().is_none());
+            fixture
+                .network
+                .finish(batch.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
+            let next = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            assert_ne!(batch.attempt, next.attempt);
+            assert_eq!(next.messages.len(), 1);
+            assert_eq!(next.messages[0].body, "next batch");
+        });
+    }
+
+    #[test]
+    fn busy_and_idle_delivery_require_readiness_without_revoking_in_flight_attempts() {
+        smol::block_on(async {
+            for status in ["busy", "idle"] {
+                let fixture = Fixture::new();
+                let a = peer(Uuid::new_v4(), "Alice");
+                let mut b = peer(a.space, "Bob");
+                b.status = status.into();
+                b.can_receive = false;
+                fixture.join(&[a.clone(), b.clone()]).await;
+                let id = fixture.send(&a, &b, status).await;
+                assert!(fixture.network.claim(token(&b)).await.unwrap().is_none());
+                assert_eq!(
+                    fixture.saved().await.messages[0].deliveries[0].state,
+                    DeliveryState::Queued
+                );
+                b.can_receive = true;
+                fixture
+                    .network
+                    .sync(vec![a.clone(), b.clone()])
+                    .await
+                    .unwrap();
+                let batch = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+                assert_eq!(batch.messages[0].id, id);
+                b.can_receive = false;
+                fixture
+                    .network
+                    .sync(vec![a.clone(), b.clone()])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.saved().await.messages[0].deliveries[0].state,
+                    DeliveryState::Delivering
+                );
+                fixture
+                    .network
+                    .finish(batch.attempt, DeliveryOutcome::Delivered)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.saved().await.messages[0].deliveries[0].state,
+                    DeliveryState::Delivered
+                );
+                assert!(fixture.network.claim(token(&b)).await.unwrap().is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn offline_and_disabled_runtime_queue_mail_until_current_authorization_returns() {
         smol::block_on(async {
             let fixture = Fixture::new();
             let mut a = peer(Uuid::new_v4(), "Original sender");
@@ -1543,96 +1450,230 @@ mod tests {
             fixture.join(&[a.clone(), b.clone()]).await;
             let old_token = token(&b);
             b.token = None;
-            b.status = "offline".into();
+            b.delivery_enabled = false;
+            b.status = "Offline".into();
             fixture
                 .network
                 .sync(vec![a.clone(), b.clone()])
                 .await
                 .unwrap();
-            let id = fixture.send(&a, &b, "queued offline").await;
-            assert!(
-                !fixture
-                    .saved()
-                    .await
-                    .members
-                    .iter()
-                    .find(|member| member.thread == b.thread)
-                    .unwrap()
-                    .online
-            );
-            assert!(
-                fixture
-                    .network
-                    .call(old_token, Action::Inbox)
-                    .await
-                    .is_err()
-            );
+            let id = fixture.send(&a, &b, "offline queue").await;
+            assert!(fixture.network.claim(old_token).await.is_err());
             a.title = "Renamed sender".into();
             b.title = "Renamed recipient".into();
             b.token = Some(Uuid::new_v4());
-            b.status = "busy".into();
-            fixture
-                .network
-                .sync(vec![b.clone(), a.clone()])
-                .await
-                .unwrap();
-            fixture.updates.try_recv().unwrap();
             fixture
                 .network
                 .sync(vec![a.clone(), b.clone()])
                 .await
                 .unwrap();
+            assert!(fixture.network.claim(token(&b)).await.unwrap().is_none());
+            assert!(fixture.network.claim(old_token).await.is_err());
+            b.delivery_enabled = true;
+            fixture
+                .network
+                .sync(vec![a.clone(), b.clone()])
+                .await
+                .unwrap();
+            let _ = fixture.updates.try_recv();
+            fixture.network.sync(vec![b.clone(), a]).await.unwrap();
             assert!(
                 fixture.updates.try_recv().is_err(),
-                "Equal contexts must not publish another snapshot"
+                "equal contexts should be quiet"
             );
-            assert!(
-                fixture
-                    .network
-                    .call(old_token, Action::Inbox)
-                    .await
-                    .is_err()
-            );
-            let inbox = messages(
-                &fixture
-                    .network
-                    .call(token(&b), Action::Inbox)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(inbox[0].id, id);
-            assert_eq!(inbox[0].sender_name, "Original sender");
-            assert_eq!(inbox[0].deliveries[0].recipient_name, "Original recipient");
-            let saved = fixture.saved().await;
+            let batch = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            assert_eq!(batch.messages[0].id, id);
+            assert_eq!(batch.messages[0].sender_name, "Original sender");
             assert_eq!(
-                saved
-                    .members
-                    .iter()
-                    .find(|member| member.thread == a.thread)
-                    .unwrap()
-                    .title,
-                a.title
-            );
-            assert_eq!(
-                saved
-                    .members
-                    .iter()
-                    .find(|member| member.thread == b.thread)
-                    .unwrap()
-                    .status,
-                "busy"
+                batch.messages[0].deliveries[0].recipient_name,
+                "Original recipient"
             );
         });
     }
 
     #[test]
-    fn broadcasts_freeze_recipients_and_preserve_partial_dispositions_across_leave_rejoin() {
+    fn revocation_marks_attempt_unknown_and_context_changes_close_only_queued_mail() {
+        smol::block_on(async {
+            for operation in [
+                "leave", "move", "archive", "missing", "rotate", "offline", "disable", "invalid",
+            ] {
+                let fixture = Fixture::new();
+                let a = peer(Uuid::new_v4(), "Alice");
+                let mut b = peer(a.space, "Bob");
+                fixture.join(&[a.clone(), b.clone()]).await;
+                fixture.send(&a, &b, "possibly accepted").await;
+                let batch = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+                fixture.send(&a, &b, "still queued").await;
+                match operation {
+                    "leave" => fixture.network.set_joined(b.thread, false).await.unwrap(),
+                    "missing" => fixture.network.sync(vec![a.clone()]).await.unwrap(),
+                    "invalid" => assert!(
+                        fixture
+                            .network
+                            .sync(vec![a.clone(), b.clone(), b.clone()])
+                            .await
+                            .is_err()
+                    ),
+                    _ => {
+                        match operation {
+                            "move" => b.space = Uuid::new_v4(),
+                            "archive" => b.eligible = false,
+                            "rotate" => b.token = Some(Uuid::new_v4()),
+                            "offline" => b.token = None,
+                            "disable" => b.delivery_enabled = false,
+                            _ => unreachable!(),
+                        }
+                        fixture
+                            .network
+                            .sync(vec![a.clone(), b.clone()])
+                            .await
+                            .unwrap();
+                    }
+                }
+                let saved = fixture.saved().await;
+                assert!(
+                    matches!(
+                        saved.messages[0].deliveries[0].state,
+                        DeliveryState::Unknown { .. }
+                    ),
+                    "{operation}"
+                );
+                assert_eq!(saved.messages[0].deliveries[0].attempt, Some(batch.attempt));
+                let expected = match operation {
+                    "leave" => DeliveryState::Closed {
+                        reason: "left".into(),
+                    },
+                    "move" => DeliveryState::Closed {
+                        reason: "moved".into(),
+                    },
+                    "archive" | "missing" => DeliveryState::Closed {
+                        reason: "unavailable".into(),
+                    },
+                    _ => DeliveryState::Queued,
+                };
+                assert_eq!(
+                    saved.messages[1].deliveries[0].state, expected,
+                    "{operation}"
+                );
+                // A native receipt remains meaningful after membership removal:
+                // correlate the attempt, never a potentially replaced token.
+                fixture
+                    .network
+                    .finish(batch.attempt, DeliveryOutcome::Delivered)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.saved().await.messages[0].deliveries[0].state,
+                    DeliveryState::Delivered
+                );
+                b.space = a.space;
+                b.eligible = true;
+                b.token = Some(Uuid::new_v4());
+                b.delivery_enabled = true;
+                fixture.network.sync(vec![a, b.clone()]).await.unwrap();
+                fixture.network.set_joined(b.thread, true).await.unwrap();
+                let next = fixture.network.claim(token(&b)).await.unwrap();
+                if matches!(expected, DeliveryState::Closed { .. }) {
+                    assert!(next.is_none(), "rejoin cannot resurrect closed mail");
+                } else {
+                    assert_eq!(next.unwrap().messages[0].body, "still queued");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn stale_receipts_cannot_overwrite_other_attempts_or_final_outcomes() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), "Alice");
+            let b = peer(a.space, "Bob");
+            fixture.join(&[a.clone(), b.clone()]).await;
+            fixture.send(&a, &b, "unknown").await;
+            let first = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            fixture
+                .network
+                .finish(
+                    first.attempt,
+                    DeliveryOutcome::Unknown("connection lost".into()),
+                )
+                .await
+                .unwrap();
+            assert!(fixture.network.claim(token(&b)).await.unwrap().is_none());
+            fixture.send(&a, &b, "new attempt").await;
+            let second = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            let before = fixture.saved().await;
+            fixture
+                .network
+                .finish(Uuid::new_v4(), DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
+            assert_eq!(fixture.saved().await, before);
+            fixture
+                .network
+                .finish(first.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
+            let saved = fixture.saved().await;
+            assert_eq!(
+                saved.messages[0].deliveries[0].state,
+                DeliveryState::Delivered
+            );
+            assert_eq!(
+                saved.messages[1].deliveries[0].state,
+                DeliveryState::Delivering
+            );
+            assert_eq!(
+                saved.messages[1].deliveries[0].attempt,
+                Some(second.attempt)
+            );
+            fixture
+                .network
+                .finish(
+                    first.attempt,
+                    DeliveryOutcome::Unknown("stale failure".into()),
+                )
+                .await
+                .unwrap();
+            fixture
+                .network
+                .finish(
+                    second.attempt,
+                    DeliveryOutcome::Failed("native rejected".into()),
+                )
+                .await
+                .unwrap();
+            let before = fixture.saved().await;
+            fixture
+                .network
+                .finish(second.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
+            fixture
+                .network
+                .finish(first.attempt, DeliveryOutcome::Failed("late".into()))
+                .await
+                .unwrap();
+            assert_eq!(fixture.saved().await, before);
+            assert!(fixture.network.claim(token(&b)).await.unwrap().is_none());
+            assert!(
+                !before
+                    .messages
+                    .iter()
+                    .any(|message| message.deliveries[0].pending())
+            );
+        });
+    }
+
+    #[test]
+    fn broadcasts_freeze_members_and_claims_expose_only_the_recipient_disposition() {
         smol::block_on(async {
             let fixture = Fixture::new();
             let a = peer(Uuid::new_v4(), "Alice");
             let b = peer(a.space, "Bob");
             let c = peer(a.space, "Carol");
-            let d = peer(a.space, "Dave");
+            let d = peer(a.space, "Late joiner");
+            let elsewhere = peer(Uuid::new_v4(), "Other Space");
             fixture.join(std::slice::from_ref(&a)).await;
             assert!(
                 fixture
@@ -1646,7 +1687,9 @@ mod tests {
                     .await
                     .is_err()
             );
-            fixture.join(&[a.clone(), b.clone(), c.clone()]).await;
+            fixture
+                .join(&[a.clone(), b.clone(), c.clone(), elsewhere.clone()])
+                .await;
             fixture
                 .network
                 .call(
@@ -1659,237 +1702,172 @@ mod tests {
                 .unwrap();
             fixture
                 .network
-                .sync(vec![a.clone(), b.clone(), c.clone(), d.clone()])
+                .sync(vec![
+                    a.clone(),
+                    b.clone(),
+                    c.clone(),
+                    d.clone(),
+                    elsewhere.clone(),
+                ])
                 .await
                 .unwrap();
             fixture.network.set_joined(d.thread, true).await.unwrap();
-            let inbox = messages(
-                &fixture
-                    .network
-                    .call(token(&b), Action::Inbox)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(inbox.len(), 1);
-            assert_eq!(inbox[0].deliveries.len(), 1);
-            assert_eq!(inbox[0].deliveries[0].recipient, b.thread);
+            let batch = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            assert_eq!(batch.messages.len(), 1);
+            assert!(batch.messages[0].broadcast);
+            assert_eq!(batch.messages[0].deliveries.len(), 1);
+            assert_eq!(batch.messages[0].deliveries[0].recipient, b.thread);
+            fixture
+                .network
+                .finish(batch.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
             fixture.network.set_joined(c.thread, false).await.unwrap();
+            fixture.network.set_joined(c.thread, true).await.unwrap();
+            assert!(fixture.network.claim(token(&c)).await.unwrap().is_none());
+            assert!(fixture.network.claim(token(&d)).await.unwrap().is_none());
             assert!(
                 fixture
                     .network
-                    .call(token(&c), Action::Inbox)
+                    .claim(token(&elsewhere))
                     .await
-                    .is_err()
+                    .unwrap()
+                    .is_none()
             );
-            fixture.network.set_joined(c.thread, true).await.unwrap();
-            assert!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&c), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .is_empty()
-            );
-            assert!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&d), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .is_empty()
-            );
+            assert!(fixture.network.claim(token(&a)).await.unwrap().is_none());
             let saved = fixture.saved().await;
-            assert_eq!(saved.messages.len(), 1);
             assert_eq!(saved.messages[0].deliveries.len(), 2);
-            let delivered = saved.messages[0]
-                .deliveries
-                .iter()
-                .find(|delivery| delivery.recipient == b.thread)
-                .unwrap();
-            assert!(delivered.retrieved);
-            assert!(delivered.closed.is_none());
-            let closed = saved.messages[0]
-                .deliveries
-                .iter()
-                .find(|delivery| delivery.recipient == c.thread)
-                .unwrap();
-            assert!(!closed.retrieved);
-            assert_eq!(closed.closed.as_deref(), Some("left"));
+            assert_eq!(
+                saved.messages[0]
+                    .deliveries
+                    .iter()
+                    .find(|delivery| delivery.recipient == b.thread)
+                    .unwrap()
+                    .state,
+                DeliveryState::Delivered
+            );
+            assert_eq!(
+                saved.messages[0]
+                    .deliveries
+                    .iter()
+                    .find(|delivery| delivery.recipient == c.thread)
+                    .unwrap()
+                    .state,
+                DeliveryState::Closed {
+                    reason: "left".into()
+                }
+            );
             fixture.send(&a, &c, "new membership").await;
             assert_eq!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&c), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .len(),
-                1
-            );
-        });
-    }
-
-    #[test]
-    fn moves_archives_and_missing_threads_close_stale_deliveries_without_cross_space_reads() {
-        smol::block_on(async {
-            let fixture = Fixture::new();
-            let a = peer(Uuid::new_v4(), "Old Space");
-            let mut b = peer(a.space, "Moving");
-            fixture.join(&[a.clone(), b.clone()]).await;
-            fixture.send(&a, &b, "old Space secret").await;
-            b.space = Uuid::new_v4();
-            let c = peer(b.space, "New Space");
-            fixture
-                .network
-                .sync(vec![a.clone(), b.clone(), c.clone()])
-                .await
-                .unwrap();
-            assert!(
                 fixture
                     .network
-                    .call(token(&b), Action::Inbox)
+                    .claim(token(&c))
                     .await
-                    .is_err()
-            );
-            fixture.network.set_joined(b.thread, true).await.unwrap();
-            fixture.network.set_joined(c.thread, true).await.unwrap();
-            fixture.send(&c, &b, "new Space message").await;
-            let inbox = messages(
-                &fixture
-                    .network
-                    .call(token(&b), Action::Inbox)
-                    .await
-                    .unwrap(),
-            );
-            assert_eq!(inbox.len(), 1);
-            assert_eq!(inbox[0].body, "new Space message");
-            fixture.send(&c, &b, "before archive").await;
-            b.eligible = false;
-            fixture
-                .network
-                .sync(vec![a.clone(), b.clone(), c.clone()])
-                .await
-                .unwrap();
-            b.eligible = true;
-            fixture
-                .network
-                .sync(vec![a.clone(), b.clone(), c.clone()])
-                .await
-                .unwrap();
-            fixture.network.set_joined(b.thread, true).await.unwrap();
-            assert!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .is_empty()
-            );
-            fixture.send(&c, &b, "before deletion").await;
-            fixture
-                .network
-                .sync(vec![a.clone(), c.clone()])
-                .await
-                .unwrap();
-            fixture.network.sync(vec![a, b.clone(), c]).await.unwrap();
-            fixture.network.set_joined(b.thread, true).await.unwrap();
-            assert!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .is_empty()
-            );
-            let saved = fixture.saved().await;
-            assert_eq!(
-                saved.messages[0].deliveries[0].closed.as_deref(),
-                Some("moved")
-            );
-            assert_eq!(
-                saved.messages[2].deliveries[0].closed.as_deref(),
-                Some("unavailable")
-            );
-            assert_eq!(
-                saved.messages[3].deliveries[0].closed.as_deref(),
-                Some("unavailable")
+                    .unwrap()
+                    .unwrap()
+                    .messages[0]
+                    .body,
+                "new membership"
             );
         });
     }
 
     #[test]
-    fn real_store_reopen_restores_members_and_pending_but_never_runtime_authority() {
+    fn real_store_restart_resets_presence_and_never_retries_uncertain_delivery() {
         smol::block_on(async {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), "Alice");
+            let mut b = peer(a.space, "Bob");
+            fixture.join(&[a.clone(), b.clone()]).await;
+            let uncertain = fixture.send(&a, &b, "in flight at crash").await;
+            let attempt = fixture
+                .network
+                .claim(token(&b))
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt;
+            let queued = fixture.send(&a, &b, "still queued").await;
             let Fixture {
                 network,
                 updates,
                 store,
                 directory,
-            } = Fixture::new();
-            let a = peer(Uuid::new_v4(), "Alice");
-            let mut b = peer(a.space, "Bob");
+            } = fixture;
+            store.flush().await.unwrap();
+            drop(network);
+            drop(updates);
+            drop(store);
+            let store = reopen(&directory.0);
+            let workspace = store.snapshot().await.unwrap();
+            let (network, updates) =
+                Network::start(store.clone(), workspace.settings.get(SETTING)).unwrap();
+            network.flush().await.unwrap();
+            let restarted = updates.recv().await.unwrap();
+            assert!(
+                restarted
+                    .members
+                    .iter()
+                    .all(|member| member.automatic && !member.online && !member.delivery_enabled)
+            );
+            assert_eq!(restarted.messages[0].id, uncertain);
+            assert!(matches!(
+                restarted.messages[0].deliveries[0].state,
+                DeliveryState::Unknown { .. }
+            ));
+            assert_eq!(restarted.messages[0].deliveries[0].attempt, Some(attempt));
+            assert_eq!(restarted.messages[1].id, queued);
+            assert_eq!(
+                restarted.messages[1].deliveries[0].state,
+                DeliveryState::Queued
+            );
+            assert_eq!(
+                store.snapshot().await.unwrap().settings[SETTING],
+                serde_json::to_value(&restarted).unwrap()
+            );
+            let old_token = token(&b);
+            assert!(network.claim(old_token).await.is_err());
+            b.token = Some(Uuid::new_v4());
+            b.delivery_enabled = false;
             network.sync(vec![a.clone(), b.clone()]).await.unwrap();
-            network.set_joined(a.thread, true).await.unwrap();
-            network.set_joined(b.thread, true).await.unwrap();
+            assert!(network.claim(old_token).await.is_err());
+            assert!(network.claim(token(&b)).await.unwrap().is_none());
+            b.delivery_enabled = true;
+            network.sync(vec![a, b.clone()]).await.unwrap();
+            let batch = network.claim(token(&b)).await.unwrap().unwrap();
+            assert_eq!(batch.messages.len(), 1);
+            assert_eq!(batch.messages[0].id, queued);
+            assert_ne!(batch.attempt, attempt);
             network
-                .call(
-                    token(&a),
-                    Action::Send {
-                        recipient: b.thread,
-                        body: "survives restart".into(),
-                    },
-                )
+                .finish(attempt, DeliveryOutcome::Delivered)
                 .await
                 .unwrap();
-            store.flush().await.unwrap();
+            network
+                .finish(batch.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
             drop(network);
             drop(updates);
             drop(store);
-
             let store = reopen(&directory.0);
             let workspace = store.snapshot().await.unwrap();
             let (network, updates) =
                 Network::start(store.clone(), workspace.settings.get(SETTING)).unwrap();
-            let initial = updates.try_recv().unwrap();
-            assert_eq!(initial.members.len(), 2);
-            assert!(initial.members.iter().all(|member| !member.online));
-            assert_eq!(initial.messages.len(), 1);
-            let old_token = token(&b);
-            assert!(network.call(old_token, Action::Inbox).await.is_err());
-            b.token = Some(Uuid::new_v4());
-            network.sync(vec![a.clone(), b.clone()]).await.unwrap();
-            assert!(network.call(old_token, Action::Inbox).await.is_err());
-            let inbox = messages(&network.call(token(&b), Action::Inbox).await.unwrap());
-            assert_eq!(inbox.len(), 1);
-            assert_eq!(inbox[0].body, "survives restart");
-            store.flush().await.unwrap();
-            drop(network);
-            drop(updates);
-            drop(store);
-
-            let store = reopen(&directory.0);
-            let workspace = store.snapshot().await.unwrap();
-            let (network, updates) =
-                Network::start(store.clone(), workspace.settings.get(SETTING)).unwrap();
-            network.sync(vec![a, b.clone()]).await.unwrap();
-            assert!(messages(&network.call(token(&b), Action::Inbox).await.unwrap()).is_empty());
-            drop(network);
-            drop(updates);
-            drop(store);
+            network.flush().await.unwrap();
+            assert!(
+                updates
+                    .recv()
+                    .await
+                    .unwrap()
+                    .messages
+                    .iter()
+                    .all(|message| message.deliveries[0].state == DeliveryState::Delivered)
+            );
         });
     }
 
     #[test]
-    fn concurrent_sends_and_inbox_reads_are_serial_and_never_double_retrieve() {
+    fn concurrent_sends_and_claims_preserve_order_and_never_double_lease() {
         smol::block_on(async {
             let fixture = Fixture::new();
             let a = peer(Uuid::new_v4(), "Alice");
@@ -1915,40 +1893,68 @@ mod tests {
             }
             let mut ids = HashSet::new();
             for send in sends {
-                let response = send.await;
-                assert!(ids.insert(response["message"]["id"].as_str().unwrap().to_owned()));
+                assert!(ids.insert(send.await["message"]["id"].as_str().unwrap().to_owned()));
             }
+            let order = fixture
+                .saved()
+                .await
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>();
             let left = fixture.network.clone();
             let right = fixture.network.clone();
             let token = token(&b);
-            let left = smol::spawn(async move { left.call(token, Action::Inbox).await.unwrap() });
-            let right = smol::spawn(async move { right.call(token, Action::Inbox).await.unwrap() });
-            let first = messages(&left.await);
-            let second = messages(&right.await);
-            assert_eq!(first.len() + second.len(), 64);
-            assert!(first.is_empty() || second.is_empty());
+            let left = smol::spawn(async move { left.claim(token).await.unwrap() });
+            let right = smol::spawn(async move { right.claim(token).await.unwrap() });
+            let (left, right) = (left.await, right.await);
+            assert!(left.is_none() || right.is_none());
+            let batch = left.or(right).unwrap();
+            assert_eq!(
+                batch
+                    .messages
+                    .iter()
+                    .map(|message| message.id)
+                    .collect::<Vec<_>>(),
+                order
+            );
+            fixture
+                .network
+                .finish(batch.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
             assert!(
                 fixture
                     .saved()
                     .await
                     .messages
                     .iter()
-                    .all(|message| message.deliveries[0].retrieved)
+                    .all(|message| message.deliveries[0].state == DeliveryState::Delivered)
             );
         });
     }
 
+    async fn deliver_all(network: &Network, peer: &Peer) {
+        while let Some(batch) = network.claim(token(peer)).await.unwrap() {
+            network
+                .finish(batch.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
+        }
+    }
+
     #[test]
-    fn pending_inbox_capacity_rejects_broadcast_atomically_and_does_not_evict_pending() {
+    fn recipient_capacity_counts_in_flight_and_broadcast_overflow_is_atomic() {
         smol::block_on(async {
             let fixture = Fixture::new();
             let a = peer(Uuid::new_v4(), "Alice");
-            let b = peer(a.space, "Full inbox");
-            let c = peer(a.space, "Empty inbox");
+            let b = peer(a.space, "Full");
+            let c = peer(a.space, "Empty");
             fixture.join(&[a.clone(), b.clone(), c.clone()]).await;
             for _ in 0..MAX_PENDING_PER_RECIPIENT {
                 fixture.send(&a, &b, "pending").await;
             }
+            let batch = fixture.network.claim(token(&b)).await.unwrap().unwrap();
             let before = fixture.saved().await;
             assert!(
                 fixture
@@ -1976,27 +1982,12 @@ mod tests {
                     .is_err()
             );
             assert_eq!(fixture.saved().await, before);
-            assert!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&c), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .is_empty()
-            );
-            assert_eq!(
-                messages(
-                    &fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .unwrap()
-                )
-                .len(),
-                MAX_PENDING_PER_RECIPIENT
-            );
+            assert!(fixture.network.claim(token(&c)).await.unwrap().is_none());
+            fixture
+                .network
+                .finish(batch.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
             fixture
                 .network
                 .call(
@@ -2007,13 +1998,22 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let saved = fixture.saved().await;
-            assert_eq!(saved.messages.last().unwrap().deliveries.len(), 2);
+            assert_eq!(
+                fixture
+                    .saved()
+                    .await
+                    .messages
+                    .last()
+                    .unwrap()
+                    .deliveries
+                    .len(),
+                2
+            );
         });
     }
 
     #[test]
-    fn global_pending_capacity_is_shared_across_recipients_and_frees_on_retrieval() {
+    fn global_capacity_is_shared_and_only_terminal_dispositions_free_it() {
         smol::block_on(async {
             let fixture = Fixture::new();
             let a = peer(Uuid::new_v4(), "Alice");
@@ -2036,13 +2036,19 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let extra = peer(a.space, "Additional empty inbox");
+            let extra = peer(a.space, "Empty");
             peers.push(extra.clone());
             fixture.network.sync(peers).await.unwrap();
             fixture
                 .network
                 .set_joined(extra.thread, true)
                 .await
+                .unwrap();
+            let batch = fixture
+                .network
+                .claim(token(&recipients[0]))
+                .await
+                .unwrap()
                 .unwrap();
             let before = fixture.saved().await;
             assert!(
@@ -2052,7 +2058,7 @@ mod tests {
                         token(&a),
                         Action::Send {
                             recipient: extra.thread,
-                            body: "global overflow".into()
+                            body: "overflow".into()
                         }
                     )
                     .await
@@ -2061,7 +2067,10 @@ mod tests {
             assert_eq!(fixture.saved().await, before);
             fixture
                 .network
-                .call(token(&recipients[0]), Action::Inbox)
+                .finish(
+                    batch.attempt,
+                    DeliveryOutcome::Failed("native rejection".into()),
+                )
                 .await
                 .unwrap();
             fixture.send(&a, &extra, "freed capacity").await;
@@ -2096,20 +2105,16 @@ mod tests {
                         token(&a),
                         Action::Send {
                             recipient: recipients[1].thread,
-                            body: "full history".into()
+                            body: "full history".into(),
                         }
                     )
                     .await
                     .is_err()
             );
             assert_eq!(fixture.saved().await.messages.len(), MAX_MESSAGES);
+            deliver_all(&fixture.network, &recipients[0]).await;
             fixture
-                .network
-                .call(token(&recipients[0]), Action::Inbox)
-                .await
-                .unwrap();
-            fixture
-                .send(&a, &recipients[1], "evicts oldest retrieved only")
+                .send(&a, &recipients[1], "evicts oldest terminal only")
                 .await;
             let saved = fixture.saved().await;
             assert_eq!(saved.messages.len(), MAX_MESSAGES);
@@ -2123,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn bodies_are_byte_bounded_and_large_escaped_inboxes_are_retrieved_in_transport_safe_batches() {
+    fn bodies_are_byte_bounded_and_escaped_batches_stay_within_64_kib_in_order() {
         smol::block_on(async {
             let fixture = Fixture::new();
             let a = peer(Uuid::new_v4(), "Alice");
@@ -2146,38 +2151,26 @@ mod tests {
             }
             assert!(fixture.saved().await.messages.is_empty());
             let body = "\0".repeat(MAX_BODY_BYTES);
+            let mut ids = Vec::new();
             for _ in 0..24 {
-                fixture.send(&a, &b, &body).await;
+                ids.push(fixture.send(&a, &b, &body).await);
             }
-            assert!(
-                fixture
-                    .saved()
-                    .await
-                    .messages
-                    .iter()
-                    .all(|message| !message.deliveries[0].retrieved)
-            );
-            let mut retrieved = HashSet::new();
+            let mut delivered = Vec::new();
             let mut batches = 0;
-            loop {
-                let inbox = fixture
+            while let Some(batch) = fixture.network.claim(token(&b)).await.unwrap() {
+                assert!(serde_json::to_vec(&batch).unwrap().len() <= MAX_BATCH_BYTES);
+                batches += 1;
+                for message in &batch.messages {
+                    assert_eq!(message.body, body);
+                    delivered.push(message.id);
+                }
+                fixture
                     .network
-                    .call(token(&b), Action::Inbox)
+                    .finish(batch.attempt, DeliveryOutcome::Delivered)
                     .await
                     .unwrap();
-                assert!(serde_json::to_vec(&inbox).unwrap().len() <= MAX_INBOX_BYTES);
-                let batch = messages(&inbox);
-                assert_eq!(inbox["remaining"], 24 - retrieved.len() - batch.len());
-                if batch.is_empty() {
-                    break;
-                }
-                batches += 1;
-                for message in batch {
-                    assert!(retrieved.insert(message.id));
-                    assert_eq!(message.body, body);
-                }
             }
-            assert_eq!(retrieved.len(), 24);
+            assert_eq!(delivered, ids);
             assert!(batches > 1);
             assert!(
                 fixture
@@ -2185,20 +2178,95 @@ mod tests {
                     .await
                     .messages
                     .iter()
-                    .all(|message| message.deliveries[0].retrieved)
+                    .all(|message| message.deliveries[0].state == DeliveryState::Delivered)
             );
         });
     }
 
     #[test]
-    fn failed_writes_never_accept_send_retrieval_or_stale_membership_invalidation() {
+    fn escaped_metadata_remains_deliverable_as_a_bounded_singleton() {
         smol::block_on(async {
-            for operation in ["send", "inbox", "move", "leave"] {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), &"\0".repeat(MAX_CONTEXT_BYTES));
+            let b = peer(a.space, &"\0".repeat(MAX_CONTEXT_BYTES));
+            fixture.join(&[a.clone(), b.clone()]).await;
+            let id = fixture.send(&a, &b, "small body").await;
+            let batch = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            assert!(encoded_len(&batch).unwrap() > MAX_BATCH_BYTES);
+            assert_eq!(batch.messages[0].id, id);
+            assert_eq!(batch.messages[0].sender_name, a.title);
+            fixture
+                .network
+                .finish(batch.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.saved().await.messages[0].deliveries[0].state,
+                DeliveryState::Delivered
+            );
+        });
+    }
+
+    #[test]
+    fn a_lease_not_sent_to_native_can_be_deferred_but_uncertain_mail_cannot() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), "Sender");
+            let b = peer(a.space, "Recipient");
+            fixture.join(&[a.clone(), b.clone()]).await;
+            let id = fixture
+                .send(&a, &b, "wait for the open permission dialog")
+                .await;
+            let first = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            fixture
+                .network
+                .finish(first.attempt, DeliveryOutcome::Deferred)
+                .await
+                .unwrap();
+            let second = fixture.network.claim(token(&b)).await.unwrap().unwrap();
+            assert_ne!(first.attempt, second.attempt);
+            assert_eq!(second.messages[0].id, id);
+            fixture
+                .network
+                .finish(
+                    second.attempt,
+                    DeliveryOutcome::Unknown("native write was not confirmed".into()),
+                )
+                .await
+                .unwrap();
+            let before = fixture.saved().await;
+            fixture
+                .network
+                .finish(second.attempt, DeliveryOutcome::Deferred)
+                .await
+                .unwrap();
+            assert_eq!(fixture.saved().await, before);
+            assert!(fixture.network.claim(token(&b)).await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn store_failures_never_publish_uncommitted_send_claim_receipt_or_revocation() {
+        smol::block_on(async {
+            for operation in ["send", "claim", "finish", "move", "leave", "disable"] {
                 let fixture = Fixture::new();
                 let a = peer(Uuid::new_v4(), "Alice");
                 let mut b = peer(a.space, "Bob");
                 fixture.join(&[a.clone(), b.clone()]).await;
-                fixture.send(&a, &b, "last committed pending message").await;
+                fixture.send(&a, &b, "last committed").await;
+                let attempt = if operation == "finish" || operation == "disable" {
+                    Some(
+                        fixture
+                            .network
+                            .claim(token(&b))
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .attempt,
+                    )
+                } else {
+                    None
+                };
                 let before = fixture.saved().await;
                 let blocker =
                     rusqlite::Connection::open(fixture.directory.0.join("drostje.sqlite3"))
@@ -2216,25 +2284,33 @@ mod tests {
                         )
                         .await
                         .map(|_| ()),
-                    "inbox" => fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .map(|_| ()),
+                    "claim" => fixture.network.claim(token(&b)).await.map(|_| ()),
+                    "finish" => {
+                        fixture
+                            .network
+                            .finish(attempt.unwrap(), DeliveryOutcome::Delivered)
+                            .await
+                    }
                     "move" => {
                         b.space = Uuid::new_v4();
                         fixture.network.sync(vec![a.clone(), b.clone()]).await
                     }
                     "leave" => fixture.network.set_joined(b.thread, false).await,
+                    "disable" => {
+                        b.delivery_enabled = false;
+                        fixture.network.sync(vec![a.clone(), b.clone()]).await
+                    }
                     _ => unreachable!(),
                 };
-                assert!(
-                    result.is_err(),
-                    "{operation} must report persistence failure"
-                );
+                assert!(result.is_err(), "{operation}");
                 let failed = fixture.updates.try_recv().unwrap();
-                assert!(failed.error.is_some());
-                assert!(failed.members.iter().all(|member| !member.online));
+                assert!(failed.error.is_some(), "{operation}");
+                assert!(
+                    failed
+                        .members
+                        .iter()
+                        .all(|member| !member.online && !member.delivery_enabled)
+                );
                 assert_eq!(failed.messages, before.messages);
                 assert_eq!(fixture.saved().await, before);
                 assert!(
@@ -2244,24 +2320,63 @@ mod tests {
                         .await
                         .is_err()
                 );
-                assert!(
-                    fixture
-                        .network
-                        .call(token(&b), Action::Inbox)
-                        .await
-                        .is_err()
-                );
+                assert!(fixture.network.claim(token(&b)).await.is_err());
                 blocker.execute_batch("ROLLBACK").unwrap();
                 assert!(
                     fixture.network.sync(vec![a, b]).await.is_err(),
-                    "A failed actor cannot silently re-enable itself"
+                    "reopen is required after failure"
                 );
             }
         });
     }
 
     #[test]
-    fn member_capacity_and_saved_state_validation_fail_honestly_without_losing_state() {
+    fn startup_migration_failure_disables_mutations_without_publishing_authority() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), "Alice");
+            fixture.join(std::slice::from_ref(&a)).await;
+            let mut legacy = serde_json::to_value(fixture.saved().await).unwrap();
+            legacy["members"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("automatic");
+            legacy["members"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("delivery_enabled");
+            let Fixture {
+                network,
+                updates,
+                store,
+                directory,
+            } = fixture;
+            drop(network);
+            drop(updates);
+            store
+                .set_setting(SETTING.into(), legacy.clone())
+                .await
+                .unwrap();
+            let blocker = rusqlite::Connection::open(directory.0.join("drostje.sqlite3")).unwrap();
+            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let (network, updates) = Network::start(store.clone(), Some(&legacy)).unwrap();
+            assert!(network.flush().await.is_err());
+            let failed = updates.recv().await.unwrap();
+            assert!(failed.error.is_some());
+            assert!(
+                failed
+                    .members
+                    .iter()
+                    .all(|member| !member.online && !member.delivery_enabled && !member.automatic)
+            );
+            assert_eq!(store.snapshot().await.unwrap().settings[SETTING], legacy);
+            blocker.execute_batch("ROLLBACK").unwrap();
+            assert!(network.sync(vec![a]).await.is_err());
+        });
+    }
+
+    #[test]
+    fn member_capacity_and_saved_validation_preserve_the_last_committed_state() {
         smol::block_on(async {
             let fixture = Fixture::new();
             let space = Uuid::new_v4();
@@ -2290,7 +2405,7 @@ mod tests {
                 )
                 .is_err()
             );
-            let mut corrupt = before;
+            let mut corrupt = before.clone();
             corrupt.members[1].thread = corrupt.members[0].thread;
             assert!(
                 Network::start(
@@ -2302,10 +2417,86 @@ mod tests {
             assert!(
                 Network::start(
                     fixture.store.clone(),
-                    Some(&json!({"members": [], "messages": [], "token": Uuid::new_v4()}))
+                    Some(&json!({
+                        "members": [], "messages": [], "token": Uuid::new_v4(),
+                    }))
                 )
                 .is_err()
             );
+            let mut invalid = peers[0].clone();
+            invalid.title = "x".repeat(MAX_CONTEXT_BYTES + 1);
+            assert!(fixture.network.sync(vec![invalid]).await.is_err());
+            assert!(
+                fixture
+                    .network
+                    .call(token(&peers[0]), Action::Members)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn saved_attempts_and_dispositions_are_validated_without_compatibility_aliases() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), "Alice");
+            let b = peer(a.space, "Bob");
+            fixture.join(&[a.clone(), b.clone()]).await;
+            fixture.send(&a, &b, "first").await;
+            fixture.send(&a, &b, "second").await;
+            let before = fixture.saved().await;
+            for invalid in [
+                "missing_attempt",
+                "queued_attempt",
+                "duplicate_id",
+                "mixed",
+                "two_attempts",
+                "cross_recipient_attempt",
+            ] {
+                let mut saved = serde_json::to_value(&before).unwrap();
+                let attempt = Uuid::new_v4();
+                match invalid {
+                    "missing_attempt" => {
+                        saved["messages"][0]["deliveries"][0]["state"] =
+                            json!({"status": "delivering"})
+                    }
+                    "queued_attempt" => {
+                        saved["messages"][0]["deliveries"][0]["attempt"] = json!(attempt)
+                    }
+                    "duplicate_id" => {
+                        saved["messages"][1]["id"] = saved["messages"][0]["id"].clone()
+                    }
+                    "mixed" => saved["messages"][0]["deliveries"][0]["retrieved"] = json!(false),
+                    "two_attempts" | "cross_recipient_attempt" => {
+                        for index in 0..2 {
+                            saved["messages"][index]["deliveries"][0]["state"] =
+                                json!({"status": "delivering"});
+                            saved["messages"][index]["deliveries"][0]["attempt"] =
+                                json!(if index == 0 || invalid == "cross_recipient_attempt" {
+                                    attempt
+                                } else {
+                                    Uuid::new_v4()
+                                });
+                        }
+                        if invalid == "cross_recipient_attempt" {
+                            saved["messages"][1]["deliveries"][0]["recipient"] = json!(a.thread);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    Network::start(fixture.store.clone(), Some(&saved)).is_err(),
+                    "{invalid}"
+                );
+            }
+            assert!(
+                serde_json::from_value::<Delivery>(json!({
+                    "recipient": b.thread, "recipient_name": "Bob", "retrieved": false,
+                }))
+                .is_err()
+            );
+            assert_eq!(fixture.saved().await, before);
         });
     }
 }

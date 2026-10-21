@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import { registerBrowserTools } from "./client.mjs";
+import { registerPeerDelivery } from "./peer.mjs";
 
 // Pi aliases @sinclair/typebox to its installed TypeBox implementation.
 export default function (api) {
@@ -19,4 +20,5 @@ export default function (api) {
     return Type.String(options);
   }
   registerBrowserTools(api, schema);
+  registerPeerDelivery(api, "pi");
 }

@@ -1,12 +1,14 @@
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     ptr::NonNull,
+    sync::Arc,
 };
 
 use super::wayland::WaylandGlSurface;
 use super::{
     ClipboardRead, ClipboardWrite, KeyAction, Modifiers, MouseButton, MouseState, NativeFrame,
-    NativeSnapshot, NativeSurfaceState, NativeWakeup, native_clipboard_approval, native_wakeup,
+    NativeSnapshot, NativeSurfaceState, NativeWakeup, ProcessInfo, native_clipboard_approval,
+    native_wakeup,
 };
 
 #[repr(C)]
@@ -31,7 +33,13 @@ unsafe extern "C" {
     ) -> *mut RawSurface;
     fn gpui_ghostty_surface_linux_free(surface: *mut RawSurface);
     fn gpui_ghostty_surface_linux_tick(surface: *mut RawSurface);
-    fn gpui_ghostty_surface_linux_needs_confirm_quit(surface: *const RawSurface) -> bool;
+    fn gpui_ghostty_surface_linux_process_info(
+        surface: *const RawSurface,
+        root: *mut u64,
+        foreground: *mut u64,
+        login_wrapper: *mut bool,
+    ) -> bool;
+    fn gpui_ghostty_surface_linux_expected_program(surface: *const RawSurface) -> *const c_char;
     fn gpui_ghostty_surface_linux_is_alive(surface: *const RawSurface) -> bool;
     fn gpui_ghostty_surface_linux_snapshot(
         surface: *mut RawSurface,
@@ -115,6 +123,7 @@ pub struct NativeSurface {
     platform: Box<WaylandGlSurface>,
     wakeup: NativeWakeup,
     state: NativeSurfaceState,
+    expected_program: Option<Arc<CStr>>,
 }
 
 impl NativeSurface {
@@ -152,11 +161,22 @@ impl NativeSurface {
         };
         let raw = NonNull::new(raw)
             .ok_or_else(|| "libghostty could not create a Wayland terminal surface".to_owned())?;
+        // SAFETY: The getter borrows an immutable NUL-terminated path from
+        // this live surface; copy it before the surface can be destroyed.
+        let expected_program = unsafe {
+            let program = gpui_ghostty_surface_linux_expected_program(raw.as_ptr());
+            if program.is_null() {
+                None
+            } else {
+                Some(Arc::<CStr>::from(CStr::from_ptr(program)))
+            }
+        };
         Ok(Self {
             raw,
             platform,
             wakeup,
             state: NativeSurfaceState::default(),
+            expected_program,
         })
     }
 
@@ -199,9 +219,28 @@ impl NativeSurface {
         // SAFETY: This surface owns the live adapter handle until Drop.
         unsafe { gpui_ghostty_surface_linux_is_alive(self.raw.as_ptr()) }
     }
-    pub fn needs_confirm_quit(&self) -> bool {
-        // SAFETY: This surface owns the live adapter handle until Drop.
-        unsafe { gpui_ghostty_surface_linux_needs_confirm_quit(self.raw.as_ptr()) }
+    pub fn process_info(&self) -> Option<ProcessInfo> {
+        let (mut root, mut foreground) = (0, 0);
+        let mut login_wrapper = false;
+        // SAFETY: This surface owns the live adapter handle on the main thread,
+        // and all output pointers are writable stack values for this call only.
+        let available = unsafe {
+            gpui_ghostty_surface_linux_process_info(
+                self.raw.as_ptr(),
+                &mut root,
+                &mut foreground,
+                &mut login_wrapper,
+            )
+        };
+        if !available {
+            return None;
+        }
+        ProcessInfo::from_raw(
+            root,
+            foreground,
+            login_wrapper,
+            self.expected_program.as_ref()?,
+        )
     }
 
     pub fn snapshot(&mut self) -> Result<Option<NativeSnapshot>, String> {

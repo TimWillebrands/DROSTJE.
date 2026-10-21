@@ -1,4 +1,5 @@
 import { registerBrowserTools } from "./client.mjs";
+import { registerPeerDelivery } from "./peer.mjs";
 
 // OMP injects its omptype-backed Zod builder into every extension factory.
 export default function (api) {
@@ -24,4 +25,5 @@ export default function (api) {
     return value.description ? result.describe(value.description) : result;
   }
   registerBrowserTools(api, schema);
+  registerPeerDelivery(api, "omp");
 }

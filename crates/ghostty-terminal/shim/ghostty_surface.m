@@ -5,9 +5,13 @@
 #import <stdlib.h>
 #import <string.h>
 #import <ghostty.h>
+#include "process_activity.h"
 
 extern bool drost_ghostty_config_command(ghostty_config_t, const char *const *, size_t);
 extern void drost_ghostty_config_theme(ghostty_config_t, const uint8_t *);
+extern uint64_t drost_ghostty_surface_root_pid(ghostty_surface_t);
+extern bool drost_ghostty_surface_login_wrapper(ghostty_surface_t);
+extern const char *drost_ghostty_surface_expected_program(ghostty_surface_t);
 
 @interface GpuiGhosttyView : NSView {
 @public
@@ -223,9 +227,30 @@ bool gpui_ghostty_surface_is_alive(const gpui_ghostty_surface *state) {
     return state != NULL && state->surface != NULL && !ghostty_surface_process_exited(state->surface);
 }
 
-bool gpui_ghostty_surface_needs_confirm_quit(const gpui_ghostty_surface *state) {
-    return state == NULL || state->surface == NULL ||
-        ghostty_surface_needs_confirm_quit(state->surface);
+bool gpui_ghostty_surface_process_info(
+    const gpui_ghostty_surface *state, uint64_t *root, uint64_t *foreground,
+    bool *login_wrapper
+) {
+    *root = 0;
+    *foreground = 0;
+    *login_wrapper = false;
+    if (state == NULL || state->surface == NULL) return false;
+    *root = drost_ghostty_surface_root_pid(state->surface);
+    if (*root == 0) return false;
+    *foreground = ghostty_surface_foreground_pid(state->surface);
+    *login_wrapper = drost_ghostty_surface_login_wrapper(state->surface);
+    return *foreground != 0;
+}
+
+const char *gpui_ghostty_surface_expected_program(const gpui_ghostty_surface *state) {
+    if (state == NULL || state->surface == NULL) return NULL;
+    return drost_ghostty_surface_expected_program(state->surface);
+}
+
+int gpui_ghostty_process_activity(
+    uint32_t root, uint32_t foreground, bool login_wrapper, const char *expected_program
+) {
+    return drost_process_activity(root, foreground, login_wrapper, expected_program);
 }
 
 bool gpui_ghostty_surface_snapshot(

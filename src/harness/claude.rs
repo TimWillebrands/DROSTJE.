@@ -13,6 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod peer;
+
 const FRAME: usize = 1_048_576;
 const OUTPUT_FRAME: usize = 67_108_864;
 /// Claude Code (2.1.x, `--input-format stream-json`) emits its `system/init` frame only after
@@ -193,6 +195,7 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session, Opti
             "--output-format",
             "stream-json",
             "--verbose",
+            "--replay-user-messages",
             "--permission-prompts",
             "host",
             "--permission-prompt-tool",
@@ -335,6 +338,9 @@ struct Actor {
     history: Vec<Value>,
     sequence: usize,
     turn: Turn,
+    peer_turn: Option<Uuid>,
+    peer: peer::Inbox,
+    peer_blocked: bool,
     idle_sleep_assertion: Option<IdleSleepAssertion>,
     permissions: HashMap<String, Permission>,
     tools: HashMap<String, ToolActivity>,
@@ -367,6 +373,7 @@ impl Actor {
             .append(true)
             .open(&session.transcript_path)
             .context("Open Claude Code transcript")?;
+        let peer = peer::Inbox::new(child.child.id(), session.id);
         Ok(Self {
             config,
             session,
@@ -388,6 +395,9 @@ impl Actor {
             history,
             sequence,
             turn: Turn::default(),
+            peer_turn: None,
+            peer,
+            peer_blocked: false,
             idle_sleep_assertion: None,
             permissions: HashMap::new(),
             tools: HashMap::new(),
@@ -467,7 +477,7 @@ impl Actor {
                         self.write_offset = 0;
                         if let Some((request_id, history)) = completed.accepted {
                             self.append_history(&history)?;
-                            // Claude Code never echoes prompts; show one as soon as it is accepted.
+                            // Show our submitted history once; native replay echoes are suppressed.
                             for message in normalize_history(
                                 &history,
                                 self.sequence,
@@ -505,9 +515,11 @@ impl Actor {
             })
             .collect();
         self.emit(ConversationEvent::Ready {
+            peer_delivery: false,
             session_ref: self.session.reference.clone(),
             models,
         });
+        self.emit_peer_availability(None);
         self.emit_history()?;
         self.state(ConversationState::Ready);
         // The `initialize` answer carries the model catalog before any prompt is sent.
@@ -545,9 +557,21 @@ impl Actor {
                     }
                 }
             }
-            self.flush()?;
+            if !self.closing {
+                self.flush()?;
+                if self.peer.probe() {
+                    self.emit_peer_availability(None);
+                }
+                for update in self.peer.tick() {
+                    self.emit(ConversationEvent::PeerDelivery {
+                        attempt: update.attempt,
+                        outcome: update.outcome,
+                    });
+                }
+            }
             if self.closing {
                 self.child.stdin.take();
+                self.stop_peer("Claude runtime closed before native admission");
                 self.settle(TurnOutcome::Unknown);
                 self.state(ConversationState::Disconnected);
                 return Ok(());
@@ -639,17 +663,53 @@ impl Actor {
 
     fn command(&mut self, command: ConversationCommand) -> Result<()> {
         if self.closing {
+            if let ConversationCommand::DeliverPeer(delivery) = command {
+                self.emit(ConversationEvent::PeerDelivery {
+                    attempt: delivery.attempt,
+                    outcome: PeerDeliveryOutcome::Rejected("Claude runtime is closing".into()),
+                });
+            }
             return Ok(());
         }
         match command {
             ConversationCommand::Close => self.closing = true,
+            ConversationCommand::DeliverPeer(delivery) => {
+                let attempt = delivery.attempt;
+                let result = (|| -> Result<()> {
+                    ensure!(
+                        self.peer.ready && !self.peer_blocked,
+                        "Claude native peer inbox is unavailable or blocked by inbound policy"
+                    );
+                    ensure!(
+                        !matches!(
+                            self.state,
+                            ConversationState::WaitingForInput
+                                | ConversationState::Interrupting
+                                | ConversationState::Disconnected
+                                | ConversationState::Failed
+                        ),
+                        "Claude runtime cannot admit peer context in its current state"
+                    );
+                    ensure!(
+                        self.child.child.try_wait()?.is_none(),
+                        "Claude runtime has stopped"
+                    );
+                    self.peer.send(delivery)
+                })();
+                if let Err(error) = result {
+                    self.emit(ConversationEvent::PeerDelivery {
+                        attempt,
+                        outcome: PeerDeliveryOutcome::Rejected(format!("{error:#}")),
+                    });
+                }
+            }
             ConversationCommand::LoadHistory { cursor } => {
                 if cursor.is_none() {
                     self.emit_history()?;
                 }
             }
             ConversationCommand::SelectModel(model) => {
-                if self.turn.id.is_some() {
+                if self.turn.id.is_some() || self.peer_turn.is_some() {
                     self.emit(ConversationEvent::Failed {
                         request_id: None,
                         message: "Model selection requires an idle Claude Code conversation".into(),
@@ -665,7 +725,8 @@ impl Actor {
                 }
             }
             ConversationCommand::Interrupt => {
-                if self.turn.id.is_some() && !self.turn.interrupting {
+                self.stop_peer("Claude runtime was interrupted before native admission");
+                if (self.turn.id.is_some() || self.peer_turn.is_some()) && !self.turn.interrupting {
                     self.turn.interrupting = true;
                     self.state(ConversationState::Interrupting);
                     let request_id = Uuid::new_v4().to_string();
@@ -711,7 +772,7 @@ impl Actor {
             } => {
                 let attempt = (|| -> Result<()> {
                     ensure!(
-                        self.turn.id.is_none(),
+                        self.turn.id.is_none() && self.peer_turn.is_none(),
                         "A conversation already has an active turn"
                     );
                     ensure!(
@@ -736,6 +797,7 @@ impl Actor {
                     }
                     let frame = json!({
                         "type":"user",
+                        "uuid":request_id,
                         "message":{"role":"user","content":content},
                         "parent_tool_use_id":Value::Null,
                         "session_id":self.session.id,
@@ -798,6 +860,46 @@ impl Actor {
     }
 
     fn frame(&mut self, frame: Value) -> Result<()> {
+        let (updates, peer_messages) = self.peer.observe(&frame);
+        for update in updates {
+            self.emit(ConversationEvent::PeerDelivery {
+                attempt: update.attempt,
+                outcome: update.outcome,
+            });
+        }
+        let native_ids = peer::correlated_ids(&frame);
+        let peer_ids = native_ids
+            .iter()
+            .copied()
+            .filter(|id| self.peer.known(id))
+            .collect::<Vec<_>>();
+        if self.turn.id.is_none()
+            && self.peer_turn.is_none()
+            && ((frame["type"] == "user" && frame["origin"]["kind"] == "peer")
+                || (frame["type"] == "command_lifecycle" && frame["state"] == "started"))
+        {
+            if let Some(id) = peer_ids.first() {
+                self.begin_peer(*id);
+            }
+        }
+        let correlated_peer_echo = !peer_messages.is_empty();
+        for (attempt, messages) in peer_messages {
+            let history =
+                json!({"type":"drostje_peer","id":attempt,"messages":messages,"native":frame});
+            self.append_history(&history)?;
+            self.emit(ConversationEvent::MessageUpdated(Message {
+                id: attempt.to_string(),
+                role: "peer".into(),
+                content: messages
+                    .into_iter()
+                    .map(ContentBlock::PeerMessage)
+                    .collect(),
+                raw: Some(frame.clone()),
+                tool_call_id: None,
+                error: false,
+                exit_code: None,
+            }));
+        }
         match frame["type"].as_str().unwrap_or("") {
             "system" if frame["subtype"] == "init" => {
                 let id = frame["session_id"]
@@ -838,6 +940,7 @@ impl Actor {
                         .into_iter()
                         .collect();
                     self.emit(ConversationEvent::Ready {
+                        peer_delivery: self.peer.ready && !self.peer_blocked,
                         session_ref: self.session.reference.clone(),
                         models,
                     });
@@ -872,6 +975,28 @@ impl Actor {
                 self.emit(ConversationEvent::MessageUpdated(message));
             }
             "user" => {
+                if peer::is_context(&frame) {
+                    if !correlated_peer_echo {
+                        self.append_history(&frame)?;
+                        for message in normalize_history(
+                            &frame,
+                            self.sequence,
+                            &self.config.session_dir,
+                            &mut self.images,
+                        )? {
+                            self.emit(ConversationEvent::MessageUpdated(message));
+                        }
+                    }
+                    return Ok(());
+                }
+                // --replay-user-messages echoes ordinary stdin prompts. Their local history
+                // was already appended when the input pipe accepted the original frame.
+                if !frame["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+                {
+                    return Ok(());
+                }
                 self.append_history(&frame)?;
                 for message in normalize_tool_results(
                     &frame,
@@ -930,6 +1055,12 @@ impl Actor {
                 }
             }
             "result" => {
+                if frame["origin"]["kind"] == "peer" || !peer_ids.is_empty() {
+                    self.emit(ConversationEvent::Diagnostic {
+                        label: "Claude native peer result".into(),
+                        raw: frame.clone(),
+                    });
+                }
                 let error = frame["is_error"].as_bool().unwrap_or(false)
                     || frame["subtype"]
                         .as_str()
@@ -951,9 +1082,46 @@ impl Actor {
                 } else {
                     TurnOutcome::Completed
                 };
-                self.settle(outcome);
-                self.state(ConversationState::Ready);
+                let settles_user = self.turn.id.is_some_and(|id| {
+                    native_ids.contains(&id)
+                        || (native_ids.is_empty() && frame["origin"]["kind"] != "peer")
+                });
+                if settles_user {
+                    self.settle_user(outcome.clone());
+                    // A result can consume both user input and safe-boundary peer context.
+                    if self.peer_turn.is_some() {
+                        self.settle_peer(outcome);
+                    }
+                } else if let Some(id) = peer_ids.first().copied().or(self.peer_turn) {
+                    if self.peer_turn.is_none() {
+                        self.begin_peer(id);
+                    }
+                    self.settle_peer(outcome);
+                } else {
+                    self.emit(ConversationEvent::Diagnostic {
+                        label: "Uncorrelated Claude result".into(),
+                        raw: frame.clone(),
+                    });
+                }
+                if self.turn.id.is_none() && self.peer_turn.is_none() {
+                    self.state(ConversationState::Ready);
+                }
                 self.refresh_usage(&[CONTEXT_USAGE_REQUEST, USAGE_REQUEST])?;
+            }
+            "system" if frame["subtype"] == "peer_message_hold" => {
+                if frame["lane"] == "socket" && native_ids.iter().any(|id| self.peer.tracks(id)) {
+                    self.peer_blocked = frame["state"] != "released";
+                    let reason = self.peer_blocked.then(|| format!(
+                        "Claude native inbound policy {} this message ({}). Review crossSessionInbound in the session; Space delivery never bypasses it.",
+                        frame["state"].as_str().unwrap_or("blocked"),
+                        frame["cause"].as_str().or_else(|| frame["outcome"].as_str()).unwrap_or("approval required")
+                    ));
+                    self.emit_peer_availability(reason);
+                }
+                self.emit(ConversationEvent::Diagnostic {
+                    label: "Claude native peer inbound policy".into(),
+                    raw: frame,
+                });
             }
             // Claude Code pushes the whole list again whenever it changes.
             "system" if frame["subtype"] == "commands_changed" => {
@@ -1011,6 +1179,7 @@ impl Actor {
                     if !models.is_empty() {
                         self.models_reported = true;
                         self.emit(ConversationEvent::Ready {
+                            peer_delivery: self.peer.ready && !self.peer_blocked,
                             session_ref: self.session.reference.clone(),
                             models,
                         });
@@ -1044,7 +1213,7 @@ impl Actor {
         self.emit(event);
     }
 
-    fn settle(&mut self, outcome: TurnOutcome) {
+    fn settle_user(&mut self, outcome: TurnOutcome) {
         self.idle_sleep_assertion = None;
         if let Some(request_id) = self.turn.id.take() {
             self.permissions.clear();
@@ -1056,7 +1225,57 @@ impl Actor {
         self.turn = Turn::default();
     }
 
+    fn begin_peer(&mut self, request_id: Uuid) {
+        self.peer_turn = Some(request_id);
+        if self.idle_sleep_assertion.is_none() {
+            match IdleSleepAssertion::acquire("DROSTJE. peer conversation turn") {
+                Ok(assertion) => self.idle_sleep_assertion = Some(assertion),
+                Err(error) => self.emit(ConversationEvent::Notice {
+                    level: "warning".into(),
+                    text: format!("Could not prevent idle sleep during peer turn: {error:#}"),
+                }),
+            }
+        }
+        self.emit(ConversationEvent::PeerTurnStarted { request_id });
+        self.state(ConversationState::Running);
+    }
+
+    fn settle_peer(&mut self, outcome: TurnOutcome) {
+        if let Some(request_id) = self.peer_turn.take() {
+            self.emit(ConversationEvent::TurnSettled {
+                request_id,
+                outcome,
+            });
+            if self.turn.id.is_none() {
+                self.permissions.clear();
+                self.idle_sleep_assertion = None;
+            }
+        }
+    }
+
+    fn settle(&mut self, outcome: TurnOutcome) {
+        self.settle_peer(outcome.clone());
+        self.settle_user(outcome);
+    }
+
+    fn emit_peer_availability(&mut self, reason: Option<String>) {
+        self.emit(ConversationEvent::PeerDeliveryAvailable {
+            available: self.peer.ready && !self.peer_blocked,
+            reason: reason.or_else(|| (!self.peer.ready).then(|| "Claude has not published a live protocol-1 inbox for this child PID and session UUID".into())),
+        });
+    }
+
+    fn stop_peer(&mut self, reason: &str) {
+        for update in self.peer.stop(reason) {
+            self.emit(ConversationEvent::PeerDelivery {
+                attempt: update.attempt,
+                outcome: update.outcome,
+            });
+        }
+    }
+
     fn disconnect(&mut self, message: String) {
+        self.stop_peer("Claude runtime disconnected before native admission");
         self.settle(TurnOutcome::Unknown);
         self.state(ConversationState::Failed);
         self.emit(ConversationEvent::Failed {
@@ -1554,6 +1773,36 @@ fn normalize_history(
     images: &mut ImageCache,
 ) -> Result<Vec<Message>> {
     match frame["type"].as_str().unwrap_or("") {
+        "drostje_peer" => Ok(vec![Message {
+            id: frame["id"].as_str().unwrap_or("peer").into(),
+            role: "peer".into(),
+            content: serde_json::from_value::<Vec<PeerMessage>>(frame["messages"].clone())?
+                .into_iter()
+                .map(ContentBlock::PeerMessage)
+                .collect(),
+            raw: Some(frame["native"].clone()),
+            tool_call_id: None,
+            error: false,
+            exit_code: None,
+        }]),
+        "user" if peer::is_context(frame) => Ok(vec![Message {
+            id: frame["uuid"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("claude-peer-{sequence}")),
+            role: "peer".into(),
+            content: vec![ContentBlock::Text(
+                frame["origin"]["body"]
+                    .as_str()
+                    .or_else(|| frame["message"]["content"].as_str())
+                    .unwrap_or("Native peer context")
+                    .into(),
+            )],
+            raw: Some(frame.clone()),
+            tool_call_id: None,
+            error: false,
+            exit_code: None,
+        }]),
         "drostje_user" => {
             let images: Vec<ImageAttachment> = serde_json::from_value(frame["images"].clone())?;
             let mut content = Vec::new();

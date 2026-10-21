@@ -1,4 +1,4 @@
-//! Space-local membership and mailbox inspection. Selection never retrieves an agent's mail.
+//! Space-local membership and delivery inspection. Rendering never delivers or acknowledges mail.
 use super::{
     agents::Activity,
     commands::{self, Command, button},
@@ -7,7 +7,7 @@ use super::{
 use crate::{
     app::{AppState, PresentationChange},
     model::ThreadId,
-    network::{Member, NetworkMessage},
+    network::{DeliveryState, Member, NetworkMessage},
 };
 use gpui_kit::{
     component::{
@@ -48,6 +48,7 @@ impl Row {
 struct NetworkList {
     rows: Vec<Row>,
     selected: Option<IndexPath>,
+    state: Entity<AppState>,
     owner: WeakEntity<Workspace>,
     empty: &'static str,
 }
@@ -86,11 +87,12 @@ impl ListDelegate for NetworkList {
             Row::Member(member) => (
                 member.title.clone(),
                 format!(
-                    "{} · {}",
+                    "{} · {} · Native: {}",
                     member.project,
-                    crate::harness::display_name(&member.harness)
+                    crate::harness::display_name(&member.harness),
+                    member.status
                 ),
-                member.status.clone(),
+                network_readiness(member, self.state.read(cx)).to_owned(),
             ),
             Row::Message(message) => (
                 if message.broadcast {
@@ -160,24 +162,56 @@ impl ListDelegate for NetworkList {
     }
 }
 
-fn delivery_summary(message: &NetworkMessage) -> String {
-    let retrieved = message
-        .deliveries
-        .iter()
-        .filter(|delivery| delivery.retrieved)
-        .count();
-    let pending = message
-        .deliveries
-        .iter()
-        .filter(|delivery| !delivery.retrieved && delivery.closed.is_none())
-        .count();
-    if pending > 0 {
-        format!("{pending} queued")
-    } else if retrieved == message.deliveries.len() {
-        "Retrieved".into()
+fn network_readiness(member: &Member, state: &AppState) -> &'static str {
+    if !member.automatic {
+        "Network: consent needed"
+    } else if !member.delivery_enabled {
+        "Network: paused"
+    } else if state.network_delivery_reason(member.thread).is_some() {
+        "Network: blocked"
     } else {
-        "Closed".into()
+        "Network: ready"
     }
+}
+
+fn delivery_label(state: &DeliveryState) -> &'static str {
+    match state {
+        DeliveryState::Queued => "Queued",
+        DeliveryState::Delivering => "Delivering",
+        DeliveryState::Delivered => "Delivered",
+        DeliveryState::Failed { .. } => "Failed",
+        DeliveryState::Unknown { .. } => "Unknown",
+        DeliveryState::Closed { .. } => "Closed",
+    }
+}
+
+fn delivery_summary(message: &NetworkMessage) -> String {
+    let mut counts = [0; 6];
+    for delivery in &message.deliveries {
+        let index = match &delivery.state {
+            DeliveryState::Queued => 0,
+            DeliveryState::Delivering => 1,
+            DeliveryState::Delivered => 2,
+            DeliveryState::Failed { .. } => 3,
+            DeliveryState::Unknown { .. } => 4,
+            DeliveryState::Closed { .. } => 5,
+        };
+        counts[index] += 1;
+    }
+    [
+        "Queued",
+        "Delivering",
+        "Delivered",
+        "Failed",
+        "Unknown",
+        "Closed",
+    ]
+    .into_iter()
+    .zip(counts)
+    .filter(|(_, count)| *count > 0)
+    .map(|(label, count)| format!("{label}: {count}"))
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 pub(super) struct NetworkPanel {
@@ -205,6 +239,7 @@ impl NetworkPanel {
                 NetworkList {
                     rows: Vec::new(),
                     selected: None,
+                    state: state.clone(),
                     owner: owner.clone(),
                     empty: "No agents have joined this Space network",
                 },
@@ -273,6 +308,7 @@ impl NetworkPanel {
         let space = state.thread_space(self.id);
         let revision = (state.network.revision, space);
         if self.revision == Some(revision) {
+            self.list.update(cx, |_, cx| cx.notify());
             return;
         }
         self.revision = Some(revision);
@@ -287,12 +323,7 @@ impl NetworkPanel {
                         && state.thread_in_space(member.thread, member.space)
                 })
                 .cloned()
-                .map(|mut member| {
-                    if state.network.snapshot.waiting.contains(&member.thread) {
-                        member.status = "Waiting for message".into();
-                    }
-                    Row::Member(member)
-                })
+                .map(Row::Member)
                 .collect(),
             View::Messages => state
                 .network
@@ -389,20 +420,36 @@ impl Render for NetworkPanel {
             .filter(|message| Some(message.space) == space)
             .flat_map(|message| &message.deliveries)
             .filter(|delivery| {
-                delivery.recipient == self.id && !delivery.retrieved && delivery.closed.is_none()
+                delivery.recipient == self.id && matches!(&delivery.state, DeliveryState::Queued)
             })
             .count();
+        let delivery_enabled = state.network_delivery_enabled(self.id);
+        let delivery_reason = joined
+            .then(|| state.network_delivery_reason(self.id))
+            .flatten();
         let header = v_flex().flex_shrink_0().p_2().gap_2()
             .child(h_flex().min_w_0().gap_2()
                 .child(div().flex_1().min_w_0().text_ellipsis().child(Label::new(format!("Space network · {name}")).text_sm()))
+                .when(joined && !delivery_enabled, |header| {
+                    header.child(button("resume-network-delivery", Command::ResumeNetworkDelivery, &self.owner, state)
+                        .label("Resume")
+                        .loading(pending).debug_selector(|| "resume-network-delivery".into()))
+                })
                 .child(button("toggle-space-network", if joined { Command::LeaveSpaceNetwork } else { Command::JoinSpaceNetwork }, &self.owner, state)
+                    .label(if joined { "Leave" } else { "Join" })
                     .loading(pending).debug_selector(|| "toggle-space-network".into())))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground)
-                .child(if joined {
-                    format!("Joined · {pending_messages} queued. network wait pauses the current turn; inbox retrieves mail. Messages never start turns.")
-                } else {
-                    "Join to make this agent discoverable and exchange messages in this Space. Conversation history and Drafts stay private.".into()
-                }))
+            .child(Label::new(if joined {
+                format!("{} · {pending_messages} queued", if delivery_enabled { "Automatic delivery enabled" } else { "Automatic delivery paused" })
+            } else {
+                "Not joined".into()
+            }).text_xs())
+            .when_some(delivery_reason, |header, reason| {
+                header.child(Label::new(reason).text_xs().text_color(cx.theme().muted_foreground))
+            })
+            .child(Label::new("Join or Resume consents to automatic delivery at safe boundaries while busy and paid-turn wakeups while idle. Drafts and conversation history stay private. Stopped or closed agents never restart from a message; paused legacy members need Resume consent.")
+                .text_xs().text_color(cx.theme().muted_foreground))
+            .child(Label::new("Delivered means the native runtime accepted the message, not that the model read or acted on it. Failed and Unknown deliveries are not retried automatically.")
+                .text_xs().text_color(cx.theme().muted_foreground))
             .when_some(state.network.error.clone(), |header, error| header.child(Alert::error("network-error", error).small()));
         let selected_view = match self.view {
             View::Members => 0,
@@ -465,6 +512,7 @@ impl Render for NetworkPanel {
                         &self.inspection_focus,
                         &self.inspection_scroll,
                         window,
+                        state,
                         cx,
                     ))
                 })
@@ -546,39 +594,78 @@ fn detail_view(
     focus: &FocusHandle,
     scroll: &ScrollHandle,
     window: &Window,
+    state: &AppState,
     cx: &App,
 ) -> AnyElement {
     let content = match row {
-        Row::Member(member) => v_flex()
-            .gap_1()
-            .child(Label::new(member.title).secondary(member.project))
-            .child(
-                div()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .whitespace_normal()
-                    .child(member.worktree),
-            )
-            .child(format!(
-                "{} · {}",
-                crate::harness::display_name(&member.harness),
-                member.status
-            ))
-            .child("Return opens this Thread; absence of a message is not a file reservation")
-            .into_any_element(),
+        Row::Member(member) => {
+            let readiness = network_readiness(&member, state);
+            let reason = if !member.automatic {
+                "Automatic delivery needs new consent. Open this Thread and choose Resume network delivery.".into()
+            } else {
+                state.network_delivery_reason(member.thread).unwrap_or_else(|| {
+                    if member.delivery_enabled {
+                        "Eligible for automatic delivery at native safe boundaries or an idle paid turn.".into()
+                    } else {
+                        "Open this Thread and choose Resume network delivery.".into()
+                    }
+                })
+            };
+            v_flex()
+                .gap_1()
+                .child(Label::new(member.title).secondary(member.project))
+                .child(
+                    div()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .whitespace_normal()
+                        .child(member.worktree),
+                )
+                .child(Label::new("Native state").secondary(format!(
+                    "{} · {}",
+                    crate::harness::display_name(&member.harness),
+                    member.status
+                )))
+                .child(Label::new(readiness).secondary(reason))
+                .child(Label::new(
+                    "Return opens this Thread; absence of a message is not a file reservation",
+                ))
+                .into_any_element()
+        }
         Row::Message(message) => v_flex()
             .gap_2()
             .child(Label::new(message.sender_name).secondary(message.created_at))
             .child("Return focuses this message; j/k scroll, Escape returns to the list")
             .child(div().whitespace_normal().child(message.body))
             .children(message.deliveries.into_iter().map(|delivery| {
-                let status = if delivery.retrieved {
-                    "Retrieved by agent".to_owned()
-                } else if let Some(reason) = delivery.closed {
-                    format!("Closed: {reason}")
-                } else {
-                    "Queued; not retrieved".into()
+                let detail = match &delivery.state {
+                    DeliveryState::Queued => state
+                        .network_delivery_reason(delivery.recipient)
+                        .unwrap_or_else(|| {
+                            "Waiting for the next native safe boundary or idle turn".into()
+                        }),
+                    DeliveryState::Delivering => "Awaiting native runtime acceptance".to_owned(),
+                    DeliveryState::Delivered => {
+                        "Accepted by the native runtime; not proof of model action".to_owned()
+                    }
+                    DeliveryState::Failed { reason }
+                    | DeliveryState::Unknown { reason }
+                    | DeliveryState::Closed { reason } => reason.clone(),
                 };
-                Label::new(delivery.recipient_name).secondary(status)
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .child(Label::new(delivery.recipient_name))
+                            .child(
+                                Tag::secondary()
+                                    .outline()
+                                    .xsmall()
+                                    .child(delivery_label(&delivery.state)),
+                            ),
+                    )
+                    .child(Label::new(detail).text_color(cx.theme().muted_foreground))
             }))
             .into_any_element(),
     };

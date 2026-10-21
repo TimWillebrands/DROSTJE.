@@ -3,9 +3,9 @@ use super::commands::{
 };
 use crate::model::{DraftKey, DraftRevision, DraftSnapshot};
 use crate::neovim::grid::{Cell, GridSnapshot, Highlight, HighlightedChunk};
-use crate::neovim::{ClipboardContent, NvimCommand, NvimEditor, NvimEvent};
+use crate::neovim::{ClipboardContent, NvimCommand, NvimEditor, NvimEvent, NvimTheme};
 use gpui_kit::{
-    component::{ActiveTheme, alert::Alert, label::Label},
+    component::{ActiveTheme, Theme, alert::Alert, label::Label},
     prelude::*,
     *,
 };
@@ -28,6 +28,8 @@ pub enum NvimViewEvent {
     ModeChanged,
     /// A key the caret popup claimed instead of Neovim.
     CaretPopupKey(CaretPopupKey),
+    /// Neovim asked to stop editing (`:q`, `:wq`, `ZZ`…); the owner moves focus away.
+    Leave,
 }
 
 /// What the caret popup's Actions ask of its owner. Bindings live in `commands::bind_keys`
@@ -96,7 +98,7 @@ struct RowCacheKey {
     viewport: Size<Pixels>,
     scale_factor: f32,
     cols: usize,
-    theme: [u32; 4],
+    theme: NvimTheme,
     defaults: [u32; 3],
     highlights: Arc<HashMap<u64, Highlight>>,
 }
@@ -192,7 +194,7 @@ pub struct NvimView {
     font_size: Pixels,
     font: Font,
     scale_factor: f32,
-    theme_colors: Option<[u32; 4]>,
+    theme_colors: Option<NvimTheme>,
     frame: Option<Frame>,
     row_cache: RowCache,
     requested_size: Option<(u32, u32)>,
@@ -489,6 +491,7 @@ impl NvimView {
                 cx.emit(NvimViewEvent::CompositionChanged(self.has_composition()));
             }
             NvimEvent::InputRejected(error) => self.reject(error, cx),
+            NvimEvent::Leave => cx.emit(NvimViewEvent::Leave),
             NvimEvent::Failed(error) => self.fail(error, cx),
             NvimEvent::Ready => {
                 self.ready = true;
@@ -814,27 +817,13 @@ impl NvimView {
 
     fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let theme = cx.theme();
-        let background = theme.background.to_rgb();
-        let colors = [
-            u32::from(background.blend(theme.foreground.to_rgb())) >> 8,
-            u32::from(background) >> 8,
-            u32::from(background.blend(theme.selection.to_rgb())) >> 8,
-            u32::from(background.blend(theme.caret.to_rgb())) >> 8,
-        ];
+        let colors = nvim_theme(theme);
         let font = font(theme.mono_font_family.clone());
         let font_changed = self.font != font;
         self.font = font;
         if self.ready
             && self.theme_colors != Some(colors)
-            && self.send(
-                NvimCommand::Theme {
-                    foreground: colors[0],
-                    background: colors[1],
-                    selection: colors[2],
-                    caret: colors[3],
-                },
-                cx,
-            )
+            && self.send(NvimCommand::Theme(colors), cx)
         {
             self.theme_colors = Some(colors);
         }
@@ -1909,6 +1898,30 @@ fn clipboard_content(item: &ClipboardItem) -> Option<ClipboardContent> {
     })
 }
 
+/// Every role Neovim's highlight groups draw from, flattened onto the editor background
+/// so translucent kit colors read the same inside Neovim as around it.
+fn nvim_theme(theme: &Theme) -> NvimTheme {
+    let background = theme.background.to_rgb();
+    let packed = |color: Hsla| u32::from(background.blend(color.to_rgb())) >> 8;
+    NvimTheme {
+        dark: theme.is_dark(),
+        foreground: packed(theme.foreground),
+        background: u32::from(background) >> 8,
+        muted: packed(theme.muted_foreground),
+        surface: packed(theme.muted),
+        border: packed(theme.border),
+        selection: packed(theme.selection),
+        caret: packed(theme.caret),
+        accent: packed(theme.primary),
+        popover: packed(theme.popover),
+        popover_foreground: packed(theme.popover_foreground),
+        success: packed(theme.success),
+        warning: packed(theme.warning),
+        danger: packed(theme.danger),
+        info: packed(theme.info),
+    }
+}
+
 fn colors(grid: &GridSnapshot, id: u64) -> (Hsla, Hsla, Hsla) {
     let default = Highlight::default();
     let highlight = grid.highlights.get(&id).unwrap_or(&default);
@@ -2215,7 +2228,7 @@ fn chunk_range(chunks: &[HighlightedChunk], range: Range<usize>) -> Vec<Highligh
 
 #[cfg(test)]
 mod row_cache_tests {
-    use super::{Cell, GridSnapshot, Highlight, RowCache, RowCacheKey, RowShape};
+    use super::{Cell, GridSnapshot, Highlight, NvimTheme, RowCache, RowCacheKey, RowShape};
     use gpui_kit::{font, px, size};
     use std::cell::Cell as Counter;
     use std::sync::Arc;
@@ -2228,7 +2241,7 @@ mod row_cache_tests {
             viewport: size(px(800.), px(400.)),
             scale_factor: 2.,
             cols: grid.cols,
-            theme: [0; 4],
+            theme: NvimTheme::default(),
             defaults: [grid.default_fg, grid.default_bg, grid.default_sp],
             highlights: Arc::clone(&grid.highlights),
         }
@@ -2297,7 +2310,7 @@ mod row_cache_tests {
             |key| key.viewport.width = px(400.),
             |key| key.scale_factor = 1.,
             |key| key.cols = 2,
-            |key| key.theme[0] = 1,
+            |key| key.theme.foreground = 1,
             |key| key.defaults[0] = 1,
             |key| {
                 Arc::make_mut(&mut key.highlights).insert(

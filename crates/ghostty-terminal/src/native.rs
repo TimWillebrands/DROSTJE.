@@ -1,16 +1,74 @@
 //! Safe, narrow Rust ownership wrappers for Ghostty's native render surfaces.
 
 use std::{
-    ffi::c_void,
+    ffi::{CStr, c_void},
     ptr::NonNull,
     sync::{Arc, OnceLock},
 };
 
 #[cfg(not(target_os = "linux"))]
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 
 use crate::clipboard::{ClipboardApproval, ClipboardApprovalCallback, ClipboardOperation};
 use async_channel::{Receiver, Sender};
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProcessInfo {
+    pub root: u32,
+    pub foreground: u32,
+    pub login_wrapper: bool,
+    pub expected_program: Arc<CStr>,
+}
+
+unsafe extern "C" {
+    fn gpui_ghostty_process_activity(
+        root: u32,
+        foreground: u32,
+        login_wrapper: bool,
+        expected_program: *const std::ffi::c_char,
+    ) -> std::ffi::c_int;
+}
+
+impl ProcessInfo {
+    fn from_raw(
+        root: u64,
+        foreground: u64,
+        login_wrapper: bool,
+        expected_program: &Arc<CStr>,
+    ) -> Option<Self> {
+        let root = u32::try_from(root).ok()?;
+        let foreground = u32::try_from(foreground).ok()?;
+        if root == 0
+            || foreground == 0
+            || root > i32::MAX as u32
+            || foreground > i32::MAX as u32
+            || expected_program.to_bytes().is_empty()
+        {
+            return None;
+        }
+        Some(Self {
+            root,
+            foreground,
+            login_wrapper,
+            expected_program: Arc::clone(expected_program),
+        })
+    }
+
+    /// Performs OS process enumeration; call only on a background executor.
+    pub fn needs_confirm_quit(self) -> bool {
+        // SAFETY: Process identities cross by value; the program is a valid
+        // NUL-terminated string alive through the call. The shim retains no
+        // pointers and returns zero only when it can establish an idle shell.
+        unsafe {
+            gpui_ghostty_process_activity(
+                self.root,
+                self.foreground,
+                self.login_wrapper,
+                self.expected_program.as_ptr(),
+            ) != 0
+        }
+    }
+}
 
 struct NativeCallbacks {
     sender: Sender<()>,
@@ -239,7 +297,13 @@ mod platform {
         ) -> *mut RawSurface;
         fn gpui_ghostty_surface_free(surface: *mut RawSurface);
         fn gpui_ghostty_surface_tick(surface: *mut RawSurface);
-        fn gpui_ghostty_surface_needs_confirm_quit(surface: *const RawSurface) -> bool;
+        fn gpui_ghostty_surface_process_info(
+            surface: *const RawSurface,
+            root: *mut u64,
+            foreground: *mut u64,
+            login_wrapper: *mut bool,
+        ) -> bool;
+        fn gpui_ghostty_surface_expected_program(surface: *const RawSurface) -> *const c_char;
         fn gpui_ghostty_surface_is_alive(surface: *const RawSurface) -> bool;
         fn gpui_ghostty_surface_snapshot(
             surface: *mut RawSurface,
@@ -305,6 +369,7 @@ mod platform {
         raw: NonNull<RawSurface>,
         wakeup: NativeWakeup,
         state: NativeSurfaceState,
+        expected_program: Option<Arc<CStr>>,
         _main_thread: PhantomData<Rc<()>>,
     }
 
@@ -338,10 +403,21 @@ mod platform {
                 )
             };
             let raw = NonNull::new(raw).ok_or("libghostty could not create a terminal surface")?;
+            // SAFETY: The getter borrows an immutable NUL-terminated path from
+            // this live surface; copy it before the surface can be destroyed.
+            let expected_program = unsafe {
+                let program = gpui_ghostty_surface_expected_program(raw.as_ptr());
+                if program.is_null() {
+                    None
+                } else {
+                    Some(Arc::<CStr>::from(CStr::from_ptr(program)))
+                }
+            };
             Ok(Self {
                 raw,
                 wakeup,
                 state: NativeSurfaceState::default(),
+                expected_program,
                 _main_thread: PhantomData,
             })
         }
@@ -359,9 +435,28 @@ mod platform {
             // SAFETY: `raw` remains valid for this value's lifetime.
             unsafe { gpui_ghostty_surface_is_alive(self.raw.as_ptr()) }
         }
-        pub fn needs_confirm_quit(&self) -> bool {
-            // SAFETY: `raw` remains valid for this value's lifetime.
-            unsafe { gpui_ghostty_surface_needs_confirm_quit(self.raw.as_ptr()) }
+        pub fn process_info(&self) -> Option<ProcessInfo> {
+            let (mut root, mut foreground) = (0, 0);
+            let mut login_wrapper = false;
+            // SAFETY: `raw` remains live on the main thread, and all output
+            // pointers refer to writable stack values for this call only.
+            let available = unsafe {
+                gpui_ghostty_surface_process_info(
+                    self.raw.as_ptr(),
+                    &mut root,
+                    &mut foreground,
+                    &mut login_wrapper,
+                )
+            };
+            if !available {
+                return None;
+            }
+            ProcessInfo::from_raw(
+                root,
+                foreground,
+                login_wrapper,
+                self.expected_program.as_ref()?,
+            )
         }
 
         pub fn snapshot(&mut self) -> Result<Option<NativeSnapshot>, String> {
@@ -599,6 +694,32 @@ pub enum MouseButton {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_info_rejects_unknown_and_out_of_range_identities() {
+        let expected_program = Arc::<CStr>::from(c"/bin/sh");
+        let info = ProcessInfo::from_raw(1, i32::MAX as u64, false, &expected_program).unwrap();
+        assert_eq!(info.root, 1);
+        assert_eq!(info.foreground, i32::MAX as u32);
+        assert!(!info.login_wrapper);
+        assert!(
+            ProcessInfo::from_raw(1, 2, true, &expected_program)
+                .unwrap()
+                .login_wrapper
+        );
+        assert!(Arc::ptr_eq(&info.expected_program, &expected_program));
+        assert!(ProcessInfo::from_raw(1, 2, false, &Arc::<CStr>::from(c"")).is_none());
+        for (root, foreground) in [
+            (0, 1),
+            (1, 0),
+            (i32::MAX as u64 + 1, 1),
+            (1, i32::MAX as u64 + 1),
+            (u64::MAX, 1),
+            (1, u64::MAX),
+        ] {
+            assert!(ProcessInfo::from_raw(root, foreground, false, &expected_program).is_none());
+        }
+    }
 
     #[test]
     fn explicit_visibility_survives_layout_and_resize() {

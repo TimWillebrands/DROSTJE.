@@ -605,7 +605,7 @@ impl Workspace {
     ) {
         // A delayed validation result must not interrupt another thread or surface.
         if self.state.read(cx).selected_thread != Some(thread_id)
-            || self.dialog.is_some()
+            || self.has_open_form(cx)
             || self.extension.is_some()
             || self.palette.is_some()
             || window.has_active_dialog(cx)

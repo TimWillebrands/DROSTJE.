@@ -521,13 +521,9 @@ impl Workspace {
             return;
         }
         let result: Result<Value, String> = match operation {
-            BrowserToolOperation::Network {
-                token,
-                action,
-                cancelled,
-            } => {
+            BrowserToolOperation::Network { token, action } => {
                 self.state.update(cx, |state, _| {
-                    state.network_tool(thread, token, action, cancelled, reply)
+                    state.network_tool(thread, token, action, reply)
                 });
                 return;
             }

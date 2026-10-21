@@ -275,7 +275,7 @@ impl PromptEditor {
                             cx.notify();
                         });
                         let view = cx.new(|cx| NvimView::new(editor, window, cx));
-                        this._subscriptions.push(cx.subscribe_in(&view, window, |this, _, event: &NvimViewEvent, window, cx| {
+                        this._subscriptions.push(cx.subscribe_in(&view, window, |this, view, event: &NvimViewEvent, window, cx| {
                             match event {
                                 NvimViewEvent::DraftActivated(draft) => {
                                     this.active = Some(draft.key.clone());
@@ -320,6 +320,13 @@ impl PromptEditor {
                                 }
                                 NvimViewEvent::CaretPopupKey(key) => {
                                     this.completion_key(*key, cx);
+                                    return;
+                                }
+                                // Same Action as Cmd-Escape; a late request after focus moved is moot.
+                                NvimViewEvent::Leave => {
+                                    if view.focus_handle(cx).is_focused(window) {
+                                        window.dispatch_action(Box::new(super::commands::LeaveEditor), cx);
+                                    }
                                     return;
                                 }
                             }
@@ -1459,15 +1466,43 @@ impl Workspace {
     }
 
     pub fn quit_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.read(cx).shutting_down || self.quit_requested {
+        if self.state.read(cx).shutting_down
+            || self.quit_requested
+            || self.terminal_confirmation
+            || self
+                .extension
+                .as_ref()
+                .is_some_and(|form| !form.inline_answer)
+        {
             return;
         }
-        // Do not stack quit confirmation over a native dialog or sheet.
-        if window.has_active_dialog(cx) || window.has_active_sheet(cx) {
+        let palette = self
+            .palette
+            .as_ref()
+            .filter(|palette| palette.read(cx).hosted())
+            .cloned();
+        let form = self
+            .dialog
+            .as_ref()
+            .filter(|dialog| dialog.read(cx).hosted())
+            .cloned();
+        let has_dialog = window.has_active_dialog(cx);
+        let has_sheet = window.has_active_sheet(cx);
+        let known_host = if palette.is_some() && form.is_none() {
+            has_dialog && !has_sheet
+        } else if let Some(form) = &form {
+            match form.read(cx).kind {
+                super::settings::DialogKind::Settings(_) => has_sheet && !has_dialog,
+                _ => has_dialog && !has_sheet,
+            }
+        } else {
+            false
+        };
+        // Only suspend our retained surfaces. Extension and terminal-risk prompts
+        // must finish their own decision before Quit can replace their host.
+        if (has_dialog || has_sheet) && !known_host {
             return;
         }
-        // Keep workspace-owned forms and pickers intact until Quit is accepted. In
-        // particular, a cancelled window-close must leave the user's task recoverable.
         self.quit_requested = true;
         let state = self.state.read(cx);
         let allow_data_loss = state.storage_error.is_some() || state.shutdown_error.is_some();
@@ -1488,10 +1523,22 @@ impl Workspace {
         if self.has_running_terminals(cx) {
             message.push_str(" All terminal shells and their foreground jobs will be stopped. Terminal tabs reopen with a new shell; running jobs and scrollback are not restored.");
         }
+        let previous_focus = window.focused(cx);
+        if let Some(palette) = &palette {
+            palette.update(cx, |palette, cx| palette.suspend(window, cx));
+        }
+        if let Some(form) = &form {
+            let kind = form.read(cx).kind.clone();
+            form.update(cx, |form, cx| form.unhost(cx));
+            super::settings::close_surface(&kind, window, cx);
+        }
         let owner = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, window, _| {
             let confirm = owner.clone();
             let close = owner.clone();
+            let palette = palette.clone();
+            let form = form.clone();
+            let previous_focus = previous_focus.clone();
             alert
                 .title("Quit DROSTJE.")
                 .description(message.clone())
@@ -1515,12 +1562,43 @@ impl Workspace {
                     });
                     false
                 })
-                .on_cancel(move |_, _, cx| {
-                    let _ = close.update(cx, |workspace, cx| {
-                        workspace.quit_requested = false;
-                        cx.notify();
+                .on_cancel(move |_, window, cx| {
+                    let close = close.clone();
+                    let palette = palette.clone();
+                    let form = form.clone();
+                    let previous_focus = previous_focus.clone();
+                    // Close only the alert before rehosting the retained surface.
+                    // An automatic/deferred close could dismiss the replacement
+                    // or restore background focus after the Settings sheet opens.
+                    window.defer(cx, move |window, cx| {
+                        window.close_dialog(cx);
+                        let _ = close.update(cx, |workspace, cx| {
+                            workspace.quit_requested = false;
+                            if let Some(palette) = palette
+                                .filter(|palette| workspace.palette.as_ref() == Some(palette))
+                            {
+                                palette.update(cx, |palette, cx| palette.reopen(window, cx));
+                            }
+                            if let Some(form) =
+                                form.filter(|form| workspace.dialog.as_ref() == Some(form))
+                            {
+                                super::settings::open_surface(close.clone(), window, cx);
+                                // open_surface defers host creation and initial focus.
+                                // Restore the exact field after those are scheduled.
+                                window.defer(cx, move |window, _cx| {
+                                    window.on_next_frame(move |window, cx| {
+                                        if form.read(cx).hosted()
+                                            && let Some(focus) = previous_focus
+                                        {
+                                            focus.focus(window, cx);
+                                        }
+                                    });
+                                });
+                            }
+                            cx.notify();
+                        });
                     });
-                    true
+                    false
                 })
         });
     }
@@ -1529,12 +1607,14 @@ impl Workspace {
 #[cfg(all(test, feature = "runtime-qa"))]
 mod quit_tests {
     use crate::{app::AppState, model::WorkspaceSnapshot, ui::workspace::Workspace};
+    use gpui_kit::{
+        AnyWindowHandle, AppContext, Entity, Focusable, TestAppContext,
+        component::{Root, WindowExt},
+    };
     use uuid::Uuid;
 
-    #[gpui_kit::test]
-    fn cancelling_quit_keeps_the_open_palette(cx: &mut gpui_kit::TestAppContext) {
-        use gpui_kit::{AppContext, component::Root};
-
+    fn workspace_window(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
+        cx.dispatcher.allow_parking();
         let data_dir = std::env::temp_dir().join(format!("drostje-quit-qa-{}", Uuid::new_v4()));
         std::fs::create_dir(&data_dir).unwrap();
         let store = crate::store::Store::open(data_dir.clone()).unwrap();
@@ -1549,33 +1629,159 @@ mod quit_tests {
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::ui::theme::initialize(None, Some(&data_dir), cx);
+            crate::ui::commands::bind_keys(cx);
         });
 
         let mut workspace = None;
         let window = cx.add_window(|window, cx| {
             let state = cx.new(|cx| AppState::new(bootstrap, cx));
             let view = cx.new(|cx| Workspace::new(state.clone(), window, cx));
-            let palette =
-                super::super::commands::Palette::open(view.downgrade(), state.clone(), window, cx);
-            state.update(cx, |state, _| {
-                state.active_threads.insert(Uuid::new_v4());
-            });
-            view.update(cx, |workspace, _| workspace.palette = Some(palette));
             workspace = Some(view.clone());
             let root = cx.new(|_| super::super::workspace::WorkspaceRoot { workspace: view });
             Root::new(root, window, cx)
         });
-        let workspace = workspace.unwrap();
+        (window.into(), workspace.unwrap())
+    }
 
-        cx.update_window(window.into(), |_, window, cx| {
-            workspace.update(cx, |workspace, cx| workspace.quit_review(window, cx));
+    fn draw_frames(cx: &mut TestAppContext, window: AnyWindowHandle) {
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.update_window(window, |_, window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui_kit::test]
+    fn cancelling_quit_keeps_the_open_palette(cx: &mut TestAppContext) {
+        let (window, workspace) = workspace_window(cx);
+
+        let (palette, command) = cx
+            .update_window(window, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_palette(window, cx);
+                    let palette = workspace.palette.clone().unwrap();
+                    let command = palette.read(cx).command.clone();
+                    command.update(cx, |command, cx| {
+                        command.set_query("settings", window, cx);
+                    });
+                    workspace.state.update(cx, |state, _| {
+                        state.active_threads.insert(Uuid::new_v4());
+                    });
+                    // Also exercise the palette's still-pending initial focus callback.
+                    workspace.quit_review(window, cx);
+                    assert!(workspace.quit_requested);
+                    assert!(!palette.read(cx).hosted());
+                    (palette, command)
+                })
+            })
+            .unwrap();
+        draw_frames(cx, window);
+        cx.update_window(window, |_, window, cx| {
+            assert!(window.has_active_dialog(cx));
+            assert!(!command.focus_handle(cx).is_focused(window));
         })
         .unwrap();
-        assert!(cx.read(|cx| workspace.read(cx).palette.is_some()));
 
-        cx.simulate_keystrokes(window.into(), "escape");
-        cx.run_until_parked();
-        assert!(cx.read(|cx| workspace.read(cx).palette.is_some()));
-        assert!(!cx.read(|cx| workspace.read(cx).quit_requested));
+        cx.simulate_keystrokes(window, "escape");
+        draw_frames(cx, window);
+        cx.update_window(window, |_, window, cx| {
+            let workspace = workspace.read(cx);
+            assert!(!workspace.quit_requested);
+            assert_eq!(workspace.palette.as_ref(), Some(&palette));
+            assert_eq!(palette.read(cx).command, command);
+            assert!(palette.read(cx).hosted());
+            assert_eq!(command.read(cx).query(cx).as_ref(), "settings");
+            assert!(command.focus_handle(cx).is_focused(window));
+            assert!(window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn cancelling_quit_keeps_the_settings_draft(cx: &mut TestAppContext) {
+        let (window, workspace) = workspace_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute(super::super::commands::Command::Settings, window, cx);
+            });
+        })
+        .unwrap();
+        draw_frames(cx, window);
+
+        let (form, input) = cx
+            .update_window(window, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    let form = workspace.dialog.clone().unwrap();
+                    let input = form.read(cx).fields[0].input.clone();
+                    input.update(cx, |input, cx| {
+                        input.set_value("retained settings draft", window, cx);
+                    });
+                    input.focus_handle(cx).focus(window, cx);
+                    workspace.state.update(cx, |state, _| {
+                        state.active_threads.insert(Uuid::new_v4());
+                    });
+                    workspace.quit_review(window, cx);
+                    assert!(workspace.quit_requested);
+                    assert!(!form.read(cx).hosted());
+                    assert!(!window.has_active_sheet(cx));
+                    (form, input)
+                })
+            })
+            .unwrap();
+        draw_frames(cx, window);
+        cx.update_window(window, |_, window, cx| {
+            assert!(window.has_active_dialog(cx));
+            assert!(!input.focus_handle(cx).is_focused(window));
+        })
+        .unwrap();
+
+        cx.simulate_keystrokes(window, "escape");
+        draw_frames(cx, window);
+        cx.update_window(window, |_, window, cx| {
+            let workspace = workspace.read(cx);
+            assert!(!workspace.quit_requested);
+            assert_eq!(workspace.dialog.as_ref(), Some(&form));
+            assert!(form.read(cx).hosted());
+            assert_eq!(input.read(cx).value().as_ref(), "retained settings draft");
+            assert!(input.focus_handle(cx).is_focused(window));
+            assert!(window.has_active_sheet(cx));
+            assert!(!window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn quit_does_not_interrupt_an_unknown_modal(cx: &mut TestAppContext) {
+        let (window, workspace) = workspace_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            window.open_alert_dialog(cx, |alert, _, _| alert.title("Terminal risk"));
+            workspace.update(cx, |workspace, cx| {
+                workspace.quit_review(window, cx);
+                assert!(!workspace.quit_requested);
+            });
+            assert!(window.has_active_dialog(cx));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn quit_does_not_interrupt_terminal_confirmation_over_a_palette(cx: &mut TestAppContext) {
+        let (window, workspace) = workspace_window(cx);
+        cx.update_window(window, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_palette(window, cx);
+                workspace.terminal_confirmation = true;
+                window.open_alert_dialog(cx, |alert, _, _| alert.title("Terminal risk"));
+                workspace.quit_review(window, cx);
+                assert!(!workspace.quit_requested);
+                assert!(workspace.palette.as_ref().unwrap().read(cx).hosted());
+            });
+            assert!(window.has_active_dialog(cx));
+        })
+        .unwrap();
     }
 }

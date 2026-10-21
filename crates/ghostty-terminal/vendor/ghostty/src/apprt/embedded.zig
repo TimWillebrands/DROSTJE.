@@ -1749,6 +1749,27 @@ pub const CAPI = struct {
         return surface.core_surface.getProcessInfo(.foreground_pid) orelse 0;
     }
 
+    /// DROSTJE-only root subprocess identity; unsupported backends return zero.
+    export fn drost_ghostty_surface_root_pid(surface: *Surface) u64 {
+        return switch (surface.core_surface.io.backend) {
+            .exec => |*exec| exec.drostRootPid(),
+        };
+    }
+
+    /// DROSTJE-only construction metadata, not a runtime process-name guess.
+    export fn drost_ghostty_surface_login_wrapper(surface: *Surface) bool {
+        return switch (surface.core_surface.io.backend) {
+            .exec => |*exec| exec.drostLoginWrapper(),
+        };
+    }
+
+    /// Borrowed immutable executable path, valid until surface destruction.
+    export fn drost_ghostty_surface_expected_program(surface: *Surface) ?[*:0]const u8 {
+        return switch (surface.core_surface.io.backend) {
+            .exec => |*exec| if (exec.drostExpectedProgram()) |program| program.ptr else null,
+        };
+    }
+
     /// Returns the PTY name for the surface. The returned string must be
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {

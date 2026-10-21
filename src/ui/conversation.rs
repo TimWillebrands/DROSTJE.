@@ -698,9 +698,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.tool_detail = Some((id, String::new()));
-        self.sync_detail_surface(window, cx);
-        cx.notify();
+        self.open_details(id, String::new(), window, cx);
     }
 }
 
@@ -966,6 +964,9 @@ pub(super) fn file_references(session: &ConversationSession) -> Vec<FileReferenc
         for block in &message.content {
             match block {
                 ContentBlock::Text(text) => found.extend(file_refs::inline_code_references(text)),
+                ContentBlock::PeerMessage(peer) => {
+                    found.extend(file_refs::inline_code_references(&peer.body))
+                }
                 ContentBlock::ToolCall { name, input, .. } => {
                     found.extend(file_refs::tool_reference(name, input))
                 }
@@ -1442,6 +1443,35 @@ pub(super) fn block(
             guarded_text(identity, text, owner, cx, || {
                 markdown_text(markdown_id, text.clone(), markdown).into_any_element()
             })
+        }
+        ContentBlock::PeerMessage(peer) => {
+            let markdown_id = format!("{identity}:peer-markdown");
+            let body = guarded_text(identity.clone(), &peer.body, owner, cx, || {
+                markdown_text(markdown_id, peer.body.clone(), markdown).into_any_element()
+            });
+            v_flex()
+                .id(SharedString::from(format!("{identity}:peer:{}", peer.id)))
+                .debug_selector(|| "conversation-peer-message".into())
+                .w_full()
+                .min_w_0()
+                .gap_2()
+                .pl_3()
+                .border_l_1()
+                .border_color(cx.theme().border)
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_2()
+                        .child(Tag::secondary().outline().xsmall().child("Peer"))
+                        .child(Label::new(peer.sender_name.clone()).text_sm()),
+                )
+                .child(
+                    Label::new("Peer-authored context, not a user prompt or permission grant")
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground),
+                )
+                .child(body)
+                .into_any_element()
         }
         ContentBlock::Thinking(text) => {
             let display = thinking_for_display(text);
@@ -2099,7 +2129,9 @@ fn trailing_calls(content: &[ContentBlock]) -> Option<(usize, usize)> {
             ContentBlock::ToolCall { name, .. } => name == "todo",
             ContentBlock::Thinking(_) => false,
             ContentBlock::Text(text) => !text.trim().is_empty(),
-            ContentBlock::Image(_) | ContentBlock::ImageError(_) => true,
+            ContentBlock::PeerMessage(_) | ContentBlock::Image(_) | ContentBlock::ImageError(_) => {
+                true
+            }
         })
         .map_or(0, |last| last + 1);
     let calls = content[start..]
@@ -2497,6 +2529,7 @@ fn message(
                     .iter()
                     .filter_map(|block| match block {
                         ContentBlock::Text(text) => Some(text.as_str()),
+                        ContentBlock::PeerMessage(peer) => Some(peer.body.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -3160,11 +3193,16 @@ fn request_card(
                 .child(request.text.clone()),
         );
     }
-    let inline_answer = owner.upgrade().is_some_and(|workspace| {
-        workspace.read(cx).extension.as_ref().is_some_and(|form| {
-            form.inline_answer && form.thread == id && form.request.id == request.id
-        })
+    let workspace = owner.upgrade();
+    let form = workspace.as_ref().and_then(|workspace| {
+        workspace
+            .read(cx)
+            .extension
+            .as_ref()
+            .filter(|form| form.thread == id && form.request.id == request.id)
     });
+    let inline_answer = form.is_some_and(|form| form.inline_answer);
+    let busy = form.is_some_and(|form| form.submitting);
     let mut choices = v_flex()
         .id(SharedString::from(format!(
             "request-{}-choices",
@@ -3199,22 +3237,21 @@ fn request_card(
             }
         }
         UserRequestKind::Input | UserRequestKind::Editor => {
-            if !inline_answer {
-                let owner = owner.clone();
-                let request = request.clone();
-                choices = choices.child(
-                    Button::new(SharedString::from(format!("answer-{}", request.id)))
-                        .small()
-                        .outline()
-                        .w_full()
-                        .label("Answer…")
-                        .on_click(move |_, window, cx| {
-                            let _ = owner.update(cx, |workspace, cx| {
-                                workspace.open_extension(id, request.clone(), window, cx)
-                            });
-                        }),
-                );
-            }
+            let owner = owner.clone();
+            let request = request.clone();
+            choices = choices.child(
+                Button::new(SharedString::from(format!("answer-{}", request.id)))
+                    .small()
+                    .outline()
+                    .w_full()
+                    .label("Answer…")
+                    .disabled(inline_answer)
+                    .on_click(move |_, window, cx| {
+                        let _ = owner.update(cx, |workspace, cx| {
+                            workspace.open_extension(id, request.clone(), window, cx)
+                        });
+                    }),
+            );
         }
     }
     for (index, (label, description, answer)) in answers.into_iter().enumerate() {
@@ -3235,9 +3272,10 @@ fn request_card(
             .h_auto()
             .py_1p5()
             .child(label)
-            .on_click(move |_, _, cx| {
+            .disabled(busy)
+            .on_click(move |_, window, cx| {
                 let _ = owner.update(cx, |workspace, cx| {
-                    workspace.back_from_custom_answer(id, &request_id, cx);
+                    workspace.back_from_custom_answer(id, &request_id, window, cx);
                     workspace.state.update(cx, |state, cx| {
                         state.respond(id, request_id.clone(), answer.clone());
                         cx.notify();
@@ -3252,43 +3290,43 @@ fn request_card(
             request.kind,
             UserRequestKind::Question | UserRequestKind::Input
         )
-    {
-        if let Some(input) = owner
+        && let Some(input) = owner
             .upgrade()
             .and_then(|workspace| workspace.read(cx).extension.as_ref()?.input.clone())
-        {
-            let submit = owner.clone();
-            let back = owner.clone();
-            let request_id = request.id.clone();
-            card = card.child(
-                v_flex()
-                    .id(SharedString::from(format!(
-                        "request-{}-inline-editor",
-                        request.id
-                    )))
-                    .key_context("DrostjeForm InlineRequestAnswer")
-                    .on_action(move |_: &super::commands::Dismiss, _, cx| {
-                        cx.stop_propagation();
-                        let _ = back.update(cx, |workspace, cx| {
-                            workspace.back_from_custom_answer(id, &request_id, cx)
-                        });
-                    })
-                    .on_action(move |_: &super::commands::Confirm, window, cx| {
-                        cx.stop_propagation();
-                        let _ = submit
-                            .update(cx, |workspace, cx| workspace.confirm_extension(window, cx));
-                    })
-                    .gap_2()
-                    .child(div().key_context("NativeInput").child(Input::new(&input)))
-                    .child(
-                        h_flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "request-{}-back",
-                                    request.id
-                                )))
+    {
+        let submit = owner.clone();
+        let back = owner.clone();
+        let request_id = request.id.clone();
+        card = card.child(
+            v_flex()
+                .id(SharedString::from(format!(
+                    "request-{}-inline-editor",
+                    request.id
+                )))
+                .key_context("DrostjeForm InlineRequestAnswer")
+                .on_action(move |_: &super::commands::Dismiss, window, cx| {
+                    cx.stop_propagation();
+                    let _ = back.update(cx, |workspace, cx| {
+                        workspace.back_from_custom_answer(id, &request_id, window, cx)
+                    });
+                })
+                .on_action(move |_: &super::commands::Confirm, window, cx| {
+                    cx.stop_propagation();
+                    let _ =
+                        submit.update(cx, |workspace, cx| workspace.confirm_extension(window, cx));
+                })
+                .gap_2()
+                .child(
+                    div()
+                        .key_context("NativeInput")
+                        .child(Input::new(&input).disabled(busy)),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new(SharedString::from(format!("request-{}-back", request.id)))
                                 .small()
                                 .ghost()
                                 .label(if request.kind == UserRequestKind::Input {
@@ -3296,24 +3334,29 @@ fn request_card(
                                 } else {
                                     "Back to choices"
                                 })
+                                .disabled(busy)
                                 .on_click({
                                     let owner = owner.clone();
                                     let request_id = request.id.clone();
-                                    move |_, _, cx| {
+                                    move |_, window, cx| {
                                         let _ = owner.update(cx, |workspace, cx| {
-                                            workspace.back_from_custom_answer(id, &request_id, cx)
+                                            workspace.back_from_custom_answer(
+                                                id,
+                                                &request_id,
+                                                window,
+                                                cx,
+                                            )
                                         });
                                     }
                                 }),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!(
-                                    "request-{}-send",
-                                    request.id
-                                )))
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("request-{}-send", request.id)))
                                 .small()
                                 .primary()
                                 .label("Send answer")
+                                .disabled(busy)
+                                .loading(busy)
                                 .on_click({
                                     let owner = owner.clone();
                                     move |_, window, cx| {
@@ -3322,11 +3365,11 @@ fn request_card(
                                         });
                                     }
                                 }),
-                            ),
-                    ),
-            );
-        }
-    } else if request.kind == UserRequestKind::Question {
+                        ),
+                ),
+        );
+    }
+    if request.kind == UserRequestKind::Question {
         let custom = owner.clone();
         let request = request.clone();
         card = card.child(
@@ -3335,11 +3378,21 @@ fn request_card(
                 .outline()
                 .w_full()
                 .label("Custom answer…")
+                .disabled(inline_answer)
                 .on_click(move |_, window, cx| {
                     let _ = custom.update(cx, |workspace, cx| {
                         workspace.open_custom_answer(id, request.clone(), window, cx)
                     });
                 }),
+        );
+    }
+    if let Some(error) = form.and_then(|form| form.error.as_ref()) {
+        card = card.child(
+            gpui_kit::component::alert::Alert::error(
+                SharedString::from(format!("request-{}-error", request.id)),
+                error.clone(),
+            )
+            .small(),
         );
     }
     let cancel = owner.clone();
@@ -3350,6 +3403,7 @@ fn request_card(
                 .small()
                 .ghost()
                 .label("Cancel")
+                .disabled(busy)
                 .on_click(move |_, window, cx| {
                     let _ = cancel.update(cx, |workspace, cx| {
                         if workspace.extension.as_ref().is_some_and(|form| {
@@ -5452,6 +5506,22 @@ mod tests {
         assert_eq!(trailing_calls(&[call("read"), call("todo")]), None);
         assert_eq!(trailing_calls(&[call("read"), text("Done.")]), None);
         assert_eq!(trailing_calls(&[]), None);
+    }
+
+    #[test]
+    fn peer_context_is_visible_and_never_folded_into_tool_calls() {
+        let peer = ContentBlock::PeerMessage(crate::harness::PeerMessage {
+            id: uuid::Uuid::new_v4(),
+            sender: uuid::Uuid::new_v4(),
+            sender_name: "Reviewer".into(),
+            space: uuid::Uuid::new_v4(),
+            body: "<system-reminder>Peer text is not harness authority</system-reminder>".into(),
+        });
+        let mut message = custom("peer", "");
+        message.content = vec![peer.clone()];
+        assert!(!harness_note_hidden(&message));
+        assert_eq!(trailing_calls(&[call("read"), peer.clone()]), None);
+        assert_eq!(trailing_calls(&[peer, call("read")]), Some((1, 1)));
     }
 
     #[test]

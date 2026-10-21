@@ -135,6 +135,7 @@ impl AppState {
             );
             return;
         }
+        self.pause_network_delivery(id);
         if let Some(old) = self.conversations.remove(&id) {
             if let Some(commands) = old.commands {
                 let _ = commands.try_send(ConversationCommand::Close);
@@ -336,7 +337,9 @@ impl AppState {
 
     pub fn interrupt(&mut self, id: ThreadId) {
         if self.is_conversation(id) && self.active_threads.contains(&id) {
+            self.pause_network_delivery(id);
             self.send_command(id, ConversationCommand::Interrupt);
+            self.sync_network();
         }
     }
     pub fn select_model(&mut self, id: ThreadId, model: ModelKey) {
@@ -520,6 +523,7 @@ impl AppState {
             session.submitted.insert(request_id, draft);
         }
         self.active_threads.insert(id);
+        self.authorize_network_user_turn(id);
         thread.submission = Some(
             json!({"request_id":request_id,"text":text,"attachments":images,"state":"pending"}),
         );
@@ -915,6 +919,10 @@ impl AppState {
         let Some(mut session) = self.conversations.remove(&id) else {
             return;
         };
+        let mut peer_delivery = None;
+        let mut peer_turn = None;
+        let mut peer_settled = None;
+        let mut pause_network = false;
         let refresh_diff = matches!(
             &event,
             ConversationEvent::Ready { .. }
@@ -929,6 +937,13 @@ impl AppState {
                 | ConversationEvent::StateChanged(_)
                 | ConversationEvent::TitleChanged(_)
                 | ConversationEvent::Failed { .. }
+                | ConversationEvent::PeerDeliveryAvailable { .. }
+                | ConversationEvent::PeerDelivery { .. }
+                | ConversationEvent::PeerTurnStarted { .. }
+                | ConversationEvent::UserRequest(_)
+                | ConversationEvent::UserRequestDismissed { .. }
+                | ConversationEvent::SubmissionAccepted { .. }
+                | ConversationEvent::TurnSettled { .. }
         );
         let presentation = match &event {
             ConversationEvent::HistoryReset
@@ -936,6 +951,9 @@ impl AppState {
             | ConversationEvent::MessageUpdated(_)
             | ConversationEvent::ToolUpdated(_) => PresentationChange::Transcript(id),
             ConversationEvent::Ready { .. }
+            | ConversationEvent::PeerDeliveryAvailable { .. }
+            | ConversationEvent::PeerDelivery { .. }
+            | ConversationEvent::PeerTurnStarted { .. }
             | ConversationEvent::StateChanged(_)
             | ConversationEvent::UserRequest(_)
             | ConversationEvent::UserRequestDismissed { .. }
@@ -974,10 +992,15 @@ impl AppState {
         };
         match event {
             ConversationEvent::Ready {
+                peer_delivery,
                 session_ref,
                 models,
             } => {
                 session.models = models;
+                session.peer_delivery = peer_delivery;
+                if peer_delivery {
+                    session.peer_delivery_reason = None;
+                }
                 session.persisted = false;
                 if let Some(mut thread) = thread.take() {
                     thread.session_ref = Some(session_ref);
@@ -1003,7 +1026,24 @@ impl AppState {
                     .detach();
                 }
             }
+            ConversationEvent::PeerDeliveryAvailable { available, reason } => {
+                session.peer_delivery = available;
+                session.peer_delivery_reason = reason;
+                pause_network = !available;
+            }
+            ConversationEvent::PeerDelivery { attempt, outcome } => {
+                peer_delivery = Some((attempt, outcome));
+            }
+            ConversationEvent::PeerTurnStarted { request_id } => {
+                peer_turn = Some(request_id);
+            }
             ConversationEvent::StateChanged(state) => {
+                pause_network = matches!(
+                    state,
+                    ConversationState::Disconnected
+                        | ConversationState::Failed
+                        | ConversationState::Interrupting
+                );
                 if matches!(
                     state,
                     ConversationState::Running
@@ -1120,6 +1160,7 @@ impl AppState {
                 request_id,
                 outcome,
             } => {
+                peer_settled = Some((request_id, outcome.clone()));
                 self.active_threads.remove(&id);
                 session.preparing = false;
                 session.outcome = Some(outcome.clone());
@@ -1255,6 +1296,7 @@ impl AppState {
                 message,
             } => {
                 session.error = Some(message.clone());
+                pause_network = true;
                 session.preparing = false;
                 session.auto_dispatch = false;
                 if request_id.is_some() {
@@ -1278,8 +1320,21 @@ impl AppState {
             }
         }
         self.conversations.insert(id, session);
+        if pause_network {
+            self.pause_network_delivery(id);
+        }
+        if let Some((attempt, outcome)) = peer_delivery {
+            self.network_delivery_event(id, attempt, outcome);
+        }
+        if let Some(request_id) = peer_turn {
+            self.network_peer_turn_started(id, request_id);
+        }
+        if let Some((request_id, outcome)) = peer_settled {
+            self.network_peer_turn_settled(id, request_id, &outcome);
+        }
         if network_changed {
             self.sync_network();
+            self.schedule_network_delivery();
         }
         if refresh_diff {
             self.queue_conversation_diff(id, cx);

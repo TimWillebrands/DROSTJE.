@@ -18,6 +18,8 @@ const CHUNK: usize = 262_144;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const MODEL_TIMEOUT: Duration = Duration::from_secs(60);
 
+mod peer;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dialect {
     Omp,
@@ -406,6 +408,7 @@ enum RequestKind {
     Prompt(Uuid),
     Abort,
     Commands,
+    Peer(Option<Uuid>),
 }
 struct Pending {
     kind: RequestKind,
@@ -520,6 +523,7 @@ struct Actor {
     dialogs: HashMap<String, Dialog>,
     tools: HashMap<String, ToolActivity>,
     turn: Turn,
+    peers: peer::Peers,
     idle_sleep_assertion: Option<IdleSleepAssertion>,
     state: ConversationState,
     ready_deadline: Instant,
@@ -568,6 +572,7 @@ impl Actor {
             dialogs: HashMap::new(),
             tools: HashMap::new(),
             turn: Turn::default(),
+            peers: peer::Peers::default(),
             idle_sleep_assertion: None,
             state: ConversationState::Starting,
             ready_deadline: Instant::now() + CONTROL_TIMEOUT,
@@ -619,6 +624,7 @@ impl Actor {
         self.request(json!({ "type": command }), RequestKind::Commands)
     }
     fn commands(&mut self, raw: &Value) {
+        self.peer_commands(raw);
         match parse_commands(self.dialect, raw) {
             Ok((commands, rejected)) => {
                 if !rejected.is_empty() {
@@ -642,6 +648,11 @@ impl Actor {
         });
     }
     fn state(&mut self, state: ConversationState) {
+        let state = if state == ConversationState::Ready && !self.peers.turns.is_empty() {
+            ConversationState::Running
+        } else {
+            state
+        };
         // Ready can precede prompt acceptance. Keep protection until that turn settles.
         if state == ConversationState::Disconnected
             || (state == ConversationState::Ready && self.turn.id.is_none())
@@ -655,6 +666,8 @@ impl Actor {
     }
     fn active(&self) -> bool {
         self.turn.id.is_some()
+            || self.peers.idle.is_some()
+            || !self.peers.turns.is_empty()
             || matches!(
                 self.state,
                 ConversationState::Running
@@ -755,6 +768,10 @@ impl Actor {
                     }
                 }
             }
+            self.cancel_peers(
+                false,
+                "Peer delivery cancelled after possible dispatch; never replay",
+            )?;
             self.flush()?;
             if self.closing {
                 if self.writes.is_empty() {
@@ -884,19 +901,29 @@ impl Actor {
     }
     fn command(&mut self, command: ConversationCommand) -> Result<()> {
         if self.closing {
-            if let ConversationCommand::Submit { request_id, .. } = command {
-                self.emit(ConversationEvent::Failed {
-                    request_id: Some(request_id),
-                    message: "Conversation is closing; prompt was not sent".into(),
-                });
+            match command {
+                ConversationCommand::Submit { request_id, .. } => {
+                    self.emit(ConversationEvent::Failed {
+                        request_id: Some(request_id),
+                        message: "Conversation is closing; prompt was not sent".into(),
+                    })
+                }
+                ConversationCommand::DeliverPeer(delivery) => self.deliver_peer(delivery),
+                _ => {}
             }
             return Ok(());
         }
         match command {
             ConversationCommand::Close => self.close()?,
+            ConversationCommand::DeliverPeer(delivery) => self.deliver_peer(delivery),
             ConversationCommand::Interrupt => {
+                self.cancel_peers(
+                    true,
+                    "Peer delivery interrupted after possible dispatch; never replay",
+                )?;
                 if self.active() {
                     self.turn.interrupting = true;
+                    self.peers.interrupted = true;
                     self.state(ConversationState::Interrupting);
                     self.cancel_dialogs(false)?;
                     self.request(json!({"type":"abort"}), RequestKind::Abort)?;
@@ -969,6 +996,10 @@ impl Actor {
             } => {
                 let attempt = (|| -> Result<()> {
                     ensure!(self.initialized, "OMP has not initialized");
+                    ensure!(
+                        text.trim_start().split_whitespace().next() != Some("/__drostje_peer"),
+                        "The peer transport command is private"
+                    );
                     ensure!(
                         !self.submissions.contains(&request_id),
                         "This submission ID was already used; input is never replayed"
@@ -1073,6 +1104,9 @@ impl Actor {
         if let Some(event) = self.turn.settle(outcome) {
             self.emit(event);
         }
+        if self.turn.id.is_none() {
+            self.turn = Turn::default();
+        }
         self.cancel_dialogs(false)?;
         self.state(ConversationState::Ready);
         if self.closing {
@@ -1095,9 +1129,14 @@ impl Actor {
         if self.closing {
             return Ok(());
         }
+        self.cancel_peers(
+            true,
+            "Conversation closing after possible peer dispatch; never replay",
+        )?;
         self.cancel_dialogs(false)?;
         if self.active() {
             self.turn.interrupting = true;
+            self.peers.interrupted = true;
             self.state(ConversationState::Interrupting);
             self.request(json!({"type":"abort"}), RequestKind::Abort)?;
         }
@@ -1107,7 +1146,12 @@ impl Actor {
         Ok(())
     }
     fn disconnect(&mut self, message: String) {
+        self.peer_disconnected(&message);
         let ids: Vec<_> = self.dialogs.keys().cloned().collect();
+        self.emit(ConversationEvent::PeerDeliveryAvailable {
+            available: false,
+            reason: Some(message.clone()),
+        });
         self.dialogs.clear();
         for request_id in ids {
             self.emit(ConversationEvent::UserRequestDismissed { request_id });
@@ -1117,6 +1161,9 @@ impl Actor {
         }
         let pending = std::mem::take(&mut self.requests.pending);
         for (_, request) in pending {
+            if matches!(request.kind, RequestKind::Peer(_)) {
+                continue;
+            }
             self.emit(ConversationEvent::Failed {
                 request_id: match request.kind {
                     RequestKind::Prompt(id) => Some(id),
@@ -1132,6 +1179,7 @@ impl Actor {
         self.state(ConversationState::Disconnected);
     }
     fn tick(&mut self) -> Result<()> {
+        self.peer_tick()?;
         let now = Instant::now();
         ensure!(
             self.negotiated || now < self.ready_deadline,
@@ -1142,7 +1190,7 @@ impl Actor {
             .requests
             .pending
             .iter()
-            .filter(|(_, p)| p.deadline <= now)
+            .filter(|(_, p)| p.deadline <= now && !matches!(p.kind, RequestKind::Peer(Some(_))))
             .map(|(id, _)| id.clone())
             .collect();
         for id in expired {
@@ -1170,6 +1218,10 @@ impl Actor {
                 RequestKind::Commands => self.emit(ConversationEvent::CommandsUnavailable(
                     format!("{} did not list its commands in time", self.dialect.name()),
                 )),
+                RequestKind::Peer(None) => self.emit(ConversationEvent::PeerDeliveryAvailable {
+                    available: false,
+                    reason: Some("Native peer delivery handshake timed out".into()),
+                }),
                 _ => {
                     self.emit(ConversationEvent::Failed {
                         request_id: None,
@@ -1256,20 +1308,24 @@ impl Actor {
                         );
                         if raw["stopReason"] == "error" {
                             self.turn.failed = true;
+                            self.peers.failed = true;
                         }
                         if raw["stopReason"] == "aborted" {
                             self.turn.interrupting = true;
+                            self.peers.interrupted = true;
                         }
                         self.emit(ConversationEvent::MessageUpdated(message));
                     }
                 }
                 if self.dialect == Dialect::Omp
+                    && self.turn.id.is_some()
                     && let Some(outcome) = self.turn.agent_end(&value)
                 {
                     self.finish(outcome)?;
                 }
             }
             "agent_settled" if self.dialect == Dialect::Pi => {
+                let peer_turn = self.peer_settled();
                 let outcome = if self.turn.interrupting {
                     TurnOutcome::Interrupted
                 } else if self.turn.failed {
@@ -1277,7 +1333,19 @@ impl Actor {
                 } else {
                     TurnOutcome::Completed
                 };
-                if self.turn.id.is_some() {
+                if self.turn.id.is_some() || peer_turn {
+                    self.finish(outcome)?;
+                }
+            }
+            "session_settled" if self.dialect == Dialect::Omp => {
+                if self.peer_settled() {
+                    let outcome = if self.turn.interrupting {
+                        TurnOutcome::Interrupted
+                    } else if self.turn.failed {
+                        TurnOutcome::Failed
+                    } else {
+                        TurnOutcome::Completed
+                    };
                     self.finish(outcome)?;
                 }
             }
@@ -1292,6 +1360,15 @@ impl Actor {
                     .get("message")
                     .or_else(|| value["assistantMessageEvent"].get("partial"));
                 if let Some(raw) = raw {
+                    if kind == "message_start" || kind == "message_end" {
+                        self.peer_message(raw);
+                    }
+                    if peer::messages(raw).is_some() {
+                        self.emit(ConversationEvent::Diagnostic {
+                            label: "Native peer message lifecycle".into(),
+                            raw: value.clone(),
+                        });
+                    }
                     if kind == "message_start" || self.current_message.is_none() {
                         self.sequence += 1;
                         self.current_message =
@@ -1305,9 +1382,11 @@ impl Actor {
                     );
                     if raw["stopReason"] == "error" {
                         self.turn.failed = true;
+                        self.peers.failed = true;
                     }
                     if raw["stopReason"] == "aborted" {
                         self.turn.interrupting = true;
+                        self.peers.interrupted = true;
                     }
                     self.emit(ConversationEvent::MessageUpdated(message));
                     if kind == "message_end" {
@@ -1366,6 +1445,10 @@ impl Actor {
                     .unwrap_or_else(|| self.dialect.name()),
             ),
             "extension_error" => {
+                if value["event"] == "send_message" {
+                    self.peer_dispatch_error(&string(&value, "error"));
+                    self.notice("warning", "Native custom-message dispatch failed; unconfirmed peer outcomes are unknown and will not be replayed");
+                }
                 self.notice(
                     "error",
                     format!(
@@ -1439,6 +1522,25 @@ impl Actor {
         );
         if value["success"] == false {
             match pending.kind {
+                RequestKind::Peer(attempt) => {
+                    if let Some(attempt) = attempt {
+                        self.peer_outcome(
+                            attempt,
+                            PeerDeliveryOutcome::Unknown(string(&value, "error")),
+                        );
+                        if self.peers.idle == Some(attempt) {
+                            self.peers.idle = None;
+                        }
+                    } else {
+                        self.emit(ConversationEvent::PeerDeliveryAvailable {
+                            available: false,
+                            reason: Some(format!(
+                                "Native peer bridge failed: {}",
+                                string(&value, "error")
+                            )),
+                        });
+                    }
+                }
                 RequestKind::History { generation, .. }
                     if generation != self.history_generation => {}
                 RequestKind::History { generation, .. }
@@ -1628,6 +1730,7 @@ impl Actor {
                 }
             }
             RequestKind::Commands => self.commands(&data["commands"]),
+            RequestKind::Peer(_) => {} // RPC command handling is not a context receipt.
             RequestKind::Abort => {
                 // Abort acknowledgement alone does not prove that the agent stopped.
                 self.next_poll = Instant::now();
@@ -1663,6 +1766,7 @@ impl Actor {
         self.emit(ConversationEvent::Ready {
             session_ref: self.session_ref.clone().unwrap(),
             models: self.models.clone().unwrap(),
+            peer_delivery: self.peers.ready,
         });
         if !self.initialized {
             self.initialized = true;
@@ -1729,6 +1833,9 @@ impl Actor {
         self.emit(ConversationEvent::ToolUpdated(tool));
     }
     fn extension(&mut self, value: Value) -> Result<()> {
+        if self.peer_status(&value)? {
+            return Ok(());
+        }
         if self.closing {
             return Ok(());
         }
@@ -1940,6 +2047,9 @@ fn parse_commands(dialect: Dialect, raw: &Value) -> Result<(Vec<SlashCommand>, V
             rejected.push(entry.clone());
             continue;
         };
+        if name == peer::COMMAND {
+            continue;
+        }
         let source = match entry["source"].as_str().unwrap_or("") {
             "builtin" => CommandSource::Builtin,
             "skill" => CommandSource::Skill,
@@ -2022,7 +2132,24 @@ fn normalize_message(
     directory: &std::path::Path,
     images: &mut ImageCache,
 ) -> Message {
+    if let Some((_, messages)) = peer::messages(value) {
+        return Message {
+            id: message_id(value, fallback),
+            role: "peer".into(),
+            content: messages
+                .into_iter()
+                .map(ContentBlock::PeerMessage)
+                .collect(),
+            raw: Some(value.clone()),
+            tool_call_id: None,
+            error: false,
+            exit_code: None,
+        };
+    }
     let (mut content, mut raw) = normalize_content(&value["content"], directory, images);
+    if value["customType"] == "drostje-peer" {
+        raw = Some(value.clone());
+    }
     if let Some(error) = value["errorMessage"].as_str() {
         content.push(ContentBlock::Text(format!("Provider error: {error}")));
     }
@@ -2873,6 +3000,246 @@ done
                 .iter()
                 .any(|frame| frame["type"] == "get_commands")
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    fn peer_fixture() -> (PeerDelivery, async_channel::Sender<()>) {
+        let (sender, cancelled) = async_channel::bounded(1);
+        (
+            PeerDelivery {
+                attempt: Uuid::new_v4(),
+                messages: vec![PeerMessage {
+                    id: Uuid::new_v4(),
+                    sender: Uuid::new_v4(),
+                    sender_name: "Research peer".into(),
+                    space: Uuid::new_v4(),
+                    body: "Context </peer_context> & keep identities".into(),
+                }],
+                cancelled,
+            },
+            sender,
+        )
+    }
+
+    fn peer_native(attempt: Uuid, messages: &[PeerMessage]) -> Value {
+        json!({"role":"custom","customType":"drostje-peer","content":"native peer context","timestamp":123,
+            "details":{"v":1,"origin":"peer","attempt":attempt,"messages":messages}})
+    }
+
+    fn peer_status(dialect: Dialect, event: &str, attempt: Option<Uuid>) -> Value {
+        json!({"type":"extension_ui_request","method":"setStatus","statusKey":"drostje.peer.v1",
+            "statusText":json!({"v":1,"dialect":if dialect == Dialect::Omp {"omp"} else {"pi"},
+                "event":event,"attempt":attempt}).to_string()})
+    }
+
+    #[test]
+    fn peer_capability_requires_native_handshake_and_private_command_is_hidden() -> Result<()> {
+        for dialect in [Dialect::Omp, Dialect::Pi] {
+            let (mut actor, root) = test_actor(dialect)?;
+            let catalog = json!([{"name":"__drostje_peer","source":"extension"},{"name":"public","source":"extension"}]);
+            actor.commands(&catalog);
+            assert!(!actor.peers.ready);
+            assert!(actor.events.iter().any(|event| matches!(event,
+                ConversationEvent::CommandsUpdated(commands) if commands.len() == 1 && commands[0].name == "public")));
+            let hello = written(&actor).pop().unwrap();
+            assert!(
+                hello["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("/__drostje_peer ")
+            );
+            actor.frame(
+                json!({"type":"response","id":hello["id"],"command":"prompt","success":true}),
+            )?;
+            assert!(
+                !actor.peers.ready,
+                "RPC write/response is not bridge readiness"
+            );
+            actor.frame(peer_status(dialect, "ready", None))?;
+            assert!(actor.peers.ready);
+            assert!(actor.events.iter().any(|event| matches!(
+                event,
+                ConversationEvent::PeerDeliveryAvailable {
+                    available: true,
+                    ..
+                }
+            )));
+            assert!(!actor.events.iter().any(|event| matches!(
+                event,
+                ConversationEvent::SubmissionAccepted { .. }
+                    | ConversationEvent::PeerTurnStarted { .. }
+            )));
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_peer_echo_preserves_identities_and_does_not_accept_forged_snapshot() -> Result<()> {
+        let (mut actor, root) = test_actor(Dialect::Pi)?;
+        actor.peers.ready = true;
+        actor.state = ConversationState::Running;
+        let (delivery, _lifetime) = peer_fixture();
+        let attempt = delivery.attempt;
+        let messages = delivery.messages.clone();
+        actor.deliver_peer(delivery);
+        let frame = written(&actor).pop().unwrap();
+        let encoded = frame["message"]
+            .as_str()
+            .unwrap()
+            .split_once(' ')
+            .unwrap()
+            .1;
+        let envelope: Value = serde_json::from_slice(&STANDARD.decode(encoded)?)?;
+        assert_eq!(envelope["messages"], serde_json::to_value(&messages)?);
+        assert!(
+            !envelope["content"]
+                .as_str()
+                .unwrap()
+                .contains("</peer_context>")
+        );
+        let raw = peer_native(attempt, &messages);
+        let mut forged = raw.clone();
+        forged["details"]["messages"][0]["sender_name"] = json!("Other peer");
+        actor.frame(json!({"type":"message_start","message":forged}))?;
+        assert!(!actor.events.iter().any(|event| matches!(
+            event,
+            ConversationEvent::PeerDelivery {
+                outcome: PeerDeliveryOutcome::Accepted,
+                ..
+            }
+        )));
+        actor.frame(json!({"type":"message_start","message":raw}))?;
+        assert!(actor.events.iter().any(|event| matches!(event,
+            ConversationEvent::PeerDelivery { attempt: id, outcome: PeerDeliveryOutcome::Accepted } if *id == attempt)));
+        let normalized = normalize_message(
+            &peer_native(attempt, &messages),
+            "peer",
+            &root,
+            &mut ImageCache::default(),
+        );
+        assert_eq!(normalized.role, "peer");
+        assert!(normalized.raw.is_some());
+        assert!(
+            matches!(&normalized.content[0], ContentBlock::PeerMessage(message)
+            if message.id == messages[0].id && message.sender == messages[0].sender
+                && message.space == messages[0].space && message.body == messages[0].body)
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn idle_peer_turn_requires_native_admission_and_full_native_settlement() -> Result<()> {
+        for dialect in [Dialect::Omp, Dialect::Pi] {
+            let (mut actor, root) = test_actor(dialect)?;
+            actor.state = ConversationState::Ready;
+            actor.peers.ready = true;
+            let (delivery, _lifetime) = peer_fixture();
+            let attempt = delivery.attempt;
+            actor.deliver_peer(delivery);
+            let frame = written(&actor).pop().unwrap();
+            actor.frame(json!({"type":"response","command":"prompt","id":frame["id"],"success":true,"data":{"agentInvoked":false}}))?;
+            assert!(actor.turn.id.is_none());
+            assert!(
+                actor.active(),
+                "pending native admission reserves idle turn"
+            );
+            assert!(!actor.events.iter().any(|event| matches!(
+                event,
+                ConversationEvent::PeerDelivery {
+                    outcome: PeerDeliveryOutcome::Accepted,
+                    ..
+                } | ConversationEvent::SubmissionAccepted { .. }
+            )));
+            actor.frame(peer_status(dialect, "turn_started", Some(attempt)))?;
+            assert!(
+                actor.turn.id.is_none(),
+                "peer turns never occupy the user submission slot"
+            );
+            assert_eq!(actor.peers.turns, vec![attempt]);
+            actor.frame(json!({"type":"agent_end","messages":[],"isTerminal":true}))?;
+            assert_eq!(
+                actor.peers.turns,
+                vec![attempt],
+                "low-level loop end is not session settlement"
+            );
+            actor.frame(json!({"type":if dialect == Dialect::Omp {"session_settled"} else {"agent_settled"}}))?;
+            assert!(actor.turn.id.is_none());
+            assert!(actor.peers.turns.is_empty());
+            assert!(actor.events.iter().any(|event| matches!(event,
+                ConversationEvent::TurnSettled { request_id, outcome: TurnOutcome::Completed } if *request_id == attempt)));
+            assert!(
+                !actor
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, ConversationEvent::SubmissionAccepted { .. }))
+            );
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn busy_peer_receipt_has_no_ordinary_control_deadline() -> Result<()> {
+        let (mut actor, root) = test_actor(Dialect::Omp)?;
+        actor.peers.ready = true;
+        actor.turn.begin(Uuid::new_v4());
+        let (delivery, _lifetime) = peer_fixture();
+        let attempt = delivery.attempt;
+        let messages = delivery.messages.clone();
+        actor.deliver_peer(delivery);
+        for pending in actor.requests.pending.values_mut() {
+            pending.deadline = Instant::now() - CONTROL_TIMEOUT;
+        }
+        actor.tick()?;
+        assert!(!actor.events.iter().any(|event| matches!(
+            event,
+            ConversationEvent::PeerDelivery { .. } | ConversationEvent::Failed { .. }
+        )));
+        actor.frame(json!({"type":"message_end","message":peer_native(attempt, &messages)}))?;
+        assert!(actor.events.iter().any(|event| matches!(
+            event,
+            ConversationEvent::PeerDelivery {
+                outcome: PeerDeliveryOutcome::Accepted,
+                ..
+            }
+        )));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn peer_cancellation_distinguishes_unsent_from_uncertain_and_allows_late_receipt() -> Result<()>
+    {
+        let (mut actor, root) = test_actor(Dialect::Pi)?;
+        actor.peers.ready = true;
+        actor.state = ConversationState::Ready;
+        let (delivery, lifetime) = peer_fixture();
+        let unsent = delivery.attempt;
+        actor.deliver_peer(delivery);
+        drop(lifetime);
+        actor.cancel_peers(false, "cancelled")?;
+        assert!(actor.writes.is_empty());
+        assert!(actor.events.iter().any(|event| matches!(event,
+            ConversationEvent::PeerDelivery { attempt, outcome: PeerDeliveryOutcome::Rejected(_) } if *attempt == unsent)));
+        let (delivery, lifetime) = peer_fixture();
+        let attempt = delivery.attempt;
+        let messages = delivery.messages.clone();
+        actor.deliver_peer(delivery);
+        actor.writes.clear(); // transport has consumed the write; acceptance is not known
+        drop(lifetime);
+        actor.cancel_peers(false, "cancelled after dispatch")?;
+        assert!(actor.events.iter().any(|event| matches!(event,
+            ConversationEvent::PeerDelivery { attempt: id, outcome: PeerDeliveryOutcome::Unknown(_) } if *id == attempt)));
+        actor.peer_message(&peer_native(attempt, &messages));
+        assert!(
+            matches!(actor.events.back(), Some(ConversationEvent::PeerDelivery {
+            attempt: id, outcome: PeerDeliveryOutcome::Accepted }) if *id == attempt)
+        );
+        actor.disconnect("transport lost".into());
+        assert!(!actor.peers.ready);
+        assert!(actor.turn.id.is_none());
         fs::remove_dir_all(root)?;
         Ok(())
     }

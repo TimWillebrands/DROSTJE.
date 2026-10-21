@@ -122,6 +122,7 @@ pub struct Terminal {
     _subscriptions: Vec<Subscription>,
     frame: Option<Arc<RenderImage>>,
     frame_dirty: bool,
+    default_shell: bool,
 }
 
 impl Terminal {
@@ -143,6 +144,7 @@ impl Terminal {
         }
         let cwd = CString::new(options.working_directory.as_os_str().as_bytes())
             .map_err(|_| "Terminal directory contains a NUL byte")?;
+        let default_shell = options.program.is_none();
         let mut argv =
             Vec::with_capacity(options.args.len() + usize::from(options.program.is_some()));
         if let Some(program) = options.program {
@@ -199,6 +201,7 @@ impl Terminal {
                 _subscriptions: subscriptions,
                 frame: None,
                 frame_dirty: true,
+                default_shell,
             };
             terminal.start_ticking(cx);
             terminal
@@ -222,12 +225,22 @@ impl Terminal {
         })
         .unwrap_or(TerminalStatus::Closed)
     }
-    pub fn needs_confirm_quit(&self) -> bool {
-        stop_needs_confirmation(
-            self.status(),
-            self.backend_error.is_some(),
-            self.with_surface(|surface| surface.needs_confirm_quit()),
-        )
+    /// Snapshot native identities on the platform thread; inspect processes off it.
+    /// Missing process information remains conservative, without requiring shell integration.
+    pub fn needs_confirm_quit(&self, cx: &App) -> Task<bool> {
+        if self.status() != TerminalStatus::Running {
+            return Task::ready(false);
+        }
+        if self.backend_error.is_some() || !self.default_shell {
+            return Task::ready(true);
+        }
+        let Some(processes) = self
+            .with_surface(|surface| surface.process_info())
+            .flatten()
+        else {
+            return Task::ready(true);
+        };
+        cx.background_spawn(async move { processes.needs_confirm_quit() })
     }
     pub fn backend_error(&self) -> Option<&str> {
         self.backend_error.as_deref()
@@ -996,55 +1009,11 @@ fn native_keycode(key: &str) -> Option<u32> {
     })
 }
 
-fn stop_needs_confirmation(
-    status: TerminalStatus,
-    backend_error: bool,
-    native_decision: Option<bool>,
-) -> bool {
-    match status {
-        TerminalStatus::Running => backend_error || native_decision.unwrap_or(true),
-        TerminalStatus::Exited | TerminalStatus::Closed => false,
-    }
-}
-
 #[cfg(test)]
 mod input_tests {
-    use super::{TerminalStatus, native_text_key, stop_needs_confirmation};
+    use super::native_text_key;
     use gpui_kit::Keystroke;
 
-    #[test]
-    fn terminal_stop_confirmation_warns_for_jobs_and_unknown_native_state() {
-        assert!(stop_needs_confirmation(
-            TerminalStatus::Running,
-            false,
-            Some(true)
-        ));
-        assert!(stop_needs_confirmation(
-            TerminalStatus::Running,
-            false,
-            None
-        ));
-        assert!(stop_needs_confirmation(
-            TerminalStatus::Running,
-            true,
-            Some(false)
-        ));
-        assert!(!stop_needs_confirmation(
-            TerminalStatus::Running,
-            false,
-            Some(false)
-        ));
-        assert!(!stop_needs_confirmation(
-            TerminalStatus::Exited,
-            true,
-            Some(true)
-        ));
-        assert!(!stop_needs_confirmation(
-            TerminalStatus::Closed,
-            false,
-            None
-        ));
-    }
     #[test]
     fn return_with_native_text_remains_a_terminal_key_not_a_paste() {
         let enter = Keystroke::parse("enter").unwrap().with_simulated_ime();

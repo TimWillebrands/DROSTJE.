@@ -1,6 +1,6 @@
 use super::{
     ClipboardContent, DraftKey, DraftRevision, DraftSnapshot, NvimCommand, NvimConfig, NvimEditor,
-    NvimEvent,
+    NvimEvent, NvimTheme,
     grid::GridReducer,
     rpc::{self, Incoming, Rpc},
 };
@@ -46,10 +46,16 @@ pub(super) async fn open(config: NvimConfig) -> Result<NvimEditor> {
     })
 }
 
-fn theme_args(colors: [u32; 4]) -> Vec<Value> {
+fn theme_args(theme: NvimTheme) -> Vec<Value> {
+    let colors = theme
+        .colors()
+        .into_iter()
+        .map(|(role, color)| (role, color.into()));
     vec![
         "return drostje.theme(...)".into(),
-        Value::Array(colors.into_iter().map(Value::from).collect()),
+        Value::Array(vec![rpc::dictionary(
+            std::iter::once(("dark", theme.dark.into())).chain(colors),
+        )]),
     ]
 }
 
@@ -193,7 +199,7 @@ struct Session {
     vim_entered: bool,
     composition: bool,
     frozen: bool,
-    theme: Option<[u32; 4]>,
+    theme: Option<NvimTheme>,
     /// Requests sent by `detach`, by RPC ID, whose replies arrive as `Incoming::Response`.
     detached: HashMap<u64, &'static str>,
     failed: Option<String>,
@@ -340,8 +346,8 @@ impl Session {
             vec![self.channel.into(), self.generation.to_string().into()],
         )
         .await?;
-        if let Some(colors) = self.theme {
-            self.apply_theme(colors).await?;
+        if let Some(theme) = self.theme {
+            self.apply_theme(theme).await?;
         }
         self.call("nvim_command", vec!["redraw!".into()]).await?;
         let deadline = Instant::now() + RPC_TIMEOUT;
@@ -350,13 +356,13 @@ impl Session {
         }
         Ok(())
     }
-    async fn apply_theme(&mut self, colors: [u32; 4]) -> Result<()> {
-        self.call("nvim_exec_lua", theme_args(colors)).await?;
+    async fn apply_theme(&mut self, theme: NvimTheme) -> Result<()> {
+        self.call("nvim_exec_lua", theme_args(theme)).await?;
         self.call("nvim_command", vec!["redraw!".into()]).await?;
         Ok(())
     }
-    async fn send_theme(&mut self, colors: [u32; 4]) -> Result<()> {
-        self.detach("nvim_exec_lua", theme_args(colors)).await?;
+    async fn send_theme(&mut self, theme: NvimTheme) -> Result<()> {
+        self.detach("nvim_exec_lua", theme_args(theme)).await?;
         self.detach("nvim_command", vec!["redraw!".into()]).await
     }
     /// Send a non-editing UI request without awaiting its reply. Neovim defers
@@ -497,6 +503,7 @@ impl Session {
                     }
                 }
                 "drostje_vim_enter"
+                | "drostje_leave"
                 | "drostje_drain"
                 | "drostje_snapshot"
                 | "drostje_cursor"
@@ -508,6 +515,7 @@ impl Session {
                     }
                     match method.as_str() {
                         "drostje_vim_enter" => self.vim_entered = true,
+                        "drostje_leave" => self.events.emit(NvimEvent::Leave),
                         "drostje_drain" => {
                             ensure!(args.len() >= 3, "Malformed input-drain callback");
                             let sequence = args[1].as_u64().context("Invalid drain sequence")?;
@@ -1212,24 +1220,18 @@ impl Session {
             }
             NvimCommand::ResumeInput => self.frozen = false,
             NvimCommand::SetComposition(value) => self.composition = value,
-            NvimCommand::Theme {
-                foreground,
-                background,
-                selection,
-                caret,
-            } => {
-                let colors = [foreground, background, selection, caret];
-                if colors.iter().any(|color| *color > 0xffffff) {
+            NvimCommand::Theme(theme) => {
+                if theme.colors().iter().any(|(_, color)| *color > 0xffffff) {
                     self.events.emit(NvimEvent::InputRejected(
                         "Neovim theme colors must be packed 24-bit RGB".into(),
                     ));
                     return;
                 }
-                self.theme = Some(colors);
+                self.theme = Some(theme);
                 // Theme updates are non-editing and remain valid while input is
                 // frozen. Retain the newest colors through failed restarts.
                 if self.failed.is_none()
-                    && let Err(error) = self.send_theme(colors).await
+                    && let Err(error) = self.send_theme(theme).await
                 {
                     self.fail(format!("Could not apply editor theme: {error:#}"));
                 }

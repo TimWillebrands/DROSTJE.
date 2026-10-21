@@ -29,7 +29,7 @@ use gpui_kit::{
             PanelStyle, TabGroup, panel_handle, register_panel,
         },
         h_flex,
-        input::{Input, InputEvent, InputState},
+        input::{InputEvent, InputState},
         menu::{PopupMenu, PopupMenuItem},
         notification::Notification,
         shimmer::ShimmerText,
@@ -98,6 +98,8 @@ struct InlineRename {
     surface: RenameSurface,
     input: Entity<InputState>,
     error: Option<String>,
+    return_focus: Option<FocusHandle>,
+    _subscription: Subscription,
 }
 
 impl PanelKind {
@@ -280,7 +282,7 @@ pub struct Workspace {
     live_layouts: BTreeMap<SpaceId, DockAreaState>,
     active_terminal: Option<TerminalId>,
     space_terminals: BTreeMap<SpaceId, TerminalId>,
-    terminal_confirmation: bool,
+    pub(super) terminal_confirmation: bool,
     inline_rename: Option<InlineRename>,
     welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>>,
     /// While a layout is loaded or reset, panel callbacks must not touch thread state.
@@ -297,6 +299,8 @@ pub struct Workspace {
     thread_search: Entity<InputState>,
     pub palette: Option<Entity<Palette>>,
     pub dialog: Option<Entity<SurfaceContent>>,
+    surface_drafts: Vec<Entity<SurfaceContent>>,
+    background_worktree_request: Option<uuid::Uuid>,
     pub(super) commit_panel_thread: Option<ThreadId>,
     pub(super) theme_editor: Option<Entity<super::theme_editor::ThemeEditor>>,
     /// When to open each Conversation's Agents tab.
@@ -448,6 +452,8 @@ impl Workspace {
             detail_surface: None,
             palette: None,
             dialog: None,
+            surface_drafts: Vec::new(),
+            background_worktree_request: None,
             commit_panel_thread: None,
             theme_editor: None,
             agent_activity: BTreeMap::new(),
@@ -704,7 +710,7 @@ impl Workspace {
         let ScrollDelta::Pixels(delta) = event.delta else {
             return;
         };
-        if self.dialog.is_some()
+        if self.has_open_form(cx)
             || self.palette.is_some()
             || self.theme_editor.is_some()
             || window.has_active_dialog(cx)
@@ -1417,15 +1423,55 @@ impl Workspace {
             self.finish_terminal_stop(id, restart, window, cx);
             return;
         }
-        let neovim = pane.read(cx).neovim_target().is_some();
-        let needs_confirmation = pane
-            .read(cx)
-            .native()
-            .is_none_or(|native| native.read(cx).needs_confirm_quit());
-        if !neovim && !needs_confirmation {
-            self.finish_terminal_stop(id, restart, window, cx);
+        if pane.read(cx).neovim_target().is_some() {
+            self.show_terminal_stop_confirmation(id, restart, window, cx);
             return;
         }
+        let native = pane.read(cx).native();
+        let check = native.as_ref().map_or_else(
+            || Task::ready(true),
+            |native| native.read(cx).needs_confirm_quit(cx),
+        );
+        self.terminal_confirmation = true;
+        cx.notify();
+        cx.spawn_in(window, async move |workspace, window| {
+            let needs_confirmation = check.await;
+            let _ = workspace.update_in(window, |workspace, window, cx| {
+                workspace.terminal_confirmation = false;
+                cx.notify();
+                // Never apply a delayed process result to a replaced terminal.
+                let current = workspace.terminals.borrow().get(&id).cloned();
+                if current.as_ref() != Some(&panel)
+                    || panel.read(cx).terminal.as_ref() != Some(&pane)
+                    || pane.read(cx).native() != native
+                    || workspace.navigation_blocked(window, cx)
+                {
+                    return;
+                }
+                if !pane.read(cx).is_alive(cx) || !needs_confirmation {
+                    workspace.finish_terminal_stop(id, restart, window, cx);
+                } else {
+                    workspace.show_terminal_stop_confirmation(id, restart, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+    fn show_terminal_stop_confirmation(
+        &mut self,
+        id: TerminalId,
+        restart: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.terminals.borrow().get(&id).cloned() else {
+            return;
+        };
+        let neovim = panel
+            .read(cx)
+            .terminal
+            .as_ref()
+            .is_some_and(|pane| pane.read(cx).neovim_target().is_some());
         self.terminal_confirmation = true;
         let (description, ok_text) = match (neovim, restart) {
             (true, restart) => (
@@ -1437,11 +1483,11 @@ impl Workspace {
                 },
             ),
             (false, true) => (
-                "This stops this terminal's shell and foreground jobs. Other terminals are not affected.",
+                "This stops this terminal's shell and running jobs. Other terminals are not affected.",
                 "Restart terminal",
             ),
             (false, false) => (
-                "This stops this terminal's shell and foreground jobs. Other terminals are not affected.",
+                "This stops this terminal's shell and running jobs. Other terminals are not affected.",
                 "Close terminal",
             ),
         };
@@ -1929,11 +1975,13 @@ impl Workspace {
             || self.terminal_confirmation
             || self.state.read(cx).shutting_down
             || self.palette.is_some()
-            || self.dialog.is_some()
+            || self.has_open_form(cx)
             || self.theme_editor.is_some()
-            || self.extension.is_some()
+            || self
+                .extension
+                .as_ref()
+                .is_some_and(|form| !form.inline_answer)
             || self.image_preview.is_some()
-            || self.tool_detail.is_some()
             || window.has_active_dialog(cx)
             || window.has_active_sheet(cx)
             || self
@@ -2292,12 +2340,13 @@ impl Workspace {
             return;
         }
         let Some(name) = name else { return };
+        let return_focus = window.focused(cx);
         let input = cx.new(|cx| {
             let mut input = InputState::new(window, cx);
             input.set_value(name, window, cx);
             input
         });
-        self._subscriptions.push(cx.subscribe_in(
+        let subscription = cx.subscribe_in(
             &input,
             window,
             |workspace, _, event: &InputEvent, window, cx| {
@@ -2305,7 +2354,7 @@ impl Workspace {
                     workspace.commit_rename(window, cx);
                 }
             },
-        ));
+        );
         input.update(cx, |input, cx| input.focus(window, cx));
         input.update(cx, |input, cx| input.select_all(window, cx));
         self.inline_rename = Some(InlineRename {
@@ -2313,6 +2362,8 @@ impl Workspace {
             surface,
             input,
             error: None,
+            return_focus,
+            _subscription: subscription,
         });
         cx.notify();
     }
@@ -2333,8 +2384,13 @@ impl Workspace {
             )
         })
     }
-    pub(super) fn cancel_rename(&mut self, cx: &mut Context<Self>) {
-        if self.inline_rename.take().is_some() {
+    pub(super) fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(rename) = self.inline_rename.take() {
+            rename
+                .return_focus
+                .as_ref()
+                .unwrap_or(&self.focus)
+                .focus(window, cx);
             cx.notify();
         }
     }
@@ -2390,7 +2446,7 @@ impl Workspace {
             Ok(())
         });
         match result {
-            Ok(()) => self.inline_rename = None,
+            Ok(()) => self.cancel_rename(window, cx),
             Err(error) => {
                 if let Some(rename) = self.inline_rename.as_mut() {
                     rename.error = Some(format!("{error:#}"));
@@ -2916,7 +2972,9 @@ impl Workspace {
                 }
                 None
             }
-            Command::JoinSpaceNetwork | Command::LeaveSpaceNetwork => {
+            Command::JoinSpaceNetwork
+            | Command::LeaveSpaceNetwork
+            | Command::ResumeNetworkDelivery => {
                 let thread = self
                     .state
                     .read(cx)
@@ -2924,7 +2982,11 @@ impl Workspace {
                     .map(|thread| thread.id);
                 if let Some(id) = thread {
                     self.state.update(cx, |state, cx| {
-                        state.set_network_joined(id, command == Command::JoinSpaceNetwork, cx);
+                        if command == Command::ResumeNetworkDelivery {
+                            state.resume_network_delivery(id, cx);
+                        } else {
+                            state.set_network_joined(id, command == Command::JoinSpaceNetwork, cx);
+                        }
                         state.show_thread_sidebar(id, SidebarTab::Agents);
                     });
                 }
@@ -3042,7 +3104,7 @@ impl Workspace {
                 }
                 self.dismiss(window, cx);
                 if self.detail_surface.is_some()
-                    || self.dialog.is_some()
+                    || self.has_open_form(cx)
                     || self.palette.is_some()
                     || self.theme_editor.is_some()
                 {
@@ -3223,11 +3285,7 @@ impl Workspace {
         };
         self.dismiss(window, cx);
         let kind = DialogKind::Commit(thread);
-        let retained = self
-            .dialog
-            .as_ref()
-            .filter(|dialog| dialog.read(cx).kind == kind)
-            .cloned();
+        let retained = self.take_surface_draft(&kind, cx);
         let new_surface = retained.is_none();
         let state = self.state.clone();
         let owner = cx.entity().downgrade();
@@ -3365,26 +3423,49 @@ impl Workspace {
         if self.detail_surface.is_some() || self.palette.is_some() || self.theme_editor.is_some() {
             return;
         }
-        let retained = self
-            .dialog
-            .as_ref()
-            .filter(|dialog| dialog.read(cx).kind == kind)
-            .cloned();
-        let new_surface = retained.is_none();
+        let retained = self.take_surface_draft(&kind, cx);
         let state = self.state.clone();
         let owner = cx.entity().downgrade();
-        let commit = matches!(kind, DialogKind::Commit(_));
         let dialog = retained
             .unwrap_or_else(|| cx.new(|cx| SurfaceContent::new(kind, state, owner, window, cx)));
-        // Generate only for a new form. Reopening a retained commit draft must not
-        // replace a message the user already wrote.
-        if commit && new_surface {
-            dialog.update(cx, |dialog, cx| dialog.write_commit_subject(cx));
-        }
         self.dialog = Some(dialog);
         super::settings::open_surface(cx.entity().downgrade(), window, cx);
         cx.notify();
     }
+    fn take_surface_draft(
+        &mut self,
+        kind: &DialogKind,
+        cx: &App,
+    ) -> Option<Entity<SurfaceContent>> {
+        if let Some(dialog) = self.dialog.take() {
+            self.surface_drafts.push(dialog);
+        }
+        let index = self
+            .surface_drafts
+            .iter()
+            .position(|dialog| dialog.read(cx).kind == *kind)?;
+        Some(self.surface_drafts.remove(index))
+    }
+
+    fn discard_surface(&mut self, id: uuid::Uuid, cx: &App) {
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).surface_id() == id)
+        {
+            self.dialog = None;
+            self.commit_panel_thread = None;
+        }
+        self.surface_drafts
+            .retain(|dialog| dialog.read(cx).surface_id() != id);
+    }
+
+    pub(super) fn has_open_form(&self, cx: &App) -> bool {
+        self.dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.read(cx).hosted())
+    }
+
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self
             .editor
@@ -3393,7 +3474,12 @@ impl Workspace {
         {
             return;
         }
-        if self.extension.is_some() {
+        // Inline answers are Conversation content with their own Escape, not a layer.
+        if self
+            .extension
+            .as_ref()
+            .is_some_and(|form| !form.inline_answer)
+        {
             self.close_extension(true, window, cx);
             if self.extension.is_some() {
                 return;
@@ -3403,8 +3489,7 @@ impl Workspace {
             return;
         }
         self.image_preview = None;
-        self.tool_detail = None;
-        self.commit_panel_thread = None;
+        let closed_commit = self.commit_panel_thread.take().is_some();
         if let Some(palette) = self.palette.take() {
             palette.update(cx, |palette, cx| palette.dismiss(window, cx));
         }
@@ -3417,9 +3502,11 @@ impl Workspace {
                 (dialog.kind.clone(), dialog.hosted(), dialog.request)
             };
             if hosted {
+                dialog.update(cx, |dialog, cx| dialog.unhost(cx));
                 super::settings::close_surface(&kind, window, cx);
             }
             if let Some(request) = request {
+                self.background_worktree_request = Some(request);
                 window.push_notification(
                     Notification::new()
                         .id1::<WorktreeProgressNotice>(request.to_string())
@@ -3429,16 +3516,26 @@ impl Workspace {
                 );
             }
         }
+        if closed_commit {
+            self.focus_region(Region::Thread, window, cx);
+        }
         cx.notify();
     }
     pub fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.extension.is_some() {
+        if self
+            .extension
+            .as_ref()
+            .is_some_and(|form| !form.inline_answer)
+        {
             self.confirm_extension(window, cx);
             return;
         }
         let Some(dialog) = self.dialog.as_ref().cloned() else {
             return;
         };
+        if !dialog.read(cx).hosted() && self.commit_panel_thread.is_none() {
+            return;
+        }
         // A request already running owns the dialog until it settles.
         if dialog.read(cx).request.is_some() {
             return;
@@ -3483,7 +3580,7 @@ impl Workspace {
                 if matches!(kind, DialogKind::Commit(_)) {
                     self.commit_panel_thread = None;
                 }
-                super::settings::discard_surface(&cx.entity().downgrade(), id, cx);
+                self.discard_surface(id, cx);
             }
             Ok(Some(request)) => {
                 dialog.update(cx, |dialog, cx| dialog.begin_request(request, cx));
@@ -3513,12 +3610,17 @@ impl Workspace {
         };
         let dialog = self
             .dialog
-            .as_ref()
-            .filter(|dialog| dialog.read(cx).last_request() == Some(request))
+            .iter()
+            .chain(self.surface_drafts.iter())
+            .find(|dialog| dialog.read(cx).last_request() == Some(request))
             .cloned();
         let hosted = dialog
             .as_ref()
             .is_some_and(|dialog| dialog.read(cx).hosted());
+        let background = self.background_worktree_request == Some(request);
+        if !matches!(status, crate::app::WorktreeRequestStatus::Pending) && background {
+            self.background_worktree_request = None;
+        }
         match status {
             crate::app::WorktreeRequestStatus::Done(_) => {
                 if let Some(dialog) = dialog {
@@ -3532,9 +3634,9 @@ impl Workspace {
                     if matches!(kind, DialogKind::Commit(_)) {
                         self.commit_panel_thread = None;
                     }
-                    super::settings::discard_surface(&cx.entity().downgrade(), id, cx);
+                    self.discard_surface(id, cx);
                 }
-                if !hosted {
+                if !hosted || background {
                     window.push_notification(
                         Notification::success("Git operation completed")
                             .id1::<WorktreeProgressNotice>(request.to_string()),
@@ -3546,7 +3648,7 @@ impl Workspace {
             }
             crate::app::WorktreeRequestStatus::Failed(error)
             | crate::app::WorktreeRequestStatus::Refused(error) => {
-                if !hosted {
+                if !hosted || background {
                     window.push_notification(
                         Notification::error(format!("Git operation failed: {error}"))
                             .id1::<WorktreeProgressNotice>(request.to_string()),
@@ -3735,7 +3837,10 @@ impl Workspace {
     }
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.read(cx).shutting_down
-            || self.extension.is_some()
+            || self
+                .extension
+                .as_ref()
+                .is_some_and(|form| !form.inline_answer)
             || self
                 .editor
                 .as_ref()
@@ -3745,7 +3850,7 @@ impl Workspace {
         }
         self.dismiss(window, cx);
         if self.detail_surface.is_some()
-            || self.dialog.is_some()
+            || self.has_open_form(cx)
             || self.palette.is_some()
             || self.theme_editor.is_some()
         {
@@ -3771,7 +3876,7 @@ impl Workspace {
         }
         self.dismiss(window, cx);
         if self.detail_surface.is_some()
-            || self.dialog.is_some()
+            || self.has_open_form(cx)
             || self.palette.is_some()
             || self.theme_editor.is_some()
         {
@@ -4010,6 +4115,9 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &LeaveSpaceNetwork, w, cx| {
                     this.execute(Command::LeaveSpaceNetwork, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &ResumeNetworkDelivery, w, cx| {
+                    this.execute(Command::ResumeNetworkDelivery, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &CustomizeTheme, w, cx| {
                     this.execute(Command::CustomizeTheme, w, cx)
                 }))
@@ -4140,12 +4248,18 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &Dismiss, w, cx| {
                     if this.inline_rename.is_some() {
-                        this.cancel_rename(cx);
+                        this.cancel_rename(w, cx);
                     } else {
                         this.dismiss(w, cx);
                     }
                 }))
-                .on_action(cx.listener(|this, _: &Confirm, w, cx| this.confirm_dialog(w, cx)))
+                .on_action(cx.listener(|this, _: &Confirm, w, cx| {
+                    if this.inline_rename.is_some() {
+                        this.commit_rename(w, cx);
+                    } else {
+                        this.confirm_dialog(w, cx);
+                    }
+                }))
                 .on_action(cx.listener(|this, _: &Quit, w, cx| this.quit_review(w, cx)))
                 .on_action(cx.listener(|this, _: &ToggleProjects, w, cx| {
                     this.execute(Command::ToggleProjects, w, cx)
@@ -4680,9 +4794,9 @@ impl Panel for WorkspacePanel {
             workspace
                 .read(cx)
                 .inline_rename()
-                .and_then(|(target, surface, input, _)| {
+                .and_then(|(target, surface, input, error)| {
                     (target == RenameTarget::Thread(id) && surface == RenameSurface::Tab)
-                        .then_some(input)
+                        .then_some((input, error))
                 })
         });
         let selector = group.clone();
@@ -4708,7 +4822,9 @@ impl Panel for WorkspacePanel {
                 cx,
             ))
             .map(|tab| match rename_input {
-                Some(input) => tab.child(Input::new(&input).small().appearance(false)),
+                Some((input, error)) => {
+                    tab.child(sidebar::inline_editor(&input, error, &self.workspace, cx))
+                }
                 None if titling => tab.child(ShimmerText::new(title)),
                 None => tab.child(title),
             })

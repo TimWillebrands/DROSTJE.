@@ -591,10 +591,15 @@ const Subprocess = struct {
     cwd: ?[:0]const u8,
     env: ?EnvMap,
     args: []const [:0]const u8,
+    drost_expected_program: ?[:0]const u8 = null,
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+
+    // DROSTJE reads process identities on the UI thread. Publish only after
+    // PTY initialization, without exposing the IO-thread-owned Process union.
+    drost_root_pid: std.atomic.Value(u32) = .init(0),
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -826,6 +831,7 @@ const Subprocess = struct {
         }
 
         // Build our args list
+        var args_fallback = false;
         const args: []const [:0]const u8 = execCommand(
             alloc,
             shell_command,
@@ -838,6 +844,7 @@ const Subprocess = struct {
             // about to crash, but we can try.
             error.OutOfMemory => oom: {
                 log.warn("failed to allocate space for command args, falling back to basic shell", .{});
+                args_fallback = true;
 
                 // The comptime here is important to ensure the full slice
                 // is put into the binary data and not the stack.
@@ -849,6 +856,18 @@ const Subprocess = struct {
 
             // This logs on its own, this is a bad error.
             error.SystemError => return err,
+        };
+
+        // Preserve the executable before macOS login wrapping. Shell strings
+        // are intentionally unknown: arbitrary shell syntax has no fixed target.
+        const drost_expected_program: ?[:0]const u8 = if (args_fallback)
+            args[0]
+        else switch (shell_command) {
+            .direct => |argv| if (argv.len > 0 and argv[0].len > 0)
+                try alloc.dupeZ(u8, argv[0])
+            else
+                null,
+            .shell => null,
         };
 
         // We have to copy the cwd because there is no guarantee that
@@ -872,6 +891,7 @@ const Subprocess = struct {
             .env = env,
             .cwd = cwd,
             .args = args,
+            .drost_expected_program = drost_expected_program,
 
             .rt_pre_exec_info = cfg.rt_pre_exec_info,
             .rt_post_fork_info = cfg.rt_post_fork_info,
@@ -1080,6 +1100,10 @@ const Subprocess = struct {
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
 
         self.process = .{ .fork_exec = cmd };
+        if (comptime builtin.os.tag != .windows) {
+            const pid = if (cmd.pid) |pid| std.math.cast(u32, pid) orelse 0 else 0;
+            self.drost_root_pid.store(pid, .release);
+        }
         return switch (builtin.os.tag) {
             .windows => .{
                 .read = pty.out_pipe,
@@ -1104,6 +1128,7 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        self.drost_root_pid.store(0, .release);
         self.process = null;
     }
 
@@ -1112,6 +1137,7 @@ const Subprocess = struct {
     /// for it to terminate, so it will not block.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
+        self.drost_root_pid.store(0, .release);
         // DROSTJE owns the terminal session, including a foreground job which
         // job-control shells put in a different process group from themselves.
         // Use the PTY's actual foreground group, never a guessed descendant PID.
@@ -2076,6 +2102,26 @@ fn appendEnvAlways(
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Exec, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.subprocess.getProcessInfo(info);
+}
+
+/// DROSTJE-only snapshot, avoiding concurrent access to the Process union.
+/// A nonzero acquire also publishes the initialized PTY to the caller.
+pub fn drostRootPid(self: *Exec) u64 {
+    return self.subprocess.drost_root_pid.load(.acquire);
+}
+
+/// DROSTJE-only metadata for the login wrapper constructed by execCommand.
+pub fn drostLoginWrapper(self: *Exec) bool {
+    if (comptime builtin.os.tag != .macos) return false;
+    // Args are immutable after construction and remain alive until the surface
+    // is destroyed, so the UI thread can read them without the IO state lock.
+    const args = self.subprocess.args;
+    return args.len > 0 and std.mem.eql(u8, args[0], "/usr/bin/login");
+}
+
+/// Immutable construction metadata, valid until the surface is destroyed.
+pub fn drostExpectedProgram(self: *Exec) ?[:0]const u8 {
+    return self.subprocess.drost_expected_program;
 }
 
 test "execCommand darwin: shell command" {

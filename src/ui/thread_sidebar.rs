@@ -273,9 +273,21 @@ pub(super) fn render(
                     .tool_detail
                     .as_ref()
                     .filter(|(thread, _)| *thread == id)?;
-                Some(super::overlays::render_details(
-                    &workspace, id, tool, owner, cx,
-                ))
+                Some(
+                    div()
+                        .id("thread-details-inspector")
+                        .debug_selector(|| "thread-details-inspector".into())
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .overflow_y_scroll()
+                        .track_scroll(output_scroll)
+                        .p_3()
+                        .child(super::overlays::render_details(
+                            workspace, id, tool, owner, cx,
+                        ))
+                        .into_any_element(),
+                )
             })
             .unwrap_or_else(|| div().p_3().child("No details selected").into_any_element()),
         SidebarTab::Review => super::review::render(state, id, owner, cx),
