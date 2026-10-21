@@ -90,6 +90,11 @@ impl Browser {
 impl Drop for Browser {
     fn drop(&mut self) {
         self.runtime.shutdown();
+        // Let Servo tear down its GL surfaces before the test process exits.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.runtime.0.0.memory.lock().stopped && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
         let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
@@ -249,14 +254,16 @@ fn real_content_height_grows_shrinks_reflows_and_resumes(browser: &Browser) {
     browser.runtime.close(id);
 }
 
-struct DiagnosticServer {
+/// Real loopback HTTP: WebGPU and other origin-keyed APIs are unavailable to
+/// the opaque origins of `file:` URLs.
+struct HttpFixture {
     url: String,
     stopped: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
-impl DiagnosticServer {
-    fn start() -> Self {
+impl HttpFixture {
+    fn start(index: &'static str) -> Self {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -284,17 +291,7 @@ impl DiagnosticServer {
                     continue;
                 } // Real dropped HTTP connection.
                 let (status, body) = if path == "/" {
-                    (
-                        "200 OK",
-                        r#"<!doctype html><title>Diagnostics smoke</title>
-                    <script>
-                    console.warn('native-console-smoke');
-                    fetch('/missing').then(r => { window.fetchStatus = r.status; });
-                    fetch('/broken').catch(() => { window.fetchFailed = true; });
-                    const xhr = new XMLHttpRequest(); xhr.open('GET', '/missing');
-                    xhr.onload = () => { window.xhrStatus = xhr.status; }; xhr.send();
-                    </script><img src='/missing'>"#,
-                    )
+                    ("200 OK", index)
                 } else {
                     ("404 Not Found", "missing")
                 };
@@ -313,7 +310,7 @@ impl DiagnosticServer {
     }
 }
 
-impl Drop for DiagnosticServer {
+impl Drop for HttpFixture {
     fn drop(&mut self) {
         self.stopped
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -324,7 +321,16 @@ impl Drop for DiagnosticServer {
 }
 
 fn real_diagnostics_and_document_metadata(browser: &Browser) {
-    let server = DiagnosticServer::start();
+    let server = HttpFixture::start(
+        r#"<!doctype html><title>Diagnostics smoke</title>
+        <script>
+        console.warn('native-console-smoke');
+        fetch('/missing').then(r => { window.fetchStatus = r.status; });
+        fetch('/broken').catch(() => { window.fetchFailed = true; });
+        const xhr = new XMLHttpRequest(); xhr.open('GET', '/missing');
+        xhr.onload = () => { window.xhrStatus = xhr.status; }; xhr.send();
+        </script><img src='/missing'>"#,
+    );
     let id = BrowserId::new_v4();
     browser.runtime.open(id, server.url.clone());
     browser.until("startup network diagnostics", || {
@@ -499,6 +505,10 @@ fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
     }
     real_content_height_grows_shrinks_reflows_and_resumes(&browser);
     real_diagnostics_and_document_metadata(&browser);
+    real_webgpu_canvas_presents_its_render_pass(&browser);
+    real_webgpu_canvas_survives_resizing_every_frame(&browser);
+    real_webgpu_releases_devices_of_documents_that_navigate_away(&browser);
+    real_indexeddb_is_deleted_when_the_last_surface_on_its_origin_closes(&browser);
     browser.runtime.command(
         id,
         BrowserCommand::Navigate {
@@ -595,6 +605,262 @@ fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
         browser.runtime.0.0.memory.lock().stopped
     });
     println!(
-        "In-process Servo proof: dedicated worker, HTML/CSS pixels, nested JS, click, Unicode text, key, wheel, resize, natural content-height opt-in/grow/shrink/width reflow/disable/resume/body fallback/navigation, reload, back/forward, isolated WebViews, missing-file recovery, JS exception, close/reopen, cooperative shutdown"
+        "In-process Servo proof: dedicated worker, HTML/CSS pixels, nested JS, click, Unicode text, key, wheel, resize, natural content-height opt-in/grow/shrink/width reflow/disable/resume/body fallback/navigation, WebGPU canvas presentation, per-frame resizing and navigation, IndexedDB deletion on last close, reload, back/forward, isolated WebViews, missing-file recovery, JS exception, close/reopen, cooperative shutdown"
     );
+}
+
+fn real_webgpu_canvas_presents_its_render_pass(browser: &Browser) {
+    let server = HttpFixture::start(
+        r#"<!doctype html><title>WebGPU smoke</title>
+        <style>html,body{margin:0;background:#fff}canvas{display:block;width:64px;height:64px}</style>
+        <canvas width=64 height=64></canvas><script>
+        window.gpuResult = 'pending';
+        (async () => {
+          if (!navigator.gpu) throw new Error('navigator.gpu is missing');
+          const adapter = await navigator.gpu.requestAdapter();
+          if (!adapter) throw new Error('No WebGPU adapter');
+          const limits = adapter.limits;
+          window.gpuLimits = [limits.maxSampledTexturesPerShaderStage, limits.maxSamplersPerShaderStage,
+            limits.maxBindingsPerBindGroup, limits.maxBindGroups];
+          // As PixiJS does: request the adapter's limits, then size shaders from them.
+          const device = await adapter.requestDevice({requiredLimits: {
+            maxSampledTexturesPerShaderStage: limits.maxSampledTexturesPerShaderStage,
+            maxSamplersPerShaderStage: limits.maxSamplersPerShaderStage}});
+          const context = document.querySelector('canvas').getContext('webgpu');
+          context.configure({device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: 'opaque'});
+          const encoder = device.createCommandEncoder();
+          encoder.beginRenderPass({colorAttachments: [{view: context.getCurrentTexture().createView(),
+            clearValue: {r: 0.2, g: 0.4, b: 0.6, a: 1}, loadOp: 'clear', storeOp: 'store'}]}).end();
+          device.queue.submit([encoder.finish()]);
+          await device.queue.onSubmittedWorkDone();
+          window.gpuResult = 'presented';
+        })().catch(error => { window.gpuResult = String(error); });
+        </script>"#,
+    );
+    let id = BrowserId::new_v4();
+    browser.runtime.open(id, server.url.clone());
+    browser.until("WebGPU submission", || {
+        !browser.snapshot(id).loading && browser.evaluate(id, "window.gpuResult") != "pending"
+    });
+    assert_eq!(browser.evaluate(id, "window.gpuResult"), "presented");
+    // Raw Vulkan maxima (524288 samplers) made PixiJS generate a 134 MB shader.
+    let limits = browser.evaluate(id, "window.gpuLimits");
+    let limits: Vec<u64> = limits
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|limit| limit.as_f64().unwrap() as u64)
+        .collect();
+    assert!(
+        limits[0] <= 16 && limits[1] <= 16 && limits[2] <= 1000 && limits[3] <= 4,
+        "adapter must expose WebGPU's default binding-count limits, not driver maxima: {limits:?}"
+    );
+    // sRGB-agnostic: the canvas centre is the clear colour, not the white page.
+    browser.until("WebGPU canvas pixels in the Servo frame", || {
+        browser.snapshot(id).frame.is_some_and(|frame| {
+            let offset = (32 * frame.width as usize + 32) * 4;
+            let [r, g, b, a] = frame.rgba[offset..offset + 4] else {
+                return false;
+            };
+            a == 255 && r < g && g < b && b < 220
+        })
+    });
+    browser.runtime.close(id);
+}
+
+fn real_webgpu_canvas_survives_resizing_every_frame(browser: &Browser) {
+    // A canvas that shrinks while its previous, larger frame is still the
+    // WebRender descriptor used to panic the worker during texture upload.
+    let server = HttpFixture::start(
+        r#"<!doctype html><title>WebGPU resize smoke</title>
+        <style>html,body{margin:0;background:#fff}canvas{display:block}</style>
+        <canvas></canvas><script>
+        window.gpuFrames = 0;
+        (async () => {
+          const adapter = await navigator.gpu.requestAdapter();
+          const device = await adapter.requestDevice();
+          const canvas = document.querySelector('canvas');
+          const context = canvas.getContext('webgpu');
+          const format = navigator.gpu.getPreferredCanvasFormat();
+          const sizes = [[640, 480], [64, 48], [500, 300], [32, 640], [320, 24]];
+          const draw = () => {
+            const [width, height] = sizes[window.gpuFrames % sizes.length];
+            canvas.width = width;
+            canvas.height = height;
+            context.configure({device, format, alphaMode: 'opaque'});
+            const encoder = device.createCommandEncoder();
+            encoder.beginRenderPass({colorAttachments: [{view: context.getCurrentTexture().createView(),
+              clearValue: {r: 0.2, g: 0.4, b: 0.6, a: 1}, loadOp: 'clear', storeOp: 'store'}]}).end();
+            device.queue.submit([encoder.finish()]);
+            window.gpuFrames += 1;
+            requestAnimationFrame(draw);
+          };
+          requestAnimationFrame(draw);
+        })().catch(error => { window.gpuFrames = String(error); });
+        </script>"#,
+    );
+    let id = BrowserId::new_v4();
+    browser.runtime.open(id, server.url.clone());
+    // `snapshot` fails the test as soon as the worker reports a panic.
+    browser.until("200 resized WebGPU frames", || {
+        if browser.snapshot(id).loading {
+            return false;
+        }
+        let frames = browser.evaluate(id, "window.gpuFrames");
+        assert!(frames.is_number(), "WebGPU resize page failed: {frames}");
+        browser.snapshot(id);
+        frames.as_f64().is_some_and(|frames| frames >= 200.0)
+    });
+    browser.runtime.close(id);
+}
+
+fn real_webgpu_releases_devices_of_documents_that_navigate_away(browser: &Browser) {
+    // A navigated-away document's devices used to live until script collected
+    // them, which never happened. A process gets about ten devices; the next
+    // request failed and panicked the site's shared WebGPU thread, after which
+    // every document on the site waited forever for WebGPU.
+    let server = HttpFixture::start(
+        r#"<!doctype html><title>WebGPU navigation smoke</title><canvas width=64 height=64></canvas><script>
+        window.gpuFrames = 0;
+        (async () => {
+          const adapter = await navigator.gpu.requestAdapter();
+          const device = await adapter.requestDevice();
+          // Like PixiJS's support check plus renderer: two devices per document.
+          window.spare = await (await navigator.gpu.requestAdapter()).requestDevice();
+          const context = document.querySelector('canvas').getContext('webgpu');
+          context.configure({device, format: navigator.gpu.getPreferredCanvasFormat(), alphaMode: 'opaque'});
+          const draw = () => {
+            device.pushErrorScope('validation');
+            const encoder = device.createCommandEncoder();
+            encoder.beginRenderPass({colorAttachments: [{view: context.getCurrentTexture().createView(),
+              clearValue: {r: 0.2, g: 0.4, b: 0.6, a: 1}, loadOp: 'clear', storeOp: 'store'}]}).end();
+            device.queue.submit([encoder.finish()]);
+            device.popErrorScope();
+            window.gpuFrames += 1;
+            requestAnimationFrame(draw);
+          };
+          requestAnimationFrame(draw);
+        })().catch(error => { window.gpuFrames = String(error); });
+        </script>"#,
+    );
+    let id = BrowserId::new_v4();
+    let rendering = |label: &str| {
+        browser.until(label, || {
+            if browser.snapshot(id).loading {
+                return false;
+            }
+            let frames = browser.evaluate(id, "window.gpuFrames");
+            assert!(
+                frames.is_number() || frames.is_null(),
+                "WebGPU page failed: {frames}"
+            );
+            frames.as_f64().is_some_and(|frames| frames >= 10.0)
+        });
+    };
+    browser.runtime.open(id, server.url.clone());
+    for _ in 0..12 {
+        rendering("WebGPU frames before leaving");
+        browser.runtime.command(
+            id,
+            BrowserCommand::Navigate {
+                url: format!("{}missing", server.url),
+            },
+        );
+        browser.until("same-site document without WebGPU", || {
+            let snapshot = browser.snapshot(id);
+            !snapshot.loading && snapshot.url.ends_with("/missing")
+        });
+        browser.runtime.command(
+            id,
+            BrowserCommand::Navigate {
+                url: server.url.clone(),
+            },
+        );
+    }
+    rendering("WebGPU frames after repeated navigation");
+    browser.runtime.close(id);
+}
+
+fn real_indexeddb_is_deleted_when_the_last_surface_on_its_origin_closes(browser: &Browser) {
+    // Keeps its connection open, as real sites do, so deletion cannot rely on
+    // the page closing it.
+    let server = HttpFixture::start(
+        r#"<!doctype html><title>IndexedDB smoke</title><script>
+        indexedDB.databases().then(databases => {
+          window.before = databases.map(({ name }) => name).join(',');
+          const request = indexedDB.open('drostje-smoke', 1);
+          request.onupgradeneeded = () => request.result.createObjectStore('notes');
+          request.onsuccess = () => {
+            const transaction = request.result.transaction('notes', 'readwrite');
+            transaction.objectStore('notes').put('kept', 'note');
+            transaction.oncomplete = () => { window.stored = true; };
+          };
+        });
+        </script>"#,
+    );
+    let open = |label: &str| {
+        let id = BrowserId::new_v4();
+        browser.runtime.open(id, server.url.clone());
+        browser.until(label, || {
+            !browser.snapshot(id).loading && browser.evaluate(id, "window.stored === true") == true
+        });
+        (id, browser.evaluate(id, "window.before"))
+    };
+    // Servo 0.7 falls back to `./bottles` when it has no usable config directory.
+    let working_directory_bottles =
+        || std::fs::read_dir("bottles").map_or(0, |entries| entries.flatten().count());
+    let bottles_before = working_directory_bottles();
+    let (first, before) = open("first surface stores a record");
+    assert_eq!(
+        working_directory_bottles(),
+        bottles_before,
+        "IndexedDB must live in the engine profile, not the working directory"
+    );
+    assert_eq!(before, "");
+    let (second, before) = open("second surface on the same origin");
+    assert_eq!(before, "drostje-smoke");
+    browser.runtime.close(first);
+    // Longer than the close deadline: a closing surface never outlives it.
+    thread::sleep(Duration::from_secs(6));
+    let (third, before) = open("surface after a sibling closed");
+    assert_eq!(
+        before, "drostje-smoke",
+        "a live surface keeps its origin's data"
+    );
+    browser.runtime.close(second);
+    browser.runtime.close(third);
+    thread::sleep(Duration::from_secs(6));
+    let (fourth, before) = open("surface after every surface closed");
+    assert_eq!(before, "", "closing the last surface deletes its IndexedDB");
+    browser.runtime.close(fourth);
+}
+
+#[test]
+#[ignore = "requires a working native Servo renderer and desktop graphics session"]
+fn real_has_selector_lists_apply() {
+    let browser = Browser::start();
+    // DaisyUI 5 declares its theme variables behind a selector list like this one.
+    std::fs::write(
+        browser.directory.join("has.html"),
+        r#"<!doctype html><title>Has selector</title><style>
+        :where(:root),:root:has(input.theme-controller:checked),[data-theme=light]{--radius-field:7px}
+        </style>"#,
+    )
+    .unwrap();
+    let id = BrowserId::new_v4();
+    browser.runtime.open(
+        id,
+        url::Url::from_file_path(browser.directory.join("has.html"))
+            .unwrap()
+            .to_string(),
+    );
+    browser.until("page load", || !browser.snapshot(id).loading);
+    assert_eq!(
+        browser.evaluate(
+            id,
+            "getComputedStyle(document.documentElement).getPropertyValue('--radius-field').trim()"
+        ),
+        "7px"
+    );
+    browser.runtime.close(id);
 }

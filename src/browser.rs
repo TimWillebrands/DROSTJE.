@@ -2,10 +2,14 @@
 //! a dedicated worker thread; commands and evaluation results are bounded.
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::OsStr,
     io,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use parking_lot::Mutex;
@@ -20,6 +24,27 @@ use command::{Event, MAX_PENDING, PageState, Request};
 use diagnostics::Diagnostics;
 
 pub type BrowserId = uuid::Uuid;
+
+static CONTENT_PROCESSES: AtomicBool = AtomicBool::new(false);
+
+/// Must run first in `main`, before any other startup work. Servo re-executes
+/// `current_exe` as `--content-process <token>` to host a site's script and
+/// layout; such a process is served here and `true` means the caller must exit.
+/// Otherwise engines started by this process run pages in content processes, so
+/// a page that crashes its process shows Servo's crash page instead of taking
+/// DROSTJE down. Binaries that never call this (libtest) keep pages in-process.
+pub fn serve_content_process() -> bool {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(OsStr::new("--content-process")) {
+        CONTENT_PROCESSES.store(true, Ordering::Relaxed);
+        return false;
+    }
+    match args.next().and_then(|token| token.into_string().ok()) {
+        Some(token) => engine::run_content_process(token),
+        None => eprintln!("A Servo content process was started without a valid token"),
+    }
+    true
+}
 
 #[derive(Clone, Debug)]
 pub struct BrowserSnapshot {
@@ -449,6 +474,25 @@ impl BrowserRuntime {
         }
         drop(memory);
         shared.wake();
+    }
+
+    /// Waits for the worker to finish Servo's cooperative shutdown after
+    /// `shutdown`; exiting the process during that teardown crashes in Servo's
+    /// threads. Returns `false` when the timeout elapsed first.
+    pub fn wait_for_shutdown(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let memory = self.0.0.memory.lock();
+                if memory.stopped || !memory.started {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 

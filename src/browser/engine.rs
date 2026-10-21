@@ -4,27 +4,33 @@ use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     thread,
     time::{Duration, Instant},
 };
 
+use content_security_policy::Destination;
 use dpi::PhysicalSize;
 use euclid::{Box2D, Point2D, Scale, Size2D};
 use serde_json::Value;
 use servo::{
     Code, CompositionEvent, CompositionState, ConsoleLogLevel, EventLoopWaker, ImeEvent,
     InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers,
-    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo,
-    ServoBuilder, ServoDelegate, ServoError, SoftwareRenderingContext, UserContentManager,
-    WebResourceLoad, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
-    WheelEvent, WheelMode,
+    MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences,
+    RenderingContext, Servo, ServoBuilder, ServoDelegate, ServoError, SoftwareRenderingContext,
+    UserContentManager, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
+    WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 use uuid::Uuid;
 
 use super::command::{self, BrowserCommand, Event, PageState, Request};
 use super::{Shared, apply_event, fail};
+use closing::{CLEAR_STORAGE_DOCUMENT, CLEAR_STORAGE_PATH, ClosingPage, storage_origin};
+use profile::EngineProfile;
+
+mod closing;
+mod profile;
 
 const MAX_WEBVIEWS: usize = 16;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -168,6 +174,10 @@ struct Delegate {
     frame_generation: Cell<u64>,
     frame_current: Cell<bool>,
     capture_pending: Cell<bool>,
+    /// Storage origins of every document this surface loaded, frames included.
+    loaded_origins: RefCell<Vec<Url>>,
+    closing: Cell<bool>,
+    crash: Cell<Crash>,
 }
 
 impl Delegate {
@@ -204,6 +214,19 @@ impl Delegate {
         self.dirty.set(false);
     }
 
+    fn record_document(&self, url: &Url) {
+        if let Some(origin) = storage_origin(url) {
+            let mut origins = self.loaded_origins.borrow_mut();
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+    }
+
+    fn has_loaded_origin(&self, origin: &Url) -> bool {
+        self.loaded_origins.borrow().contains(origin)
+    }
+
     fn diagnostic(&self, kind: &'static str, level: String, message: String) {
         self.output.send(
             Event::Diagnostic {
@@ -235,6 +258,7 @@ impl Delegate {
 
 impl WebViewDelegate for Delegate {
     fn notify_url_changed(&self, _: WebView, url: Url) {
+        self.record_document(&url);
         self.invalidate_content_height();
         self.update(|state| state.url = url.to_string());
     }
@@ -258,6 +282,9 @@ impl WebViewDelegate for Delegate {
         });
         if status == LoadStatus::Complete {
             self.dirty.set(true);
+            if self.crash.get() == Crash::Settling {
+                self.crash.set(Crash::Settled);
+            }
         }
     }
 
@@ -284,6 +311,7 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_crashed(&self, _: WebView, reason: String, backtrace: Option<String>) {
+        self.crash.set(Crash::Settling);
         if let Some(backtrace) = backtrace {
             eprintln!("Servo page crash: {backtrace}");
         }
@@ -313,6 +341,27 @@ impl WebViewDelegate for Delegate {
     }
 
     fn load_web_resource(&self, _: WebView, load: WebResourceLoad) {
+        let request = load.request();
+        if self.closing.get() {
+            if request.is_for_main_frame && request.url.path() == CLEAR_STORAGE_PATH {
+                let url = request.url.clone();
+                let mut response = load.intercept(WebResourceResponse::new(url));
+                response.send_body_data(CLEAR_STORAGE_DOCUMENT.to_vec());
+                response.finish();
+            }
+            // A closing surface is invisible; its loads are not diagnostics.
+            return;
+        }
+        if matches!(
+            request.destination,
+            Destination::Document
+                | Destination::Frame
+                | Destination::IFrame
+                | Destination::Object
+                | Destination::Embed
+        ) {
+            self.record_document(&request.url);
+        }
         self.diagnostic(
             "request",
             "info".into(),
@@ -328,6 +377,19 @@ struct Page {
     delegate: Rc<Delegate>,
     last_frame: Instant,
     scale: f32,
+    /// The latest navigation requested while the crash page was settling.
+    held_navigation: Option<BrowserCommand>,
+}
+
+/// Servo replaces a crashed document with its crash page, which becomes current
+/// only once loaded; until then Servo drops embedder loads for that WebView.
+/// Its reload replays the crash entry, so Reload of a crashed page loads the
+/// crashed URL afresh instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Crash {
+    None,
+    Settling,
+    Settled,
 }
 
 impl Page {
@@ -364,6 +426,9 @@ impl Page {
             frame_generation: Cell::new(0),
             frame_current: Cell::new(false),
             capture_pending: Cell::new(false),
+            loaded_origins: RefCell::default(),
+            closing: Cell::new(false),
+            crash: Cell::new(Crash::None),
         });
         let user_contents = Rc::new(UserContentManager::new(servo));
         user_contents.add_script(Rc::new(include_str!("diagnostics.js").into()));
@@ -380,6 +445,7 @@ impl Page {
             delegate,
             last_frame: Instant::now() - FRAME_INTERVAL,
             scale: 1.0,
+            held_navigation: None,
         })
     }
 
@@ -393,7 +459,32 @@ impl Page {
         )))
     }
 
+    fn release_held_navigation(&mut self) {
+        if self.delegate.crash.get() == Crash::Settling {
+            return;
+        }
+        if let Some(command) = self.held_navigation.take()
+            && let Err(error) = self.command(command)
+        {
+            self.delegate.error(error);
+        }
+    }
+
     fn command(&mut self, command: BrowserCommand) -> Result<(), String> {
+        if let BrowserCommand::Navigate { .. }
+        | BrowserCommand::Back
+        | BrowserCommand::Forward
+        | BrowserCommand::Reload = command
+        {
+            if self.delegate.crash.get() == Crash::Settling {
+                // Servo drops loads until its crash page replaces the dead document.
+                self.held_navigation = Some(command);
+                return Ok(());
+            }
+            if !matches!(command, BrowserCommand::Reload) {
+                self.delegate.crash.set(Crash::None);
+            }
+        }
         match command {
             BrowserCommand::Navigate { url } => {
                 let url = parse_url(&url)?;
@@ -442,7 +533,11 @@ impl Page {
                     // notifying its delegate, so invalidate this identity here.
                     state.document_revision += 1;
                 });
-                self.view.reload();
+                let crashed = self.delegate.crash.replace(Crash::None) == Crash::Settled;
+                match self.view.url().filter(|_| crashed) {
+                    Some(url) => self.view.load(url),
+                    None => self.view.reload(),
+                }
             }
             BrowserCommand::Resize {
                 width,
@@ -836,6 +931,22 @@ fn js_value(value: JSValue) -> Value {
     }
 }
 
+/// Stylo prefs are process-wide statics: the engine process and every content
+/// process, where layout runs, set them before styling anything.
+fn configure_stylo() {
+    // Servo does not expose this Stylo pref. Without it a selector list containing
+    // :has() invalidates its whole rule, which drops DaisyUI's theme variables.
+    // Servo 0.7 matches :has() when an element is styled but does not yet
+    // invalidate it on later DOM or state changes.
+    stylo_static_prefs::set_pref!("layout.css.has-selector.enabled", true);
+}
+
+/// Serves one Servo content process until its event loop exits.
+pub(super) fn run_content_process(token: String) {
+    configure_stylo();
+    servo::run_content_process(token);
+}
+
 pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
     // Respect a provider already selected by the host. Concurrent installers may
     // win the race; either way Rustls has a process-wide provider before Servo starts.
@@ -843,12 +954,39 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
     let output = Arc::new(Output(shared.clone()));
+    // WebGPU runs on Servo's own wgpu device and presents through WebRender
+    // images, so it does not depend on the software GL rendering context.
+    // GPU canvas pages routinely pair it with OffscreenCanvas for 2D scratch work.
+    let preferences = Preferences {
+        dom_webgpu_enabled: true,
+        dom_offscreen_canvas_enabled: true,
+        // A suspended back-forward document keeps its WebGPU devices alive, and a
+        // process gets about ten; navigating discards the old document instead.
+        session_history_max_length: 0,
+        // Storage lives in the per-run profile; closing.rs deletes it per closed surface.
+        dom_indexeddb_enabled: true,
+        ..Preferences::default()
+    };
+    configure_stylo();
+    let profile = EngineProfile::create()
+        .map_err(|error| format!("Could not create Servo's storage directory: {error}"))?;
+    let opts = Opts {
+        config_dir: Some(profile.path().to_path_buf()),
+        multiprocess: super::CONTENT_PROCESSES.load(Ordering::Relaxed),
+        // Servo's default exits the whole process when a page's script panics;
+        // DROSTJE shows the crash page for that WebView instead.
+        hard_fail: false,
+        ..Opts::default()
+    };
     let servo = ServoBuilder::default()
+        .opts(opts)
+        .preferences(preferences)
         .event_loop_waker(Box::new(Waker(thread::current())))
         .build();
     // Do not call Servo::setup_logging: it replaces the host's process-wide logger.
     servo.set_delegate(Rc::new(EngineDelegate(output.clone())));
     let mut pages = HashMap::<Uuid, Page>::new();
+    let mut closing = Vec::<ClosingPage>::new();
     let mut batch = VecDeque::<Request>::with_capacity(64);
     loop {
         {
@@ -868,9 +1006,21 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
             let length = memory.queue.len().min(64);
             batch.extend(memory.queue.drain(..length));
         }
-        // Closing is an identity removal, not an unbounded lifecycle queue. Drop
+        // Closing is an identity removal, not an unbounded lifecycle queue. Retire
         // obsolete WebViews here, never under the snapshot lock or on the UI thread.
-        pages.retain(|id, _| shared.memory.lock().wire_ids.contains_key(id));
+        let closed: Vec<Uuid> = {
+            let memory = shared.memory.lock();
+            pages
+                .keys()
+                .filter(|id| !memory.wire_ids.contains_key(id))
+                .copied()
+                .collect()
+        };
+        for id in closed {
+            if let Some(page) = pages.remove(&id).and_then(ClosingPage::new) {
+                closing.push(page);
+            }
+        }
         while let Some(request) = batch.pop_front() {
             {
                 let memory = shared.memory.lock();
@@ -992,15 +1142,18 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
         }
         servo.spin_event_loop();
         for page in pages.values_mut() {
+            page.release_held_navigation();
             page.paint_if_dirty();
             page.measure_content_if_due();
         }
+        closing.retain_mut(|page| page.advance(&pages));
         if !shared.memory.lock().queue.is_empty() {
             continue;
         }
         let animating = pages
             .values()
-            .any(|page| page.view.animating() || page.delegate.dirty.get());
+            .any(|page| page.view.animating() || page.delegate.dirty.get())
+            || !closing.is_empty();
         thread::park_timeout(if animating {
             Duration::from_millis(16)
         } else {
@@ -1009,8 +1162,10 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
     }
     // Cooperative Servo shutdown stays on this worker. Unlike a helper process,
     // an in-process engine cannot be forcibly killed without killing the app.
+    closing.clear();
     pages.clear();
     drop(servo);
+    drop(profile);
     Ok(())
 }
 
