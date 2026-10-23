@@ -469,6 +469,8 @@ impl SurfaceContent {
                         ("omp", "OMP executable (blank: discover on PATH)"),
                         ("pi", "Pi executable (blank: discover on PATH)"),
                         ("claude", "Claude Code executable (blank: discover on PATH)"),
+                        ("codex", "Codex executable (blank: discover on PATH)"),
+                        ("opencode", "OpenCode executable (blank: discover on PATH)"),
                         (
                             "llama",
                             "llama.cpp executable (blank: discover automatically)",
@@ -1173,6 +1175,8 @@ impl SurfaceContent {
                         "omp": self.value("omp", cx),
                         "pi": pi,
                         "claude": self.value("claude", cx),
+                        "codex": self.value("codex", cx),
+                        "opencode": self.value("opencode", cx),
                         "llama": self.value("llama", cx),
                         "factory": self.value("factory", cx),
                         "azdo": self.value("azdo", cx),
@@ -1494,7 +1498,9 @@ impl SurfaceContent {
             );
         let tools = fields(
             "Tools",
-            &["nvim", "omp", "pi", "claude", "llama", "factory", "azdo"],
+            &[
+                "nvim", "omp", "pi", "claude", "codex", "opencode", "llama", "factory", "azdo",
+            ],
         )
         .description(
             "Tool installation and upgrades run only at your explicit request. DROSTJE. does not authenticate for you.",
@@ -1594,6 +1600,8 @@ impl SurfaceContent {
             ("omp", "OMP"),
             ("pi", "Pi"),
             ("claude", "Claude Code"),
+            ("codex", "Codex"),
+            ("opencode", "OpenCode"),
             ("llama", "llama.cpp"),
             ("factory", "Factory"),
             ("azdo", "Azure DevOps (azdo)"),

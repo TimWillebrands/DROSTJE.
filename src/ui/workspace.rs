@@ -2754,6 +2754,8 @@ impl Workspace {
                 | Command::NewOmpConversation
                 | Command::NewPiConversation
                 | Command::NewClaudeCodeConversation
+                | Command::NewCodexConversation
+                | Command::NewOpenCodeConversation
                 | Command::NewConversationInWorktree
                 | Command::NewConversationInWorkspace
                 | Command::NewFactoryThread
@@ -3145,6 +3147,8 @@ impl Workspace {
             | Command::NewOmpConversation
             | Command::NewPiConversation
             | Command::NewClaudeCodeConversation
+            | Command::NewCodexConversation
+            | Command::NewOpenCodeConversation
             | Command::NewFactoryThread => {
                 let created = self.state.update(cx, |state, cx| {
                     let result = if command == Command::NewConversation {
@@ -3155,6 +3159,10 @@ impl Workspace {
                         state.new_conversation("pi")
                     } else if command == Command::NewClaudeCodeConversation {
                         state.new_conversation("claude-code")
+                    } else if command == Command::NewCodexConversation {
+                        state.new_conversation("codex")
+                    } else if command == Command::NewOpenCodeConversation {
+                        state.new_conversation("opencode")
                     } else {
                         state.new_thread(ThreadKind::Factory)
                     };
@@ -4034,6 +4042,12 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &NewClaudeCodeConversation, w, cx| {
                     this.execute(Command::NewClaudeCodeConversation, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &NewCodexConversation, w, cx| {
+                    this.execute(Command::NewCodexConversation, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &NewOpenCodeConversation, w, cx| {
+                    this.execute(Command::NewOpenCodeConversation, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &NewConversationInWorktree, w, cx| {
                     this.execute(Command::NewConversationInWorktree, w, cx)

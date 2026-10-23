@@ -1,20 +1,25 @@
 //! Native conversation boundary. Provider wire objects stay in their harness module.
 mod claude;
+mod codex;
 mod commands;
 mod omp;
+mod opencode;
 mod pi;
+mod stdio;
 use crate::model::{ImageAttachment, ModelKey};
 pub use commands::{CommandCatalog, CommandSource, SlashCommand, invocation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{path::PathBuf, time::SystemTime};
-pub const CONVERSATION_HARNESSES: [&str; 3] = ["omp", "pi", "claude-code"];
+pub const CONVERSATION_HARNESSES: [&str; 5] = ["omp", "pi", "claude-code", "codex", "opencode"];
 
 pub fn executable_name(harness: &str) -> anyhow::Result<&'static str> {
     match harness {
         "omp" => Ok("omp"),
         "pi" => Ok("pi"),
         "claude-code" => Ok("claude"),
+        "codex" => Ok("codex"),
+        "opencode" => Ok("opencode"),
         harness => anyhow::bail!("Unsupported conversation harness: {harness}"),
     }
 }
@@ -24,14 +29,17 @@ pub fn display_name(harness: &str) -> &str {
         "omp" => "OMP",
         "pi" => "Pi",
         "claude-code" => "Claude Code",
+        "codex" => "Codex",
+        "opencode" => "OpenCode",
         harness => harness,
     }
 }
 
 use uuid::Uuid;
 
-/// Permission modes a harness accepts as a launch flag, as `(value, label)`. Empty when the
-/// harness has none.
+/// Permission modes a harness accepts at launch, as `(value, label)`. Empty when the
+/// harness has none. Claude Code takes them as `--permission-mode`; Codex maps them to a
+/// sandbox, approval policy and approval reviewer; OpenCode to its session mode (agent).
 pub fn permission_modes(harness: &str) -> &'static [(&'static str, &'static str)] {
     match harness {
         "claude-code" => &[
@@ -41,7 +49,24 @@ pub fn permission_modes(harness: &str) -> &'static [(&'static str, &'static str)
             ("dontAsk", "Don't ask"),
             ("bypassPermissions", "Bypass permissions"),
         ],
+        "codex" => &[
+            ("read-only", "Read only"),
+            ("ask", "Ask for approval"),
+            ("auto", "Auto review"),
+            ("full-access", "Full access"),
+        ],
+        "opencode" => &[("build", "Build"), ("plan", "Plan")],
         _ => &[],
+    }
+}
+
+/// The permission mode that lets the harness review its own permission requests, which
+/// "Yes and switch to auto" selects. `None` when the harness has no such mode, so its
+/// permission requests do not offer the switch.
+pub fn auto_permission_mode(harness: &str) -> Option<&'static str> {
+    match harness {
+        "claude-code" | "codex" => Some("auto"),
+        _ => None,
     }
 }
 
@@ -53,9 +78,9 @@ pub struct ConversationConfig {
     pub session_dir: PathBuf,
     pub session_ref: Option<String>,
     pub model: Option<ModelKey>,
-    /// Claude Code effort level (`--effort`); `None` means the harness default.
+    /// Effort level from the model's catalog; `None` means the harness default.
     pub effort: Option<String>,
-    /// Claude Code permission mode (`--permission-mode`); `None` means the harness default.
+    /// One of `permission_modes(harness)`; `None` means the harness default.
     pub permission_mode: Option<String>,
     /// Optional live artifact/browser tools, scoped to this application's conversation.
     pub browser_tools: Option<crate::browser_tools::BrowserToolConfig>,
@@ -141,8 +166,8 @@ pub enum ConversationCommand {
 pub enum UserAnswer {
     Value(String),
     Confirmed(bool),
-    /// Approve this Claude Code permission, switch the session to auto, and approve other
-    /// permission requests that are already pending.
+    /// Approve this permission, switch the session to `auto_permission_mode`, and approve
+    /// other permission requests that are already pending.
     PermissionAuto,
     Cancelled {
         timed_out: bool,
@@ -237,9 +262,10 @@ pub struct ToolActivity {
 pub enum UserRequestKind {
     Confirm,
     Select,
-    /// A Claude Code permission request. Kept distinct so only permissions expose auto approval.
+    /// A permission request from a harness with an `auto_permission_mode`. Kept distinct so
+    /// only permissions expose auto approval.
     Permission,
-    /// A Claude Code AskUserQuestion selection which also accepts a free-form answer.
+    /// A single-choice question which also accepts a free-form answer.
     Question,
     Input,
     Editor,
@@ -337,6 +363,8 @@ pub async fn open(config: ConversationConfig) -> anyhow::Result<ConversationHand
     match config.harness.as_str() {
         "claude-code" => claude::open(config).await,
         "omp" | "pi" => omp::open(config).await,
+        "codex" => codex::open(config).await,
+        "opencode" => opencode::open(config).await,
         harness => anyhow::bail!("Unsupported conversation harness: {harness}"),
     }
 }
@@ -346,14 +374,16 @@ pub async fn install_pi(data_dir: PathBuf) -> anyhow::Result<PathBuf> {
 }
 
 /// Largest physical JSONL request for a supported harness, without loading or
-/// base64-encoding the owned image files.
+/// base64-encoding the owned image files. Codex receives image paths, not bytes, so its
+/// requests are never the largest.
 pub fn submission_size(
     request_id: Uuid,
     text: &str,
     images: &[ImageAttachment],
 ) -> anyhow::Result<u64> {
     Ok(omp::submission_size(request_id, text, images)?
-        .max(claude::submission_size(request_id, text, images)?))
+        .max(claude::submission_size(request_id, text, images)?)
+        .max(opencode::submission_size(text, images)?))
 }
 /// Image preparation uses this before writing reviewed copies to disk.
 pub fn submission_size_for_lengths(
@@ -361,11 +391,11 @@ pub fn submission_size_for_lengths(
     text: &str,
     images: &[(&str, u64)],
 ) -> anyhow::Result<u64> {
-    Ok(
-        omp::submission_size_for_lengths(request_id, text, images)?.max(
-            claude::submission_size_for_lengths(request_id, text, images)?,
-        ),
-    )
+    Ok(omp::submission_size_for_lengths(request_id, text, images)?
+        .max(claude::submission_size_for_lengths(
+            request_id, text, images,
+        )?)
+        .max(opencode::submission_size_for_lengths(text, images)?))
 }
 
 /// A bounded exact-byte cache avoids rewriting the same image on every canonical
@@ -422,7 +452,24 @@ impl ImageCache {
 
 #[cfg(test)]
 mod tests {
-    use super::permission_modes;
+    use super::{CONVERSATION_HARNESSES, auto_permission_mode, executable_name, permission_modes};
+
+    #[test]
+    fn every_conversation_harness_resolves_an_executable_and_auto_is_one_of_its_modes() {
+        for harness in CONVERSATION_HARNESSES {
+            assert!(executable_name(harness).is_ok(), "{harness}");
+            if let Some(auto) = auto_permission_mode(harness) {
+                assert!(
+                    permission_modes(harness)
+                        .iter()
+                        .any(|(value, _)| *value == auto),
+                    "{harness} offers {auto} without listing it"
+                );
+            }
+        }
+        assert_eq!(auto_permission_mode("opencode"), None);
+        assert!(executable_name("cursor").is_err());
+    }
 
     #[test]
     fn claude_code_offers_all_supported_permission_modes() {

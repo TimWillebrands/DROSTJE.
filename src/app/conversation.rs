@@ -400,6 +400,8 @@ impl AppState {
         self.save_thread(thread);
         self.retry_conversation(id);
     }
+    /// "Yes and switch to auto" persists the harness's auto permission mode, so the
+    /// next launch keeps it; harnesses without one keep their mode.
     pub fn respond(&mut self, id: ThreadId, request_id: String, answer: UserAnswer) {
         let switches_to_auto = matches!(&answer, UserAnswer::PermissionAuto)
             && self
@@ -414,9 +416,10 @@ impl AppState {
                 .iter()
                 .find(|thread| thread.id == id)
                 .cloned()
-            && thread.permission_mode.as_deref() != Some("auto")
+            && let Some(auto) = harness::auto_permission_mode(&thread.harness)
+            && thread.permission_mode.as_deref() != Some(auto)
         {
-            thread.permission_mode = Some("auto".into());
+            thread.permission_mode = Some(auto.into());
             self.save_thread(thread);
         }
         self.send_command(id, ConversationCommand::Respond { request_id, answer });

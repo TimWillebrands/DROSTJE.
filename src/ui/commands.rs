@@ -27,6 +27,8 @@ gpui_kit::actions!(
         NewOmpConversation,
         NewPiConversation,
         NewClaudeCodeConversation,
+        NewCodexConversation,
+        NewOpenCodeConversation,
         NewConversationInWorktree,
         NewConversationInWorkspace,
         SwitchHarness,
@@ -145,6 +147,8 @@ pub enum Command {
     NewOmpConversation,
     NewPiConversation,
     NewClaudeCodeConversation,
+    NewCodexConversation,
+    NewOpenCodeConversation,
     NewConversationInWorktree,
     NewConversationInWorkspace,
     SwitchHarness,
@@ -211,7 +215,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 76] = [
+    pub const ALL: [Self; 78] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -224,6 +228,8 @@ impl Command {
         Self::NewOmpConversation,
         Self::NewPiConversation,
         Self::NewClaudeCodeConversation,
+        Self::NewCodexConversation,
+        Self::NewOpenCodeConversation,
         Self::NewConversationInWorktree,
         Self::NewConversationInWorkspace,
         Self::SwitchHarness,
@@ -304,6 +310,8 @@ impl Command {
             Self::NewOmpConversation => "New OMP conversation",
             Self::NewPiConversation => "New Pi conversation",
             Self::NewClaudeCodeConversation => "New Claude Code conversation",
+            Self::NewCodexConversation => "New Codex conversation",
+            Self::NewOpenCodeConversation => "New OpenCode conversation",
             Self::NewConversationInWorktree => "New conversation in new worktree…",
             Self::NewConversationInWorkspace => "New conversation in workspace…",
             Self::SwitchHarness => "Switch harness…",
@@ -385,6 +393,8 @@ impl Command {
             Self::NewOmpConversation => Box::new(NewOmpConversation),
             Self::NewPiConversation => Box::new(NewPiConversation),
             Self::NewClaudeCodeConversation => Box::new(NewClaudeCodeConversation),
+            Self::NewCodexConversation => Box::new(NewCodexConversation),
+            Self::NewOpenCodeConversation => Box::new(NewOpenCodeConversation),
             Self::NewConversationInWorktree => Box::new(NewConversationInWorktree),
             Self::NewConversationInWorkspace => Box::new(NewConversationInWorkspace),
             Self::SwitchHarness => Box::new(SwitchHarness),
@@ -489,6 +499,8 @@ impl Command {
             | Self::NewOmpConversation
             | Self::NewPiConversation
             | Self::NewClaudeCodeConversation
+            | Self::NewCodexConversation
+            | Self::NewOpenCodeConversation
             | Self::RenameProject => state.mutable_project_reason(),
             Self::InstallPi if state.installing_pi => {
                 Some("Pi installation is already running.".into())
@@ -1745,6 +1757,16 @@ impl Render for Palette {
                     cx,
                 )
             }))
+            .on_action(cx.listener(|this, _: &NewCodexConversation, w, cx| {
+                this.run(PaletteTarget::Command(Command::NewCodexConversation), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &NewOpenCodeConversation, w, cx| {
+                this.run(
+                    PaletteTarget::Command(Command::NewOpenCodeConversation),
+                    w,
+                    cx,
+                )
+            }))
             .on_action(cx.listener(|this, _: &NewConversationInWorktree, w, cx| {
                 this.run(
                     PaletteTarget::Command(Command::NewConversationInWorktree),
@@ -2030,6 +2052,19 @@ mod tests {
             })
             .unwrap();
             cx.read(|cx| assert_eq!(view.read(cx).keys, expected, "{context}"));
+        }
+    }
+
+    #[test]
+    fn palette_offers_a_new_conversation_command_for_every_harness() {
+        for harness in crate::harness::CONVERSATION_HARNESSES {
+            let label = format!("New {} conversation", crate::harness::display_name(harness));
+            assert!(
+                super::Command::ALL
+                    .iter()
+                    .any(|command| command.label() == label),
+                "the palette has no {label:?}"
+            );
         }
     }
 

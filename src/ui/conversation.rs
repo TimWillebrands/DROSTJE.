@@ -3160,8 +3160,10 @@ fn humanise_key(key: &str) -> String {
     out
 }
 
+/// `harness` decides whether a permission request offers switching to its auto mode.
 fn request_card(
     id: ThreadId,
+    harness: &str,
     request: &UserRequest,
     owner: &WeakEntity<Workspace>,
     cx: &App,
@@ -3215,7 +3217,9 @@ fn request_card(
         .overflow_y_scroll()
         .gap_1();
     let mut answers: Vec<(String, Option<String>, UserAnswer)> = Vec::new();
-    if request.kind == UserRequestKind::Permission {
+    if request.kind == UserRequestKind::Permission
+        && crate::harness::auto_permission_mode(harness).is_some()
+    {
         answers.push((
             "Yes and switch to auto".into(),
             Some("Approve all permission asks already open".into()),
@@ -3863,7 +3867,7 @@ fn render_content(
             ));
         }
         for request in session.requests.values() {
-            history = history.child(inset(request_card(id, request, owner, cx)));
+            history = history.child(inset(request_card(id, &thread.harness, request, owner, cx)));
         }
         for (index, (key, lines)) in session.widgets.iter().enumerate() {
             if key.starts_with("Proposed editor replacement") {
@@ -5284,8 +5288,30 @@ mod tests {
                     .id("request-harness")
                     .test_support()
                     .w(px(420.))
-                    .child(request_card(Uuid::from_u128(1), &request, &owner, cx))
-                    .child(request_card(Uuid::from_u128(1), &permission, &owner, cx))
+                    .child(request_card(
+                        Uuid::from_u128(1),
+                        "claude-code",
+                        &request,
+                        &owner,
+                        cx,
+                    ))
+                    .child(request_card(
+                        Uuid::from_u128(1),
+                        "claude-code",
+                        &permission,
+                        &owner,
+                        cx,
+                    ))
+                    .child(request_card(
+                        Uuid::from_u128(1),
+                        "opencode",
+                        &UserRequest {
+                            id: "permission-manual".into(),
+                            ..permission.clone()
+                        },
+                        &owner,
+                        cx,
+                    ))
             }
         }
 
@@ -5332,6 +5358,12 @@ mod tests {
                 assert!(
                     auto.size.height > px(0.),
                     "{mode} permission card must expose auto approval"
+                );
+                assert!(
+                    window.try_find("request-permission-1").is_some()
+                        && window.try_find("request-permission-manual-0").is_some()
+                        && window.try_find("request-permission-manual-1").is_none(),
+                    "{mode} a harness without an auto mode offers only its own options"
                 );
                 assert!(
                     long_choice.left() >= card.left() && long_choice.right() <= card.right(),

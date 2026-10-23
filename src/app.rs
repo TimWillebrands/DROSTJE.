@@ -270,7 +270,8 @@ impl Bootstrap {
         let mut snapshot = smol::block_on(store.snapshot())?;
         if !snapshot.settings.contains_key("executables") {
             let value = json!({
-                "nvim": "", "omp": "", "pi": "", "claude": "", "llama": "", "factory": ""
+                "nvim": "", "omp": "", "pi": "", "claude": "", "codex": "", "opencode": "",
+                "llama": "", "factory": ""
             });
             smol::block_on(store.set_setting("executables".into(), value.clone()))?;
             snapshot.settings.insert("executables".into(), value);
@@ -311,21 +312,23 @@ impl Bootstrap {
 }
 
 fn executable_diagnostics(settings: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
-    ["nvim", "omp", "pi", "claude", "llama", "factory", "azdo"]
-        .into_iter()
-        .map(|name| {
-            let explicit = settings
-                .get("executables")
-                .and_then(|v| v.get(name))
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty());
-            let diagnostic = match platform::resolve_executable(name, explicit) {
-                Ok(path) => format!("Resolved: {}", path.display()),
-                Err(error) => format!("Unavailable: {error:#}"),
-            };
-            (name.into(), diagnostic)
-        })
-        .collect()
+    [
+        "nvim", "omp", "pi", "claude", "codex", "opencode", "llama", "factory", "azdo",
+    ]
+    .into_iter()
+    .map(|name| {
+        let explicit = settings
+            .get("executables")
+            .and_then(|v| v.get(name))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty());
+        let diagnostic = match platform::resolve_executable(name, explicit) {
+            Ok(path) => format!("Resolved: {}", path.display()),
+            Err(error) => format!("Unavailable: {error:#}"),
+        };
+        (name.into(), diagnostic)
+    })
+    .collect()
 }
 
 enum Write {
@@ -2057,6 +2060,43 @@ mod tests {
                 assert_eq!(thread.effort.as_deref(), Some("high"));
                 assert_eq!(thread.permission_mode.as_deref(), Some("plan"));
             });
+        }
+
+        #[gpui_kit::test]
+        fn switching_to_auto_persists_only_a_harness_auto_mode(cx: &mut TestAppContext) {
+            use crate::harness::{UserAnswer, UserRequest, UserRequestKind};
+            cx.dispatcher.allow_parking();
+            let (_dir, state, _) = open(cx);
+            for (harness, expected) in [
+                ("codex", Some("auto")),
+                ("claude-code", Some("auto")),
+                ("opencode", Some("plan")),
+            ] {
+                let id = new_conversation(&state, cx);
+                state.update(cx, |state, _| {
+                    let mut thread = state.thread().unwrap().clone();
+                    thread.harness = harness.into();
+                    thread.permission_mode = Some("plan".into());
+                    state.save_thread(thread);
+                    let mut session = ConversationSession::new(None);
+                    session.requests.insert(
+                        "ask".into(),
+                        UserRequest {
+                            id: "ask".into(),
+                            kind: UserRequestKind::Permission,
+                            title: "Allow?".into(),
+                            options: Vec::new(),
+                            text: String::new(),
+                            placeholder: None,
+                            deadline: None,
+                        },
+                    );
+                    state.conversations.insert(id, session);
+                    state.respond(id, "ask".into(), UserAnswer::PermissionAuto);
+                    let thread = state.snapshot.threads.iter().find(|t| t.id == id).unwrap();
+                    assert_eq!(thread.permission_mode.as_deref(), expected, "{harness}");
+                });
+            }
         }
 
         #[gpui_kit::test]

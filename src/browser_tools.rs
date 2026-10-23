@@ -190,8 +190,12 @@ impl BrowserToolServer {
     }
 }
 
+/// Extra argv and environment a harness launch needs for the DROSTJE tools.
+type HarnessLaunch = (Vec<std::ffi::OsString>, Vec<(&'static str, String)>);
+
 /// Runs in the harness's existing blocking preparation worker. No Node subprocess is
-/// needed for Claude: its supported Streamable HTTP MCP transport talks to this server.
+/// needed for Claude Code, Codex or OpenCode: their Streamable HTTP MCP transports talk
+/// to this server directly.
 pub(crate) fn configure_harness(
     command: &mut Command,
     harness: &str,
@@ -199,48 +203,84 @@ pub(crate) fn configure_harness(
     config: Option<&BrowserToolConfig>,
 ) -> Option<String> {
     let config = config?;
-    let install = || -> Result<Vec<std::ffi::OsString>> {
+    let url = format!(
+        "{}/mcp/{}/{}",
+        config.endpoint, config.thread, config.network_token
+    );
+    let install = || -> Result<HarnessLaunch> {
         let directory = session_dir.join("browser-tools");
         std::fs::create_dir_all(&directory).context("Create browser tool extension directory")?;
-        if harness == "claude-code" {
-            let mcp = directory.join("mcp.json");
-            let contents = json!({"mcpServers": {"drostje": {
-                "type": "http", "url": format!("{}/mcp/{}/{}", config.endpoint, config.thread, config.network_token)
-            }}});
-            std::fs::write(&mcp, serde_json::to_vec(&contents)?)?;
-            Ok(vec!["--mcp-config".into(), mcp.into_os_string(),
-                "--append-system-prompt".into(),
-                format!("{INSTRUCTIONS} In Claude Code the tools are named mcp__drostje__show_artifact, mcp__drostje__browser, and mcp__drostje__network.").into()])
-        } else {
-            ensure!(
-                matches!(harness, "omp" | "pi"),
-                "Unsupported browser harness: {harness}"
-            );
-            for (name, contents) in [
-                ("tools.json", TOOL_SPECS),
-                (
-                    "client.mjs",
-                    include_str!("../assets/browser-tools/client.mjs"),
-                ),
-                ("omp.ts", include_str!("../assets/browser-tools/omp.ts")),
-                ("pi.ts", include_str!("../assets/browser-tools/pi.ts")),
-                ("peer.mjs", include_str!("../assets/browser-tools/peer.mjs")),
-            ] {
-                std::fs::write(directory.join(name), contents)
-                    .with_context(|| format!("Install browser tool extension {name}"))?;
+        match harness {
+            "claude-code" => {
+                let mcp = directory.join("mcp.json");
+                let contents = json!({"mcpServers": {"drostje": {"type": "http", "url": url}}});
+                std::fs::write(&mcp, serde_json::to_vec(&contents)?)?;
+                Ok((vec!["--mcp-config".into(), mcp.into_os_string(),
+                    "--append-system-prompt".into(),
+                    format!("{INSTRUCTIONS} In Claude Code the tools are named mcp__drostje__show_artifact, mcp__drostje__browser, and mcp__drostje__network.").into()], Vec::new()))
             }
-            Ok(vec![
-                "--extension".into(),
-                directory.join(format!("{harness}.ts")).into_os_string(),
-                "--append-system-prompt".into(),
-                INSTRUCTIONS.into(),
-            ])
+            // `-c` values parse as TOML; a JSON string is a valid TOML basic string.
+            "codex" => Ok((
+                vec![
+                    "-c".into(),
+                    format!("mcp_servers.drostje.url={}", serde_json::to_string(&url)?).into(),
+                    "-c".into(),
+                    format!(
+                        "developer_instructions={}",
+                        serde_json::to_string(&format!("{INSTRUCTIONS} In Codex the tools come from the drostje MCP server: show_artifact, browser and network."))?
+                    )
+                    .into(),
+                ],
+                Vec::new(),
+            )),
+            // OpenCode merges inline configuration over the user's own and reads
+            // instructions from files, so the instructions live beside the session.
+            "opencode" => {
+                let instructions = directory.join("instructions.md");
+                std::fs::write(&instructions, format!("{INSTRUCTIONS} In OpenCode the tools come from the drostje MCP server and are named drostje_show_artifact, drostje_browser and drostje_network.\n"))?;
+                let mut inline = std::env::var("OPENCODE_CONFIG_CONTENT")
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .filter(Value::is_object)
+                    .unwrap_or_else(|| json!({}));
+                inline["mcp"]["drostje"] = json!({"type": "remote", "url": url, "enabled": true});
+                let mut files = inline["instructions"].as_array().cloned().unwrap_or_default();
+                files.push(json!(instructions));
+                inline["instructions"] = Value::Array(files);
+                Ok((Vec::new(), vec![("OPENCODE_CONFIG_CONTENT", serde_json::to_string(&inline)?)]))
+            }
+            "omp" | "pi" => {
+                for (name, contents) in [
+                    ("tools.json", TOOL_SPECS),
+                    (
+                        "client.mjs",
+                        include_str!("../assets/browser-tools/client.mjs"),
+                    ),
+                    ("omp.ts", include_str!("../assets/browser-tools/omp.ts")),
+                    ("pi.ts", include_str!("../assets/browser-tools/pi.ts")),
+                    ("peer.mjs", include_str!("../assets/browser-tools/peer.mjs")),
+                ] {
+                    std::fs::write(directory.join(name), contents)
+                        .with_context(|| format!("Install browser tool extension {name}"))?;
+                }
+                Ok((
+                    vec![
+                        "--extension".into(),
+                        directory.join(format!("{harness}.ts")).into_os_string(),
+                        "--append-system-prompt".into(),
+                        INSTRUCTIONS.into(),
+                    ],
+                    Vec::new(),
+                ))
+            }
+            harness => anyhow::bail!("Unsupported browser harness: {harness}"),
         }
     };
     match install() {
-        Ok(arguments) => {
+        Ok((arguments, environment)) => {
             command
                 .args(arguments)
+                .envs(environment)
                 .env("DROSTJE_BROWSER_ENDPOINT", &config.endpoint)
                 .env("DROSTJE_BROWSER_THREAD", config.thread.to_string())
                 .env("DROSTJE_NETWORK_TOKEN", config.network_token.to_string());
@@ -250,7 +290,10 @@ pub(crate) fn configure_harness(
             let warning = format!(
                 "DROSTJE tools unavailable: {error:#}. Conversation remains available without artifact/browser/network tools."
             );
-            command.arg("--append-system-prompt").arg(&warning);
+            // Only the harnesses with a system prompt flag can tell the agent why.
+            if matches!(harness, "claude-code" | "omp" | "pi") {
+                command.arg("--append-system-prompt").arg(&warning);
+            }
             Some(warning)
         }
     }
@@ -918,6 +961,68 @@ fn integer(value: &Value, field: &str, default: Option<u64>, min: u64, max: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_and_opencode_reach_the_tools_through_streamable_http_mcp() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!("drostje-tools-{}", Uuid::new_v4()));
+        let config = BrowserToolConfig {
+            endpoint: "http://127.0.0.1:4100".into(),
+            thread: Uuid::from_u128(7),
+            network_token: Uuid::from_u128(9),
+        };
+        let url = format!(
+            "http://127.0.0.1:4100/mcp/{}/{}",
+            config.thread, config.network_token
+        );
+
+        let mut codex = Command::new("codex");
+        codex.arg("app-server");
+        assert_eq!(
+            configure_harness(&mut codex, "codex", &directory, Some(&config)),
+            None
+        );
+        let args: Vec<String> = codex
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[..3],
+            [
+                "app-server",
+                "-c",
+                &format!("mcp_servers.drostje.url={}", json!(url))
+            ]
+        );
+        assert!(args[4].starts_with("developer_instructions=\"DROSTJE provides"));
+
+        let mut opencode = Command::new("opencode");
+        assert_eq!(
+            configure_harness(&mut opencode, "opencode", &directory, Some(&config)),
+            None
+        );
+        let inline = opencode
+            .get_envs()
+            .find(|(key, _)| *key == "OPENCODE_CONFIG_CONTENT")
+            .and_then(|(_, value)| value)
+            .context("OpenCode inline configuration")?;
+        let inline: Value = serde_json::from_str(&inline.to_string_lossy())?;
+        assert_eq!(
+            inline["mcp"]["drostje"],
+            json!({"type":"remote","url":url,"enabled":true})
+        );
+        let instructions = inline["instructions"][0]
+            .as_str()
+            .context("Instruction file")?;
+        assert!(std::fs::read_to_string(instructions)?.contains("drostje_show_artifact"));
+        assert_eq!(opencode.get_args().count(), 0);
+
+        let mut other = Command::new("cursor");
+        let warning = configure_harness(&mut other, "cursor", &directory, Some(&config));
+        assert!(warning.is_some_and(|text| text.contains("Unsupported browser harness")));
+        assert_eq!(other.get_args().count(), 0);
+        std::fs::remove_dir_all(&directory)?;
+        Ok(())
+    }
 
     #[test]
     fn network_actions_accept_flat_optional_fields_and_intent() {

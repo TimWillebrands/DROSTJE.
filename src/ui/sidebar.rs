@@ -398,6 +398,16 @@ fn row_menu(
                 state,
             ))
             .item(command_item(
+                "New Codex conversation",
+                Command::NewCodexConversation,
+                state,
+            ))
+            .item(command_item(
+                "New OpenCode conversation",
+                Command::NewOpenCodeConversation,
+                state,
+            ))
+            .item(command_item(
                 Command::NewConversationInWorktree.label(),
                 Command::NewConversationInWorktree,
                 state,
@@ -778,6 +788,16 @@ fn render_list(
                                                     Command::NewClaudeCodeConversation,
                                                     state,
                                                 ))
+                                                .item(command_item(
+                                                    "Codex",
+                                                    Command::NewCodexConversation,
+                                                    state,
+                                                ))
+                                                .item(command_item(
+                                                    "OpenCode",
+                                                    Command::NewOpenCodeConversation,
+                                                    state,
+                                                ))
                                             }),
                                         )
                                         .child({
@@ -847,6 +867,12 @@ fn render_list(
                     }
                     ThreadKind::Conversation if thread.harness == "pi" => {
                         ("Pi conversation", Icon::new(IconName::Bot))
+                    }
+                    ThreadKind::Conversation if thread.harness == "codex" => {
+                        ("Codex conversation", Icon::new(IconName::SquareTerminal))
+                    }
+                    ThreadKind::Conversation if thread.harness == "opencode" => {
+                        ("OpenCode conversation", Icon::new(IconName::Frame))
                     }
                     ThreadKind::Conversation => ("OMP conversation", Icon::new(IconName::Bot)),
                     ThreadKind::Factory => ("Factory thread", Icon::new(IconName::Cpu)),
@@ -1474,6 +1500,22 @@ pub(super) fn render(
                                     state,
                                 )
                                 .icon(IconName::Asterisk),
+                            )
+                            .item(
+                                command_item(
+                                    "Codex conversation",
+                                    Command::NewCodexConversation,
+                                    state,
+                                )
+                                .icon(IconName::SquareTerminal),
+                            )
+                            .item(
+                                command_item(
+                                    "OpenCode conversation",
+                                    Command::NewOpenCodeConversation,
+                                    state,
+                                )
+                                .icon(IconName::Frame),
                             )
                             .item(
                                 command_item("Factory thread", Command::NewFactoryThread, state)
