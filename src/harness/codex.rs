@@ -81,6 +81,9 @@ fn prepare(
     permission_overrides(config.permission_mode.as_deref())?;
     let saved = saved_thread(config)?;
     let mut command = Command::new(&config.executable);
+    for key in &config.credential_env {
+        command.env_remove(key);
+    }
     command.arg("app-server").current_dir(&config.cwd);
     let warning = crate::browser_tools::configure_harness(
         &mut command,
@@ -2779,6 +2782,7 @@ done
                     .to_string()
             });
             let handle = smol::block_on(open(ConversationConfig {
+                credential_env: Vec::new(),
                 harness: "codex".into(),
                 executable,
                 cwd,

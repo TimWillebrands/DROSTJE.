@@ -5,7 +5,10 @@
 //! into that file's [`RowKind::File`] row. Text Git did not write in a recognised shape stays a
 //! [`RowKind::Note`] so nothing is dropped.
 
+#[cfg(feature = "desktop")]
 use gpui_kit::SharedString;
+#[cfg(not(feature = "desktop"))]
+type SharedString = std::sync::Arc<str>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Patch {

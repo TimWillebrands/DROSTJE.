@@ -1558,6 +1558,8 @@ mod tests {
             title: title.into(),
             harness: "omp".into(),
             session_ref: None,
+            remote: None,
+            execution_started: false,
             model: None,
             effort: None,
             permission_mode: None,

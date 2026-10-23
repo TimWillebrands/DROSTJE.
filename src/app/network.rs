@@ -12,6 +12,7 @@ pub struct NetworkState {
     pub pending: HashSet<ThreadId>,
     pub revision: u64,
     requests: Option<async_channel::Sender<Request>>,
+    pub(super) client: Option<Network>,
     runtimes: HashMap<ThreadId, RuntimeDelivery>,
 }
 
@@ -129,6 +130,7 @@ impl AppState {
                 return;
             }
         };
+        self.network.client = Some(network.clone());
         let (requests, receiver) = async_channel::bounded(64);
         let (updates, changes) = async_channel::bounded(64);
         self.network.requests = Some(requests);
@@ -398,10 +400,15 @@ impl AppState {
                     space,
                     title: thread.title.clone(),
                     project: project.name.clone(),
-                    worktree: self
-                        .thread_worktree(thread)
-                        .map(|worktree| worktree.path.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| project.root.to_string_lossy().into_owned()),
+                    worktree: match &thread.remote {
+                        Some(location) => {
+                            format!("remote://{}/{}", location.host, location.project)
+                        }
+                        None => self
+                            .thread_worktree(thread)
+                            .map(|worktree| worktree.path.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| project.root.to_string_lossy().into_owned()),
+                    },
                     harness: thread.harness.clone(),
                     status: status.into(),
                     token,
@@ -520,10 +527,13 @@ impl AppState {
                 session.persisted
                     && !session.preparing
                     && session.requests.is_empty()
-                    && matches!(
-                        session.state,
-                        ConversationState::Ready | ConversationState::Running
-                    )
+                    // Remote native queues cannot revoke an accepted next-turn item on
+                    // desktop detach. Keep those messages in the durable Space mailbox.
+                    && (session.state == ConversationState::Ready
+                        || (session.state == ConversationState::Running
+                            && !self.snapshot.threads.iter().any(|candidate| {
+                                candidate.id == thread && candidate.remote.is_some()
+                            })))
                     && (!self
                         .snapshot
                         .threads
@@ -860,22 +870,53 @@ impl AppState {
             }
             self.active_threads.insert(thread);
         }
-        if let Err(error) =
-            commands.try_send(ConversationCommand::DeliverPeer(harness::PeerDelivery {
-                attempt,
-                messages,
-                cancelled,
-            }))
-        {
-            self.clear_network_preparing(thread, attempt);
-            if let Some(runtime) = self.network.runtimes.get_mut(&thread) {
-                runtime.lease = None;
+        let Some(mut owner) = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|candidate| candidate.id == thread)
+            .cloned()
+        else {
+            return;
+        };
+        owner.execution_started = true;
+        let saved = self.persist_thread(owner);
+        let events = self.events.clone();
+        smol::spawn(async move {
+            let result = async {
+                saved
+                    .recv()
+                    .await
+                    .context("Persistence owner closed")?
+                    .map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    !cancelled.is_closed(),
+                    "Peer delivery admission was revoked"
+                );
+                commands
+                    .try_send(ConversationCommand::DeliverPeer(harness::PeerDelivery {
+                        attempt,
+                        messages,
+                        cancelled,
+                    }))
+                    .context("Agent command queue refused delivery")?;
+                Ok::<_, anyhow::Error>(())
             }
-            self.finish_network_delivery(
-                attempt,
-                DeliveryOutcome::Failed(format!("Agent command queue refused delivery: {error}")),
-            );
-        }
+            .await;
+            if let Err(error) = result {
+                let _ = events
+                    .send(AppEvent::Harness(
+                        thread,
+                        generation,
+                        ConversationEvent::PeerDelivery {
+                            attempt,
+                            outcome: harness::PeerDeliveryOutcome::Rejected(format!("{error:#}")),
+                        },
+                    ))
+                    .await;
+            }
+        })
+        .detach();
     }
 
     fn clear_network_preparing(&mut self, thread: ThreadId, attempt: Uuid) {
@@ -1155,7 +1196,14 @@ mod tests {
                     .unwrap();
             });
 
-            for blocker in ["permission", "input", "preparing", "unsaved", "submission"] {
+            for blocker in [
+                "permission",
+                "input",
+                "preparing",
+                "unsaved",
+                "submission",
+                "remote-running",
+            ] {
                 assert!(state.network_can_receive(thread));
                 state.runtime_network(thread, generation).claiming = true;
                 let batch = smol::block_on(mailbox.claim(generation)).unwrap().unwrap();
@@ -1178,6 +1226,19 @@ mod tests {
                     }
                     "input" => session.state = ConversationState::WaitingForInput,
                     "preparing" => session.preparing = true,
+                    "remote-running" => {
+                        session.state = ConversationState::Running;
+                        state
+                            .snapshot
+                            .threads
+                            .iter_mut()
+                            .find(|candidate| candidate.id == thread)
+                            .unwrap()
+                            .remote = Some(RemoteLocation {
+                            host: "host".into(),
+                            project: "mounted".into(),
+                        });
+                    }
                     "unsaved" => session.persisted = false,
                     "submission" => {
                         state
@@ -1229,6 +1290,26 @@ mod tests {
                     .find(|candidate| candidate.id == thread)
                     .unwrap()
                     .submission = None;
+                if blocker == "remote-running" {
+                    assert!(
+                        state.network_can_receive(thread),
+                        "Remote messages become eligible only after returning to Ready"
+                    );
+                    state
+                        .snapshot
+                        .threads
+                        .iter_mut()
+                        .find(|candidate| candidate.id == thread)
+                        .unwrap()
+                        .remote = None;
+                    state.conversations.get_mut(&thread).unwrap().state =
+                        ConversationState::Running;
+                    assert!(
+                        state.network_can_receive(thread),
+                        "Local runtimes retain busy-turn peer delivery"
+                    );
+                    state.conversations.get_mut(&thread).unwrap().state = ConversationState::Ready;
+                }
             }
             let batch = smol::block_on(mailbox.claim(generation)).unwrap().unwrap();
             let attempt = batch.attempt;

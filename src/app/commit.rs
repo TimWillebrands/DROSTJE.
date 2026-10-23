@@ -59,6 +59,9 @@ impl AppState {
         let Some(thread) = self.conversation_thread() else {
             return Some("Select a conversation first.".into());
         };
+        if let Some(reason) = self.remote_action_reason(thread.id) {
+            return Some(reason);
+        }
         if thread.archived {
             return Some("Archived threads are read-only.".into());
         }

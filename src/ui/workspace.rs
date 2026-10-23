@@ -1104,6 +1104,29 @@ impl Workspace {
         cx.notify();
     }
 
+    fn open_host_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| thread.id)
+        else {
+            return;
+        };
+        self.dismiss(window, cx);
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        self.palette = Some(Palette::open_hosts(
+            cx.entity().downgrade(),
+            self.state.clone(),
+            thread,
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
     fn open_space_picker(&mut self, moving: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(reason) = self.space_transition_reason(cx) {
             self.space_error(anyhow::anyhow!(reason), cx);
@@ -3080,6 +3103,43 @@ impl Workspace {
                 self.open_harness_picker(window, cx);
                 None
             }
+            Command::SwitchExecutionHost => {
+                self.open_host_picker(window, cx);
+                None
+            }
+            Command::RetryConversation => {
+                if let Some(thread) = self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .map(|thread| thread.id)
+                {
+                    self.state.update(cx, |state, cx| {
+                        state.retry_conversation(thread);
+                        cx.notify();
+                    });
+                }
+                None
+            }
+            Command::RetryRemoteFile => {
+                let file = self
+                    .state
+                    .read(cx)
+                    .remote_file
+                    .as_ref()
+                    .map(|file| (file.thread, file.path.clone()));
+                if let Some((thread, path)) = file {
+                    self.state.update(cx, |state, cx| {
+                        state.request_remote_file(thread, path, cx);
+                        cx.notify();
+                    });
+                }
+                None
+            }
+            Command::RemoveRemoteHost => {
+                self.confirm_remove_remote_host(window, cx);
+                None
+            }
             Command::RemoveWorktree => self
                 .state
                 .read(cx)
@@ -3307,6 +3367,89 @@ impl Workspace {
         dialog.update(cx, |dialog, cx| dialog.focus_commit_message(window, cx));
         self.dialog = Some(dialog);
         cx.notify();
+    }
+
+    pub(super) fn selected_remote_host(&self, cx: &App) -> Option<String> {
+        let dialog = self.dialog.as_ref()?.read(cx);
+        if !matches!(dialog.kind, DialogKind::Settings(_)) {
+            return None;
+        }
+        let id = dialog.value("remote_host", cx);
+        self.state
+            .read(cx)
+            .remote_hosts()
+            .iter()
+            .any(|host| host.id == id)
+            .then_some(id)
+    }
+
+    fn confirm_remove_remote_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_remote_host(cx) else {
+            return;
+        };
+        let Some(surface) = self.dialog.clone() else {
+            return;
+        };
+        let kind = surface.read(cx).kind.clone();
+        let name = self
+            .state
+            .read(cx)
+            .remote_hosts()
+            .into_iter()
+            .find(|host| host.id == id)
+            .map(|host| host.name)
+            .unwrap_or_else(|| id.clone());
+        self.dismiss(window, cx);
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        let owner = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let confirm = owner.clone();
+            let accepted_owner = owner.clone();
+            let accepted_kind = kind.clone();
+            let restore = owner.clone();
+            let id = id.clone();
+            let surface = surface.clone();
+            let kind = kind.clone();
+            alert.title(div().id("remove-host-confirmation").test_support().child(format!("Remove Host “{name}”?")))
+                .description("Removes this desktop Host configuration and its unsaved Host fields. It does not stop the Host or delete its files. Other Settings drafts are kept.")
+                .button_props(DialogButtonProps::default().ok_text("Remove Host").cancel_text("Cancel").show_cancel(true))
+                .on_ok(move |_, window, cx| {
+                    let _ = confirm.update(cx, |workspace, cx| {
+                        let result = workspace.state.update(cx, |state, cx| {
+                            let result = state.remove_remote_host(&id);
+                            cx.notify();
+                            result
+                        });
+                        surface.update(cx, |surface, cx| match result {
+                            Ok(()) => surface.remote_host_removed(window, cx),
+                            Err(error) => surface.set_error(&error, cx),
+                        });
+                    });
+                    Self::restore_host_settings(accepted_owner.clone(), accepted_kind.clone(), window, cx);
+                    false
+                })
+                .on_cancel(move |_, window, cx| {
+                    Self::restore_host_settings(restore.clone(), kind.clone(), window, cx);
+                    false
+                })
+        });
+    }
+
+    fn restore_host_settings(
+        owner: WeakEntity<Self>,
+        kind: DialogKind,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // Own the transition instead of using AlertDialog::on_close: the pinned kit's
+        // AlertDialog builder replaces that callback with its separate button props.
+        // Returning false from OK/Cancel avoids a second native close after reopening.
+        window.defer(cx, move |window, cx| {
+            window.close_dialog(cx);
+            let _ = owner.update(cx, |workspace, cx| workspace.open_dialog(kind, window, cx));
+        });
     }
 
     fn archive_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4057,6 +4200,18 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &SwitchHarness, w, cx| {
                     this.execute(Command::SwitchHarness, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SwitchExecutionHost, w, cx| {
+                    this.execute(Command::SwitchExecutionHost, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RetryConversation, w, cx| {
+                    this.execute(Command::RetryConversation, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RetryRemoteFile, w, cx| {
+                    this.execute(Command::RetryRemoteFile, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &RemoveRemoteHost, w, cx| {
+                    this.execute(Command::RemoveRemoteHost, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| {
                     this.execute(Command::RemoveWorktree, w, cx)

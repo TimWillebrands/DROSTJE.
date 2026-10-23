@@ -109,6 +109,9 @@ fn prepare(config: &mut ConversationConfig) -> Result<(StdioChild, Option<String
         );
     }
     let mut command = Command::new(&config.executable);
+    for key in &config.credential_env {
+        command.env_remove(key);
+    }
     command.arg("acp").current_dir(&config.cwd);
     let warning = crate::browser_tools::configure_harness(
         &mut command,
@@ -1653,7 +1656,7 @@ fn parse_commands(raw: &Value) -> Vec<SlashCommand> {
                 } else {
                     CommandSource::Custom
                 },
-                blocked,
+                blocked: blocked.map(Into::into),
             })
         })
         .collect()
@@ -1918,11 +1921,11 @@ mod tests {
         assert_eq!(commands[1].argument_hint.as_deref(), Some("[commit]"));
         assert_eq!(commands[1].blocked, None);
         assert_eq!(
-            commands[2].blocked,
+            commands[2].blocked.as_deref(),
             Some(super::super::commands::NEW_CONVERSATION)
         );
         assert_eq!(
-            commands[3].blocked,
+            commands[3].blocked.as_deref(),
             Some(super::super::commands::MODEL_PICKER)
         );
     }
@@ -2029,6 +2032,7 @@ done
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
 
         let handle = smol::block_on(open(ConversationConfig {
+            credential_env: Vec::new(),
             harness: "opencode".into(),
             executable,
             cwd: cwd.clone(),
@@ -2218,6 +2222,7 @@ done
         fs::write(&executable, FAKE_AGENT)?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
         let handle = smol::block_on(open(ConversationConfig {
+            credential_env: Vec::new(),
             harness: "opencode".into(),
             executable,
             cwd,

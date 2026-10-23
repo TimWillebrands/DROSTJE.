@@ -2,9 +2,9 @@
 
 # DROSTJE.
 
-*Het stuurhuis voor de agents op je machine.*
+*Het stuurhuis voor agents op je eigen machines.*
 
-DROSTJE. is een bureaublad-app waarmee je de coding agents op je eigen computer aanstuurt. Je zet ze aan het werk, kijkt mee terwijl ze bezig zijn, en stuurt grotere klussen door naar de Factory. Alles op één plek, en alles blijft van jou: je eigen repo's, je eigen tools, je eigen accounts.
+DROSTJE. is een bureaublad-app waarmee je coding agents op je eigen computer en geconfigureerde uitvoeringsmachines aanstuurt. Je zet ze aan het werk, kijkt mee terwijl ze bezig zijn, en stuurt grotere klussen door naar de Factory. Alles op één plek, met je eigen repo's, tools en accounts.
 
 ## Waarom "drost"?
 
@@ -15,6 +15,7 @@ Een **drost** (of drossaard, als je het deftig wilt zeggen) was vroeger de rentm
 - 🗂️ **Je projecten bij elkaar houden.** Voeg een bestaande Git-repo toe met één mapkeuze; archiveren verwijdert niets en is direct ongedaan te maken.
 - **Werk scheiden met Spaces.** Groepeer projecten en hun threads, met eigen open tabs, selectie en paneelindeling per Space.
 - **Meerdere threads openhouden.** Conversations en Factory-threads staan naast elkaar in tabs; de open tabs worden bewaard.
+- **Conversations op andere machines draaien.** Configureer een Host, koppel je project aan zijn checkout en gebruik hetzelfde agentnetwerk voor lokale en remote Conversations.
 - **Een echte terminal naast je threads.** Open een libghostty-terminal in de projectmap, als eigen tab of gesplitst paneel. Shellsessies blijven alleen tijdens deze app-sessie bestaan.
 - **Prompts met Neovim schrijven.** Echte normal-, insert- en visual-modi, operators, registers en undo/redo, ingebed in de bestaande composer zonder regelnummers of terminalvenster.
 - **Factory-runs starten.** Een bestaande User Story of PRD/issues-map kiezen, launch-parameters instellen en daarna de native events en resultaten volgen.
@@ -63,9 +64,67 @@ INSTALL_DIR=/usr/local ./install.sh
 
 De app-installer installeert geen Neovim, OMP, Pi, Claude Code, Codex, OpenCode, Factory, Docker of andere vereisten. Ontbrekende vereisten configureer je in Settings. Als Pi ontbreekt, kan **Install Pi** daar na een expliciete klik de officiële `@earendil-works/pi-coding-agent`-package zonder lifecycle-scripts in de DROSTJE.-datamap installeren; daarvoor zijn Node.js 22.19 of nieuwer en npm nodig.
 
-De standaardmap is `~/Library/Application Support/Drostje` op macOS en `$XDG_DATA_HOME/drostje` (standaard `~/.local/share/drostje`) op Linux. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Deze nieuwe versie gebruikt schema 2 zonder migraties; een niet-ondersteunde database wordt geweigerd, niet vervangen.
+De standaardmap is `~/Library/Application Support/Drostje` op macOS en `$XDG_DATA_HOME/drostje` (standaard `~/.local/share/drostje`) op Linux. Eén instantie mag die map tegelijk gebruiken. Projecten, threads, concepten, instellingen en launch-verwijzingen staan in SQLite; sessies, bijlagen en logs blijven bestanden. Archiveren verwijdert niets. Schema's 2 t/m 7 worden naar schema 8 gemigreerd; een niet-ondersteunde database wordt geweigerd, niet vervangen.
 
-Kies in Settings zo nodig expliciete executable-paden, de Conversation-harness per project en de gedeelde Factory-data-root. OMP, Pi, Claude Code, Codex en OpenCode draaien met je eigen lokale rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt interactieve sessies, maar niet reeds gestarte Factory-processen. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
+Kies in Settings zo nodig expliciete executable-paden, de Conversation-harness per project en de gedeelde Factory-data-root. Lokale OMP-, Pi-, Claude Code-, Codex- en OpenCode-processen draaien met je eigen rechten; Factory beheert zijn eigen containers en Git-worktrees. Sluiten stopt lokale interactieve sessies, maar niet reeds gestarte Factory-processen of lopende turns op een Host. Een onbekende uitkomst wordt nooit automatisch opnieuw verstuurd.
+
+### Conversations op een andere machine
+
+Een **Host** is een vooraf ingerichte uitvoeringsmachine. DROSTJE. blijft de enige coördinator; de Host bezit zijn processen, checkout en sessiebestanden. Beide maken een uitgaande WebSocket-verbinding naar **SEINTJE.** Er is geen SSH, provisioning, peer-to-peerverbinding of automatische bestandssynchronisatie. Factory blijft lokaal.
+
+1. Maak in SEINTJE twee afzonderlijke machine-tokens: één voor de Host en één voor DROSTJE. Configureer SEINTJE met de **token-ID's**, niet de `tk_…`-geheimen:
+
+   ```sh
+   RELAY_HOSTS='[{"host":"build-linux","hostToken":"HOST_TOKEN_ID","desktopToken":"DESKTOP_TOKEN_ID"}]'
+   RELAY_FRAME_LIMIT=16M
+   RELAY_QUEUE_LIMIT=64
+   ```
+
+   De bestaande Tokens-pagina maakt de geheimen aan; de operator kan de ID's opzoeken met `SELECT id, label FROM tokens` in SEINTJE's SQLite-database. Laat de reverse proxy WebSocket-upgrades doorgeven. Gebruik `wss://`; alleen loopbackverbindingen mogen onbeveiligde `ws://` gebruiken.
+
+2. Maak op de uitvoeringsmachine `host.json`, bijvoorbeeld:
+
+   ```json
+   {
+     "relay": {
+       "id": "build-linux",
+       "name": "Linux build machine",
+       "relay_url": "wss://seintje.example.org/v1/relay/build-linux",
+       "token_env": "DROSTJE_HOST_TOKEN",
+       "projects": {}
+     },
+     "data_dir": "/data",
+     "projects": {"app": "/projects/app"},
+     "executables": {"pi": "/usr/local/bin/pi"}
+   }
+   ```
+
+   `projects` koppelt vaste sleutels aan bestaande, absolute projectmappen. De desktop stuurt alleen zo'n sleutel, nooit zijn eigen checkoutpad of executable. Dezelfde Host en projectkoppeling mogen een gestarte Conversation niet naar een andere map verplaatsen.
+
+3. Bouw en start de headless image. Deze bevat Node.js 24.13.1 en Pi 1.2.0, maar geen providercredentials. Andere ondersteunde harnesses installeer je expliciet in een eigen afgeleide image en voeg je toe aan `executables`.
+
+   ```sh
+   docker build -f Dockerfile.host -t drostje-host .
+   docker volume create drostje-host-data
+   # Zet DROSTJE_HOST_TOKEN op het Host-token uit SEINTJE.
+   docker run --rm --name drostje-host --env DROSTJE_HOST_TOKEN \
+     --mount type=bind,src="$PWD/host.json",dst=/config/host.json,readonly \
+     --mount type=bind,src=/absolute/checkout,dst=/projects/app \
+     --mount source=drostje-host-data,target=/data \
+     drostje-host
+   ```
+
+   De container draait als `node` (UID 1000). Zorg dat die gebruiker de checkout en `/data` kan schrijven. Mount of configureer providercredentials bewust voor de gekozen harness; DROSTJE kopieert ze niet vanaf de desktop. Zonder Docker: `cargo run --no-default-features --features remote-host --bin drostje-host -- /absolute/host.json`.
+
+4. Geef DROSTJE het **desktop-token** via een omgevingsvariabele, bijvoorbeeld `DROSTJE_DESKTOP_TOKEN`, en herstart de app nadat je die omgeving hebt aangepast. Kies **Settings → Hosts**: Host ID `build-linux`, dezelfde relay-URL, credentialvariabele `DROSTJE_DESKTOP_TOKEN` en project key `app` voor het geselecteerde Project. Alleen de variabelenaam wordt opgeslagen, niet het geheim.
+
+5. Maak een Conversation en kies **Switch execution Host…** via de palette of de locatie onder de composer. De keuze blijft wijzigbaar totdat uitvoering begint; daarna start je voor een andere locatie een nieuwe Conversation. **Changes** en alleen-lezen bestandsweergaven lezen de Host-checkout. Lokale terminal-, branch-, commit- en worktree-acties wijzigen die remote checkout niet. Remote agents krijgen de `network`-tool, niet de desktopbrowser- of artifacttools.
+
+Bij verbindingsverlies maakt een actieve turn zijn werk af en bewaart de Host de gebeurtenissen. Nieuwe prompts en peer-turns wachten op de desktop; remote peer-context wordt uitsluitend aan een idle runtime aangeboden. Reconnect herstelt waarnemingen, niet onbevestigde opdrachten. De desktop blijft verantwoordelijk voor Space-lidmaatschap en toestemming; na app-herstart is **Resume** nodig voor automatische coördinatie. Na verlies van het Host-proces is expliciet **Reconnect conversation** nodig; een onbekende turn wordt nooit opnieuw gestart. Een vervangen of ingetrokken relayverbinding vereist expliciet opnieuw verbinden, en op de Host een bewuste procesherstart.
+
+Bewaar `/data`, inclusief SQLite/WAL, sessies en bijlagen. Eén Host-proces mag de datamap gebruiken. Herstelgebeurtenissen zijn begrensd op 2.048 events en 64 MiB per Conversation; een te oude cursor geeft een zichtbare herstelmelding in plaats van stil verlies. De Host bewaart maximaal 256 sessies, 100.000 commandoreceipts en 512 MiB ontvangen bijlagen. Ruimte- en opslagfouten stoppen nieuwe toelating, niet met een verzonnen resultaat.
+
+**Vertrouwensgrens:** TLS beschermt beide verbindingen, maar SEINTJE kan de inhoud lezen; dit is geen end-to-endversleuteling. Gebruik vertrouwde uitvoeringsmachines en aparte relaytokens. Een token geeft toegang tot de gekoppelde Host, niet tot een OS-sandbox. De relaycredential wordt niet aan harness-kindprocessen doorgegeven, maar processen onder dezelfde OS-gebruiker zijn geen beveiligingsgrens.
 
 ### Agents laten doorwerken op macOS
 
@@ -118,6 +177,8 @@ Het toolschema is één vlak object: de optionele velden `recipient` en `body` m
 
 Bij een werkende agent wordt peer-context op een veilige native grens aangeboden, zonder een lopende tool te onderbreken. Bij een idle, live en geautoriseerde agent kan een bericht automatisch een nieuwe turn starten, met de normale providerkosten en het bestaande tool- en toestemmingsbeleid. Een open toestemmingsvraag of verzoek om gebruikersinvoer wordt niet door een peer beantwoord; de wachtrij wacht totdat die blokkade is opgelost. Berichten zijn herkenbaar als **peer-origin**, niet als een gebruikersprompt. De privé-Draft, bijlagen, promptwachtrij en toetsenbordfocus blijven ongemoeid; ontvangen tekst geeft nooit toestemming om beperkingen te omzeilen.
 
+Voor een Conversation op een Host wordt peer-context alleen aangeboden wanneer de native runtime idle is. Zo kan een eerder ingepland peer-bericht na netwerkverlies niet alsnog een volgende turn starten. De Host vraagt `members`, `send` en `broadcast` altijd aan de live desktopcoördinator; offline wordt zo'n verzoek geweigerd.
+
 Toestemming voor automatische ontvangst wordt lokaal bewaard, maar de autorisatie van een draaiende runtime niet. Na app-herstart, herstellen of reconnect begint ontvangst **gepauzeerd**. Gebruik Resume; een nieuwe expliciete gebruikersprompt kan alleen eerder verleende automatische toestemming voor die runtime heractiveren. Een oude deelname van vóór automatische aflevering geeft geen toestemming voor betaalde wakeups: daarvoor is eerst expliciet Resume nodig. Stoppen en een tab sluiten pauzeren de aflevering; een bericht start nooit een gestopte of gesloten runtime opnieuw. Van Space wisselen is geen afmelding. Leave trekt de deelname in; archiveren, een verwijderde werkboom of verplaatsen naar een andere Space kan opnieuw aanmelden vereisen. Oude berichten verhuizen niet mee.
 
 De afleverstatussen betekenen:
@@ -145,7 +206,7 @@ De adresbalk accepteert web-URL's en absolute bestandspaden. `Cmd-L` focust het 
 
 `Ctrl-W`, gevolgd door `h/j/k/l`, verplaatst focus ook vanuit een browserpagina of de adresbalk naar het dichtstbijzijnde aangrenzende paneel. Control vasthouden voor de tweede toets werkt eveneens. Zonder buur blijft de focus staan; gewone letters en tekstbewerking blijven bij de webpagina.
 
-OMP, Pi, Claude Code, Codex en OpenCode krijgen bij het starten van hun sessie instructies en de volgende browsertools, naast `network` (Codex en OpenCode via de lokale MCP-server `drostje`, zonder hun eigen configuratiebestanden te wijzigen):
+Lokale OMP-, Pi-, Claude Code-, Codex- en OpenCode-sessies krijgen bij het starten instructies en de volgende browsertools, naast `network` (Codex en OpenCode via de lokale MCP-server `drostje`, zonder hun eigen configuratiebestanden te wijzigen). Remote Conversations krijgen alleen `network`:
 
 - `show_artifact`: schrijf eerst een HTML-bestand, bijvoorbeeld `/tmp/chart.html`, en geef daarna `{"path":"/tmp/chart.html","title":"Chart"}` aan de tool. De toolkaart in de Conversation wordt een interactieve browser. Relatieve CSS-, JavaScript- en afbeeldingsbestanden blijven naast het HTML-bestand werken.
 - `browser`: open met `{"action":"open","url":"http://localhost:3000","placement":"sidebar"}` of `"placement":"tab"`. Gebruik het teruggegeven `id` voor alle volgende acties. In Claude Code heten de tools `mcp__drostje__show_artifact` en `mcp__drostje__browser`.
@@ -244,6 +305,8 @@ De OMP-integratie is getest met `18.2.0` (native RPC v2). Normale Pi gebruikt de
 ```sh
 cargo check --all-targets
 cargo test
+cargo check --no-default-features --features remote-host --bin drostje-host
+cargo test --no-default-features --features remote-host --lib remote::
 node --test assets/browser-tools/peer.test.mjs
 cargo test --test neovim_runtime -- --ignored --nocapture
 cargo test --features runtime-qa native_composition_is_recovery_only_until_committed -- --ignored --nocapture
@@ -270,6 +333,7 @@ Maak eerst de wegwerp-repository `FX` uit [het applicatieplan](DROSTJE_APPLICATI
 ```sh
 export DROSTJE_RUNTIME_FIXTURE="$FX"
 cargo test --features runtime-qa --lib workspace_actions_with_real_backends -- --ignored --nocapture
+cargo test --features runtime-qa --lib remote_host_settings_selection_and_failure_are_keyboard_safe -- --ignored --nocapture
 cargo test --features runtime-qa --lib editor_startup_failure_and_restart_preserve_draft -- --ignored --nocapture
 cargo test --features runtime-qa --lib thread_workspace_keyboard_and_themes -- --ignored --nocapture
 cargo test --features runtime-qa --lib keyboard_focus_moves_visibly_between_draft_and_projects -- --ignored --nocapture

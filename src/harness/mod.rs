@@ -74,6 +74,8 @@ pub fn auto_permission_mode(harness: &str) -> Option<&'static str> {
 pub struct ConversationConfig {
     pub harness: String,
     pub executable: PathBuf,
+    /// Relay credential environment keys that must never reach provider subprocesses.
+    pub credential_env: Vec<String>,
     pub cwd: PathBuf,
     pub session_dir: PathBuf,
     pub session_ref: Option<String>,
@@ -90,6 +92,9 @@ pub struct ConversationConfig {
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub commands: async_channel::Sender<ConversationCommand>,
+    /// Native adapters close this channel only after their child owner is reaped.
+    /// Keep each actor's child field before its output sender in drop order.
+    /// Remote hosts use channel termination, not a queued Close, to release ownership.
     pub events: async_channel::Receiver<ConversationEvent>,
 }
 /// Agent-authored context, never user consent or editor content.
@@ -110,7 +115,7 @@ pub struct PeerDelivery {
     pub cancelled: async_channel::Receiver<()>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PeerDeliveryOutcome {
     Accepted,
     Rejected(String),
@@ -162,7 +167,7 @@ pub enum ConversationCommand {
     },
     Close,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum UserAnswer {
     Value(String),
     Confirmed(bool),
@@ -173,7 +178,7 @@ pub enum UserAnswer {
         timed_out: bool,
     },
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationState {
     Starting,
     Ready,
@@ -183,14 +188,14 @@ pub enum ConversationState {
     Disconnected,
     Failed,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnOutcome {
     Completed,
     Interrupted,
     Failed,
     Unknown,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelChoice {
     pub key: ModelKey,
     pub name: String,
@@ -199,26 +204,26 @@ pub struct ModelChoice {
     pub efforts: Vec<String>,
 }
 /// Tokens in the model's context window, as last reported by the harness.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUsage {
     pub used_tokens: u64,
     pub max_tokens: u64,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LimitWindow {
     FiveHour,
     SevenDay,
 }
 /// Plan rate-limit utilisation for one window; only reported by harnesses whose
 /// login has plan limits.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageLimit {
     pub window: LimitWindow,
     /// Percentage of the window used, 0–100.
     pub percent_used: f32,
     pub resets_at: Option<SystemTime>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ContentBlock {
     Text(String),
     Thinking(String),
@@ -235,7 +240,7 @@ pub enum ContentBlock {
         input: Value,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
     pub role: String,
@@ -246,7 +251,7 @@ pub struct Message {
     pub error: bool,
     pub exit_code: Option<i64>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolActivity {
     pub id: String,
     pub name: String,
@@ -258,7 +263,7 @@ pub struct ToolActivity {
     pub complete: bool,
     pub raw: Option<Value>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UserRequestKind {
     Confirm,
     Select,
@@ -270,12 +275,12 @@ pub enum UserRequestKind {
     Input,
     Editor,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserOption {
     pub value: String,
     pub description: Option<String>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserRequest {
     pub id: String,
     pub kind: UserRequestKind,
@@ -285,7 +290,7 @@ pub struct UserRequest {
     pub placeholder: Option<String>,
     pub deadline: Option<SystemTime>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ConversationEvent {
     Ready {
         /// Whether this runtime supports native peer-origin context injection.

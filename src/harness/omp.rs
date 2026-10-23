@@ -291,6 +291,9 @@ fn prepare(
         }
     }
     let mut command = Command::new(&config.executable);
+    for key in &config.credential_env {
+        command.env_remove(key);
+    }
     command
         .args(["--mode", "rpc"])
         .arg("--session-dir")
@@ -2113,7 +2116,7 @@ fn parse_commands(dialect: Dialect, raw: &Value) -> Result<(Vec<SlashCommand>, V
                 .filter(|hint| !hint.is_empty())
                 .map(str::to_owned),
             source,
-            blocked,
+            blocked: blocked.map(Into::into),
         });
     }
     Ok((commands, rejected))
@@ -2370,6 +2373,7 @@ done
         )?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
         let handle = smol::block_on(open(ConversationConfig {
+            credential_env: Vec::new(),
             harness: "pi".into(),
             executable,
             cwd,
@@ -2482,6 +2486,7 @@ done
         let root = std::env::temp_dir().join(format!("drostje-omp-power-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)?;
         let mut config = ConversationConfig {
+            credential_env: Vec::new(),
             harness: "omp".into(),
             executable: "/usr/bin/true".into(),
             cwd: root.clone(),
@@ -2895,6 +2900,7 @@ done
         let root = std::env::temp_dir().join(format!("drostje-omp-commands-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)?;
         let mut config = ConversationConfig {
+            credential_env: Vec::new(),
             harness: match dialect {
                 Dialect::Omp => "omp",
                 Dialect::Pi => "pi",
@@ -2945,7 +2951,7 @@ done
         assert_eq!(commands.len(), 5);
         assert_eq!(commands[0].aliases, ["models"]);
         assert_eq!(
-            commands[0].blocked,
+            commands[0].blocked.as_deref(),
             Some(super::super::commands::MODEL_PICKER)
         );
         assert_eq!(

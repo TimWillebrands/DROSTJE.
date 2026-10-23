@@ -48,6 +48,7 @@ fn exercise(harness_name: &str, executable: PathBuf) -> Result<()> {
         effort: None,
         permission_mode: None,
         browser_tools: None,
+        credential_env: Vec::new(),
         allow_empty_session: true,
     }))?;
     let mut models = 0;

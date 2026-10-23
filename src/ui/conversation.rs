@@ -3809,7 +3809,41 @@ fn render_content(
         );
     };
     let active = state.active_threads.contains(&id);
-    if let Some(Err(error)) = state.repositories.get(&project.id) {
+    let host_reason = state.thread_host_selection_reason(id).or_else(|| {
+        (state.selected_thread != Some(id)).then(|| "Select this Conversation first.".to_owned())
+    });
+    let host_owner = owner.clone();
+    history = history.child(
+        h_flex()
+            .id("conversation-execution-location")
+            .test_support()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .flex_wrap()
+            .child(
+                Button::new("switch-execution-host")
+                    .small()
+                    .ghost()
+                    .label(state.thread_host_label(id))
+                    .disabled(host_reason.is_some())
+                    .tooltip(
+                        host_reason
+                            .unwrap_or_else(|| Command::SwitchExecutionHost.label().to_owned()),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let _ = host_owner.update(cx, |workspace, cx| {
+                            workspace.execute(Command::SwitchExecutionHost, window, cx)
+                        });
+                    }),
+            )
+            .child(gpui_kit::component::label::Label::new(
+                state.thread_host_status(id),
+            )),
+    );
+    if thread.remote.is_none()
+        && let Some(Err(error)) = state.repositories.get(&project.id)
+    {
         history = history.child(
             Alert::error(
                 "conversation-root-error",
@@ -4237,6 +4271,7 @@ fn render_content(
         ));
     }
     if let Some(workspace) = owner.upgrade() {
+        let launch_settings_reason = state.remote_launch_settings_reason(id);
         if let Some(picker) = workspace
             .read(cx)
             .model_picker
@@ -4267,6 +4302,12 @@ fn render_content(
         {
             trailing = trailing.child(
                 div()
+                    .id("conversation-effort")
+                    .when_some(launch_settings_reason.clone(), |view, reason| {
+                        view.tooltip(move |window, cx| {
+                            Tooltip::new(reason.clone()).build(window, cx)
+                        })
+                    })
                     .min_w_0()
                     .max_w(rems(10.))
                     .key_context("NativeInput")
@@ -4274,7 +4315,7 @@ fn render_content(
                         Select::new(&picker.select)
                             .small()
                             .appearance(false)
-                            .disabled(active)
+                            .disabled(active || launch_settings_reason.is_some())
                             .placeholder("Effort"),
                     ),
             );
@@ -4287,6 +4328,12 @@ fn render_content(
         {
             trailing = trailing.child(
                 div()
+                    .id("conversation-permissions")
+                    .when_some(launch_settings_reason.clone(), |view, reason| {
+                        view.tooltip(move |window, cx| {
+                            Tooltip::new(reason.clone()).build(window, cx)
+                        })
+                    })
                     .min_w_0()
                     .max_w(rems(12.))
                     .key_context("NativeInput")
@@ -4294,7 +4341,7 @@ fn render_content(
                         Select::new(&picker.select)
                             .small()
                             .appearance(false)
-                            .disabled(active)
+                            .disabled(active || launch_settings_reason.is_some())
                             .placeholder("Permissions"),
                     ),
             );
@@ -4306,21 +4353,22 @@ fn render_content(
         .get(&id)
         .is_none_or(|session| session.error.is_some());
     if unavailable {
-        let retry = owner.clone();
         trailing = trailing.child(
-            Button::new("retry-model-discovery")
-                .small()
-                .ghost()
-                .label("Models unavailable · Retry")
-                .disabled(active)
-                .on_click(move |_, _, cx| {
-                    let _ = retry.update(cx, |workspace, cx| {
-                        workspace.state.update(cx, |state, cx| {
-                            state.retry_conversation(id);
-                            cx.notify();
-                        });
-                    });
-                }),
+            button(
+                "retry-model-discovery",
+                Command::RetryConversation,
+                owner,
+                state,
+            )
+            .label(if thread.remote.is_some() {
+                "Reconnect Host"
+            } else {
+                "Models unavailable · Retry"
+            })
+            .disabled(
+                state.selected_thread != Some(id)
+                    || Command::RetryConversation.disabled_reason(state).is_some(),
+            ),
         );
     }
     if active {
@@ -4444,7 +4492,26 @@ fn workspace_controls(
     state: &AppState,
     owner: &WeakEntity<Workspace>,
     cx: &App,
-) -> impl IntoElement {
+) -> AnyElement {
+    if let Some(location) = &thread.remote {
+        return h_flex()
+            .id("composer-remote-workspace")
+            .test_support()
+            .min_w_0()
+            .gap_2()
+            .px_2()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                Tag::secondary()
+                    .small()
+                    .child("Host workspace · read-only here"),
+            )
+            .child(gpui_kit::component::label::Label::new(
+                location.project.clone(),
+            ))
+            .into_any_element();
+    }
     let selected = state.selected_thread == Some(thread.id);
     let worktree = state.thread_worktree(thread);
     let label = match worktree {
@@ -4557,6 +4624,7 @@ fn workspace_controls(
                     }),
                 ),
         )
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -5158,6 +5226,8 @@ mod tests {
                 title: "Queue".into(),
                 harness: "omp".into(),
                 session_ref: None,
+                remote: None,
+                execution_started: false,
                 model: None,
                 effort: None,
                 permission_mode: None,

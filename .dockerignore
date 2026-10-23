@@ -1,0 +1,7 @@
+.git
+.claude
+.agents
+**/target
+reports
+research_notes
+.DS_Store

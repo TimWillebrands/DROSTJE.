@@ -32,6 +32,10 @@ gpui_kit::actions!(
         NewConversationInWorktree,
         NewConversationInWorkspace,
         SwitchHarness,
+        SwitchExecutionHost,
+        RetryConversation,
+        RetryRemoteFile,
+        RemoveRemoteHost,
         NewFactoryThread,
         NewTerminal,
         RestartTerminal,
@@ -152,6 +156,10 @@ pub enum Command {
     NewConversationInWorktree,
     NewConversationInWorkspace,
     SwitchHarness,
+    SwitchExecutionHost,
+    RetryConversation,
+    RetryRemoteFile,
+    RemoveRemoteHost,
     NewFactoryThread,
     NewTerminal,
     RestartTerminal,
@@ -215,7 +223,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 78] = [
+    pub const ALL: [Self; 82] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -233,6 +241,10 @@ impl Command {
         Self::NewConversationInWorktree,
         Self::NewConversationInWorkspace,
         Self::SwitchHarness,
+        Self::SwitchExecutionHost,
+        Self::RetryConversation,
+        Self::RetryRemoteFile,
+        Self::RemoveRemoteHost,
         Self::NewFactoryThread,
         Self::NewTerminal,
         Self::RestartTerminal,
@@ -315,6 +327,10 @@ impl Command {
             Self::NewConversationInWorktree => "New conversation in new worktree…",
             Self::NewConversationInWorkspace => "New conversation in workspace…",
             Self::SwitchHarness => "Switch harness…",
+            Self::SwitchExecutionHost => "Switch execution Host…",
+            Self::RetryConversation => "Reconnect conversation",
+            Self::RetryRemoteFile => "Read Host file again",
+            Self::RemoveRemoteHost => "Remove configured Host…",
             Self::NewFactoryThread => "New Factory thread",
             Self::NewTerminal => "New terminal",
             Self::RestartTerminal => "Restart terminal",
@@ -398,6 +414,10 @@ impl Command {
             Self::NewConversationInWorktree => Box::new(NewConversationInWorktree),
             Self::NewConversationInWorkspace => Box::new(NewConversationInWorkspace),
             Self::SwitchHarness => Box::new(SwitchHarness),
+            Self::SwitchExecutionHost => Box::new(SwitchExecutionHost),
+            Self::RetryConversation => Box::new(RetryConversation),
+            Self::RetryRemoteFile => Box::new(RetryRemoteFile),
+            Self::RemoveRemoteHost => Box::new(RemoveRemoteHost),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::NewTerminal => Box::new(NewTerminal),
             Self::RestartTerminal => Box::new(RestartTerminal),
@@ -525,6 +545,33 @@ impl Command {
                 state.create_worktree_reason()
             }
             Self::SwitchHarness => state.switch_harness_reason(),
+            Self::SwitchExecutionHost => match state.conversation_thread() {
+                Some(thread) => state.thread_host_selection_reason(thread.id),
+                None => Some("Select a Conversation first.".into()),
+            },
+            Self::RetryConversation => match state.conversation_thread() {
+                None => Some("Select a Conversation first.".into()),
+                Some(thread) if thread.archived => Some("Archived threads are read-only.".into()),
+                Some(thread)
+                    if thread.remote.is_none() && state.active_threads.contains(&thread.id) =>
+                {
+                    Some("Wait for the active turn or interrupt it before reconnecting.".into())
+                }
+                Some(thread)
+                    if state
+                        .conversations
+                        .get(&thread.id)
+                        .is_some_and(|session| session.error.is_none()) =>
+                {
+                    Some("The Conversation is connected or connecting.".into())
+                }
+                Some(_) => None,
+            },
+            Self::RetryRemoteFile => match &state.remote_file {
+                None => Some("Open a Host file first.".into()),
+                Some(file) if file.loading => Some("The Host file is loading.".into()),
+                Some(_) => None,
+            },
             Self::RemoveWorktree => state.remove_worktree_reason(),
             Self::SwitchBranch => state.switch_branch_reason(),
             Self::CommitChanges => state.commit_reason(),
@@ -535,6 +582,15 @@ impl Command {
             }
             Self::NextThread | Self::PreviousThread if state.open_threads.len() < 2 => {
                 Some("Open at least two threads.".into())
+            }
+            Self::NewTerminal | Self::NewNeovim
+                if state
+                    .conversation_thread()
+                    .is_some_and(|thread| thread.remote.is_some()) =>
+            {
+                state
+                    .conversation_thread()
+                    .and_then(|thread| state.remote_action_reason(thread.id))
             }
             Self::NewTerminal | Self::NewNeovim => state.mutable_project_reason().or_else(|| {
                 state
@@ -641,6 +697,10 @@ impl Command {
             return Some("Application is shutting down.".into());
         }
         match self {
+            Self::RemoveRemoteHost => workspace.selected_remote_host(cx).map_or_else(
+                || Some("Choose a configured Host in Settings first.".into()),
+                |host| state.remove_remote_host_reason(&host),
+            ),
             Self::WidenSidebar | Self::NarrowSidebar if state.thread().is_none() => {
                 Some("Select a thread first".into())
             }
@@ -718,7 +778,7 @@ pub const CLOSE_THREAD_KEY: &str = if cfg!(target_os = "macos") {
 pub fn bind_keys(cx: &mut App) {
     let workspace = Some("Workspace && !Command && !PopupMenu && !Sheet && !Dialog");
     let command = Some("DrostjePalette");
-    let picker = Some("SpacePicker || HarnessPicker");
+    let picker = Some("SpacePicker || HarnessPicker || HostPicker");
     let navigation = Some(
         "Workspace && !Input && !NativeInput && !Browser && !Command && !PopupMenu && !Sheet && !Dialog",
     );
@@ -977,6 +1037,7 @@ pub struct Palette {
     slash_commands: Option<Uuid>,
     /// The Conversation this palette offers to move to another harness.
     harnesses: Option<Uuid>,
+    hosts: Option<Uuid>,
     files: Option<FilePicker>,
     _subscriptions: Vec<Subscription>,
 }
@@ -999,6 +1060,21 @@ impl Palette {
         cx: &mut App,
     ) -> Entity<Self> {
         Self::open_with_spaces(owner, state, None, None, Some(thread), None, window, cx)
+    }
+
+    pub fn open_hosts(
+        owner: WeakEntity<Workspace>,
+        state: Entity<AppState>,
+        thread: Uuid,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let palette = Self::open(owner, state, window, cx);
+        palette.update(cx, |palette, cx| {
+            palette.hosts = Some(thread);
+            cx.notify();
+        });
+        palette
     }
 
     pub fn open_slash_commands(
@@ -1083,6 +1159,7 @@ impl Palette {
                 state,
                 closed: false,
                 hosted: false,
+                hosts: None,
                 spaces,
                 slash_commands,
                 harnesses,
@@ -1217,10 +1294,15 @@ impl Palette {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        let count = match (&self.spaces, self.harnesses) {
-            (Some(picker), _) => picker.spaces.len(),
-            (None, Some(_)) => crate::harness::CONVERSATION_HARNESSES.len(),
-            (None, None) => 0,
+        let hosts = self.hosts.map(|_| self.state.read(cx).remote_hosts());
+        let count = if let Some(hosts) = &hosts {
+            hosts.len() + 2
+        } else {
+            match (&self.spaces, self.harnesses) {
+                (Some(picker), _) => picker.spaces.len(),
+                (None, Some(_)) => crate::harness::CONVERSATION_HARNESSES.len(),
+                (None, None) => 0,
+            }
         };
         if count == 0 {
             return;
@@ -1243,7 +1325,25 @@ impl Palette {
                 .iter()
                 .position(|candidate| candidate == harness)
         });
-        let next = picker_row(count, current, delta, edge, skipped);
+        let mut next = picker_row(count, current, delta, edge, skipped);
+        if let (Some(thread), Some(hosts)) = (self.hosts, &hosts) {
+            let project = self
+                .state
+                .read(cx)
+                .snapshot
+                .threads
+                .iter()
+                .find(|candidate| candidate.id == thread)
+                .map(|thread| thread.project_id.to_string());
+            while next > 0
+                && next <= hosts.len()
+                && project
+                    .as_ref()
+                    .is_none_or(|project| !hosts[next - 1].projects.contains_key(project))
+            {
+                next = picker_row(count, Some(next), delta, false, None);
+            }
+        }
         self.command.update(cx, |command, cx| {
             command.set_selected_index(
                 Some(gpui_kit::component::IndexPath::new(0).row(next)),
@@ -1321,6 +1421,115 @@ impl Palette {
             });
             cx.notify();
         });
+    }
+
+    fn run_host(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.hosts else { return };
+        let hosts = self.state.read(cx).remote_hosts();
+        if row == hosts.len() + 1 {
+            self.run(PaletteTarget::Command(Command::Settings), window, cx);
+            return;
+        }
+        let host = if row == 0 {
+            None
+        } else {
+            let Some(host) = hosts.get(row - 1) else {
+                return;
+            };
+            Some(host.id.clone())
+        };
+        if self.closed || !self.hosted {
+            return;
+        }
+        let result = self.state.update(cx, |state, cx| {
+            let result = state.set_thread_host(thread, host.as_deref());
+            if let Err(error) = &result {
+                state.notice(crate::app::NoticeLevel::Warning, format!("{error:#}"));
+            }
+            cx.notify();
+            result
+        });
+        if result.is_ok() {
+            self.closed = true;
+            self.hosted = false;
+            let id = cx.entity().entity_id();
+            let _ = self.owner.update(cx, |workspace, cx| {
+                if workspace
+                    .palette
+                    .as_ref()
+                    .is_some_and(|palette| palette.entity_id() == id)
+                {
+                    workspace.palette = None;
+                    window.close_dialog(cx);
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    fn render_hosts(&self, thread: Uuid, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.state.read(cx);
+        let conversation = state
+            .snapshot
+            .threads
+            .iter()
+            .find(|candidate| candidate.id == thread);
+        let current = conversation.and_then(|thread| thread.remote.as_ref());
+        let mut group = CommandGroup::new()
+            .label("Execution location · fixed after the first turn")
+            .item(
+                CommandItem::new()
+                    .label("Local · this computer")
+                    .checked(current.is_none()),
+            );
+        for host in state.remote_hosts() {
+            let mapping =
+                conversation.and_then(|thread| host.projects.get(&thread.project_id.to_string()));
+            let label = match mapping {
+                Some(project) => format!("{} · {} · {project}", host.name, host.id),
+                None => format!("{} · map this Project in Settings first", host.name),
+            };
+            group = group.item(
+                CommandItem::new()
+                    .label(label)
+                    .checked(current.is_some_and(|location| location.host == host.id))
+                    .disabled(mapping.is_none()),
+            );
+        }
+        group = group.item(CommandItem::new().label("Configure Hosts in Settings…"));
+        let confirm = cx.entity().downgrade();
+        let cancel = cx.entity().downgrade();
+        div()
+            .id("execution-host-picker")
+            .test_support()
+            .key_context("HostPicker")
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                this.navigate_picker(1, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
+                this.navigate_picker(-1, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, window, cx| {
+                this.navigate_picker(-1, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
+                this.navigate_picker(1, true, window, cx)
+            }))
+            .child(
+                NativeCommand::new(&self.command)
+                    .searchable(false)
+                    .bordered(false)
+                    .max_h(rems(26.))
+                    .group(group)
+                    .on_confirm(move |index, window, cx| {
+                        let _ = confirm
+                            .update(cx, |palette, cx| palette.run_host(index.row, window, cx));
+                    })
+                    .on_cancel(move |_, cx| {
+                        let _ = cancel.update(cx, |palette, cx| palette.cleanup(cx));
+                    }),
+            )
+            .into_any_element()
     }
 
     fn run_slash_command(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1592,6 +1801,9 @@ impl Palette {
 
 impl Render for Palette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(thread) = self.hosts {
+            return self.render_hosts(thread, cx);
+        }
         if let Some(picker) = &self.spaces {
             return self.render_spaces(picker, cx);
         }
@@ -1783,6 +1995,18 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &SwitchHarness, w, cx| {
                 this.run(PaletteTarget::Command(Command::SwitchHarness), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SwitchExecutionHost, w, cx| {
+                this.run(PaletteTarget::Command(Command::SwitchExecutionHost), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RetryConversation, w, cx| {
+                this.run(PaletteTarget::Command(Command::RetryConversation), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RetryRemoteFile, w, cx| {
+                this.run(PaletteTarget::Command(Command::RetryRemoteFile), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RemoveRemoteHost, w, cx| {
+                this.run(PaletteTarget::Command(Command::RemoveRemoteHost), w, cx)
             }))
             .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| {
                 this.run(PaletteTarget::Command(Command::RemoveWorktree), w, cx)

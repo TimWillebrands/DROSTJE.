@@ -1,9 +1,11 @@
 //! Slash commands a harness offers for prompt text: skills, prompt templates, extension
 //! and plugin commands, and the harness's own builtins. They run when a prompt starts with
 //! `/name`, so DROSTJE. only lists them and refuses the ones that would change state it owns.
+use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// Where a harness says a command comes from. Unknown sources are kept verbatim.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandSource {
     Builtin,
     Skill,
@@ -34,7 +36,7 @@ impl CommandSource {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommand {
     /// Without the leading `/`.
     pub name: String,
@@ -45,7 +47,7 @@ pub struct SlashCommand {
     pub source: CommandSource,
     /// Why DROSTJE. refuses to send this command. Blocked commands would replace the
     /// session, model or directory DROSTJE. tracks for the Conversation.
-    pub blocked: Option<&'static str>,
+    pub blocked: Option<Cow<'static, str>>,
 }
 
 impl SlashCommand {
@@ -98,7 +100,7 @@ impl CommandCatalog {
     /// Why `text` must not be sent, when it invokes a blocked command.
     pub fn refusal(&self, text: &str) -> Option<String> {
         let command = self.invoked(text)?;
-        let reason = command.blocked?;
+        let reason = command.blocked.as_deref()?;
         Some(format!(
             "/{} is not available in DROSTJE.: {reason}",
             command.name
@@ -154,7 +156,7 @@ mod tests {
     #[test]
     fn invoked_resolves_aliases_and_prefers_builtins() {
         let mut clear = command("clear", &["reset", "new"], CommandSource::Builtin);
-        clear.blocked = Some(NEW_CONVERSATION);
+        clear.blocked = Some(NEW_CONVERSATION.into());
         let catalog = CommandCatalog::Ready(vec![
             command("review", &[], CommandSource::Custom),
             command("review", &[], CommandSource::Builtin),
@@ -192,7 +194,7 @@ mod tests {
                 .is_some()
         );
         let mut clear = command("clear", &[], CommandSource::Builtin);
-        clear.blocked = Some(NEW_CONVERSATION);
+        clear.blocked = Some(NEW_CONVERSATION.into());
         assert!(
             CommandCatalog::Ready(vec![clear.clone()])
                 .unavailable_reason()

@@ -18,10 +18,19 @@ impl Shutdown {
                 .conversations
                 .iter()
                 .filter_map(|(id, session)| {
-                    session
-                        .commands
-                        .clone()
-                        .map(|commands| (state.active_threads.contains(id), commands))
+                    session.commands.clone().map(|commands| {
+                        (
+                            interrupt_on_shutdown(
+                                state.active_threads.contains(id),
+                                state
+                                    .snapshot
+                                    .threads
+                                    .iter()
+                                    .any(|thread| thread.id == *id && thread.remote.is_some()),
+                            ),
+                            commands,
+                        )
+                    })
                 })
                 .collect(),
             drains: state
@@ -117,5 +126,22 @@ impl AppState {
         })
         .detach();
         cx.notify();
+    }
+}
+
+fn interrupt_on_shutdown(active: bool, remote: bool) -> bool {
+    active && !remote
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interrupt_on_shutdown;
+
+    #[test]
+    fn remote_shutdown_detaches_without_interrupting_the_active_turn() {
+        assert!(!interrupt_on_shutdown(true, true));
+        assert!(!interrupt_on_shutdown(false, true));
+        assert!(interrupt_on_shutdown(true, false));
+        assert!(!interrupt_on_shutdown(false, false));
     }
 }

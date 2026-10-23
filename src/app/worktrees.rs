@@ -72,6 +72,9 @@ impl AppState {
     /// The checkout a thread's processes run in. A removed worktree still resolves to its
     /// old directory so reads fail honestly instead of silently falling back to the root.
     pub fn working_tree_of(&self, thread: &Thread) -> Option<(WorkingTree, PathBuf)> {
+        if thread.remote.is_some() {
+            return None;
+        }
         if let Some(worktree) = self.thread_worktree(thread) {
             return Some((WorkingTree::Worktree(worktree.id), worktree.path.clone()));
         }
@@ -171,6 +174,9 @@ impl AppState {
         let Some(thread) = self.conversation_thread() else {
             return Some("Select a conversation first.".into());
         };
+        if let Some(reason) = self.remote_action_reason(thread.id) {
+            return Some(reason);
+        }
         if thread.archived {
             return Some("Archived threads are read-only.".into());
         }
@@ -299,6 +305,12 @@ impl AppState {
     }
 
     pub fn create_worktree_reason(&self) -> Option<String> {
+        if let Some(reason) = self
+            .selected_thread
+            .and_then(|id| self.remote_action_reason(id))
+        {
+            return Some(reason);
+        }
         if let Some(reason) = self.mutable_project_reason() {
             return Some(reason);
         }

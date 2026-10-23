@@ -206,6 +206,9 @@ fn session(config: &mut ConversationConfig) -> Result<Session> {
 fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session, Option<String>)> {
     let session = session(config)?;
     let mut command = Command::new(&config.executable);
+    for key in &config.credential_env {
+        command.env_remove(key);
+    }
     // `--permission-prompts host` only names who answers; without `--permission-prompt-tool
     // stdio` the CLI never sends `can_use_tool` and auto-denies every prompt.
     command
@@ -1517,7 +1520,7 @@ fn parse_commands(raw: &Value, terminal: &[String]) -> Option<Vec<SlashCommand>>
                     .filter(|hint| !hint.is_empty())
                     .map(str::to_owned),
                 source,
-                blocked,
+                blocked: blocked.map(Into::into),
             })
         })
         .collect();
@@ -2522,6 +2525,7 @@ mod tests {
             "session_dir":fs::canonicalize(&session_dir)?,
         }))?;
         let config = || ConversationConfig {
+            credential_env: Vec::new(),
             harness: "claude-code".into(),
             executable: root.join("claude"),
             cwd: cwd.clone(),
@@ -2609,6 +2613,7 @@ done
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
 
         let handle = smol::block_on(open(ConversationConfig {
+            credential_env: Vec::new(),
             harness: "claude-code".into(),
             executable: executable.clone(),
             cwd,

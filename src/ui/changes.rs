@@ -61,6 +61,11 @@ pub(super) fn render(
     owner: &WeakEntity<Workspace>,
     cx: &App,
 ) -> AnyElement {
+    let remote = state
+        .snapshot
+        .threads
+        .iter()
+        .any(|thread| thread.id == id && thread.remote.is_some());
     let diff = state.conversation_diff(id);
     let loading = diff.is_none_or(|diff| diff.loading);
     let result = diff.and_then(|diff| diff.result.as_ref());
@@ -169,6 +174,12 @@ pub(super) fn render(
         .debug_selector(|| "conversation-diff-sidebar".into())
         .flex_1()
         .min_h_0()
+        .when(remote, |view| {
+            view.child(
+                gpui_kit::component::label::Label::new(state.thread_host_label(id))
+                    .secondary("Host changes · read-only here; local Git actions are disabled"),
+            )
+        })
         .child(
             h_flex()
                 .flex_shrink_0()
@@ -180,13 +191,17 @@ pub(super) fn render(
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child(div().min_w_0().child(summary))
-                .child(
-                    button("commit-changes", Command::CommitChanges, owner, state)
-                        .label("Commit…")
-                        .debug_selector(|| "commit-changes".into()),
-                ),
+                .when(!remote, |row| {
+                    row.child(
+                        button("commit-changes", Command::CommitChanges, owner, state)
+                            .label("Commit…")
+                            .debug_selector(|| "commit-changes".into()),
+                    )
+                }),
         )
-        .when_some(commit_panel, |view, panel| view.child(panel))
+        .when_some(commit_panel.filter(|_| !remote), |view, panel| {
+            view.child(panel)
+        })
         .child(content)
         .into_any_element()
 }

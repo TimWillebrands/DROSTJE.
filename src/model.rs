@@ -236,6 +236,13 @@ pub struct PullRequestLink {
     pub archived_on_close: bool,
 }
 
+/// A host project key, never a desktop or arbitrary remote filesystem path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteLocation {
+    pub host: String,
+    pub project: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Thread {
     pub id: ThreadId,
@@ -256,6 +263,12 @@ pub struct Thread {
     /// harness sessions are pinned to the directory they started in.
     #[serde(default)]
     pub worktree_id: Option<WorktreeId>,
+    /// Execution location selected before the first turn; absent in legacy local threads.
+    #[serde(default)]
+    pub remote: Option<RemoteLocation>,
+    /// Once a submission is persisted, execution location can never be reassigned.
+    #[serde(default)]
+    pub execution_started: bool,
     /// The pull request this Conversation's worktree branch was pinned to; see
     /// [`PullRequestLink`]. Never set on project-root or Factory threads.
     #[serde(default)]
@@ -355,5 +368,29 @@ mod tests {
             attachments: vec![image(), image()],
         };
         assert_eq!(images_only.preview(), "2 images");
+    }
+
+    #[test]
+    fn legacy_conversation_location_defaults_to_local_and_remote_roundtrips() {
+        let value = serde_json::json!({
+            "id": Uuid::new_v4(), "project_id": Uuid::new_v4(),
+            "kind": "conversation", "factory": null, "title": "Legacy",
+            "harness": "omp", "session_ref": null, "model": null,
+            "draft": "Unsent", "attachments": [], "submission": null,
+            "archived": false, "created_at": "2026-01-01", "updated_at": "2026-01-01"
+        });
+        let mut thread: super::Thread = serde_json::from_value(value).unwrap();
+        assert!(thread.remote.is_none());
+        assert!(!thread.execution_started);
+        thread.remote = Some(super::RemoteLocation {
+            host: "host-a".into(),
+            project: "mounted".into(),
+        });
+        thread.execution_started = true;
+        let restored: super::Thread =
+            serde_json::from_value(serde_json::to_value(&thread).unwrap()).unwrap();
+        assert_eq!(restored.remote, thread.remote);
+        assert!(restored.execution_started);
+        assert_eq!(restored.draft, "Unsent");
     }
 }

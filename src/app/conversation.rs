@@ -3,6 +3,10 @@ use crate::titles;
 
 impl AppState {
     pub fn ensure_conversation(&mut self, id: ThreadId) {
+        self.open_conversation(id, false);
+    }
+
+    fn open_conversation(&mut self, id: ThreadId, resume: bool) {
         if self.shutting_down
             || self.conversations.contains_key(&id)
             || self.storage_error.is_some()
@@ -28,12 +32,24 @@ impl AppState {
             return;
         }
         // A removed worktree has no directory to run in; the composer explains why.
-        if self.thread_worktree(&thread).is_some_and(|w| !w.is_live()) {
+        if thread.remote.is_none() && self.thread_worktree(&thread).is_some_and(|w| !w.is_live()) {
             return;
         }
-        let Some((_, root)) = self.working_tree_of(&thread) else {
-            return;
+        let root = if thread.remote.is_none() {
+            let Some((_, root)) = self.working_tree_of(&thread) else {
+                return;
+            };
+            Some(root)
+        } else {
+            None
         };
+        let remote_host = thread.remote.as_ref().and_then(|location| {
+            self.remote_hosts()
+                .into_iter()
+                .find(|host| host.id == location.host)
+        });
+        let remote_client = self.remote_client.clone();
+        let network = self.network.client.clone();
         let mut session = ConversationSession::new(thread.model.clone());
         let (finished, drain) = async_channel::bounded(1);
         session.finished = Some(drain);
@@ -43,10 +59,19 @@ impl AppState {
         let saved = self.persist_thread(thread.clone());
         let sender = self.events.clone();
         let executables = self.snapshot.settings.get("executables").cloned();
+        let credential_env = if thread.remote.is_none() {
+            self.remote_hosts()
+                .into_iter()
+                .map(|host| host.token_env)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let browser_tools =
             self.browser_tools
                 .as_ref()
                 .map(|server| crate::browser_tools::BrowserToolConfig {
+                    remote: false,
                     endpoint: server.endpoint(),
                     thread: id,
                     network_token: generation,
@@ -62,8 +87,34 @@ impl AppState {
                     .await
                     .context("Persistence owner closed")?
                     .map_err(anyhow::Error::msg)?;
+                if let Some(location) = &thread.remote {
+                    let host =
+                        remote_host.context("The Conversation's Host is no longer configured")?;
+                    let network =
+                        network.context("The desktop Space network coordinator is unavailable")?;
+                    return remote_client
+                        .open(
+                            host,
+                            id,
+                            generation,
+                            location.project.clone(),
+                            crate::remote::wire::RemoteConversationConfig {
+                                harness: thread.harness.clone(),
+                                session_ref: thread.session_ref.clone(),
+                                model: thread.model.clone(),
+                                effort: thread.effort.clone(),
+                                permission_mode: thread.permission_mode.clone(),
+                                allow_empty_session: thread.submission.is_none(),
+                            },
+                            network,
+                            resume,
+                        )
+                        .await;
+                }
                 let config = smol::unblock(move || -> Result<_> {
-                    let repository = platform::inspect_repository(&root)?;
+                    let repository = platform::inspect_repository(
+                        &root.context("Local checkout is unavailable")?,
+                    )?;
                     let executable_name = harness::executable_name(&thread.harness)?;
                     let explicit = executables
                         .as_ref()
@@ -72,6 +123,7 @@ impl AppState {
                     Ok(harness::ConversationConfig {
                         allow_empty_session: thread.submission.is_none(),
                         browser_tools,
+                        credential_env,
                         harness: thread.harness,
                         executable: platform::resolve_executable(executable_name, explicit)?,
                         cwd: repository.root,
@@ -128,7 +180,13 @@ impl AppState {
         if !self.is_conversation(id) {
             return;
         }
-        if self.active_threads.contains(&id) {
+        if self.active_threads.contains(&id)
+            && !self
+                .snapshot
+                .threads
+                .iter()
+                .any(|thread| thread.id == id && thread.remote.is_some())
+        {
             self.notice(
                 NoticeLevel::Warning,
                 "Stop the active turn before reconnecting.",
@@ -136,12 +194,12 @@ impl AppState {
             return;
         }
         self.pause_network_delivery(id);
-        if let Some(old) = self.conversations.remove(&id) {
-            if let Some(commands) = old.commands {
-                let _ = commands.try_send(ConversationCommand::Close);
-            }
+        if let Some(old) = self.conversations.remove(&id)
+            && let Some(commands) = old.commands
+        {
+            let _ = commands.try_send(ConversationCommand::Close);
         }
-        self.ensure_conversation(id);
+        self.open_conversation(id, true);
     }
 
     /// Why the selected Conversation cannot change harness, or `None` when it can. The
@@ -266,10 +324,12 @@ impl AppState {
         {
             return Some("Archived history is read-only".into());
         }
-        if !matches!(self.repositories.get(&thread.project_id), Some(Ok(_))) {
+        if thread.remote.is_none()
+            && !matches!(self.repositories.get(&thread.project_id), Some(Ok(_)))
+        {
             return Some("Project root is unavailable".into());
         }
-        if self.thread_worktree(thread).is_some_and(|w| !w.is_live()) {
+        if thread.remote.is_none() && self.thread_worktree(thread).is_some_and(|w| !w.is_live()) {
             return Some("This conversation's worktree was removed".into());
         }
         let Some(session) = self.conversations.get(&id) else {
@@ -361,6 +421,10 @@ impl AppState {
         if !self.is_conversation(id) {
             return;
         }
+        if let Some(reason) = self.remote_launch_settings_reason(id) {
+            self.notice(NoticeLevel::Warning, reason);
+            return;
+        }
         if self.active_threads.contains(&id) {
             self.notice(
                 NoticeLevel::Warning,
@@ -381,6 +445,10 @@ impl AppState {
     /// Permission mode is a launch flag like effort: a change restarts the harness process.
     pub fn select_permission_mode(&mut self, id: ThreadId, mode: Option<String>) {
         if !self.is_conversation(id) {
+            return;
+        }
+        if let Some(reason) = self.remote_launch_settings_reason(id) {
+            self.notice(NoticeLevel::Warning, reason);
             return;
         }
         if self.active_threads.contains(&id) {
@@ -416,6 +484,7 @@ impl AppState {
                 .iter()
                 .find(|thread| thread.id == id)
                 .cloned()
+            && thread.remote.is_none()
             && let Some(auto) = harness::auto_permission_mode(&thread.harness)
             && thread.permission_mode.as_deref() != Some(auto)
         {
@@ -527,11 +596,14 @@ impl AppState {
         }
         self.active_threads.insert(id);
         self.authorize_network_user_turn(id);
+        thread.execution_started = true;
         thread.submission = Some(
             json!({"request_id":request_id,"text":text,"attachments":images,"state":"pending"}),
         );
         thread.updated_at = platform::now();
-        let wants_title = titles::accepts_generated_title(&thread) && !text.trim().is_empty();
+        let wants_title = thread.remote.is_none()
+            && titles::accepts_generated_title(&thread)
+            && !text.trim().is_empty();
         let saved = self.persist_thread(thread);
         let sender = self.events.clone();
         cx.spawn(async move |this, cx| {
@@ -737,6 +809,12 @@ impl AppState {
         let Some(thread) = self.conversation_thread() else {
             return Some("Select a conversation first.".into());
         };
+        if thread.remote.is_some() {
+            return Some(
+                "Remote titles come from the Host harness; desktop title generation is unavailable"
+                    .into(),
+            );
+        }
         if !titles::accepts_regenerated_title(thread) {
             return Some("Archived threads are read-only.".into());
         }
@@ -1062,6 +1140,7 @@ impl AppState {
                     ConversationState::Disconnected | ConversationState::Failed
                 ) {
                     session.requests.clear();
+                    session.auto_dispatch = false;
                 }
                 session.state = state;
             }
@@ -1442,7 +1521,7 @@ fn harness_lock_reason(
     if active {
         return Some("Stop the active turn first.".into());
     }
-    if thread.submission.is_some() || !thread.queued.is_empty() {
+    if thread.execution_started || thread.submission.is_some() || !thread.queued.is_empty() {
         return Some(STARTED.into());
     }
     match session {
@@ -1508,6 +1587,8 @@ mod tests {
             effort: None,
             permission_mode: None,
             worktree_id: None,
+            remote: None,
+            execution_started: false,
             pull_request: None,
             draft: String::new(),
             attachments: Vec::new(),

@@ -140,6 +140,8 @@ esac
                 effort: None,
                 permission_mode: None,
                 worktree_id: None,
+                remote: None,
+                execution_started: false,
                 pull_request: None,
                 draft: String::new(),
                 attachments: Vec::new(),

@@ -268,7 +268,7 @@ mod tests {
             "Start a new session",
             CommandSource::Builtin,
         );
-        clear.blocked = Some("start a new Conversation instead");
+        clear.blocked = Some("start a new Conversation instead".into());
         let catalog = CommandCatalog::Ready(vec![
             command(
                 "compact",

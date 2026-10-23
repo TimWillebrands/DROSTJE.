@@ -237,6 +237,7 @@ fn revoked_written_frame_remains_unknown_until_positive_native_evidence() -> Res
 
 fn actor(fixture: &SocketFixture) -> Result<Actor> {
     let mut config = ConversationConfig {
+        credential_env: Vec::new(),
         harness: "claude-code".into(),
         executable: PathBuf::from("/bin/cat"),
         cwd: fixture.root.clone(),

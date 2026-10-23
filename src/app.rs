@@ -2,6 +2,8 @@ mod activity;
 mod commit;
 mod conversation;
 mod factory;
+mod remote;
+pub use remote::RemoteFileView;
 mod network;
 pub use network::NetworkState;
 mod persistence;
@@ -429,6 +431,8 @@ pub struct AppState {
     pub diagnostics: BTreeMap<String, String>,
     pub browser_tools: Option<crate::browser_tools::BrowserToolServer>,
     pub network: NetworkState,
+    pub remote_client: crate::remote::Client,
+    pub remote_file: Option<RemoteFileView>,
     /// Models the title providers have locally; `None` until first inspected.
     pub title_models: Option<crate::titles::InstalledModels>,
     /// The inspection in flight; results of earlier ones are dropped.
@@ -665,6 +669,8 @@ impl AppState {
             diagnostics,
             browser_tools,
             network: NetworkState::default(),
+            remote_client: crate::remote::Client::new(),
+            remote_file: None,
             title_models: None,
             title_models_request: None,
             notice_sequence: notices.len() as u64,
@@ -1232,11 +1238,12 @@ impl AppState {
     /// disappears without being archived or deleted. Every user activity (drafting, sending,
     /// queueing, renaming, editing a Factory configuration, archiving) bumps `updated_at`,
     /// so an unused row still carries its creation timestamp and default title. Choosing a
-    /// harness, model or effort is configuration, not activity. Live state that is not
-    /// saved yet (a turn being prepared, a transcript) counts as activity too.
+    /// harness, model or effort is configuration, not activity. A Host-bound draft remains
+    /// discoverable so its Host can be changed or released. Live state also counts as activity.
     pub fn is_untouched(&self, thread: &Thread) -> bool {
         let id = thread.id;
         let unused = !thread.archived
+            && thread.remote.is_none()
             && thread.created_at == thread.updated_at
             && thread.draft.is_empty()
             && thread.attachments.is_empty()
@@ -1650,6 +1657,8 @@ impl AppState {
                     id,
                     project_id: project.id,
                     kind,
+                    remote: None,
+                    execution_started: false,
                     factory: Some(FactoryThreadConfig {
                         source_kind: FactorySourceKind::WorkItem,
                         source: String::new(),
@@ -1729,6 +1738,8 @@ impl AppState {
             effort: defaults.effort,
             permission_mode: defaults.permission_mode,
             worktree_id,
+            remote: None,
+            execution_started: false,
             pull_request: None,
             draft: String::new(),
             attachments: Vec::new(),
@@ -1979,6 +1990,42 @@ mod tests {
                     state.snapshot.threads.iter().any(|t| t.id == draft),
                     "Nothing is deleted"
                 );
+            });
+        }
+
+        #[gpui_kit::test]
+        fn host_bound_empty_conversation_stays_discoverable_after_close(cx: &mut TestAppContext) {
+            cx.dispatcher.allow_parking();
+            let (_dir, state, project) = open(cx);
+            let id = new_conversation(&state, cx);
+            state.update(cx, |state, _| {
+                state
+                    .save_remote_host(crate::remote::RemoteHostConfig {
+                        id: "empty-host".into(),
+                        name: "Empty Host".into(),
+                        relay_url: "wss://127.0.0.1:1/remote".into(),
+                        token_env: format!("DROSTJE_TEST_UNUSED_{}", Uuid::new_v4().simple()),
+                        projects: BTreeMap::from([(project.to_string(), "mounted".into())]),
+                    })
+                    .unwrap();
+                state.set_thread_host(id, Some("empty-host")).unwrap();
+                state.close_thread(id);
+                let thread = state
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|thread| thread.id == id)
+                    .unwrap();
+                assert!(!state.is_untouched(thread));
+                assert!(state.thread_listed_in(thread, state.active_space));
+                assert!(!state.open_threads.contains(&id));
+                assert!(state.remove_remote_host_reason("empty-host").is_some());
+                state.select_thread(id);
+                assert_eq!(state.selected_thread, Some(id));
+                assert!(state.open_threads.contains(&id));
+                state.set_thread_host(id, None).unwrap();
+                assert!(state.remove_remote_host_reason("empty-host").is_none());
+                state.remove_remote_host("empty-host").unwrap();
             });
         }
 

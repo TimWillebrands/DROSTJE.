@@ -1,0 +1,31 @@
+# Headless host only: no GPUI, Servo, Ghostty, window server, or browser libraries.
+ARG RUST_VERSION=1.98.1
+FROM rust:${RUST_VERSION}-bookworm AS build
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY assets ./assets
+COPY crates ./crates
+COPY vendor ./vendor
+COPY tests ./tests
+RUN cargo build --locked --release --no-default-features --features remote-host --bin drostje-host
+
+FROM node:24.13.1-bookworm-slim
+ARG PI_VERSION=1.2.0
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates git tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global --ignore-scripts "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    && npm cache clean --force \
+    && pi --version
+COPY --from=build /build/target/release/drostje-host /usr/local/bin/drostje-host
+# Mount the JSON configuration read-only, writable project roots, persistent /data,
+# and provider credentials deliberately. The host relay key comes from token_env.
+# Other supported harnesses require explicit installation in a derived image and
+# an executables entry; availability is never inferred from a provider name.
+RUN mkdir -p /data/home /projects /config && chown -R node:node /data /projects
+USER node
+ENV HOME=/data/home
+WORKDIR /projects
+VOLUME ["/data"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/drostje-host"]
+CMD ["/config/host.json"]

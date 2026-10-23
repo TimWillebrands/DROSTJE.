@@ -9,6 +9,7 @@ use std::{
 mod shell_env;
 pub use shell_env::import_login_shell_environment;
 
+#[cfg(any(feature = "desktop", test))]
 #[cfg_attr(
     not(any(target_os = "macos", test)),
     expect(
@@ -18,7 +19,7 @@ pub use shell_env::import_login_shell_environment;
 )]
 const APPLICATION_ICON: &[u8] = include_bytes!("../assets/drostje-app-icon.png");
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "desktop"))]
 pub fn set_application_icon() -> Result<()> {
     use objc2::{AnyThread, MainThreadMarker};
     use objc2_app_kit::{NSApplication, NSImage};
@@ -35,7 +36,7 @@ pub fn set_application_icon() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "desktop")))]
 pub fn set_application_icon() -> Result<()> {
     Ok(())
 }
@@ -292,64 +293,80 @@ const MAX_DIFF_BYTES: usize = 512 * 1024;
 const MAX_UNTRACKED_FILE_BYTES: usize = 128 * 1024;
 
 pub fn working_tree_diff(root: &Path) -> Result<RepositoryDiff> {
-    let status = git(
+    let (status, status_truncated) = git_bounded(
         root,
         &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        MAX_DIFF_BYTES,
     )?;
+    ensure!(
+        !status_truncated,
+        "Git status exceeds 512 KiB; narrow the checkout before reading Changes"
+    );
     let entries = status_entries(&status);
-    let tracked = git(
+    let tracked = git_bounded(
         root,
         &[
             "diff",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-color",
             "--unified=3",
             "HEAD",
             "--",
         ],
+        MAX_DIFF_BYTES,
     );
-    let mut patch = match tracked {
+    let (mut patch, mut truncated) = match tracked {
         Ok(patch) => patch,
-        Err(error) if git(root, &["rev-parse", "--verify", "HEAD"]).is_ok() => {
+        Err(error) if git_bounded(root, &["rev-parse", "--verify", "HEAD"], 4096).is_ok() => {
             return Err(error);
         }
         Err(_) => {
-            let staged = git(
+            let (mut staged, mut truncated) = git_bounded(
                 root,
                 &[
                     "diff",
                     "--cached",
                     "--no-ext-diff",
+                    "--no-textconv",
                     "--no-color",
                     "--unified=3",
                     "--",
                 ],
+                MAX_DIFF_BYTES,
             )?;
-            let unstaged = git(
-                root,
-                &["diff", "--no-ext-diff", "--no-color", "--unified=3", "--"],
-            )?;
-            [staged, unstaged]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n")
+            if !truncated {
+                if !staged.is_empty() && staged.len() < MAX_DIFF_BYTES {
+                    staged.push('\n');
+                }
+                let (unstaged, cut) = git_bounded(
+                    root,
+                    &[
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--no-color",
+                        "--unified=3",
+                        "--",
+                    ],
+                    MAX_DIFF_BYTES.saturating_sub(staged.len()),
+                )?;
+                staged.push_str(&unstaged);
+                truncated = cut;
+            }
+            (staged, truncated)
         }
     };
     for (status, path) in &entries {
+        if truncated {
+            break;
+        }
         if *status == "??" {
-            append_untracked_patch(root, path, &mut patch)?;
+            truncated = append_untracked_patch(root, path, &mut patch)?;
         }
     }
-    let mut truncated = false;
-    if patch.len() > MAX_DIFF_BYTES {
-        let mut end = MAX_DIFF_BYTES;
-        while !patch.is_char_boundary(end) {
-            end -= 1;
-        }
-        patch.truncate(end);
+    if truncated {
         patch.push_str("\n\nDiff truncated at 512 KiB.");
-        truncated = true;
     }
     let additions = patch
         .lines()
@@ -359,7 +376,10 @@ pub fn working_tree_diff(root: &Path) -> Result<RepositoryDiff> {
         .lines()
         .filter(|line| line.starts_with('-') && !line.starts_with("---"))
         .count();
-    let head_branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
+    let head_branch = git_bounded(root, &["symbolic-ref", "--quiet", "--short", "HEAD"], 4096)
+        .ok()
+        .filter(|(_, truncated)| !truncated)
+        .map(|(branch, _)| branch.trim_end_matches(['\n', '\r']).to_owned());
     let rows = std::sync::Arc::new(crate::diff::parse(&patch));
     Ok(RepositoryDiff {
         head_branch,
@@ -389,43 +409,154 @@ fn status_entries(status: &str) -> Vec<(&str, &str)> {
     entries
 }
 
-fn append_untracked_patch(root: &Path, path: &str, patch: &mut String) -> Result<()> {
+fn append_untracked_patch(root: &Path, path: &str, patch: &mut String) -> Result<bool> {
+    use std::io::Read;
     let relative = Path::new(path);
     ensure!(
         !relative.is_absolute()
             && !relative
                 .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir)),
+                .any(|part| matches!(part, std::path::Component::ParentDir)),
         "Git returned an invalid untracked path"
     );
-    let bytes = match fs::read(root.join(relative)) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    let full = root.join(relative);
+    let metadata = match fs::symlink_metadata(&full) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("Read untracked file {}", relative.display()));
         }
     };
-    if !patch.is_empty() {
-        patch.push('\n');
+    let root = fs::canonicalize(root)?;
+    let parent = fs::canonicalize(full.parent().context("Untracked file has no parent")?)?;
+    ensure!(
+        parent.starts_with(&root),
+        "Untracked file parent is outside the checkout"
+    );
+    let symlink = metadata.file_type().is_symlink();
+    let mode = if symlink { "120000" } else { "100644" };
+    let header = format!(
+        "\ndiff --git a/{path} b/{path}\nnew file mode {mode}\n--- /dev/null\n+++ b/{path}\n"
+    );
+    if append_diff_text(patch, &header) {
+        return Ok(true);
     }
-    patch.push_str(&format!(
-        "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
-    ));
+    if !symlink && !metadata.is_file() {
+        return Ok(append_diff_text(
+            patch,
+            "Special untracked file; content omitted.\n",
+        ));
+    }
+    if !symlink && metadata.len() > MAX_UNTRACKED_FILE_BYTES as u64 {
+        return Ok(append_diff_text(
+            patch,
+            "Untracked file is larger than 128 KiB; content omitted.\n",
+        ));
+    }
+    let bytes = if symlink {
+        use std::os::unix::ffi::OsStrExt;
+        fs::read_link(&full)?.as_os_str().as_bytes().to_vec()
+    } else {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&full)?;
+        let mut bytes = Vec::new();
+        file.take((MAX_UNTRACKED_FILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+        bytes
+    };
     if bytes.len() > MAX_UNTRACKED_FILE_BYTES {
-        patch.push_str("Untracked file is larger than 128 KiB; content omitted.\n");
-    } else if let Ok(text) = std::str::from_utf8(&bytes) {
-        let lines = text.lines().count();
-        patch.push_str(&format!("@@ -0,0 +1,{lines} @@\n"));
+        return Ok(append_diff_text(
+            patch,
+            "Untracked file is larger than 128 KiB; content omitted.\n",
+        ));
+    }
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if append_diff_text(patch, &format!("@@ -0,0 +1,{} @@\n", text.lines().count())) {
+            return Ok(true);
+        }
         for line in text.lines() {
+            if patch.len() + line.len() + 2 > MAX_DIFF_BYTES {
+                return Ok(true);
+            }
             patch.push('+');
             patch.push_str(line);
             patch.push('\n');
         }
+        Ok(false)
     } else {
-        patch.push_str("Binary untracked file; content omitted.\n");
+        Ok(append_diff_text(
+            patch,
+            "Binary untracked file; content omitted.\n",
+        ))
     }
-    Ok(())
+}
+
+fn append_diff_text(patch: &mut String, text: &str) -> bool {
+    let available = MAX_DIFF_BYTES.saturating_sub(patch.len());
+    let mut end = text.len().min(available);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    patch.push_str(&text[..end]);
+    end != text.len()
+}
+
+/// Bound both pipes while reading, not after `Command::output` has allocated the
+/// entire diff. Truncation kills the producer; it is never mistaken for Git failure.
+fn git_bounded(root: &Path, args: &[&str], limit: usize) -> Result<(String, bool)> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Run Git")?;
+    let stdout = child.stdout.take().context("Git stdout missing")?;
+    let stderr = child.stderr.take().context("Git stderr missing")?;
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .take(64 * 1024)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let mut bytes = Vec::new();
+    let read = stdout.take((limit + 1) as u64).read_to_end(&mut bytes);
+    let truncated = bytes.len() > limit;
+    if truncated || read.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().context("Wait for Git")?;
+    let errors = errors
+        .join()
+        .map_err(|_| anyhow::anyhow!("Git stderr reader stopped"))??;
+    read.context("Read Git output")?;
+    ensure!(
+        truncated || status.success(),
+        "Git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&errors).trim()
+    );
+    if truncated {
+        bytes.truncate(limit);
+        if let Err(error) = std::str::from_utf8(&bytes)
+            && error.error_len().is_none()
+        {
+            bytes.truncate(error.valid_up_to());
+        }
+    }
+    Ok((
+        String::from_utf8(bytes).context("Git returned non-UTF-8 text")?,
+        truncated,
+    ))
 }
 pub fn git(root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
@@ -779,6 +910,39 @@ mod tests {
         assert!(diff.patch.contains("+new line"));
         assert!(!diff.truncated);
     }
+    #[cfg(unix)]
+    #[test]
+    fn untracked_symlinks_show_the_link_without_reading_external_content() {
+        let repository = TempRepository::new();
+        let external = repository.0.with_extension("secret");
+        fs::write(&external, "private-host-credential\n").unwrap();
+        std::os::unix::fs::symlink(&external, repository.0.join("external-link")).unwrap();
+        let diff = working_tree_diff(&repository.0).unwrap();
+        assert!(diff.patch.contains("new file mode 120000"));
+        assert!(diff.patch.contains(&external.to_string_lossy().to_string()));
+        assert!(!diff.patch.contains("private-host-credential"));
+        fs::remove_file(external).unwrap();
+    }
+
+    #[test]
+    fn oversized_untracked_and_tracked_diffs_are_bounded_during_collection() {
+        let repository = TempRepository::new();
+        fs::File::create(repository.0.join("huge.bin"))
+            .unwrap()
+            .set_len(1024 * 1024 * 1024)
+            .unwrap();
+        let diff = working_tree_diff(&repository.0).unwrap();
+        assert!(diff.patch.contains("content omitted"));
+        fs::write(
+            repository.0.join("tracked.txt"),
+            "changed line\n".repeat(100_000),
+        )
+        .unwrap();
+        let diff = working_tree_diff(&repository.0).unwrap();
+        assert!(diff.truncated);
+        assert!(diff.patch.len() <= super::MAX_DIFF_BYTES + 64);
+    }
+
     #[test]
     fn commit_all_records_tracked_and_untracked_changes() {
         use super::commit_all;

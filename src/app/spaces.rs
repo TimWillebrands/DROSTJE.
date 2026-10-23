@@ -858,6 +858,8 @@ mod tests {
             effort: None,
             permission_mode: None,
             worktree_id: None,
+            remote: None,
+            execution_started: true,
             pull_request: None,
             draft: "Keep this unsent draft".into(),
             attachments: Vec::new(),

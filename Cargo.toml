@@ -2,16 +2,30 @@
 name = "drostje"
 version = "0.1.0"
 edition = "2024"
+default-run = "drostje"
 
 [features]
-runtime-qa = ["gpui-kit/test-support"]
+default = ["desktop"]
+desktop = ["dep:gpui-kit", "dep:ghostty-terminal", "dep:servo", "dep:dpi", "dep:euclid", "dep:content-security-policy", "dep:stylo_static_prefs", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+remote-host = []
+runtime-qa = ["desktop", "gpui-kit/test-support"]
+
+[[bin]]
+name = "drostje"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "drostje-host"
+path = "src/bin/drostje-host.rs"
+required-features = ["remote-host"]
 
 [dependencies]
-gpui-kit = "=0.6.6"
+gpui-kit = { version = "=0.6.6", optional = true }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "serde", "v5"] }
 anyhow = "1"
 thiserror = "2"
 async-channel = "2"
@@ -21,19 +35,23 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 base64 = "0.22"
 rmpv = "=1.3.1"
 parking_lot = "0.12"
-ghostty-terminal = { version = "0.1.0", path = "crates/ghostty-terminal" }
+ghostty-terminal = { version = "0.1.0", path = "crates/ghostty-terminal", optional = true }
 url = "2"
-servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "multiprocess", "webcrypto", "webgpu"] }
-dpi = "0.1"
-euclid = "0.22"
+servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "multiprocess", "webcrypto", "webgpu"], optional = true }
+dpi = { version = "0.1", optional = true }
+euclid = { version = "0.22", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-content-security-policy = { version = "=0.9.0", default-features = false }
-stylo_static_prefs = "=0.22.0"
+content-security-policy = { version = "=0.9.0", default-features = false, optional = true }
+stylo_static_prefs = { version = "=0.22.0", optional = true }
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+# Tungstenite TRACE logs include raw handshake headers; compile them out even in debug builds.
+# This caps the log facade globally, not tracing's application spans.
+log = { version = "0.4", features = ["max_level_debug", "release_max_level_debug"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
+objc2 = { version = "0.6.4", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"], optional = true }
 
 [[test]]
 name = "markdown_rendering"

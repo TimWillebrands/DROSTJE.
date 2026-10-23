@@ -1,21 +1,31 @@
+#[cfg(feature = "desktop")]
 pub mod app;
 pub mod attachments;
+#[cfg(feature = "desktop")]
 pub mod browser;
 pub mod browser_tools;
 pub mod diff;
+#[cfg(feature = "desktop")]
 pub mod factory;
 pub mod file_refs;
 pub mod harness;
 pub mod model;
+#[cfg(feature = "desktop")]
 pub mod neovim;
 pub mod network;
 pub mod platform;
+pub mod remote;
 pub mod store;
+#[cfg(feature = "desktop")]
 pub mod titles;
+#[cfg(feature = "desktop")]
 pub mod tracker;
+#[cfg(feature = "desktop")]
 pub mod ui;
+#[cfg(feature = "desktop")]
 pub mod worktrees;
 
+#[cfg(feature = "desktop")]
 use gpui_kit::{
     assets::AllAssets,
     component::{Root, TitleBar},
@@ -23,8 +33,10 @@ use gpui_kit::{
 };
 
 // The default Assets bundle omits Lucide icons used by thread and tool controls.
+#[cfg(feature = "desktop")]
 const APP_ASSETS: AllAssets = AllAssets;
 
+#[cfg(feature = "desktop")]
 pub fn run() {
     // Servo content processes re-execute this binary; they must not start the app.
     if browser::serve_content_process() {
@@ -114,7 +126,7 @@ pub fn run() {
         });
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "desktop"))]
 mod tests {
     use super::APP_ASSETS;
     use gpui_kit::{AssetSource, SvgRenderer, assets::IconName};

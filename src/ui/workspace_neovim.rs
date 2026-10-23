@@ -4,6 +4,79 @@
 use super::super::terminal::{NeovimTarget, neovim_jump_expression, neovim_remote};
 use super::*;
 use crate::file_refs::{self, FileReference};
+use gpui_kit::component::{
+    Disableable,
+    alert::Alert,
+    input::{Textarea, TextareaState},
+    label::Label,
+    spinner::Spinner,
+};
+
+/// Remote file bytes only enter this read-only control, never a desktop file or editor.
+struct RemoteFileDialog {
+    state: Entity<AppState>,
+    thread: ThreadId,
+    path: String,
+    text: Entity<TextareaState>,
+    _subscription: Subscription,
+}
+
+impl Render for RemoteFileDialog {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.read(cx);
+        let file = state
+            .remote_file
+            .as_ref()
+            .filter(|file| file.thread == self.thread && file.path == self.path);
+        let mut body = v_flex()
+            .id("remote-file-view")
+            .test_support()
+            .gap_3()
+            .min_w_0()
+            .child(
+                Label::new(state.thread_host_label(self.thread))
+                    .secondary("Read-only Host file · never opened from the local Project"),
+            );
+        if let Some(file) = file {
+            if file.loading {
+                body = body
+                    .child(Spinner::new())
+                    .child(Label::new("Reading from Host…"));
+            } else if let Some(error) = &file.error {
+                body = body.child(Alert::error("remote-file-error", error.clone()));
+            } else {
+                body = body.child(Textarea::new(&self.text).readonly(true).h(rems(24.)));
+                if file.truncated {
+                    body = body.child(Alert::warning(
+                        "remote-file-truncated",
+                        "This Host file exceeds the preview limit; only its beginning is shown.",
+                    ));
+                }
+            }
+        } else {
+            body = body.child(Alert::info(
+                "remote-file-unavailable",
+                "This file view is no longer active. Close it and open the file again.",
+            ));
+        }
+        let loading = file.is_some_and(|file| file.loading);
+        body = body.child(
+            Button::new("retry-remote-file")
+                .label(Command::RetryRemoteFile.label())
+                .disabled(loading)
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(RetryRemoteFile), cx)),
+        );
+        body.on_action(cx.listener(|view, _: &RetryRemoteFile, _, cx| {
+            cx.stop_propagation();
+            view.state.update(cx, |state, cx| {
+                if Command::RetryRemoteFile.disabled_reason(state).is_none() {
+                    state.request_remote_file(view.thread, view.path.clone(), cx);
+                    cx.notify();
+                }
+            });
+        }))
+    }
+}
 
 /// The `nvim` executable setting; blank discovers Neovim on PATH.
 pub(super) fn neovim_setting(state: &AppState) -> Option<String> {
@@ -77,6 +150,18 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let remote_thread = {
+            let state = self.state.read(cx);
+            thread
+                .or_else(|| state.conversation_thread().map(|thread| thread.id))
+                .and_then(|id| state.snapshot.threads.iter().find(|thread| thread.id == id))
+                .filter(|thread| thread.remote.is_some())
+                .map(|thread| thread.id)
+        };
+        if let Some(thread) = remote_thread {
+            self.open_remote_file(thread, reference.path, window, cx);
+            return;
+        }
         let label = reference.label();
         let location = {
             let state = self.state.read(cx);
@@ -129,6 +214,67 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    fn open_remote_file(
+        &mut self,
+        thread: ThreadId,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dismiss(window, cx);
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        self.state.update(cx, |state, cx| {
+            state.request_remote_file(thread, path.clone(), cx);
+            cx.notify();
+        });
+        let state = self.state.clone();
+        let content = cx.new(|cx| {
+            let text = cx.new(|cx| TextareaState::new(window, cx));
+            let subscription = cx.observe_in(
+                &state,
+                window,
+                |view: &mut RemoteFileDialog, _, window, cx| {
+                    let content = view
+                        .state
+                        .read(cx)
+                        .remote_file
+                        .as_ref()
+                        .filter(|file| file.thread == view.thread && file.path == view.path)
+                        .and_then(|file| file.content.clone());
+                    if let Some(content) = content
+                        && view.text.read(cx).value().as_ref() != content.as_str()
+                    {
+                        view.text
+                            .update(cx, |text, cx| text.set_value(content, window, cx));
+                    }
+                    cx.notify();
+                },
+            );
+            RemoteFileDialog {
+                state: state.clone(),
+                thread,
+                path: path.clone(),
+                text,
+                _subscription: subscription,
+            }
+        });
+        window.open_dialog(cx, move |dialog, window, _| {
+            let close = state.clone();
+            dialog
+                .title(format!("Host file · {path}"))
+                .width(window.rem_size() * 48.)
+                .child(content.clone())
+                .on_close(move |_, _, cx| {
+                    close.update(cx, |state, cx| {
+                        state.close_remote_file();
+                        cx.notify();
+                    })
+                })
+        });
     }
 
     #[expect(clippy::too_many_arguments, reason = "a tab's full launch context")]

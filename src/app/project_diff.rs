@@ -4,6 +4,7 @@ use super::*;
 #[derive(Default)]
 pub struct ProjectDiffs {
     trees: HashMap<WorkingTree, ProjectDiffState>,
+    remote: HashMap<ThreadId, ProjectDiffState>,
 }
 
 /// A working tree has one cached result and at most one Git read, even when several
@@ -119,6 +120,9 @@ impl ProjectDiffState {
 }
 
 impl AppState {
+    pub(super) fn invalidate_remote_diff(&mut self, id: ThreadId) {
+        self.project_diffs.remote.remove(&id);
+    }
     pub fn working_tree_diff(&self, key: WorkingTree) -> Option<&ProjectDiffState> {
         self.project_diffs.trees.get(&key)
     }
@@ -129,6 +133,9 @@ impl AppState {
             .threads
             .iter()
             .find(|thread| thread.id == id)?;
+        if thread.remote.is_some() {
+            return self.project_diffs.remote.get(&id);
+        }
         let (key, _) = self.working_tree_of(thread)?;
         self.working_tree_diff(key)
     }
@@ -152,6 +159,7 @@ impl AppState {
         let ids: Vec<ThreadId> = ids.into_iter().collect();
         self.set_visible_reviews(&ids, cx);
         let mut interests: HashMap<WorkingTree, (PathBuf, HashSet<ThreadId>)> = HashMap::new();
+        let mut remote_interests = HashSet::new();
         if !self.shutting_down {
             for id in ids {
                 if !self.thread_sidebar_open(id)
@@ -167,6 +175,10 @@ impl AppState {
                 else {
                     continue;
                 };
+                if thread.remote.is_some() {
+                    remote_interests.insert(id);
+                    continue;
+                }
                 let Some((key, root)) = self.working_tree_of(thread) else {
                     continue;
                 };
@@ -196,9 +208,38 @@ impl AppState {
         for key in refresh {
             self.refresh_project_diff(key, true, cx);
         }
+        let mut remote_refresh = Vec::new();
+        for (id, diff) in &mut self.project_diffs.remote {
+            let interested = if remote_interests.remove(id) {
+                HashSet::from([*id])
+            } else {
+                HashSet::new()
+            };
+            if diff.set_interest(None, interested) {
+                remote_refresh.push(*id);
+            }
+        }
+        for id in remote_interests {
+            let mut diff = ProjectDiffState::new(PathBuf::new());
+            diff.set_interest(None, HashSet::from([id]));
+            self.project_diffs.remote.insert(id, diff);
+            remote_refresh.push(id);
+        }
+        for id in remote_refresh {
+            self.refresh_remote_diff(id, true, cx);
+        }
     }
 
     pub fn refresh_conversation_diff(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        if self
+            .snapshot
+            .threads
+            .iter()
+            .any(|thread| thread.id == id && thread.remote.is_some())
+        {
+            self.refresh_remote_diff(id, true, cx);
+            return;
+        }
         let Some(key) = self.conversation_tree(id) else {
             return;
         };
@@ -206,6 +247,11 @@ impl AppState {
     }
 
     pub(super) fn queue_conversation_diff(&mut self, id: ThreadId, cx: &mut Context<Self>) {
+        if let Some(diff) = self.project_diffs.remote.get_mut(&id) {
+            diff.dirty = true;
+            self.refresh_remote_diff(id, false, cx);
+            return;
+        }
         let Some(key) = self.conversation_tree(id) else {
             return;
         };
@@ -213,6 +259,53 @@ impl AppState {
             diff.dirty = true;
         }
         self.schedule_project_diff(key, cx);
+    }
+
+    fn refresh_remote_diff(&mut self, id: ThreadId, explicit: bool, cx: &mut Context<Self>) {
+        if self.shutting_down {
+            return;
+        }
+        let Some(location) = self
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .and_then(|thread| thread.remote.clone())
+        else {
+            return;
+        };
+        let Some(diff) = self.project_diffs.remote.get_mut(&id) else {
+            return;
+        };
+        let (request, changed) = diff.begin_refresh(explicit);
+        if changed {
+            cx.emit(PresentationChange::Thread(id));
+        }
+        let Some((generation, _)) = request else {
+            return;
+        };
+        let client = self.remote_client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = match client.read_diff(&location.host, id, None).await {
+                Ok(value) => smol::unblock(move || decode_remote_diff(value)).await,
+                Err(error) => Err(format!("Remote Changes unavailable: {error:#}")),
+            };
+            let _ = this.update(cx, |state, cx| {
+                let Some(diff) = state.project_diffs.remote.get_mut(&id) else {
+                    return;
+                };
+                let Some(completion) = diff.complete(generation, result) else {
+                    return;
+                };
+                if completion.changed {
+                    cx.emit(PresentationChange::Thread(id));
+                }
+                if completion.refresh_again {
+                    state.refresh_remote_diff(id, false, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub(super) fn refresh_project_diff(
@@ -300,12 +393,51 @@ impl AppState {
     }
 }
 
+fn decode_remote_diff(value: Value) -> Result<platform::RepositoryDiff, String> {
+    #[derive(serde::Deserialize)]
+    struct RemoteDiff {
+        head_branch: Option<String>,
+        patch: String,
+        changed_files: usize,
+        additions: usize,
+        deletions: usize,
+        truncated: bool,
+    }
+    let diff: RemoteDiff = serde_json::from_value(value)
+        .map_err(|error| format!("Invalid remote Changes: {error}"))?;
+    let rows = Arc::new(crate::diff::parse(&diff.patch));
+    Ok(platform::RepositoryDiff {
+        head_branch: diff.head_branch,
+        patch: diff.patch,
+        changed_files: diff.changed_files,
+        additions: diff.additions,
+        deletions: diff.deletions,
+        truncated: diff.truncated,
+        rows,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::ProjectDiffState;
     use crate::platform;
     use std::{collections::HashSet, path::PathBuf};
     use uuid::Uuid;
+
+    #[test]
+    fn remote_changes_are_decoded_without_a_desktop_checkout() {
+        let patch = "diff --git a/remote.txt b/remote.txt\n--- a/remote.txt\n+++ b/remote.txt\n@@ -1 +1 @@\n-before\n+after\n";
+        let diff = super::decode_remote_diff(serde_json::json!({
+            "head_branch": "host-only", "patch": patch, "changed_files": 1,
+            "additions": 1, "deletions": 1, "truncated": false
+        }))
+        .unwrap();
+        assert_eq!(diff.head_branch.as_deref(), Some("host-only"));
+        assert_eq!(diff.patch, patch);
+        assert_eq!(diff.changed_files, 1);
+        assert!(!diff.rows.rows.is_empty());
+        assert!(super::decode_remote_diff(serde_json::json!({"patch": patch})).is_err());
+    }
 
     fn visible_diff() -> ProjectDiffState {
         let mut diff = ProjectDiffState::new(PathBuf::from("project"));

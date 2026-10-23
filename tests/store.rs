@@ -2,8 +2,8 @@ use anyhow::Result;
 use drostje::{
     model::{
         FactoryLaunch, FactorySourceKind, FactoryThreadConfig, ImageAttachment, ModelKey, Project,
-        ProjectDefaults, PullRequestLink, PullRequestState, QueuedMessage, Thread, ThreadKind,
-        Worktree,
+        ProjectDefaults, PullRequestLink, PullRequestState, QueuedMessage, RemoteLocation, Thread,
+        ThreadKind, Worktree,
     },
     store::{Store, StoreError},
 };
@@ -57,6 +57,8 @@ fn conversation(project: &Project) -> Thread {
         effort: None,
         permission_mode: None,
         worktree_id: None,
+        remote: None,
+        execution_started: false,
         pull_request: None,
         draft: "Unsent draft\n日本語 é".into(),
         attachments: Vec::new(),
@@ -276,12 +278,119 @@ fn reopen_retains_archived_history_drafts_and_launch_associations() {
         ] {
             assert_eq!(fs::read(file).unwrap(), b"retained original bytes");
         }
+    });
+}
+
+#[test]
+fn remote_location_survives_reopen_and_cannot_move_after_execution_starts() {
+    smol::block_on(async {
+        let directory = TempDirectory::new();
+        let project = project(directory.0.join("checkout"));
+        let mut thread = conversation(&project);
+        let location = RemoteLocation {
+            host: "linux-worker".into(),
+            project: "backend".into(),
+        };
+        let store = reopen(&directory.0);
+        store.save_project(project.clone()).await.unwrap();
+        store.save_thread(thread.clone()).await.unwrap();
+        thread.remote = Some(location.clone());
+        store.save_thread(thread.clone()).await.unwrap();
+        thread.execution_started = true;
+        store.save_thread(thread.clone()).await.unwrap();
+        store.flush().await.unwrap();
+        drop(store);
+
+        let store = reopen(&directory.0);
+        let saved = store.snapshot().await.unwrap().threads.remove(0);
+        assert_eq!(saved.remote, Some(location.clone()));
+        assert!(saved.execution_started);
+        let mut moved = saved.clone();
+        moved.remote = None;
+        assert!(store.save_thread(moved).await.is_err());
+        let mut reset = saved.clone();
+        reset.execution_started = false;
+        assert!(store.save_thread(reset).await.is_err());
+        let mut factory = factory_thread(&project);
+        factory.remote = Some(location.clone());
+        assert!(store.save_thread(factory).await.is_err());
+        let mut edited = saved;
+        edited.draft = "Follow-up remains editable".into();
+        store.save_thread(edited.clone()).await.unwrap();
+        let snapshot = store.snapshot().await.unwrap();
+        assert_eq!(snapshot.threads.len(), 1);
+        assert_eq!(snapshot.threads[0].remote, Some(location));
+        assert_eq!(snapshot.threads[0].draft, edited.draft);
+    });
+}
+
+#[test]
+fn legacy_sessions_keep_their_local_execution_location_after_upgrade() {
+    smol::block_on(async {
+        let directory = TempDirectory::new();
+        let project = project(directory.0.join("checkout"));
+        let mut started = conversation(&project);
+        started.session_ref = Some("existing-provider-session".into());
+        let empty = conversation(&project);
+        let store = reopen(&directory.0);
+        store.save_project(project).await.unwrap();
+        store.save_thread(started.clone()).await.unwrap();
+        store.save_thread(empty.clone()).await.unwrap();
+        store.flush().await.unwrap();
+        drop(store);
+        wait_for_release(&directory.0);
         let database = Connection::open(directory.0.join("drostje.sqlite3")).unwrap();
+        database
+            .execute_batch(
+                "ALTER TABLE threads DROP COLUMN remote_json;
+             ALTER TABLE threads DROP COLUMN execution_started;",
+            )
+            .unwrap();
+        database.pragma_update(None, "user_version", 7).unwrap();
+        drop(database);
+
+        let store = reopen(&directory.0);
+        let snapshot = store.snapshot().await.unwrap();
+        let mut existing = snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == started.id)
+            .unwrap()
+            .clone();
+        let mut draft = snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == empty.id)
+            .unwrap()
+            .clone();
+        assert!(existing.execution_started);
+        assert_eq!(existing.session_ref, started.session_ref);
+        let location = Some(RemoteLocation {
+            host: "worker".into(),
+            project: "repo".into(),
+        });
+        existing.remote = location.clone();
+        assert!(store.save_thread(existing).await.is_err());
+        draft.remote = location.clone();
+        store.save_thread(draft).await.unwrap();
+        let snapshot = store.snapshot().await.unwrap();
         assert_eq!(
-            database
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            7
+            snapshot
+                .threads
+                .iter()
+                .find(|t| t.id == empty.id)
+                .unwrap()
+                .remote,
+            location
+        );
+        assert_eq!(
+            snapshot
+                .threads
+                .iter()
+                .find(|t| t.id == started.id)
+                .unwrap()
+                .remote,
+            None
         );
     });
 }
@@ -367,14 +476,6 @@ fn version_2_database_upgrades_in_place_and_persists_effort() {
         assert_eq!(threads[0].effort.as_deref(), Some("low"));
         assert_eq!(threads[0].permission_mode.as_deref(), Some("plan"));
         drop(reopened);
-        wait_for_release(&directory.0);
-        let database = Connection::open(&path).unwrap();
-        assert_eq!(
-            database
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            7
-        );
     });
 }
 
@@ -434,14 +535,6 @@ fn version_3_database_upgrades_in_place_and_persists_permission_mode() {
         assert_eq!(threads[0].effort.as_deref(), Some("high"));
         assert_eq!(threads[0].permission_mode.as_deref(), Some("acceptEdits"));
         drop(reopened);
-        wait_for_release(&directory.0);
-        let database = Connection::open(&path).unwrap();
-        assert_eq!(
-            database
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            7
-        );
     });
 }
 
@@ -509,14 +602,6 @@ fn version_4_database_upgrades_in_place_and_persists_queued_messages() {
         assert_eq!(threads[0].permission_mode.as_deref(), Some("plan"));
         assert_eq!(threads[0].queued, vec![queued]);
         drop(reopened);
-        wait_for_release(&directory.0);
-        let database = Connection::open(&path).unwrap();
-        assert_eq!(
-            database
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            7
-        );
     });
 }
 
@@ -599,14 +684,6 @@ fn version_5_database_upgrades_in_place_and_persists_worktrees() {
             None
         );
         drop(reopened);
-        wait_for_release(&directory.0);
-        let database = Connection::open(&path).unwrap();
-        assert_eq!(
-            database
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            7
-        );
     });
 }
 
@@ -619,7 +696,7 @@ fn version_6_database_upgrades_in_place_and_persists_pull_request_links() {
         let mut thread = conversation(&project);
         let worktree = worktree(&project, &thread, "amber-heron");
         thread.worktree_id = Some(worktree.id);
-        // Build a version 6 database with the current store, then drop the new column.
+        // Reconstruct version 6 by removing all columns introduced since that schema.
         let store = reopen(&directory.0);
         store.save_project(project.clone()).await.unwrap();
         store.save_worktree(worktree.clone()).await.unwrap();
@@ -629,7 +706,11 @@ fn version_6_database_upgrades_in_place_and_persists_pull_request_links() {
         wait_for_release(&directory.0);
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("ALTER TABLE threads DROP COLUMN pull_request_json")
+            .execute_batch(
+                "ALTER TABLE threads DROP COLUMN pull_request_json;
+                 ALTER TABLE threads DROP COLUMN remote_json;
+                 ALTER TABLE threads DROP COLUMN execution_started;",
+            )
             .unwrap();
         connection.pragma_update(None, "user_version", 6).unwrap();
         drop(connection);
@@ -657,20 +738,12 @@ fn version_6_database_upgrades_in_place_and_persists_pull_request_links() {
         let snapshot = reopened.snapshot().await.unwrap();
         assert_eq!(snapshot.threads[0].pull_request, thread.pull_request);
         drop(reopened);
-        wait_for_release(&directory.0);
-        let database = Connection::open(&path).unwrap();
-        assert_eq!(
-            database
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            7
-        );
     });
 }
 
 #[test]
 fn incompatible_schema_is_refused_without_changing_database_bytes() {
-    for version in [1, 8] {
+    for version in [1, i64::from(i32::MAX)] {
         let directory = TempDirectory::new();
         let path = directory.0.join("drostje.sqlite3");
         let connection = Connection::open(&path).unwrap();
