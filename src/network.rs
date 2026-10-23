@@ -613,7 +613,10 @@ impl Actor {
             if delivery.attempt == Some(attempt)
                 && (delivery.state == DeliveryState::Delivering
                     || (matches!(delivery.state, DeliveryState::Unknown { .. })
-                        && state == DeliveryState::Delivered))
+                        && matches!(
+                            state,
+                            DeliveryState::Delivered | DeliveryState::Failed { .. }
+                        )))
             {
                 delivery.state = state.clone();
                 if state == DeliveryState::Queued {
@@ -791,6 +794,8 @@ fn recipient_message(message: &NetworkMessage, delivery: &Delivery) -> NetworkMe
 /// One-time conversion, not a second serde/tool API. Reject mixed dispositions
 /// rather than guessing which representation is authoritative.
 fn read_saved(saved: &Value) -> Result<NetworkSnapshot> {
+    const LEGACY_RECEIPT: &str =
+        "Retrieved through the legacy inbox without a native delivery receipt";
     let mut value = saved.clone();
     if let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) {
         for message in messages {
@@ -802,6 +807,16 @@ fn read_saved(saved: &Value) -> Result<NetworkSnapshot> {
                             !fields.contains_key("retrieved") && !fields.contains_key("closed"),
                             "Mixed saved delivery formats"
                         );
+                        if fields["state"]["status"] == "delivered"
+                            && fields.get("attempt").is_none_or(Value::is_null)
+                        {
+                            fields.insert(
+                                "state".into(),
+                                serde_json::to_value(DeliveryState::Unknown {
+                                    reason: LEGACY_RECEIPT.into(),
+                                })?,
+                            );
+                        }
                         continue;
                     }
                     ensure!(
@@ -819,7 +834,9 @@ fn read_saved(saved: &Value) -> Result<NetworkSnapshot> {
                             ensure!(!retrieved, "Conflicting legacy delivery dispositions");
                             DeliveryState::Closed { reason }
                         }
-                        Some(Value::Null) | None if retrieved => DeliveryState::Delivered,
+                        Some(Value::Null) | None if retrieved => DeliveryState::Unknown {
+                            reason: LEGACY_RECEIPT.into(),
+                        },
                         Some(Value::Null) | None => DeliveryState::Queued,
                         _ => bail!("Invalid legacy delivery disposition"),
                     };
@@ -943,14 +960,15 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
                     );
                 }
                 DeliveryState::Delivering
-                | DeliveryState::Failed { .. }
-                | DeliveryState::Unknown { .. } => {
+                | DeliveryState::Delivered
+                | DeliveryState::Failed { .. } => {
                     ensure!(
                         delivery.attempt.is_some(),
                         "Saved delivery is missing its attempt"
                     );
                 }
-                DeliveryState::Delivered => {}
+                // Legacy retrieval has no native attempt to correlate with a receipt.
+                DeliveryState::Unknown { .. } => {}
             }
             match &delivery.state {
                 DeliveryState::Failed { reason }
@@ -1298,10 +1316,19 @@ mod tests {
                     .collect::<Vec<_>>(),
                 ids
             );
-            assert_eq!(
+            assert!(matches!(
                 migrated.messages[0].deliveries[0].state,
-                DeliveryState::Delivered
-            );
+                DeliveryState::Unknown { .. }
+            ));
+            assert!(migrated.messages[0].deliveries[0].attempt.is_none());
+            // Earlier push checkpoints called legacy retrieval "delivered", without
+            // a native attempt. Reopening those records must not invent a receipt.
+            let mut prior = serde_json::to_value(&migrated).unwrap();
+            prior["messages"][0]["deliveries"][0]["state"] = json!({"status":"delivered"});
+            assert!(matches!(
+                read_saved(&prior).unwrap().messages[0].deliveries[0].state,
+                DeliveryState::Unknown { .. }
+            ));
             assert_eq!(
                 migrated.messages[1].deliveries[0].state,
                 DeliveryState::Closed {
@@ -2242,6 +2269,76 @@ mod tests {
                 .unwrap();
             assert_eq!(fixture.saved().await, before);
             assert!(fixture.network.claim(token(&b)).await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn native_refusal_resolves_a_held_attempt_without_retry() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let sender = peer(Uuid::new_v4(), "Sender");
+            let recipient = peer(sender.space, "Recipient");
+            fixture.join(&[sender.clone(), recipient.clone()]).await;
+            let id = fixture
+                .send(&sender, &recipient, "Await the native policy decision")
+                .await;
+            let batch = fixture
+                .network
+                .claim(token(&recipient))
+                .await
+                .unwrap()
+                .unwrap();
+            fixture
+                .network
+                .finish(
+                    batch.attempt,
+                    DeliveryOutcome::Unknown("Native policy held this message".into()),
+                )
+                .await
+                .unwrap();
+            assert!(
+                fixture
+                    .network
+                    .claim(token(&recipient))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            fixture
+                .network
+                .finish(
+                    batch.attempt,
+                    DeliveryOutcome::Failed("Native policy denied this message".into()),
+                )
+                .await
+                .unwrap();
+            let saved = fixture.saved().await;
+            assert_eq!(saved.messages[0].id, id);
+            assert_eq!(
+                saved.messages[0].deliveries[0].state,
+                DeliveryState::Failed {
+                    reason: "Native policy denied this message".into(),
+                }
+            );
+            assert_eq!(saved.messages[0].deliveries[0].attempt, Some(batch.attempt));
+            assert!(
+                fixture
+                    .network
+                    .claim(token(&recipient))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            fixture
+                .network
+                .finish(batch.attempt, DeliveryOutcome::Delivered)
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.saved().await,
+                saved,
+                "Refused messages cannot later claim acceptance"
+            );
         });
     }
 

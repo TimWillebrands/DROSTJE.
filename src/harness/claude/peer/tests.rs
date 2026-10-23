@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 
 struct SocketFixture {
@@ -13,8 +14,10 @@ impl SocketFixture {
     fn new() -> Result<Self> {
         let root = PathBuf::from("/tmp").join(format!("drost-peer-{}", Uuid::new_v4().simple()));
         fs::create_dir(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         let socket = root.join("in.sock");
         let listener = UnixListener::bind(&socket)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         let registry = root.join(format!("{}.json", std::process::id()));
         let fixture = Self {
             root,
@@ -57,13 +60,14 @@ impl SocketFixture {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        // tick closes the transport only after the complete NDJSON frame.
+        // Writing a line is not admission; keep the sender alive for native credentials.
         assert!(inbox.tick().is_empty());
         let (stream, _) = self.listener.accept()?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         let mut bytes = String::new();
-        BufReader::new(stream).read_to_string(&mut bytes)?;
+        BufReader::new(stream).read_line(&mut bytes)?;
         assert!(bytes.ends_with('\n'));
+        assert!(inbox.records[&attempt].write.is_some());
         Ok(serde_json::from_str(&bytes)?)
     }
 }
@@ -128,8 +132,10 @@ fn real_socket_write_is_not_acceptance_and_body_cannot_forge_envelope() -> Resul
     assert_eq!(frame["session_id"], fixture.session.to_string());
     assert_eq!(frame["uuid"], attempt.to_string());
     assert_eq!(frame["priority"], "next");
-    assert!(frame.get("from").is_none());
+    let from = inbox.status.as_ref().unwrap().address();
+    assert_eq!(frame["from"], from);
     let body = frame["message"]["content"].as_str().unwrap();
+    assert!(body.contains(&format!("from=\"{from}\"")));
     assert_eq!(body.matches("</cross-session-message>").count(), 1);
     assert!(!body.contains("from-mode=\"bypass\""));
     assert!(!inbox.known(&attempt));
@@ -143,6 +149,12 @@ fn real_socket_write_is_not_acceptance_and_body_cannot_forge_envelope() -> Resul
     let mut other_peer = echo(attempt);
     other_peer["origin"]["verifiedPeerPid"] = json!(std::process::id() + 1);
     assert!(inbox.observe(&other_peer).0.is_empty());
+    let mut missing_peer_pid = echo(attempt);
+    missing_peer_pid["origin"]
+        .as_object_mut()
+        .unwrap()
+        .remove("verifiedPeerPid");
+    assert!(inbox.observe(&missing_peer_pid).0.is_empty());
     let (updates, messages) = inbox.observe(&echo(attempt));
     assert!(matches!(
         updates.as_slice(),
@@ -277,6 +289,27 @@ fn native_idle_turn_and_ordinary_user_replay_have_separate_accounting() -> Resul
     assert!(actor.turn.id.is_none());
     assert!(actor.events.iter().any(|event| matches!(event, ConversationEvent::PeerTurnStarted { request_id } if *request_id == attempt)));
     assert!(actor.events.iter().any(|event| matches!(event, ConversationEvent::MessageUpdated(Message { role, content, .. }) if role == "peer" && matches!(content.first(), Some(ContentBlock::PeerMessage(_))))));
+    let started = actor
+        .events
+        .iter()
+        .position(|event| {
+            matches!(event,
+        ConversationEvent::PeerTurnStarted { request_id } if *request_id == attempt)
+        })
+        .unwrap();
+    let accepted = actor.events.iter().position(|event| matches!(event,
+        ConversationEvent::PeerDelivery { attempt: id, outcome: PeerDeliveryOutcome::Accepted } if *id == attempt)).unwrap();
+    assert!(
+        started < accepted,
+        "Native idle turn admission must precede its first receipt"
+    );
+    let history = actor.history.len();
+    actor.frame(echo(attempt))?;
+    assert_eq!(
+        actor.history.len(),
+        history,
+        "Repeated peer replay must not duplicate history"
+    );
     actor.frame(json!({"type":"result","subtype":"success","is_error":false,"origin":{"kind":"peer"},"user_message_uuid":attempt}))?;
     assert!(actor.peer_turn.is_none());
     assert!(actor.events.iter().any(|event| matches!(event, ConversationEvent::TurnSettled { request_id, outcome: TurnOutcome::Completed } if *request_id == attempt)));
@@ -332,156 +365,410 @@ fn peer_result_does_not_settle_a_separate_queued_user_and_busy_fold_settles_user
     Ok(())
 }
 
-/// Opt-in, real installed CLI smoke. The only configured model endpoint is a loopback
-/// listener that never accepts/responds; no paid provider can receive a request. This
-/// proves native admission/provenance and idle wake, NOT successful model generation.
-/// Run after integration:
-/// DROSTJE_CLAUDE_SMOKE_BIN="$(command -v claude)" cargo test installed_claude_native_peer_smoke -- --ignored --nocapture
+/// Opt-in installed-CLI probe. macOS Seatbelt denies all IP networking for the
+/// native process and descendants; a fail-closed preflight proves that denial and
+/// verifies Unix sockets remain usable. No provider listener or fake response exists.
 #[test]
-#[ignore = "requires explicit installed Claude binary; normal fixtures never launch a provider CLI"]
+#[ignore = "requires installed Claude and macOS sandbox-exec; never launches a CLI by default"]
 fn installed_claude_native_peer_smoke() -> Result<()> {
     let executable = std::env::var_os("DROSTJE_CLAUDE_SMOKE_BIN")
-        .context("Set DROSTJE_CLAUDE_SMOKE_BIN explicitly to an installed Claude 2.1.306 binary")?;
-    let fixture = SocketFixture::new()?;
-    let config_dir = fixture.root.join("config");
-    let socket_dir = fixture.root.join("tmp");
-    fs::create_dir(&config_dir)?;
-    fs::create_dir(&socket_dir)?;
-    // Keep the port reserved, but never read a request or provide a fake model response.
-    let blocked_provider = std::net::TcpListener::bind(("127.0.0.1", 0))?;
-    let mut child = Command::new(executable)
-        .args([
-            "--print",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--replay-user-messages",
-            "--permission-prompts",
-            "host",
-            "--permission-prompt-tool",
-            "stdio",
-            "--setting-sources",
-            "",
-            "--settings",
-            "{\"crossSessionInbound\":\"accept\"}",
-            "--session-id",
-        ])
-        .arg(fixture.session.to_string())
-        .current_dir(&fixture.root)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("HOME", &fixture.root)
-        .env("CLAUDE_CONFIG_DIR", &config_dir)
-        .env("CLAUDE_CODE_TMPDIR", &socket_dir)
-        .env("ANTHROPIC_API_KEY", "sk-ant-isolated-no-provider-smoke")
-        .env(
-            "ANTHROPIC_BASE_URL",
-            format!("http://{}", blocked_provider.local_addr()?),
-        )
-        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-        .env("DISABLE_AUTOUPDATER", "1")
-        .env("DISABLE_TELEMETRY", "1")
-        .env("DISABLE_ERROR_REPORTING", "1")
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let owned = OwnedChild {
-        stdin: child.stdin.take(),
-        stdout: child.stdout.take().unwrap(),
-        stderr: child.stderr.take().unwrap(),
-        child,
-        reaped: false,
-    };
-    nonblocking(owned.stdout.as_raw_fd())?;
-    nonblocking(owned.stderr.as_raw_fd())?;
-    nonblocking(owned.stdin.as_ref().unwrap().as_raw_fd())?;
-    let mut host = actor(&fixture)?;
-    host.child.close();
-    host.child = owned;
-    host.peer = Inbox::new(host.child.child.id(), fixture.session);
-    host.peer.registry = Some(
-        config_dir
-            .join("sessions")
-            .join(format!("{}.json", host.child.child.id())),
+        .context("Set DROSTJE_CLAUDE_SMOKE_BIN explicitly to installed Claude 2.1.306")?;
+    ensure!(
+        cfg!(target_os = "macos"),
+        "Native smoke requires macOS Seatbelt; refusing unsandboxed execution"
     );
-    host.queue(
-        json!({"type":"control_request","request_id":INITIALIZE_REQUEST,
-        "request":{"subtype":"initialize"}}),
-        None,
-    )?;
+    ensure!(
+        Path::new(&executable).is_absolute(),
+        "Native smoke binary must be absolute"
+    );
+    for scenario in ["accept", "hold", "refuse", "busy"] {
+        let policy = if scenario == "busy" {
+            "accept"
+        } else {
+            scenario
+        };
+        let fixture = SocketFixture::new()?;
+        let config_dir = fixture.root.join("config");
+        let socket_dir = fixture.root.join("tmp");
+        fs::create_dir(&config_dir)?;
+        fs::create_dir(&socket_dir)?;
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))?;
+        let profile = fixture.root.join("no-ip.sb");
+        fs::write(
+            &profile,
+            "(version 1)\n(allow default)\n(deny network*)\n(allow network-inbound (local unix-socket))\n(allow network-outbound (remote unix-socket))\n",
+        )?;
+        let preflight = Command::new("/usr/bin/sandbox-exec")
+            .arg("-f").arg(&profile)
+            .args(["/usr/bin/python3", "-c",
+                "import errno,socket,sys\nfor family,address in [(socket.AF_INET,('127.0.0.1',9)),(socket.AF_INET,('192.0.2.1',443)),(socket.AF_INET6,('::1',9)),(socket.AF_INET6,('2001:db8::1',443))]:\n for kind in (socket.SOCK_STREAM,socket.SOCK_DGRAM):\n  s=socket.socket(family,kind);s.settimeout(1);code=s.connect_ex(address);s.close();assert code in (errno.EPERM,errno.EACCES),(address,kind,code)\ns=socket.socket(socket.AF_UNIX);s.connect(sys.argv[1]);s.close();print('IP_DENIED_UDS_ALLOWED')"])
+            .arg(&fixture.socket)
+            .env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &fixture.root)
+            .output()?;
+        ensure!(
+            preflight.status.success() && preflight.stdout == b"IP_DENIED_UDS_ALLOWED\n",
+            "Sandbox preflight failed closed: {}",
+            String::from_utf8_lossy(&preflight.stderr)
+        );
+        drop(fixture.listener.accept()?);
+        println!("Claude native {scenario}: OS preflight IP_DENIED_UDS_ALLOWED");
+        let mut child = Command::new("/usr/bin/sandbox-exec")
+            .arg("-f")
+            .arg(&profile)
+            .arg(&executable)
+            .args([
+                "--print",
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--replay-user-messages",
+                "--permission-prompts",
+                "host",
+                "--permission-prompt-tool",
+                "stdio",
+                "--setting-sources",
+                "",
+                "--settings",
+            ])
+            .arg(serde_json::to_string(
+                &json!({"crossSessionInbound":policy}),
+            )?)
+            .arg("--session-id")
+            .arg(fixture.session.to_string())
+            .current_dir(&fixture.root)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &fixture.root)
+            .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .env("CLAUDE_CODE_TMPDIR", &socket_dir)
+            .env("ANTHROPIC_API_KEY", "sk-ant-isolated-no-provider-smoke")
+            .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:9")
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("DISABLE_AUTOUPDATER", "1")
+            .env("DISABLE_TELEMETRY", "1")
+            .env("DISABLE_ERROR_REPORTING", "1")
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let owned = OwnedChild {
+            stdin: child.stdin.take(),
+            stdout: child.stdout.take().unwrap(),
+            stderr: child.stderr.take().unwrap(),
+            child,
+            reaped: false,
+        };
+        nonblocking(owned.stdout.as_raw_fd())?;
+        nonblocking(owned.stderr.as_raw_fd())?;
+        nonblocking(owned.stdin.as_ref().unwrap().as_raw_fd())?;
+        let mut host = actor(&fixture)?;
+        host.child.close();
+        host.child = owned;
+        host.peer = Inbox::new(host.child.child.id(), fixture.session);
+        host.peer.registry = Some(
+            config_dir
+                .join("sessions")
+                .join(format!("{}.json", host.child.child.id())),
+        );
+        host.queue(
+            json!({"type":"control_request","request_id":INITIALIZE_REQUEST,
+            "request":{"subtype":"initialize"}}),
+            None,
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !host.peer.ready {
+            host.flush()?;
+            host.peer.probe();
+            for _ in 0..16 {
+                if !host.read_stdout()? {
+                    break;
+                }
+            }
+            ensure!(
+                host.child.child.try_wait()?.is_none(),
+                "Isolated Claude exited before publishing its peer inbox"
+            );
+            ensure!(
+                Instant::now() < deadline,
+                "Claude did not publish a live protocol-1 inbox"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if scenario == "busy" {
+            installed_claude_busy_stop(&mut host, &config_dir, fixture.session)?;
+            host.stop_peer("Isolated busy smoke finished");
+            host.child.close();
+            continue;
+        }
+        let attempt = Uuid::new_v4();
+        let (cancel, mut delivery) = make_delivery(attempt);
+        delivery.messages[0].body =
+            "Isolated native transport probe. Do not use any tools or make network requests."
+                .into();
+        host.command(ConversationCommand::DeliverPeer(delivery))?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut interrupted = false;
+        loop {
+            host.poll_peer()?;
+            for _ in 0..16 {
+                if !host.read_stdout()? {
+                    break;
+                }
+            }
+            let outcome = host
+                .events
+                .iter()
+                .find_map(|event| match event {
+                    ConversationEvent::PeerDelivery {
+                        attempt: id,
+                        outcome,
+                    } if *id == attempt => Some(outcome),
+                    _ => None,
+                })
+                .cloned();
+            let provenance = host.events.iter().any(|event| matches!(event,
+                ConversationEvent::MessageUpdated(Message { role, raw: Some(raw), .. })
+                if role == "peer" && raw["origin"]["kind"] == "peer"
+                    && raw["uuid"].as_str() == Some(attempt.to_string().as_str())
+                    && raw["origin"]["verifiedPeerPid"].as_u64() == Some(u64::from(std::process::id()))));
+            let woke = host.events.iter().any(|event| {
+                matches!(event,
+                ConversationEvent::PeerTurnStarted { request_id } if *request_id == attempt)
+            });
+            if policy == "accept"
+                && matches!(outcome, Some(PeerDeliveryOutcome::Accepted))
+                && woke
+                && host.initialized
+                && !interrupted
+            {
+                ensure!(
+                    host.peer_cancel_queued,
+                    "Installed CLI did not advertise atomic queue-clearing Stop"
+                );
+                // Native replay can be flushed only when the blocked API attempt settles.
+                // Interrupt on real lifecycle admission, then demand its actual delayed echo.
+                host.command(ConversationCommand::Interrupt)?;
+                host.flush()?;
+                interrupted = true;
+            }
+            let observed = match policy {
+                "accept" => {
+                    matches!(outcome, Some(PeerDeliveryOutcome::Accepted))
+                        && provenance
+                        && woke
+                        && host.peer_turn.is_none()
+                }
+                "hold" => {
+                    matches!(outcome, Some(PeerDeliveryOutcome::Unknown(_))) && host.peer_blocked
+                }
+                "refuse" => matches!(outcome, Some(PeerDeliveryOutcome::Rejected(_))),
+                _ => unreachable!(),
+            };
+            if observed {
+                if policy != "accept" {
+                    assert!(
+                        !provenance && !woke,
+                        "Held/refused context must not start a turn"
+                    );
+                }
+                println!(
+                    "Claude native protocol1 {policy}: correlated outcome={outcome:?}, peer-origin context={provenance}, idle turn={woke}"
+                );
+                break;
+            }
+            ensure!(
+                host.child.child.try_wait()?.is_none(),
+                "Isolated Claude exited before native {policy} evidence"
+            );
+            ensure!(
+                Instant::now() < deadline,
+                "No native {policy} evidence; events={:?}",
+                host.events
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(cancel);
+        if policy == "accept" {
+            assert!(interrupted);
+            assert!(!host.turn.interrupting);
+            println!("Claude native admitted turn settled; interrupt state reset");
+        }
+        host.stop_peer("Isolated smoke finished");
+        host.child.close();
+    }
+    Ok(())
+}
+
+fn installed_claude_busy_stop(host: &mut Actor, config_dir: &Path, session: Uuid) -> Result<()> {
+    let user = Uuid::new_v4();
+    host.command(ConversationCommand::Submit {
+        request_id: user,
+        text: "Isolated native busy probe. Do not use tools or make network requests.".into(),
+        images: Vec::new(),
+    })?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         host.flush()?;
-        host.peer.probe();
-        if host.peer.ready {
-            break;
-        }
-        ensure!(
-            host.child.child.try_wait()?.is_none(),
-            "Isolated Claude exited before publishing its peer inbox"
-        );
-        ensure!(
-            Instant::now() < deadline,
-            "Installed Claude did not publish a live protocol-1 inbox"
-        );
+        host.poll_peer()?;
         for _ in 0..16 {
             if !host.read_stdout()? {
                 break;
             }
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let attempt = Uuid::new_v4();
-    let (_cancel, delivery) = make_delivery(attempt);
-    host.command(ConversationCommand::DeliverPeer(delivery))?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        for update in host.peer.tick() {
-            host.emit(ConversationEvent::PeerDelivery {
-                attempt: update.attempt,
-                outcome: update.outcome,
-            });
-        }
-        for _ in 0..16 {
-            if !host.read_stdout()? {
-                break;
-            }
-        }
-        let accepted = host.events.iter().any(|event| matches!(event,
-            ConversationEvent::PeerDelivery { attempt: id, outcome: PeerDeliveryOutcome::Accepted } if *id == attempt));
-        let provenance = host.events.iter().any(|event| {
+        let started = host.events.iter().any(|event| {
             matches!(event,
-            ConversationEvent::MessageUpdated(Message { role, raw: Some(raw), .. })
-                if role == "peer" && raw["origin"]["kind"] == "peer"
-                    && raw["uuid"].as_str() == Some(attempt.to_string().as_str()))
+            ConversationEvent::Diagnostic { raw, .. }
+            if raw["type"] == "command_lifecycle" && raw["state"] == "started"
+                && raw["command_uuid"].as_str() == Some(user.to_string().as_str()))
         });
-        let woke = host.events.iter().any(|event| {
-            matches!(event,
-            ConversationEvent::PeerTurnStarted { request_id } if *request_id == attempt)
-        });
-        if accepted && provenance && woke {
-            println!(
-                "Native protocol-1 peer admission, origin.peer echo, and idle wake confirmed; provider transport remained blocked."
+        if started && host.initialized {
+            ensure!(
+                host.peer_cancel_queued,
+                "Installed CLI did not advertise atomic queue-clearing Stop"
             );
             break;
         }
         ensure!(
-            host.child.child.try_wait()?.is_none(),
-            "Isolated Claude exited before native peer admission"
-        );
-        ensure!(
             Instant::now() < deadline,
-            "No native peer admission/provenance (managed inbound refusal or incompatible CLI may be active)"
+            "Native ordinary user turn never started"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    host.stop_peer("Isolated smoke finished");
-    host.child.close();
-    drop(blocked_provider);
+    let attempt = Uuid::new_v4();
+    let (cancel, mut delivery) = make_delivery(attempt);
+    delivery.messages[0].body =
+        format!("Native busy context marker {attempt}. Do not use tools or make network requests.");
+    host.command(ConversationCommand::DeliverPeer(delivery))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let queued = loop {
+        host.poll_peer()?;
+        for _ in 0..16 {
+            if !host.read_stdout()? {
+                break;
+            }
+        }
+        ensure!(
+            host.turn.id == Some(user) && host.peer_turn.is_none(),
+            "Native busy delivery interrupted or reattributed the ordinary turn"
+        );
+        ensure!(
+            !host.events.iter().any(|event| matches!(event,
+            ConversationEvent::TurnSettled { request_id, .. } if *request_id == user)),
+            "Ordinary turn settled before explicit Stop"
+        );
+        let mut queued = None;
+        if let Ok(projects) = fs::read_dir(config_dir.join("projects")) {
+            for project in projects.flatten() {
+                let path = project.path().join(format!("{session}.jsonl"));
+                if let Ok(file) = File::open(path) {
+                    for line in BufReader::new(file).lines().map_while(Result::ok) {
+                        if let Ok(record) = serde_json::from_str::<Value>(&line)
+                            && record["type"] == "queue-operation"
+                            && record["operation"] == "enqueue"
+                            && record["content"]
+                                .as_str()
+                                .is_some_and(|content| content.contains(&attempt.to_string()))
+                        {
+                            queued = Some(record);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(queued) = queued {
+            break queued;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Native CLI never recorded the busy peer enqueue"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    println!("Claude native busy enqueue while ordinary {user} remains active: {queued}");
+    assert!(!host.events.iter().any(|event| matches!(event,
+        ConversationEvent::PeerTurnStarted { request_id } if *request_id == attempt)));
+    // Native queue persistence is smoke evidence only, never a production receipt.
+    // The host must still avoid asserting delivery from its completed socket write.
+    assert!(!host.peer.known(&attempt));
+    host.command(ConversationCommand::Interrupt)?;
+    host.flush()?;
+    drop(cancel);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        host.flush()?;
+        host.poll_peer()?;
+        for _ in 0..16 {
+            if !host.read_stdout()? {
+                break;
+            }
+        }
+        ensure!(
+            !host.closing,
+            "Native atomic Stop unexpectedly required a fail-closed runtime termination"
+        );
+        ensure!(
+            !host.events.iter().any(|event| matches!(event,
+            ConversationEvent::PeerTurnStarted { request_id } if *request_id == attempt)),
+            "Queued peer started a new turn after Stop"
+        );
+        let cancelled = host.events.iter().find_map(|event| match event {
+            ConversationEvent::Diagnostic { label, raw }
+                if label == "Claude native queue-clearing Stop receipt" =>
+            {
+                Some(raw)
+            }
+            _ => None,
+        });
+        let settled = host.events.iter().any(|event| {
+            matches!(event,
+            ConversationEvent::TurnSettled { request_id, outcome:TurnOutcome::Interrupted }
+                if *request_id == user)
+        });
+        if let Some(receipt) = cancelled.filter(|receipt| {
+            receipt["response"]["response"]["cancelled"]
+                .as_array()
+                .is_some_and(|ids| {
+                    ids.iter()
+                        .any(|id| id.as_str() == Some(attempt.to_string().as_str()))
+                })
+                && receipt["response"]["response"]["still_queued"] == json!([])
+        }) && settled
+            && host.peer_stop.is_none()
+        {
+            println!("Claude native busy Stop receipt: {receipt}");
+            println!(
+                "Claude native ordinary {user} settled Interrupted; queued peer {attempt} cancelled without a peer run"
+            );
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Native busy Stop did not cancel the peer queue and settle the ordinary turn"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let quiet_until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < quiet_until {
+        host.poll_peer()?;
+        for _ in 0..16 {
+            if !host.read_stdout()? {
+                break;
+            }
+        }
+        ensure!(
+            host.turn.id.is_none() && host.peer_turn.is_none(),
+            "Native Stop leaked a new turn"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!host.turn.interrupting);
+    assert!(!host.events.iter().any(|event| matches!(event,
+        ConversationEvent::PeerTurnStarted { request_id } if *request_id == attempt)));
+    println!("Claude native busy Stop remained idle after cancellation; no unauthorized restart");
     Ok(())
 }
 
@@ -554,5 +841,374 @@ fn native_drop_after_hold_is_terminal_and_peer_tool_results_remain_tool_results(
     assert!(!is_context(&tool_result));
     let messages = normalize_history(&tool_result, 0, &fixture.root, &mut ImageCache::default())?;
     assert_eq!(messages[0].role, "toolResult");
+    Ok(())
+}
+
+fn status_frame(inbox: &mut Inbox, frame: &Value) -> Result<Vec<Value>> {
+    let path = inbox
+        .status
+        .as_ref()
+        .unwrap()
+        .address()
+        .strip_prefix("uds:")
+        .unwrap();
+    let mut stream = UnixStream::connect(path)?;
+    serde_json::to_writer(&mut stream, frame)?;
+    stream.write_all(b"\n")?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let frames = inbox.status_frames();
+        if !frames.is_empty() {
+            return Ok(frames);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Native status socket did not receive a frame"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn real_status_socket_correlates_hold_delivery_and_all_native_refusals() -> Result<()> {
+    let fixture = SocketFixture::new()?;
+    let mut actor = actor(&fixture)?;
+    let attempt = Uuid::new_v4();
+    let (_cancel, delivery) = make_delivery(attempt);
+    actor.peer.send(delivery)?;
+    fixture.transmit(&mut actor.peer, attempt)?;
+    let receipt = |id: Uuid, status: &str| {
+        json!({
+            "type":"control","action":"peer_message_status","orig_msg_id":id,
+            "status":status,"reason":"native diagnostic preserved"
+        })
+    };
+    for frame in status_frame(&mut actor.peer, &receipt(Uuid::new_v4(), "delivered"))? {
+        actor.frame(frame)?;
+    }
+    assert!(!actor.peer.known(&attempt));
+    for frame in status_frame(&mut actor.peer, &receipt(attempt, "held"))? {
+        actor.frame(frame)?;
+    }
+    assert!(actor.peer_blocked);
+    assert!(actor.events.iter().any(|event| matches!(event,
+        ConversationEvent::PeerDelivery { attempt: id, outcome: PeerDeliveryOutcome::Unknown(reason) }
+        if *id == attempt && reason.contains("native diagnostic preserved"))));
+    for frame in status_frame(&mut actor.peer, &receipt(attempt, "delivered"))? {
+        actor.frame(frame)?;
+    }
+    assert!(actor.peer.known(&attempt));
+    assert!(!actor.peer_blocked);
+    assert!(
+        actor.peer_turn.is_none(),
+        "Delivered receipt is not an idle turn start"
+    );
+    assert!(actor.events.iter().any(|event| matches!(event,
+        ConversationEvent::Diagnostic { raw, .. } if raw == &receipt(attempt, "held"))));
+    actor.frame(echo(attempt))?;
+    assert_eq!(actor.peer_turn, Some(attempt));
+    for status in ["refused", "denied", "expired", "dropped"] {
+        let attempt = Uuid::new_v4();
+        let (_cancel, delivery) = make_delivery(attempt);
+        actor.peer.send(delivery)?;
+        fixture.transmit(&mut actor.peer, attempt)?;
+        for frame in status_frame(&mut actor.peer, &receipt(attempt, status))? {
+            actor.frame(frame)?;
+        }
+        assert!(actor.events.iter().any(|event| matches!(event,
+            ConversationEvent::PeerDelivery { attempt: id, outcome: PeerDeliveryOutcome::Rejected(reason) }
+            if *id == attempt && reason.contains("native diagnostic preserved"))));
+        assert!(
+            actor.peer.observe(&echo(attempt)).0.is_empty(),
+            "Refusal is terminal"
+        );
+    }
+    let refused = Uuid::new_v4();
+    let (_cancel, delivery) = make_delivery(refused);
+    actor.peer.send(delivery)?;
+    fixture.transmit(&mut actor.peer, refused)?;
+    // Installed 2.1.306 reports refusal as expired + status_detail, sometimes without
+    // a separate reason. Exercise the real return socket rather than a source assertion.
+    for frame in status_frame(
+        &mut actor.peer,
+        &json!({
+            "type":"control","action":"peer_message_status","orig_msg_id":refused,
+            "status":"expired","status_detail":"refused"
+        }),
+    )? {
+        actor.frame(frame)?;
+    }
+    assert!(actor.events.iter().any(|event| matches!(event,
+        ConversationEvent::PeerDelivery { attempt: id, outcome: PeerDeliveryOutcome::Rejected(reason) }
+        if *id == refused && reason.contains("refused"))));
+    actor.child.close();
+    Ok(())
+}
+
+#[test]
+fn status_only_address_explicitly_denies_user_replies_and_cleans_up() -> Result<()> {
+    let fixture = SocketFixture::new()?;
+    let mut inbox = fixture.inbox();
+    let attempt = Uuid::new_v4();
+    let (_cancel, delivery) = make_delivery(attempt);
+    inbox
+        .send(delivery)
+        .context("Dispatch initial peer frame for reply-denial fixture")?;
+    fixture
+        .transmit(&mut inbox, attempt)
+        .context("Transmit initial peer frame for reply-denial fixture")?;
+    let path = PathBuf::from(
+        inbox
+            .status
+            .as_ref()
+            .unwrap()
+            .address()
+            .strip_prefix("uds:")
+            .unwrap(),
+    );
+    assert_eq!(fs::metadata(&path)?.mode() & 0o777, 0o600);
+    let reply = Uuid::new_v4();
+    let frame = json!({"msgV":1,"msg_id":reply,"type":"user",
+        "from":"uds:/untrusted/never-connect","message":{"role":"user","content":"actual native reply"}});
+    let frames = status_frame(&mut inbox, &frame)
+        .context("Send native user reply to status-only address")?;
+    assert_eq!(
+        frames[0], frame,
+        "Raw user reply remains visible diagnostics"
+    );
+    for _ in 0..10 {
+        inbox.status_frames();
+    }
+    let (mut stream, _) = fixture
+        .listener
+        .accept()
+        .context("Accept actual reply-denial transport")?;
+    // On macOS SO_RCVTIMEO can return EINVAL when the sender has already closed
+    // after writing its receipt. A nonblocking, deadline-bounded read handles both
+    // buffered delivery followed by EOF and a still-live sender.
+    stream
+        .set_nonblocking(true)
+        .context("Set actual reply-denial socket nonblocking")?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut bytes = Vec::new();
+    while !bytes.contains(&b'\n') {
+        inbox.status_frames();
+        let mut buffer = [0; 4096];
+        match stream.read(&mut buffer) {
+            Ok(0) => bail!("Native reply denial closed without a complete protocol frame"),
+            Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error).context("Read actual reply-denial protocol frame"),
+        }
+        ensure!(
+            bytes.len() <= 65_536,
+            "Actual reply-denial frame exceeded 64 KiB"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "Actual reply-denial protocol frame timed out"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let denial: Value =
+        serde_json::from_slice(&bytes).context("Decode actual reply-denial protocol frame")?;
+    assert_eq!(denial["action"], "peer_message_status");
+    assert_eq!(denial["orig_msg_id"], reply.to_string());
+    assert_eq!(denial["status"], "denied");
+    assert!(denial["reason"].as_str().unwrap().contains("network send"));
+    assert!(!inbox.known(&attempt));
+    // Cancellation must not strand a live runtime's status-only reply address.
+    inbox.stop("cancelled");
+    assert!(path.exists());
+    drop(inbox);
+    assert!(!path.exists());
+    assert_eq!(
+        status::address(Path::new("/tmp/a\"&<> %.sock")),
+        "uds:/tmp/a%22%26%3C%3E%20%25.sock"
+    );
+    Ok(())
+}
+
+#[test]
+fn status_listener_rejects_wrong_kernel_pid_and_nonprivate_directory() -> Result<()> {
+    let fixture = SocketFixture::new()?;
+    let mut status =
+        status::StatusInbox::bind(&fixture.socket, std::process::id() + 1, fixture.session)?;
+    let mut stream = UnixStream::connect(status.address().strip_prefix("uds:").unwrap())?;
+    stream.write_all(b"{\"type\":\"control\",\"action\":\"peer_message_status\"}\n")?;
+    let frames = status.tick();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["type"], "drostje_peer_status_diagnostic");
+    assert!(frames[0]["reason"].as_str().unwrap().contains("PID"));
+    fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o755))?;
+    assert!(
+        status::StatusInbox::bind(&fixture.socket, std::process::id(), fixture.session).is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn cancelled_unwritten_delivery_is_rejected_and_peer_settlement_resets_interrupt() -> Result<()> {
+    let fixture = SocketFixture::new()?;
+    let mut actor = actor(&fixture)?;
+    let attempt = Uuid::new_v4();
+    let (cancel, delivery) = make_delivery(attempt);
+    actor.peer.send(delivery)?;
+    drop(cancel);
+    assert!(matches!(
+        actor.peer.tick().as_slice(),
+        [Update {
+            outcome: PeerDeliveryOutcome::Rejected(_),
+            ..
+        }]
+    ));
+    assert!(actor.peer.observe(&echo(attempt)).0.is_empty());
+    // The cancelled connection has no bytes and must not be confused with the next frame.
+    drop(fixture.listener.accept()?);
+    for interrupted in [true, false] {
+        let attempt = Uuid::new_v4();
+        let (_cancel, delivery) = make_delivery(attempt);
+        actor.peer.send(delivery)?;
+        fixture.transmit(&mut actor.peer, attempt)?;
+        actor.frame(echo(attempt))?;
+        actor.turn.interrupting = interrupted;
+        actor.frame(json!({"type":"result","subtype":"success","origin":{"kind":"peer"},"user_message_uuid":attempt}))?;
+        assert!(!actor.turn.interrupting);
+        assert!(actor.events.iter().any(|event| matches!(event,
+            ConversationEvent::TurnSettled { request_id, outcome }
+            if *request_id == attempt && if interrupted { matches!(outcome, TurnOutcome::Interrupted) } else { matches!(outcome, TurnOutcome::Completed) })));
+    }
+    actor.child.close();
+    Ok(())
+}
+
+#[test]
+fn written_busy_peer_requires_native_queue_clearing_stop() -> Result<()> {
+    let fixture = SocketFixture::new()?;
+    let mut host = actor(&fixture)?;
+    host.frame(
+        json!({"type":"system","subtype":"init","session_id":fixture.session,
+        "capabilities":["interrupt_cancel_queued_v1","interrupt_receipt_v1"]}),
+    )?;
+    let user = Uuid::new_v4();
+    host.command(ConversationCommand::Submit {
+        request_id: user,
+        text: "ordinary active user turn".into(),
+        images: Vec::new(),
+    })?;
+    host.flush()?;
+    let attempt = Uuid::new_v4();
+    let (_cancel, delivery) = make_delivery(attempt);
+    host.peer.send(delivery)?;
+    fixture.transmit(&mut host.peer, attempt)?;
+    host.command(ConversationCommand::Interrupt)?;
+    let stop: Value = host
+        .writes
+        .iter()
+        .filter_map(|write| serde_json::from_slice::<Value>(&write.bytes).ok())
+        .find(|frame| frame["request"]["subtype"] == "interrupt")
+        .context("Stop was not queued")?;
+    host.frame(
+        json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":stop["request_id"],"response":{"still_queued":[],"cancelled":[attempt]}}}),
+    )?;
+    assert!(
+        !host.closing,
+        "Confirmed native queue clearing keeps the owned runtime live"
+    );
+    assert!(
+        host.peer.observe(&echo(attempt)).0.is_empty(),
+        "Cancelled native queue entry is terminal"
+    );
+    host.child.close();
+    Ok(())
+}
+
+#[test]
+fn uncertain_native_stop_fails_closed_without_treating_acceptance_as_consumption() -> Result<()> {
+    for mode in [
+        "unsupported",
+        "accepted-only",
+        "bad-receipt",
+        "timeout",
+        "close",
+    ] {
+        let fixture = SocketFixture::new()?;
+        let mut host = actor(&fixture)?;
+        if matches!(mode, "bad-receipt" | "timeout") {
+            host.frame(
+                json!({"type":"system","subtype":"init","session_id":fixture.session,
+                "capabilities":["interrupt_cancel_queued_v1","interrupt_receipt_v1"]}),
+            )?;
+        }
+        let user = Uuid::new_v4();
+        host.command(ConversationCommand::Submit {
+            request_id: user,
+            text: "ordinary active user turn".into(),
+            images: Vec::new(),
+        })?;
+        host.flush()?;
+        let attempt = Uuid::new_v4();
+        let (_cancel, delivery) = make_delivery(attempt);
+        host.peer.send(delivery)?;
+        fixture.transmit(&mut host.peer, attempt)?;
+        if mode == "accepted-only" {
+            host.frame(
+                json!({"type":"command_lifecycle","command_uuid":attempt,"state":"queued"}),
+            )?;
+            assert!(host.peer.known(&attempt));
+        }
+        host.command(if mode == "close" {
+            ConversationCommand::Close
+        } else {
+            ConversationCommand::Interrupt
+        })?;
+        if mode == "bad-receipt" {
+            let request_id = host
+                .peer_stop
+                .as_ref()
+                .context("Queue-clearing Stop was not tracked")?
+                .request_id
+                .clone();
+            host.frame(
+                json!({"type":"control_response","response":{"subtype":"success",
+                "request_id":request_id,"response":{"still_queued":[attempt],"cancelled":[]}}}),
+            )?;
+        } else if mode == "timeout" {
+            host.peer_stop
+                .as_mut()
+                .context("Queue-clearing Stop was not tracked")?
+                .deadline = Instant::now();
+            host.poll_peer()?;
+        }
+        assert!(
+            host.closing && host.child.reaped,
+            "{mode}: uncertain peer queue must be hard-stopped"
+        );
+        assert_eq!(host.state, ConversationState::Disconnected);
+        assert!(host.events.iter().any(|event| matches!(event,
+            ConversationEvent::TurnSettled { request_id, outcome:TurnOutcome::Interrupted } if *request_id == user)));
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_stop_without_offered_peer_context_keeps_existing_native_semantics() -> Result<()> {
+    let fixture = SocketFixture::new()?;
+    let mut host = actor(&fixture)?;
+    host.command(ConversationCommand::Submit {
+        request_id: Uuid::new_v4(),
+        text: "ordinary active user turn".into(),
+        images: Vec::new(),
+    })?;
+    host.flush()?;
+    host.command(ConversationCommand::Interrupt)?;
+    assert!(!host.closing && host.peer_stop.is_none());
+    assert!(host.child.child.try_wait()?.is_none());
+    host.child.close();
     Ok(())
 }

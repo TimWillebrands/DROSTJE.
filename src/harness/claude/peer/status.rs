@@ -5,7 +5,7 @@ use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
 const CONNECTIONS: usize = 16;
 const STATUS_FRAME: usize = 65_536;
-const REPLY_REASON: &str = "This address receives delivery status only; reply with the network tool and sender Thread UUID";
+const REPLY_REASON: &str = "This address receives delivery status only; use network send with the sender Thread UUID to reply";
 
 struct Incoming {
     stream: UnixStream,
@@ -16,6 +16,7 @@ struct Incoming {
 pub(super) struct StatusInbox {
     listener: UnixListener,
     path: PathBuf,
+    identity: (u64, u64),
     pub target: PathBuf,
     address: String,
     pid: u32,
@@ -45,10 +46,12 @@ impl StatusInbox {
             let _ = fs::remove_file(&path);
             return Err(error.into());
         }
+        let metadata = fs::symlink_metadata(&path)?;
         let address = address(&path);
         Ok(Self {
             listener,
             path,
+            identity: (metadata.dev(), metadata.ino()),
             target: target.into(),
             address,
             pid,
@@ -100,7 +103,11 @@ impl StatusInbox {
         let mut index = 0;
         while index < self.incoming.len() {
             let connection = &mut self.incoming[index];
-            let mut remove = Instant::now() >= connection.deadline;
+            let expired = Instant::now() >= connection.deadline;
+            let mut remove = expired;
+            if expired {
+                frames.push(diagnostic("Native status connection timed out".into()));
+            }
             let mut buffer = [0; 8192];
             if !remove {
                 match connection.stream.read(&mut buffer) {
@@ -151,21 +158,19 @@ impl StatusInbox {
                 index += 1;
             }
         }
+        let mut failures = Vec::new();
         for frame in &frames {
-            if frame["type"] == "user" {
-                if let Err(error) = self.deny_reply(frame) {
-                    // Preserve the original frame AND the explicit rejection-transport failure.
-                    // We never issue a successful delivery receipt for a native reply.
-                    return frames
-                        .iter()
-                        .cloned()
-                        .chain(std::iter::once(diagnostic(format!(
-                            "Could not return native reply denial: {error:#}"
-                        ))))
-                        .collect();
-                }
+            if frame["type"] == "user"
+                && let Err(error) = self.deny_reply(frame)
+            {
+                // Preserve the original frame AND the explicit rejection-transport failure.
+                // We never issue a successful delivery receipt for a native reply.
+                failures.push(diagnostic(format!(
+                    "Could not return native reply denial: {error:#}"
+                )));
             }
         }
+        frames.extend(failures);
         let mut index = 0;
         while index < self.outgoing.len() {
             let write = &mut self.outgoing[index];
@@ -175,8 +180,16 @@ impl StatusInbox {
                     Instant::now() < write.deadline,
                     "Native reply denial transport timed out"
                 );
-                if !connected(&write.stream)? {
+                if !connected(&write.stream).context("Poll native reply denial connection")? {
                     return Ok(());
+                }
+                if write.offset == 0 {
+                    ensure!(
+                        peer_pid(&write.stream)
+                            .context("Read connected native reply denial peer credentials")?
+                            == self.pid,
+                        "Native reply denial target PID changed"
+                    );
                 }
                 match write.stream.write(&write.bytes[write.offset..]) {
                     Ok(0) => bail!("Native reply denial socket closed"),
@@ -215,10 +228,6 @@ impl StatusInbox {
         );
         // Always send to the validated owned child socket, NEVER a sender-authored `from`.
         let stream = connect(&self.target)?;
-        ensure!(
-            peer_pid(&stream)? == self.pid,
-            "Native reply denial target PID changed"
-        );
         let mut bytes = serde_json::to_vec(&json!({
             "msgV":1,"msg_id":Uuid::new_v4(),"type":"control","action":"peer_message_status",
             "status":"denied","orig_msg_id":frame["msg_id"],"reason":REPLY_REASON,
@@ -237,7 +246,12 @@ impl StatusInbox {
 
 impl Drop for StatusInbox {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Do not unlink another socket if the path was replaced after binding.
+        if fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -258,7 +272,7 @@ pub(super) fn address(path: &Path) -> String {
     address
 }
 
-fn peer_pid(stream: &UnixStream) -> Result<u32> {
+pub(super) fn peer_pid(stream: &UnixStream) -> Result<u32> {
     #[cfg(target_os = "macos")]
     {
         let mut pid: libc::pid_t = 0;
@@ -320,5 +334,101 @@ fn peer_pid(stream: &UnixStream) -> Result<u32> {
     {
         let _ = stream;
         bail!("Native peer status credentials are unsupported on this platform")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_socket_timeouts_release_capacity_and_never_report_delivery() -> Result<()> {
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Directory(
+            PathBuf::from("/tmp").join(format!("drost-status-{}", Uuid::new_v4().simple())),
+        );
+        fs::create_dir(&root.0)?;
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700))?;
+        let target = root.0.join("target.sock");
+        let target_listener = UnixListener::bind(&target)?;
+        let mut inbox = StatusInbox::bind(&target, std::process::id(), Uuid::new_v4())?;
+        let mut clients = Vec::new();
+        for _ in 0..CONNECTIONS {
+            clients.push(UnixStream::connect(&inbox.path)?);
+        }
+        assert!(inbox.tick().is_empty());
+        assert_eq!(inbox.incoming.len(), CONNECTIONS);
+        let now = Instant::now();
+        assert!(
+            inbox
+                .incoming
+                .iter()
+                .all(|connection| connection.deadline <= now + CONNECT_DEADLINE)
+        );
+        for connection in &mut inbox.incoming {
+            connection.deadline = now;
+        }
+        let frames = inbox.tick();
+        assert_eq!(frames.len(), CONNECTIONS);
+        assert!(frames.iter().all(|frame| {
+            frame["type"] == "drostje_peer_status_diagnostic"
+                && frame["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("timed out"))
+        }));
+        assert!(inbox.incoming.is_empty());
+        for mut client in clients {
+            let mut byte = [0; 1];
+            assert_eq!(
+                client.read(&mut byte)?,
+                0,
+                "Expired real socket must be closed"
+            );
+        }
+        let stream = UnixStream::connect(&target)?;
+        let (mut receiver, _) = target_listener.accept()?;
+        inbox.outgoing.push(WriteFrame {
+            stream,
+            bytes: b"must-not-be-written\n".to_vec(),
+            offset: 0,
+            deadline: Instant::now(),
+        });
+        let frames = inbox.tick();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["type"], "drostje_peer_status_diagnostic");
+        assert!(frames[0]["reason"].as_str().unwrap().contains("timed out"));
+        assert!(inbox.outgoing.is_empty());
+        let mut byte = [0; 1];
+        assert_eq!(
+            receiver.read(&mut byte)?,
+            0,
+            "Expired denial transport must close without sending bytes"
+        );
+        // Queueing a nonblocking connection is not credential evidence. Validation
+        // belongs after connect completion and must reject before writing any receipt.
+        inbox.pid = std::process::id() + 1;
+        inbox.deny_reply(&json!({"type":"user","msg_id":Uuid::new_v4()}))?;
+        assert_eq!(inbox.outgoing.len(), 1);
+        let (mut receiver, _) = target_listener.accept()?;
+        let frames = inbox.tick();
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("target PID changed")
+        );
+        assert!(inbox.outgoing.is_empty());
+        assert_eq!(
+            receiver.read(&mut byte)?,
+            0,
+            "Unverified denial transport must not send bytes"
+        );
+        Ok(())
     }
 }

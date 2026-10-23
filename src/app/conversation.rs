@@ -1161,10 +1161,12 @@ impl AppState {
                 outcome,
             } => {
                 peer_settled = Some((request_id, outcome.clone()));
-                self.active_threads.remove(&id);
-                session.preparing = false;
-                session.outcome = Some(outcome.clone());
-                session.requests.clear();
+                if !self.network_has_other_turn(id, request_id) {
+                    self.active_threads.remove(&id);
+                    session.preparing = false;
+                    session.outcome = Some(outcome.clone());
+                    session.requests.clear();
+                }
                 session.submitted.remove(&request_id);
                 if !queue_continues(&outcome, session.interrupt_for_queue) {
                     session.auto_dispatch = false;

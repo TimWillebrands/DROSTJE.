@@ -104,10 +104,31 @@ impl OwnedChild {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        // SAFETY: the same owned child process group is still alive and must not outlive the app.
-        unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
-        let _ = self.child.wait();
+        if let Err(error) = self.terminate() {
+            eprintln!("Could not terminate the owned Claude process group: {error:#}");
+        }
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
+        // SAFETY: this is the same unreaped owned process group. An uncertain native
+        // queue must not run during the graceful EOF wait used by ordinary close().
+        let result = unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            ensure!(
+                error.raw_os_error() == Some(libc::ESRCH),
+                "Kill owned Claude process group: {error}"
+            );
+        }
+        self.stdin.take();
+        self.child
+            .wait()
+            .context("Reap terminated owned Claude process")?;
         self.reaped = true;
+        Ok(())
     }
 }
 
@@ -317,6 +338,12 @@ struct Permission {
     question: Option<String>,
 }
 
+struct PeerStop {
+    request_id: String,
+    attempts: Vec<Uuid>,
+    deadline: Instant,
+}
+
 struct Actor {
     config: ConversationConfig,
     session: Session,
@@ -341,6 +368,8 @@ struct Actor {
     peer_turn: Option<Uuid>,
     peer: peer::Inbox,
     peer_blocked: bool,
+    peer_cancel_queued: bool,
+    peer_stop: Option<PeerStop>,
     idle_sleep_assertion: Option<IdleSleepAssertion>,
     permissions: HashMap<String, Permission>,
     tools: HashMap<String, ToolActivity>,
@@ -398,6 +427,8 @@ impl Actor {
             peer_turn: None,
             peer,
             peer_blocked: false,
+            peer_cancel_queued: false,
+            peer_stop: None,
             idle_sleep_assertion: None,
             permissions: HashMap::new(),
             tools: HashMap::new(),
@@ -562,12 +593,7 @@ impl Actor {
                 if self.peer.probe() {
                     self.emit_peer_availability(None);
                 }
-                for update in self.peer.tick() {
-                    self.emit(ConversationEvent::PeerDelivery {
-                        attempt: update.attempt,
-                        outcome: update.outcome,
-                    });
-                }
+                self.poll_peer()?;
             }
             if self.closing {
                 self.child.stdin.take();
@@ -584,9 +610,12 @@ impl Actor {
                 "Claude Code did not initialize within 30 seconds of the first prompt"
             );
             for _ in 0..16 {
-                if self.events.len() >= 256 || !self.read_stdout()? {
+                if self.closing || self.events.len() >= 256 || !self.read_stdout()? {
                     break;
                 }
+            }
+            if self.closing {
+                continue;
             }
             if let Some(status) = self
                 .child
@@ -672,7 +701,15 @@ impl Actor {
             return Ok(());
         }
         match command {
-            ConversationCommand::Close => self.closing = true,
+            ConversationCommand::Close => {
+                if self.peer.written_unsettled().is_empty() {
+                    self.closing = true;
+                } else {
+                    self.hard_stop_peer(
+                        "Claude was closed with offered peer context still unsettled",
+                    )?;
+                }
+            }
             ConversationCommand::DeliverPeer(delivery) => {
                 let attempt = delivery.attempt;
                 let result = (|| -> Result<()> {
@@ -725,16 +762,35 @@ impl Actor {
                 }
             }
             ConversationCommand::Interrupt => {
+                let attempts = self.peer.written_unsettled();
                 self.stop_peer("Claude runtime was interrupted before native admission");
-                if (self.turn.id.is_some() || self.peer_turn.is_some()) && !self.turn.interrupting {
+                if self.peer_stop.is_some() {
+                    return Ok(());
+                }
+                if !attempts.is_empty() && !self.peer_cancel_queued {
+                    self.hard_stop_peer(
+                        "This Claude runtime does not advertise atomic queue-clearing Stop",
+                    )?;
+                } else if !attempts.is_empty()
+                    || ((self.turn.id.is_some() || self.peer_turn.is_some())
+                        && !self.turn.interrupting)
+                {
                     self.turn.interrupting = true;
                     self.state(ConversationState::Interrupting);
                     let request_id = Uuid::new_v4().to_string();
+                    let cancel_queued = !attempts.is_empty();
                     self.queue(
                         json!({"type":"control_request","request_id":request_id,
-                            "request":{"subtype":"interrupt"}}),
+                            "request":{"subtype":"interrupt","cancel_queued":cancel_queued}}),
                         None,
                     )?;
+                    if cancel_queued {
+                        self.peer_stop = Some(PeerStop {
+                            request_id,
+                            attempts,
+                            deadline: Instant::now() + Duration::from_secs(5),
+                        });
+                    }
                 }
             }
             ConversationCommand::Respond { request_id, answer } => {
@@ -771,6 +827,10 @@ impl Actor {
                 images,
             } => {
                 let attempt = (|| -> Result<()> {
+                    ensure!(
+                        self.peer_stop.is_none(),
+                        "Claude is still confirming native queue-clearing Stop"
+                    );
                     ensure!(
                         self.turn.id.is_none() && self.peer_turn.is_none(),
                         "A conversation already has an active turn"
@@ -861,11 +921,10 @@ impl Actor {
 
     fn frame(&mut self, frame: Value) -> Result<()> {
         let (updates, peer_messages) = self.peer.observe(&frame);
-        for update in updates {
-            self.emit(ConversationEvent::PeerDelivery {
-                attempt: update.attempt,
-                outcome: update.outcome,
-            });
+        if self.peer_blocked != self.peer.blocked() {
+            self.peer_blocked = self.peer.blocked();
+            self.emit_peer_availability(self.peer_blocked.then(||
+                "Claude native inbound policy held peer context. Review crossSessionInbound in the session; Space delivery never bypasses it.".into()));
         }
         let native_ids = peer::correlated_ids(&frame);
         let peer_ids = native_ids
@@ -873,16 +932,21 @@ impl Actor {
             .copied()
             .filter(|id| self.peer.known(id))
             .collect::<Vec<_>>();
+        let correlated_peer_echo = !peer_messages.is_empty();
         if self.turn.id.is_none()
             && self.peer_turn.is_none()
-            && ((frame["type"] == "user" && frame["origin"]["kind"] == "peer")
+            && (correlated_peer_echo
                 || (frame["type"] == "command_lifecycle" && frame["state"] == "started"))
+            && let Some(id) = peer_ids.first()
         {
-            if let Some(id) = peer_ids.first() {
-                self.begin_peer(*id);
-            }
+            self.begin_peer(*id);
         }
-        let correlated_peer_echo = !peer_messages.is_empty();
+        for update in updates {
+            self.emit(ConversationEvent::PeerDelivery {
+                attempt: update.attempt,
+                outcome: update.outcome,
+            });
+        }
         for (attempt, messages) in peer_messages {
             let history =
                 json!({"type":"drostje_peer","id":attempt,"messages":messages,"native":frame});
@@ -911,6 +975,13 @@ impl Actor {
                     "Claude Code initialized a different session"
                 );
                 self.initialized = true;
+                let capabilities = frame["capabilities"].as_array();
+                self.peer_cancel_queued = capabilities.is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item == "interrupt_cancel_queued_v1")
+                        && items.iter().any(|item| item == "interrupt_receipt_v1")
+                });
                 let terminal: Vec<String> = frame["terminal_slash_commands"]
                     .as_array()
                     .into_iter()
@@ -976,7 +1047,7 @@ impl Actor {
             }
             "user" => {
                 if peer::is_context(&frame) {
-                    if !correlated_peer_echo {
+                    if !correlated_peer_echo && !native_ids.iter().any(|id| self.peer.tracks(id)) {
                         self.append_history(&frame)?;
                         for message in normalize_history(
                             &frame,
@@ -1110,13 +1181,8 @@ impl Actor {
             }
             "system" if frame["subtype"] == "peer_message_hold" => {
                 if frame["lane"] == "socket" && native_ids.iter().any(|id| self.peer.tracks(id)) {
-                    self.peer_blocked = frame["state"] != "released";
-                    let reason = self.peer_blocked.then(|| format!(
-                        "Claude native inbound policy {} this message ({}). Review crossSessionInbound in the session; Space delivery never bypasses it.",
-                        frame["state"].as_str().unwrap_or("blocked"),
-                        frame["cause"].as_str().or_else(|| frame["outcome"].as_str()).unwrap_or("approval required")
-                    ));
-                    self.emit_peer_availability(reason);
+                    self.emit_peer_availability(self.peer_blocked.then(||
+                        "Claude native inbound policy did not release peer context. Review crossSessionInbound in the session; Space delivery never bypasses it.".into()));
                 }
                 self.emit(ConversationEvent::Diagnostic {
                     label: "Claude native peer inbound policy".into(),
@@ -1141,6 +1207,47 @@ impl Actor {
     fn control_response(&mut self, frame: &Value) -> Result<()> {
         let response = &frame["response"];
         let request_id = response["request_id"].as_str().unwrap_or("");
+        if self
+            .peer_stop
+            .as_ref()
+            .is_some_and(|stop| stop.request_id == request_id)
+        {
+            let Some(stop) = self.peer_stop.take() else {
+                return Ok(());
+            };
+            self.emit(ConversationEvent::Diagnostic {
+                label: "Claude native queue-clearing Stop receipt".into(),
+                raw: frame.clone(),
+            });
+            let cancelled = response["response"]["cancelled"]
+                .as_array()
+                .and_then(|ids| {
+                    ids.iter()
+                        .map(|id| id.as_str().and_then(|id| Uuid::parse_str(id).ok()))
+                        .collect::<Option<Vec<_>>>()
+                });
+            let cleared = response["subtype"] == "success"
+                && response["response"]["still_queued"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty);
+            if let Some(cancelled) = cancelled.filter(|ids| {
+                cleared
+                    && stop
+                        .attempts
+                        .iter()
+                        .all(|id| ids.contains(id) || self.peer.stop_accounted(id))
+            }) {
+                for update in self.peer.confirm_cancelled(&cancelled) {
+                    self.emit(ConversationEvent::PeerDelivery {
+                        attempt: update.attempt,
+                        outcome: update.outcome,
+                    });
+                }
+            } else {
+                self.hard_stop_peer("Claude did not confirm cancellation or active consumption of every offered peer message")?;
+            }
+            return Ok(());
+        }
         if let Some(index) = self.usage_requests.iter().position(|id| *id == request_id) {
             let request_id = self.usage_requests.remove(index);
             let parsed = (response["subtype"] == "success")
@@ -1249,6 +1356,7 @@ impl Actor {
             if self.turn.id.is_none() {
                 self.permissions.clear();
                 self.idle_sleep_assertion = None;
+                self.turn.interrupting = false;
             }
         }
     }
@@ -1263,6 +1371,55 @@ impl Actor {
             available: self.peer.ready && !self.peer_blocked,
             reason: reason.or_else(|| (!self.peer.ready).then(|| "Claude has not published a live protocol-1 inbox for this child PID and session UUID".into())),
         });
+    }
+
+    fn poll_peer(&mut self) -> Result<()> {
+        if self
+            .peer_stop
+            .as_ref()
+            .is_some_and(|stop| Instant::now() >= stop.deadline)
+        {
+            self.hard_stop_peer("Claude did not acknowledge queue-clearing Stop within 5 seconds")?;
+            return Ok(());
+        }
+        // Poll only bounded, credential-verified native receipts. Actual user replies are
+        // denied by the status transport and remain diagnostics, never model/user input.
+        for frame in self.peer.status_frames() {
+            if frame["type"] == "control" && frame["action"] == "peer_message_status" {
+                self.frame(frame)?;
+            } else {
+                self.emit(ConversationEvent::Diagnostic {
+                    label: "Claude native peer status socket".into(),
+                    raw: frame,
+                });
+            }
+        }
+        for update in self.peer.tick() {
+            self.emit(ConversationEvent::PeerDelivery {
+                attempt: update.attempt,
+                outcome: update.outcome,
+            });
+        }
+        Ok(())
+    }
+
+    fn hard_stop_peer(&mut self, reason: &str) -> Result<()> {
+        self.stop_peer(reason);
+        self.peer_stop = None;
+        self.child
+            .terminate()
+            .context("Fail-closed Stop of the owned Claude runtime")?;
+        self.writes.clear();
+        self.write_offset = 0;
+        self.closing = true;
+        self.settle(TurnOutcome::Interrupted);
+        self.state(ConversationState::Disconnected);
+        self.emit_peer_availability(Some(reason.into()));
+        self.emit(ConversationEvent::Notice {
+            level:"warning".into(),
+            text:format!("{reason}. Stopped this owned runtime to prevent queued peer turns from starting after Stop. Reconnect explicitly before resuming; uncertain deliveries are not retried."),
+        });
+        Ok(())
     }
 
     fn stop_peer(&mut self, reason: &str) {

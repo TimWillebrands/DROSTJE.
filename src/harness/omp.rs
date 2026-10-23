@@ -917,11 +917,12 @@ impl Actor {
             ConversationCommand::Close => self.close()?,
             ConversationCommand::DeliverPeer(delivery) => self.deliver_peer(delivery),
             ConversationCommand::Interrupt => {
+                let active = self.active();
                 self.cancel_peers(
                     true,
                     "Peer delivery interrupted after possible dispatch; never replay",
                 )?;
-                if self.active() {
+                if active {
                     self.turn.interrupting = true;
                     self.peers.interrupted = true;
                     self.state(ConversationState::Interrupting);
@@ -997,7 +998,7 @@ impl Actor {
                 let attempt = (|| -> Result<()> {
                     ensure!(self.initialized, "OMP has not initialized");
                     ensure!(
-                        text.trim_start().split_whitespace().next() != Some("/__drostje_peer"),
+                        text.split_whitespace().next() != Some("/__drostje_peer"),
                         "The peer transport command is private"
                     );
                     ensure!(
@@ -1129,12 +1130,13 @@ impl Actor {
         if self.closing {
             return Ok(());
         }
+        let active = self.active();
         self.cancel_peers(
             true,
             "Conversation closing after possible peer dispatch; never replay",
         )?;
         self.cancel_dialogs(false)?;
-        if self.active() {
+        if active {
             self.turn.interrupting = true;
             self.peers.interrupted = true;
             self.state(ConversationState::Interrupting);
@@ -1215,13 +1217,27 @@ impl Actor {
                     });
                     self.maybe_ready()?;
                 }
-                RequestKind::Commands => self.emit(ConversationEvent::CommandsUnavailable(
-                    format!("{} did not list its commands in time", self.dialect.name()),
-                )),
-                RequestKind::Peer(None) => self.emit(ConversationEvent::PeerDeliveryAvailable {
-                    available: false,
-                    reason: Some("Native peer delivery handshake timed out".into()),
-                }),
+                RequestKind::Commands => {
+                    self.emit(ConversationEvent::CommandsUnavailable(format!(
+                        "{} did not list its commands in time",
+                        self.dialect.name()
+                    )));
+                    if !self.peers.handshake {
+                        self.emit(ConversationEvent::PeerDeliveryAvailable {
+                            available: false,
+                            reason: Some("Native peer command discovery timed out".into()),
+                        });
+                    }
+                }
+                RequestKind::Peer(None) => {
+                    if !self.peers.ready {
+                        self.peers.handshake_deadline = None;
+                        self.emit(ConversationEvent::PeerDeliveryAvailable {
+                            available: false,
+                            reason: Some("Native peer delivery handshake timed out".into()),
+                        });
+                    }
+                }
                 _ => {
                     self.emit(ConversationEvent::Failed {
                         request_id: None,
@@ -1325,6 +1341,10 @@ impl Actor {
                 }
             }
             "agent_settled" if self.dialect == Dialect::Pi => {
+                if value["aborted"] == true {
+                    self.peers.interrupted = true;
+                    self.turn.interrupting = true;
+                }
                 let peer_turn = self.peer_settled();
                 let outcome = if self.turn.interrupting {
                     TurnOutcome::Interrupted
@@ -1532,6 +1552,8 @@ impl Actor {
                             self.peers.idle = None;
                         }
                     } else {
+                        self.peers.handshake_deadline = None;
+                        self.peers.ready = false;
                         self.emit(ConversationEvent::PeerDeliveryAvailable {
                             available: false,
                             reason: Some(format!(
@@ -1565,9 +1587,20 @@ impl Actor {
                 RequestKind::Negotiate => {
                     bail!("OMP refused protocol v2: {}", string(&value, "error"))
                 }
-                RequestKind::Commands => self.emit(ConversationEvent::CommandsUnavailable(string(
-                    &value, "error",
-                ))),
+                RequestKind::Commands => {
+                    self.emit(ConversationEvent::CommandsUnavailable(string(
+                        &value, "error",
+                    )));
+                    if !self.peers.handshake {
+                        self.emit(ConversationEvent::PeerDeliveryAvailable {
+                            available: false,
+                            reason: Some(format!(
+                                "Native peer command discovery failed: {}",
+                                string(&value, "error")
+                            )),
+                        });
+                    }
+                }
                 RequestKind::State if !self.initialized => {
                     bail!("OMP initialization failed: {}", string(&value, "error"))
                 }
@@ -1634,6 +1667,8 @@ impl Actor {
                     self.state(ConversationState::Running);
                 }
                 if !busy && self.turn.interrupting {
+                    self.peers.interrupted = true;
+                    self.peer_settled();
                     self.finish(TurnOutcome::Interrupted)?;
                 } else if !busy && self.history_wait && self.turn.id.is_none() {
                     self.state(ConversationState::Ready);
@@ -2856,7 +2891,7 @@ done
         );
     }
 
-    fn test_actor(dialect: Dialect) -> Result<(Actor, std::path::PathBuf)> {
+    pub(super) fn test_actor(dialect: Dialect) -> Result<(Actor, std::path::PathBuf)> {
         let root = std::env::temp_dir().join(format!("drostje-omp-commands-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)?;
         let mut config = ConversationConfig {
@@ -2885,7 +2920,7 @@ done
         Ok((actor, root))
     }
 
-    fn written(actor: &Actor) -> Vec<Value> {
+    pub(super) fn written(actor: &Actor) -> Vec<Value> {
         actor
             .writes
             .iter()
@@ -2983,8 +3018,12 @@ done
             .collect();
         assert_eq!(requests.len(), 1, "one list request at a time");
         actor.frame(json!({"id":requests[0]["id"],"type":"response","command":"get_commands","success":false,"error":"Unknown command: get_commands"}))?;
-        assert!(matches!(actor.events.back(),
-            Some(ConversationEvent::CommandsUnavailable(reason)) if reason == "Unknown command: get_commands"));
+        assert!(
+            actor
+                .events
+                .iter()
+                .any(|event| matches!(event, ConversationEvent::CommandsUnavailable(_)))
+        );
         assert!(
             !actor
                 .events
@@ -3003,7 +3042,7 @@ done
         fs::remove_dir_all(root)?;
         Ok(())
     }
-    fn peer_fixture() -> (PeerDelivery, async_channel::Sender<()>) {
+    pub(super) fn peer_fixture() -> (PeerDelivery, async_channel::Sender<()>) {
         let (sender, cancelled) = async_channel::bounded(1);
         (
             PeerDelivery {
@@ -3026,7 +3065,7 @@ done
             "details":{"v":1,"origin":"peer","attempt":attempt,"messages":messages}})
     }
 
-    fn peer_status(dialect: Dialect, event: &str, attempt: Option<Uuid>) -> Value {
+    pub(super) fn peer_status(dialect: Dialect, event: &str, attempt: Option<Uuid>) -> Value {
         json!({"type":"extension_ui_request","method":"setStatus","statusKey":"drostje.peer.v1",
             "statusText":json!({"v":1,"dialect":if dialect == Dialect::Omp {"omp"} else {"pi"},
                 "event":event,"attempt":attempt}).to_string()})

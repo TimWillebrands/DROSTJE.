@@ -446,9 +446,9 @@ impl Render for NetworkPanel {
             .when_some(delivery_reason, |header, reason| {
                 header.child(Label::new(reason).text_xs().text_color(cx.theme().muted_foreground))
             })
-            .child(Label::new("Join or Resume consents to automatic delivery at safe boundaries while busy and paid-turn wakeups while idle. Drafts and conversation history stay private. Stopped or closed agents never restart from a message; paused legacy members need Resume consent.")
+            .child(Label::new("Join / Resume allows automatic delivery and paid idle turns. Drafts stay private.")
                 .text_xs().text_color(cx.theme().muted_foreground))
-            .child(Label::new("Delivered means the native runtime accepted the message, not that the model read or acted on it. Failed and Unknown deliveries are not retried automatically.")
+            .child(Label::new("Delivered is not read. Failed / Unknown are not retried.")
                 .text_xs().text_color(cx.theme().muted_foreground))
             .when_some(state.network.error.clone(), |header, error| header.child(Alert::error("network-error", error).small()));
         let selected_view = match self.view {
@@ -688,6 +688,7 @@ fn detail_view(
                 cx.stop_propagation();
             }
         })
+        .flex_1()
         .max_h(rems(16.))
         .min_h_0()
         .overflow_y_scroll()

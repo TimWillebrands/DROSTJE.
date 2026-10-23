@@ -815,6 +815,12 @@ impl AppState {
             );
             return;
         }
+        // Persistence can finish after a permission, input or admission state change.
+        // Nothing has reached the native transport yet, so this lease can safely wait.
+        if !self.network_can_receive(thread) {
+            self.finish_network_delivery(batch.attempt, DeliveryOutcome::Deferred);
+            return;
+        }
         let Some(commands) = self
             .conversations
             .get(&thread)
@@ -919,7 +925,18 @@ impl AppState {
             runtime.lease = None;
         }
         let outcome = match outcome {
-            harness::PeerDeliveryOutcome::Accepted => DeliveryOutcome::Delivered,
+            harness::PeerDeliveryOutcome::Accepted => {
+                // A busy native runtime may consume context without admitting a new turn.
+                // Idle receipts alone do not establish admission: retain their reservation.
+                if self
+                    .conversations
+                    .get(&thread)
+                    .is_some_and(|session| session.state == ConversationState::Running)
+                {
+                    self.clear_network_preparing(thread, attempt);
+                }
+                DeliveryOutcome::Delivered
+            }
             harness::PeerDeliveryOutcome::Rejected(reason) => {
                 self.clear_network_preparing(thread, attempt);
                 if current {
@@ -958,6 +975,12 @@ impl AppState {
             session.outcome = None;
         }
         self.active_threads.insert(thread);
+    }
+    pub(super) fn network_has_other_turn(&self, thread: ThreadId, settled: Uuid) -> bool {
+        self.network.runtimes.get(&thread).is_some_and(|runtime| {
+            runtime.peer_turn.is_some_and(|turn| turn != settled)
+                || runtime.preparing.is_some_and(|turn| turn != settled)
+        })
     }
     pub(super) fn network_peer_turn_settled(
         &mut self,
@@ -1054,5 +1077,221 @@ mod tests {
         runtime.pause();
         assert!(cancelled.is_closed());
         assert!(!runtime.enabled);
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn claimed_messages_wait_when_native_readiness_changes(cx: &mut gpui_kit::TestAppContext) {
+        use super::*;
+
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            Directory(std::env::temp_dir().join(format!("drost-network-{}", Uuid::new_v4())));
+        let store = Store::open(directory.0.join("data")).unwrap();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Readiness".into(),
+            root: directory.0.join("repo"),
+            archived: false,
+            defaults: ProjectDefaults::default(),
+        };
+        let project_id = project.id;
+        smol::block_on(store.save_project(project)).unwrap();
+        let snapshot = smol::block_on(store.snapshot()).unwrap();
+        let state = cx.new(|cx| {
+            AppState::new(
+                Bootstrap {
+                    data_dir: directory.0.clone(),
+                    store,
+                    snapshot,
+                    diagnostics: BTreeMap::new(),
+                    repositories: BTreeMap::new(),
+                    browser_tools: None,
+                },
+                cx,
+            )
+        });
+        state.update(cx, |state, cx| {
+            state.select_project(project_id);
+            state.new_thread(ThreadKind::Conversation).unwrap();
+            let thread = state.selected_thread.unwrap();
+            let mut session = ConversationSession::new(None);
+            let generation = session.generation;
+            let (commands, native) = async_channel::bounded(8);
+            session.commands = Some(commands);
+            session.state = ConversationState::Ready;
+            session.persisted = true;
+            session.peer_delivery = true;
+            state.conversations.insert(thread, session);
+            state.runtime_network(thread, generation).enabled = true;
+            let peer = state
+                .network_peers()
+                .into_iter()
+                .find(|peer| peer.thread == thread)
+                .unwrap();
+            let mut member = crate::network::Member::from(&peer);
+            member.automatic = true;
+            state.network.snapshot.members.push(member);
+            let (requests, work) = async_channel::bounded(8);
+            state.network.requests = Some(requests);
+            let (mailbox, snapshots) = Network::start(state.store.clone(), None).unwrap();
+            smol::block_on(async {
+                mailbox.sync(state.network_peers()).await.unwrap();
+                mailbox.set_joined(thread, true).await.unwrap();
+                mailbox
+                    .call(
+                        generation,
+                        Action::Send {
+                            recipient: thread,
+                            body: "Keep this peer message queued while the user decides".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            });
+
+            for blocker in ["permission", "input", "preparing", "unsaved", "submission"] {
+                assert!(state.network_can_receive(thread));
+                state.runtime_network(thread, generation).claiming = true;
+                let batch = smol::block_on(mailbox.claim(generation)).unwrap().unwrap();
+                let attempt = batch.attempt;
+                let session = state.conversations.get_mut(&thread).unwrap();
+                match blocker {
+                    "permission" => {
+                        session.requests.insert(
+                            "permission".into(),
+                            UserRequest {
+                                id: "permission".into(),
+                                kind: harness::UserRequestKind::Permission,
+                                title: "Approve tool".into(),
+                                options: Vec::new(),
+                                text: "The user must decide".into(),
+                                placeholder: None,
+                                deadline: None,
+                            },
+                        );
+                    }
+                    "input" => session.state = ConversationState::WaitingForInput,
+                    "preparing" => session.preparing = true,
+                    "unsaved" => session.persisted = false,
+                    "submission" => {
+                        state
+                            .snapshot
+                            .threads
+                            .iter_mut()
+                            .find(|candidate| candidate.id == thread)
+                            .unwrap()
+                            .submission = Some(serde_json::json!({"state":"pending"}));
+                    }
+                    _ => unreachable!(),
+                }
+                state.dispatch_network_claim(thread, generation, Ok(Some(batch)));
+                assert!(
+                    native.is_empty(),
+                    "{blocker}: no native write before readiness"
+                );
+                let Request::Finish {
+                    attempt: actual,
+                    outcome,
+                } = work.try_recv().unwrap()
+                else {
+                    panic!("{blocker}: the unwritten claim must return to the mailbox");
+                };
+                assert_eq!(actual, attempt);
+                assert_eq!(outcome, DeliveryOutcome::Deferred, "{blocker}");
+                let runtime = &state.network.runtimes[&thread];
+                assert!(!runtime.claiming);
+                assert!(runtime.lease.is_none());
+                assert!(runtime.preparing.is_none());
+                assert!(!state.active_threads.contains(&thread));
+                smol::block_on(mailbox.finish(actual, outcome)).unwrap();
+                let queued = snapshots.try_recv().unwrap();
+                assert_eq!(
+                    queued.messages[0].deliveries[0].state,
+                    DeliveryState::Queued,
+                    "{blocker}"
+                );
+                assert_eq!(queued.messages[0].deliveries[0].attempt, None, "{blocker}");
+                let session = state.conversations.get_mut(&thread).unwrap();
+                session.requests.clear();
+                session.state = ConversationState::Ready;
+                session.preparing = false;
+                session.persisted = true;
+                state
+                    .snapshot
+                    .threads
+                    .iter_mut()
+                    .find(|candidate| candidate.id == thread)
+                    .unwrap()
+                    .submission = None;
+            }
+            let batch = smol::block_on(mailbox.claim(generation)).unwrap().unwrap();
+            let attempt = batch.attempt;
+            state.dispatch_network_claim(thread, generation, Ok(Some(batch)));
+            assert!(state.conversations[&thread].preparing);
+            assert!(state.active_threads.contains(&thread));
+            state.conversations.get_mut(&thread).unwrap().state = ConversationState::Running;
+            state.network_delivery_event(thread, attempt, harness::PeerDeliveryOutcome::Accepted);
+            assert!(
+                !state.conversations[&thread].preparing,
+                "Busy native delivery needs no new turn admission"
+            );
+            assert!(state.network.runtimes[&thread].preparing.is_none());
+            assert!(
+                state.active_threads.contains(&thread),
+                "The existing native turn stays active"
+            );
+            state.network_peer_turn_started(thread, attempt);
+            state.receive_conversation(
+                thread,
+                ConversationEvent::UserRequest(UserRequest {
+                    id: "peer-permission".into(),
+                    kind: harness::UserRequestKind::Permission,
+                    title: "Peer turn permission".into(),
+                    options: Vec::new(),
+                    text: "Only the user may decide".into(),
+                    placeholder: None,
+                    deadline: None,
+                }),
+                cx,
+            );
+            state.receive_conversation(
+                thread,
+                ConversationEvent::TurnSettled {
+                    request_id: Uuid::new_v4(),
+                    outcome: TurnOutcome::Completed,
+                },
+                cx,
+            );
+            assert!(
+                state.active_threads.contains(&thread),
+                "An earlier turn cannot settle the native peer turn"
+            );
+            assert!(
+                state.conversations[&thread]
+                    .requests
+                    .contains_key("peer-permission")
+            );
+            assert!(state.conversations[&thread].outcome.is_none());
+            state.receive_conversation(
+                thread,
+                ConversationEvent::TurnSettled {
+                    request_id: attempt,
+                    outcome: TurnOutcome::Completed,
+                },
+                cx,
+            );
+            assert!(!state.active_threads.contains(&thread));
+            assert!(state.conversations[&thread].requests.is_empty());
+            assert_eq!(
+                state.conversations[&thread].outcome,
+                Some(TurnOutcome::Completed)
+            );
+        });
     }
 }

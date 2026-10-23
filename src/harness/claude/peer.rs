@@ -13,6 +13,8 @@ use std::{
     },
 };
 
+mod status;
+
 const REGISTRY_LIMIT: u64 = 65_536;
 const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 const RECORD_LIMIT: usize = 128;
@@ -36,6 +38,9 @@ struct Record {
     reported: bool,
     accepted: bool,
     shown: bool,
+    held: bool,
+    started: bool,
+    settled: bool,
     terminal: bool,
 }
 
@@ -47,6 +52,7 @@ pub(super) struct Inbox {
     probe_at: Instant,
     records: HashMap<Uuid, Record>,
     order: VecDeque<Uuid>,
+    status: Option<status::StatusInbox>,
 }
 
 impl Inbox {
@@ -62,6 +68,7 @@ impl Inbox {
             probe_at: Instant::now(),
             records: HashMap::new(),
             order: VecDeque::new(),
+            status: None,
         }
     }
 
@@ -75,6 +82,34 @@ impl Inbox {
         )
     }
 
+    fn status_address(&mut self, target: &Path) -> Result<&str> {
+        if let Some(status) = &self.status {
+            ensure!(
+                status.target == target,
+                "Claude native peer socket changed during this runtime"
+            );
+        } else {
+            self.status = Some(status::StatusInbox::bind(target, self.pid, self.session)?);
+        }
+        Ok(self
+            .status
+            .as_ref()
+            .context("Claude status listener was not initialized")?
+            .address())
+    }
+
+    pub fn status_frames(&mut self) -> Vec<Value> {
+        self.status
+            .as_mut()
+            .map_or_else(Vec::new, status::StatusInbox::tick)
+    }
+
+    pub fn blocked(&self) -> bool {
+        self.records
+            .values()
+            .any(|record| record.held && !record.accepted && !record.terminal)
+    }
+
     pub fn probe(&mut self) -> bool {
         if Instant::now() < self.probe_at {
             return false;
@@ -82,9 +117,16 @@ impl Inbox {
         self.probe_at = Instant::now() + Duration::from_millis(500);
         let ready = self
             .discover()
-            .and_then(|path| connect(&path))
+            .and_then(|path| {
+                self.status_address(&path)?;
+                connect(&path)
+            })
             .and_then(|stream| {
                 ensure!(connected(&stream)?, "Claude peer inbox is still connecting");
+                ensure!(
+                    status::peer_pid(&stream)? == self.pid,
+                    "Claude native peer socket PID mismatch"
+                );
                 Ok(())
             })
             .is_ok();
@@ -110,27 +152,32 @@ impl Inbox {
             let Some(index) = self.order.iter().position(|id| {
                 self.records
                     .get(id)
-                    .is_some_and(|r| r.terminal || (r.accepted && r.shown))
+                    .is_some_and(|r| r.terminal || (r.accepted && r.shown && r.settled))
             }) else {
                 bail!("Claude peer admission tracking is full");
             };
-            let id = self.order.remove(index).unwrap();
+            let id = self
+                .order
+                .remove(index)
+                .context("Claude peer admission tracking order changed")?;
             self.records.remove(&id);
         }
         let body = super::super::peer_context(&delivery.messages)?;
-        // No `from`: this is intentionally a one-way native peer envelope. Do not invent a
-        // reply address or assert a Claude permission class / own-child authentication.
+        let path = self.discover()?;
+        // Bind the real, owned return address before connecting or writing any delivery.
+        // No sender-authored permission mode or own-child identity is asserted.
+        let from = self.status_address(&path)?.to_owned();
         let content = format!(
-            "<cross-session-message from-name=\"Space network\">\n{body}\n</cross-session-message>"
+            "<cross-session-message from=\"{from}\" from-name=\"Space network\">\n{body}\n</cross-session-message>"
         );
         let mut bytes = serde_json::to_vec(&json!({
             "msgV":1, "msg_id":delivery.attempt, "type":"user",
             "message":{"role":"user","content":content}, "priority":"next",
             "session_id":self.session, "uuid":delivery.attempt,
+            "from":from,
         }))?;
         bytes.push(b'\n');
         ensure!(bytes.len() <= FRAME, "Claude peer frame exceeds 1 MiB");
-        let path = self.discover()?;
         let stream = connect(&path)?;
         // Admission can be revoked while discovery/connect runs; no bytes have been written.
         ensure!(
@@ -152,6 +199,9 @@ impl Inbox {
                 reported: false,
                 accepted: false,
                 shown: false,
+                held: false,
+                started: false,
+                settled: false,
                 terminal: false,
             },
         );
@@ -170,7 +220,11 @@ impl Inbox {
             let mut failure = None;
             if cancelled {
                 failure = Some("Peer delivery authorization was revoked".to_owned());
-            } else if let Some(write) = &mut record.write {
+            } else if let Some(write) = record
+                .write
+                .as_mut()
+                .filter(|write| write.offset < write.bytes.len())
+            {
                 if Instant::now() >= write.deadline {
                     failure = Some(
                         "Claude peer socket did not accept the complete frame within 5 seconds"
@@ -180,7 +234,10 @@ impl Inbox {
                     match connected(&write.stream) {
                         Ok(false) => {}
                         Err(error) => failure = Some(format!("Claude peer socket: {error:#}")),
-                        Ok(true) => match write.stream.write(&write.bytes[write.offset..]) {
+                        Ok(true) => match status::peer_pid(&write.stream).and_then(|pid| {
+                            ensure!(pid == self.pid, "Claude native peer socket PID mismatch");
+                            Ok(write.stream.write(&write.bytes[write.offset..])?)
+                        }) {
                             Ok(0) => failure = Some("Claude peer socket closed".into()),
                             Ok(count) => {
                                 write.offset += count;
@@ -189,12 +246,16 @@ impl Inbox {
                                 }
                             }
                             Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::WouldBlock
-                                        | std::io::ErrorKind::Interrupted
+                                if error.downcast_ref::<std::io::Error>().is_some_and(
+                                    |error| {
+                                        matches!(
+                                            error.kind(),
+                                            std::io::ErrorKind::WouldBlock
+                                                | std::io::ErrorKind::Interrupted
+                                        )
+                                    },
                                 ) => {}
-                            Err(error) => failure = Some(format!("Claude peer socket: {error}")),
+                            Err(error) => failure = Some(format!("Claude peer socket: {error:#}")),
                         },
                     }
                 }
@@ -215,24 +276,19 @@ impl Inbox {
                         },
                     });
                 }
-            } else if record.written {
-                // Closing after a complete NDJSON frame is transport completion, NOT admission.
-                record.write = None;
             }
         }
         updates
     }
 
-    /// Only native stdout can confirm admission. Socket write completion never calls this.
+    /// Native stdout or a credential-verified status receipt can confirm admission.
     pub fn observe(&mut self, frame: &Value) -> (Vec<Update>, Vec<(Uuid, Vec<PeerMessage>)>) {
         let mut updates = Vec::new();
         let mut messages = Vec::new();
         let kind = frame["type"].as_str().unwrap_or("");
         let is_peer = frame["origin"]["kind"] == "peer";
         if is_peer
-            && frame["origin"]["verifiedPeerPid"]
-                .as_u64()
-                .is_some_and(|pid| pid != u64::from(std::process::id()))
+            && frame["origin"]["verifiedPeerPid"].as_u64() != Some(u64::from(std::process::id()))
         {
             return (updates, messages);
         }
@@ -240,6 +296,7 @@ impl Inbox {
             && frame["subtype"] == "peer_message_hold"
             && frame["lane"] == "socket";
         let lifecycle = kind == "command_lifecycle";
+        let receipt = kind == "control" && frame["action"] == "peer_message_status";
         let ids = correlated_ids(frame);
         for id in ids {
             let Some(record) = self.records.get_mut(&id) else {
@@ -249,36 +306,61 @@ impl Inbox {
             if !record.written || record.terminal {
                 continue;
             }
-            let status = if hold {
-                frame["state"].as_str()
-            } else if lifecycle {
+            let status = if receipt {
+                frame["status"].as_str()
+            } else if hold || lifecycle {
                 frame["state"].as_str()
             } else {
                 None
             };
-            let accepted = matches!(status, Some("queued" | "started" | "released"))
-                || (is_peer && matches!(kind, "user" | "assistant" | "result"))
+            let accepted = matches!(
+                status,
+                Some("queued" | "started" | "released" | "delivered")
+            ) || (is_peer && matches!(kind, "user" | "assistant" | "result"))
                 || (matches!(kind, "assistant" | "result")
                     && frame["user_message_uuids"].is_array());
+            if status == Some("started") || is_context(frame) {
+                record.started = true;
+            }
+            if kind == "result" || (lifecycle && matches!(status, Some("completed" | "cancelled")))
+            {
+                record.settled = true;
+            }
+            if status.is_some() || accepted {
+                // Keep the sender alive until native code has parsed the frame and captured
+                // kernel credentials. Closing immediately after write loses macOS peer PID.
+                record.write = None;
+            }
             if accepted && !record.accepted {
                 record.accepted = true;
+                record.held = false;
                 record.reported = true;
                 updates.push(Update {
                     attempt: id,
                     outcome: PeerDeliveryOutcome::Accepted,
                 });
             } else if !record.accepted {
+                if status == Some("held") {
+                    record.held = true;
+                }
                 let outcome = match status {
                     Some("held") if !record.reported => {
                         Some(PeerDeliveryOutcome::Unknown(format!(
                             "Claude native inbound policy held this peer message ({})",
-                            frame["cause"].as_str().unwrap_or("approval required")
+                            frame["reason"]
+                                .as_str()
+                                .or_else(|| frame["cause"].as_str())
+                                .unwrap_or("approval required")
                         )))
                     }
-                    Some("dropped" | "refused" | "discarded") => {
+                    Some(status @ ("dropped" | "refused" | "discarded" | "denied" | "expired")) => {
                         Some(PeerDeliveryOutcome::Rejected(format!(
-                            "Claude native inbound policy did not admit this peer message ({})",
-                            frame["outcome"].as_str().unwrap_or(status.unwrap())
+                            "Claude native inbound policy did not admit this peer message ({}). Review crossSessionInbound in the native session; if its inbox is unavailable, reconnect the runtime before resuming Space delivery. Space never changes native policy.",
+                            frame["reason"]
+                                .as_str()
+                                .or_else(|| frame["outcome"].as_str())
+                                .or_else(|| frame["status_detail"].as_str())
+                                .unwrap_or(status)
                         )))
                     }
                     Some("cancelled") if !record.reported => Some(PeerDeliveryOutcome::Unknown(
@@ -301,6 +383,42 @@ impl Inbox {
             }
         }
         (updates, messages)
+    }
+
+    pub fn written_unsettled(&self) -> Vec<Uuid> {
+        self.records
+            .iter()
+            .filter_map(|(&id, record)| {
+                (!record.terminal
+                    && !record.settled
+                    && (record.written
+                        || record.write.as_ref().is_some_and(|write| write.offset != 0)))
+                .then_some(id)
+            })
+            .collect()
+    }
+
+    pub fn stop_accounted(&self, id: &Uuid) -> bool {
+        self.records
+            .get(id)
+            .is_some_and(|record| record.started || record.settled || record.terminal)
+    }
+
+    pub fn confirm_cancelled(&mut self, ids: &[Uuid]) -> Vec<Update> {
+        let mut updates = Vec::new();
+        for id in ids {
+            if let Some(record) = self.records.get_mut(id) {
+                record.write = None;
+                record.settled = true;
+                record.terminal = true;
+                if !record.accepted {
+                    record.reported = true;
+                    updates.push(Update { attempt:*id, outcome:PeerDeliveryOutcome::Rejected(
+                        "Claude native Stop cancelled this queued peer message before consumption".into()) });
+                }
+            }
+        }
+        updates
     }
 
     pub fn known(&self, id: &Uuid) -> bool {
@@ -326,6 +444,7 @@ impl Inbox {
                     },
                 });
                 record.reported = true;
+                record.terminal = !uncertain;
             }
             record.write = None;
         }
@@ -344,25 +463,39 @@ pub(super) fn is_context(frame: &Value) -> bool {
 
 pub(super) fn correlated_ids(frame: &Value) -> Vec<Uuid> {
     let mut ids = Vec::new();
+    if frame["type"] == "control" && frame["action"] == "peer_message_status" {
+        if let Some(id) = frame["orig_msg_id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        {
+            ids.push(id);
+        }
+        return ids;
+    }
+    if frame["origin"]["kind"] == "peer"
+        && let Some(id) = frame["origin"]["msg_id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+    {
+        ids.push(id);
+    }
     for field in ["command_uuid", "message_uuid", "user_message_uuid"] {
         if let Some(id) = frame[field]
             .as_str()
             .and_then(|id| Uuid::parse_str(id).ok())
+            && !ids.contains(&id)
         {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
+            ids.push(id);
         }
     }
-    if frame["type"] == "user" && frame["origin"]["kind"] == "peer" {
-        if let Some(id) = frame["uuid"]
+    if frame["type"] == "user"
+        && frame["origin"]["kind"] == "peer"
+        && let Some(id) = frame["uuid"]
             .as_str()
             .and_then(|id| Uuid::parse_str(id).ok())
-        {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
+        && !ids.contains(&id)
+    {
+        ids.push(id);
     }
     for id in frame["user_message_uuids"]
         .as_array()
@@ -381,7 +514,7 @@ pub(super) fn correlated_ids(frame: &Value) -> Vec<Uuid> {
 fn registry_socket(path: &Path, pid: u32, session: Uuid) -> Result<PathBuf> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
-        metadata.is_file() && metadata.len() <= REGISTRY_LIMIT,
+        metadata.is_file() && metadata.len() <= REGISTRY_LIMIT && metadata.mode() & 0o022 == 0,
         "Invalid Claude peer registry file"
     );
     let mut bytes = Vec::new();
@@ -419,7 +552,9 @@ fn registry_socket(path: &Path, pid: u32, session: Uuid) -> Result<PathBuf> {
     );
     let socket_metadata = fs::symlink_metadata(&socket)?;
     ensure!(
-        socket_metadata.file_type().is_socket() && socket_metadata.uid() == metadata.uid(),
+        socket_metadata.file_type().is_socket()
+            && socket_metadata.uid() == metadata.uid()
+            && socket_metadata.mode() & 0o077 == 0,
         "Claude peer path is not an owned Unix socket"
     );
     // SAFETY: geteuid takes no arguments and has no memory-safety preconditions.
