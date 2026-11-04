@@ -385,7 +385,6 @@ fn terminal_body(
     let workspace = workspace.read(cx);
     if let Some(entry) = workspace.thread_terminals.get(&id) {
         if let Some(pane) = &entry.pane {
-            let bounds = entry.bounds.clone();
             return div()
                 .id("thread-terminal")
                 .debug_selector(|| "thread-terminal".into())
@@ -394,15 +393,6 @@ fn terminal_body(
                 .min_h_0()
                 .min_w_0()
                 .child(pane.clone())
-                .child(
-                    canvas(
-                        move |measured, _, _| bounds.set(Some(measured)),
-                        |_, _, _, _| {},
-                    )
-                    .absolute()
-                    .inset_0()
-                    .size_full(),
-                )
                 .into_any_element();
         }
         if let Some(error) = &entry.error {

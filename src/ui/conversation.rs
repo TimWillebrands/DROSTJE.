@@ -263,7 +263,7 @@ const ROW_ESTIMATE: f32 = 3.;
 /// transcript and a drag lands proportionally instead of skipping rows that count as zero.
 /// The list forgets every row height when its width changes; this runs after the list's
 /// prepaint and before the scrollbar's, so the thumb is right in the same frame.
-fn estimate_unmeasured_rows(
+pub(super) fn estimate_unmeasured_rows(
     list: &ListState,
     estimated_width: &Rc<Cell<Option<Pixels>>>,
     row: Pixels,
@@ -2209,12 +2209,15 @@ impl ToolRun {
 }
 
 /// Where a message's trailing tool calls start, and how many there are. Reasoning and blank
-/// text between them belong to the run; a `todo` call keeps its own card.
+/// text between them belong to the run; a `todo` call keeps its own card, and an artifact
+/// is content, never folded away inside a run of calls.
 fn trailing_calls(content: &[ContentBlock]) -> Option<(usize, usize)> {
     let start = content
         .iter()
         .rposition(|block| match block {
-            ContentBlock::ToolCall { name, .. } => name == "todo",
+            ContentBlock::ToolCall { name, .. } => {
+                name == "todo" || name.ends_with("show_artifact")
+            }
             ContentBlock::Thinking(_) => false,
             ContentBlock::Text(text) => !text.trim().is_empty(),
             ContentBlock::PeerMessage(_) | ContentBlock::Image(_) | ContentBlock::ImageError(_) => {
@@ -5782,7 +5785,7 @@ mod tests {
     }
 
     #[test]
-    fn trailing_calls_skip_reasoning_but_not_prose_or_todo() {
+    fn trailing_calls_skip_reasoning_but_not_prose_todo_or_artifacts() {
         let text = |text: &str| ContentBlock::Text(text.into());
         assert_eq!(trailing_calls(&[call("bash"), call("read")]), Some((0, 2)));
         assert_eq!(
@@ -5798,6 +5801,21 @@ mod tests {
             Some((1, 1))
         );
         assert_eq!(trailing_calls(&[call("read"), call("todo")]), None);
+        for artifact in [
+            "show_artifact",
+            "mcp__drostje__show_artifact",
+            "drostje_show_artifact",
+        ] {
+            assert_eq!(
+                trailing_calls(&[call("read"), call(artifact)]),
+                None,
+                "{artifact} keeps its own card"
+            );
+            assert_eq!(
+                trailing_calls(&[call(artifact), call("read")]),
+                Some((1, 1))
+            );
+        }
         assert_eq!(trailing_calls(&[call("read"), text("Done.")]), None);
         assert_eq!(trailing_calls(&[]), None);
     }

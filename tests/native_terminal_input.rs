@@ -12,6 +12,8 @@ use std::{
 struct Surface {
     terminal: Entity<Terminal>,
     chrome: FocusHandle,
+    neighbours: [FocusHandle; 4],
+    navigation: Vec<&'static str>,
     left: bool,
     palette: bool,
 }
@@ -28,11 +30,47 @@ impl Render for Surface {
                 }),
             )
             .on_action(
+                cx.listener(|this, _: &drostje::ui::commands::FocusLeft, window, cx| {
+                    this.navigation.push("left");
+                    this.neighbours[0].focus(window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &drostje::ui::commands::FocusDown, window, cx| {
+                    this.navigation.push("down");
+                    this.neighbours[1].focus(window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &drostje::ui::commands::FocusUp, window, cx| {
+                    this.navigation.push("up");
+                    this.neighbours[2].focus(window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &drostje::ui::commands::FocusRight, window, cx| {
+                    this.navigation.push("right");
+                    this.neighbours[3].focus(window, cx);
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &drostje::ui::commands::OpenPalette, _, _| {
                     this.palette = true;
                 }),
             )
-            .child(self.terminal.clone())
+            .flex()
+            .flex_col()
+            .child(div().h_8().track_focus(&self.neighbours[2]))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().w_8().track_focus(&self.neighbours[0]))
+                    .child(div().flex_1().min_w_0().child(self.terminal.clone()))
+                    .child(div().w_8().track_focus(&self.neighbours[3])),
+            )
+            .child(div().h_8().track_focus(&self.neighbours[1]))
     }
 }
 
@@ -87,6 +125,67 @@ async fn wait_for(
         smol::Timer::after(Duration::from_millis(20)).await;
     }
     anyhow::bail!("{expression}: expected {expected:?}, observed {last:?}")
+}
+
+async fn navigate_from_native(
+    window: WindowHandle<Root>,
+    surface: &Entity<Surface>,
+    nvim: &PathBuf,
+    socket: &PathBuf,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    let state = "json_encode([mode(), getline(1, '$'), getcmdline(), getcmdpos(), getpos('.')])";
+    let before = remote(nvim, socket, state).await?;
+    for (key, direction, neighbour) in [
+        ("secondary-alt-h", "left", 0),
+        ("secondary-alt-j", "down", 1),
+        ("secondary-alt-k", "up", 2),
+        ("secondary-alt-l", "right", 3),
+        ("secondary-alt-left", "left", 0),
+        ("secondary-alt-down", "down", 1),
+        ("secondary-alt-up", "up", 2),
+        ("secondary-alt-right", "right", 3),
+    ] {
+        cx.update_window(window.into(), |_, window, cx| {
+            let fixture = surface.read(cx);
+            let terminal = fixture.terminal.clone();
+            let native_focus = terminal.read(cx).focus_handle(cx);
+            let destination = fixture.neighbours[neighbour].clone();
+            let dispatched = fixture.navigation.len();
+            assert!(!fixture.left, "{key} required the explicit escape hatch");
+            terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+            assert!(
+                native_focus.is_focused(window),
+                "{key}: terminal not focused"
+            );
+            window.dispatch_keystroke(Keystroke::parse(key).unwrap(), cx);
+            assert!(
+                !window.has_pending_keystrokes(),
+                "{key} started an app chord"
+            );
+            assert!(
+                destination.is_focused(window),
+                "{key} did not focus {direction}"
+            );
+            assert!(
+                !native_focus.is_focused(window),
+                "{key} left native focus behind"
+            );
+            let surface = surface.read(cx);
+            assert_eq!(&surface.navigation[dispatched..], &[direction], "{key}");
+        })?;
+        // Allow native PTY input to settle before observing the real Neovim state.
+        smol::Timer::after(Duration::from_millis(50)).await;
+        anyhow::ensure!(
+            remote(nvim, socket, state).await? == before,
+            "{key} changed Neovim's mode, buffer, cursor or command line"
+        );
+    }
+    cx.update_window(window.into(), |_, window, cx| {
+        let terminal = surface.read(cx).terminal.clone();
+        terminal.update(cx, |terminal, cx| terminal.focus(window, cx));
+    })?;
+    Ok(())
 }
 
 async fn scenario(
@@ -156,8 +255,21 @@ async fn scenario(
             !window.has_pending_keystrokes(),
             "workspace intercepted native Ctrl-W"
         );
+        assert!(
+            terminal.read(cx).focus_handle(cx).is_focused(window),
+            "Ctrl-W moved focus out of native Neovim"
+        );
+        assert!(
+            surface.read(cx).navigation.is_empty(),
+            "Ctrl-W dispatched pane navigation"
+        );
+        assert!(
+            !surface.read(cx).left,
+            "Ctrl-W invoked the explicit escape hatch"
+        );
     })?;
     wait_for(&nvim, &socket, "getcmdline()", "echo ").await?;
+    navigate_from_native(window, &surface, &nvim, &socket, cx).await?;
     cx.update_window(window.into(), |_, window, cx| {
         window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
     })?;
@@ -212,9 +324,30 @@ async fn scenario(
         })
     })?;
     wait_for(&nvim, &socket, "getline(1)", ":Gé界").await?;
+    navigate_from_native(window, &surface, &nvim, &socket, cx).await?;
     cx.update_window(window.into(), |_, window, cx| {
         window.dispatch_keystroke(Keystroke::parse("secondary-shift-p").unwrap(), cx);
+        assert!(!window.has_pending_keystrokes());
+        assert!(
+            surface
+                .read(cx)
+                .terminal
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window),
+            "app shortcut unexpectedly left the terminal"
+        );
         window.dispatch_keystroke(Keystroke::parse("secondary-escape").unwrap(), cx);
+        assert!(!window.has_pending_keystrokes());
+        assert!(surface.read(cx).chrome.is_focused(window));
+        assert!(
+            !surface
+                .read(cx)
+                .terminal
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        );
     })?;
     surface.read_with(cx, |surface, _| {
         anyhow::ensure!(surface.palette, "explicit app shortcut did not dispatch");
@@ -222,7 +355,7 @@ async fn scenario(
         Ok(())
     })?;
     println!(
-        "real Ghostty/Neovim: normal-mode colon, command-mode Ctrl-W, shifted/Option text, IME commit, app shortcuts and escape passed"
+        "real Ghostty/Neovim: normal-mode colon, command-mode Ctrl-W, all eight direct pane shortcuts in command/insert mode, shifted/Option text, IME commit, app shortcuts and escape passed"
     );
     Ok(())
 }
@@ -269,6 +402,8 @@ fn main() {
                             terminal: Terminal::spawn(options, window, cx)
                                 .expect("spawn real terminal"),
                             chrome: cx.focus_handle(),
+                            neighbours: std::array::from_fn(|_| cx.focus_handle()),
+                            navigation: Vec::new(),
                             left: false,
                             palette: false,
                         });

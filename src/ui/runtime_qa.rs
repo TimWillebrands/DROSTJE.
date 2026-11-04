@@ -1600,6 +1600,139 @@ async fn conversation_diff_sidebar_tracks_working_tree(cx: &mut TestAppContext) 
 }
 
 #[gpui_kit::test]
+#[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; opens a Neovim tab from the Changes list, no provider turn"]
+async fn changes_list_is_keyboard_driven_and_opens_neovim(cx: &mut TestAppContext) {
+    let fixture = open_fixture(cx, None).await;
+    let conversation = new_conversation(cx, &fixture).await;
+    let root = cx.read(|cx| fixture.state.read(cx).project().unwrap().root.clone());
+    fs::write(root.join("notes.txt"), "after\n").unwrap();
+    fs::write(root.join("sidebar-new.txt"), "visible\n").unwrap();
+    cx.dispatch_action(fixture.window.into(), commands::RefreshConversationDiff);
+    until(cx, "working tree diff", Duration::from_secs(5), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .conversation_diff(conversation)
+            .and_then(|diff| diff.result.as_ref())
+            .is_some_and(|result| result.as_ref().is_ok_and(|diff| diff.changed_files == 2))
+    })
+    .await;
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(visual.debug_bounds("conversation-diff-patch").is_some());
+    assert!(visual.debug_bounds("toggle-changes-layout").is_some());
+    assert!(visual.debug_bounds("open-change-in-neovim").is_some());
+
+    // Keyboard only: from the Conversation into its Changes list, move, switch layout and
+    // open the cursor's line in Neovim.
+    update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| workspace.focus_region(Region::Thread, window, cx),
+    );
+    cx.run_until_parked();
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-alt-l");
+    cx.run_until_parked();
+    let cursor = |cx: &mut TestAppContext| {
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .changes_cursor(conversation, window, cx)
+        })
+        .unwrap()
+    };
+    assert_eq!(
+        cursor(cx),
+        (None, true),
+        "Cmd-Alt-l reaches the Changes list"
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "shift-g");
+    cx.run_until_parked();
+    let (last, _) = cursor(cx);
+    cx.simulate_keystrokes(fixture.window.into(), "g g j j j");
+    cx.run_until_parked();
+    assert_eq!(cursor(cx), (Some(3), true));
+    assert!(last.is_some_and(|last| last > 3));
+    cx.simulate_keystrokes(fixture.window.into(), "s");
+    until(cx, "side-by-side layout", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).changes_layout() == crate::app::ChangesLayout::SideBySide
+    })
+    .await;
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    assert!(
+        VisualTestContext::from_window(fixture.window.into(), cx)
+            .debug_bounds("conversation-diff-patch")
+            .is_some()
+    );
+    assert!(cursor(cx).1, "switching layout keeps focus in the list");
+    // `notes.txt` sorts first: its file row, hunk, then `-before` beside `+after`.
+    cx.simulate_keystrokes(fixture.window.into(), "g g j j");
+    cx.run_until_parked();
+    assert_eq!(cursor(cx).0, Some(2));
+    cx.simulate_keystrokes(fixture.window.into(), "enter");
+    until(
+        cx,
+        "Neovim tab on the change",
+        Duration::from_secs(10),
+        |cx| fixture.workspace.read(cx).neovim_tabs(cx).len() == 1,
+    )
+    .await;
+    let (_, target) = cx.read(|cx| fixture.workspace.read(cx).neovim_tabs(cx))[0].clone();
+    assert_eq!(
+        target.file.as_deref(),
+        Some(fs::canonicalize(root.join("notes.txt")).unwrap().as_path())
+    );
+    assert_eq!(target.line, Some(1));
+    // Back in the Conversation's tab, `s` in its Changes list restores the inline layout.
+    cx.simulate_keystrokes(fixture.window.into(), "ctrl-shift-tab");
+    // Pane navigation reads laid-out bounds; the thread tab must draw again first.
+    for _ in 0..3 {
+        cx.run_until_parked();
+        cx.update_window(fixture.window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.refresh();
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+    }
+    cx.simulate_keystrokes(fixture.window.into(), "cmd-alt-l");
+    cx.run_until_parked();
+    assert_eq!(
+        cursor(cx),
+        (Some(2), true),
+        "the list keeps its cursor and takes focus again"
+    );
+    cx.simulate_keystrokes(fixture.window.into(), "s");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read(|cx| fixture.state.read(cx).changes_layout()),
+        crate::app::ChangesLayout::Inline
+    );
+
+    fs::write(root.join("notes.txt"), "before\n").unwrap();
+    fs::remove_file(root.join("sidebar-new.txt")).unwrap();
+    quit(cx, &fixture).await;
+}
+
+#[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; commits in the fixture repository and rewinds it, no provider turn"]
 async fn commit_panel_commits_the_working_tree(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
@@ -2229,7 +2362,10 @@ async fn interaction_performance_workload(cx: &mut TestAppContext) {
     cx.dispatch_action(fixture.window.into(), commands::FocusProjects);
     let mut pane_samples = Vec::new();
     for _ in 0..40 {
-        for (keys, expected) in [("ctrl-w l", Region::Thread), ("ctrl-w h", Region::Projects)] {
+        for (keys, expected) in [
+            ("secondary-alt-l", Region::Thread),
+            ("secondary-alt-h", Region::Projects),
+        ] {
             let start = Instant::now();
             cx.simulate_keystrokes(fixture.window.into(), keys);
             let actual = update_workspace(
@@ -2985,7 +3121,7 @@ async fn conversation_harness_commands_are_visible_and_actionable(cx: &mut TestA
     );
     // The harness picker lists OMP, Pi, Claude Code; `g g` then `j` selects Pi.
     let unstarted = cx.read(|cx| fixture.state.read(cx).thread().unwrap().id);
-    cx.simulate_keystrokes(fixture.window.into(), "secondary-alt-h");
+    cx.dispatch_action(fixture.window.into(), commands::SwitchHarness);
     until(cx, "harness picker", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).palette.is_some()
     })
@@ -3107,7 +3243,7 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
             .unwrap();
             retained = Some(editor.snapshot(DraftKey::Thread(second)).await.unwrap());
 
-            press(cx, "secondary-escape ctrl-w h");
+            press(cx, "secondary-alt-left");
             cx.run_until_parked();
             cx.update_window(fixture.window.into(), |_, window, cx| {
                 window.render_frame(cx);
@@ -3194,10 +3330,46 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; split-pane navigation into Projects"]
 async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
+    let press = |cx: &mut TestAppContext, key: &str| {
+        cx.update_window(fixture.window.into(), |_, window, cx| window.press(key, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
     let mut threads = Vec::new();
     for _ in 0..3 {
-        threads.push(new_conversation(cx, &fixture).await);
+        // Generic New conversation reuses an untouched thread through its picker.
+        // A split-layout fixture needs three distinct Conversation identities.
+        cx.dispatch_action(fixture.window.into(), commands::NewOmpConversation);
+        let id = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+        until(
+            cx,
+            "split Conversation buffer",
+            Duration::from_secs(15),
+            |cx| {
+                fixture
+                    .workspace
+                    .read(cx)
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| {
+                        editor.read(cx).active_key() == Some(&DraftKey::Thread(id))
+                    })
+            },
+        )
+        .await;
+        threads.push(id);
     }
+    // This fixture measures outer dock adjacency. Sidebar surfaces have their
+    // own traversal scenarios and must not become extra neighbours here.
+    fixture.state.update(cx, |state, cx| {
+        for &id in &threads {
+            if state.thread_sidebar_open(id) {
+                let tab = state.thread_sidebar_tab(id);
+                state.toggle_thread_sidebar(id, tab);
+            }
+        }
+        cx.notify();
+    });
 
     let mut layout = update_workspace(
         cx,
@@ -3248,10 +3420,25 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         cx.read(|cx| fixture.state.read(cx).selected_thread),
         threads.last().copied()
     );
+    assert_eq!(
+        update_workspace(
+            cx,
+            fixture.window,
+            &fixture.workspace,
+            |workspace, window, cx| { workspace.focused_thread(window, cx) }
+        ),
+        threads.last().copied(),
+        "the layout fixture must focus the rightmost thread before navigation"
+    );
     // At the right edge, neither moving right nor moving vertically may pick
     // Projects just because its full-height pane has a different centre.
-    for keys in ["ctrl-w l", "ctrl-w ctrl-l", "ctrl-w k", "ctrl-w j"] {
-        cx.simulate_keystrokes(fixture.window.into(), keys);
+    for keys in [
+        "secondary-alt-l",
+        "secondary-alt-right",
+        "secondary-alt-k",
+        "secondary-alt-j",
+    ] {
+        press(cx, keys);
         assert_eq!(
             update_workspace(
                 cx,
@@ -3264,7 +3451,7 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         );
     }
     for expected in [Region::Thread, Region::Thread, Region::Projects] {
-        cx.simulate_keystrokes(fixture.window.into(), "ctrl-w h");
+        press(cx, "secondary-alt-h");
         assert_eq!(
             update_workspace(
                 cx,
@@ -3278,7 +3465,7 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
 
     assert_eq!(
         cx.read(|cx| fixture.workspace.read(cx).cursor),
-        threads.last().copied().map(Row::Thread),
+        Some(Row::Thread(threads[0])),
         "entering Projects anchors the visible keyboard cursor on the selected thread"
     );
     let rows = cx.read(|cx| crate::ui::sidebar::rows(fixture.state.read(cx), ""));
@@ -3288,19 +3475,27 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         ("pageup", rows.first()),
         ("pagedown", rows.last()),
     ] {
-        cx.simulate_keystrokes(fixture.window.into(), keys);
+        press(cx, keys);
         assert_eq!(
             cx.read(|cx| fixture.workspace.read(cx).cursor),
             expected.copied(),
             "{keys} must move the Projects cursor like its Vim motion"
         );
     }
-    cx.simulate_keystrokes(fixture.window.into(), "k");
+    press(cx, "k");
     assert_eq!(
         cx.read(|cx| fixture.workspace.read(cx).cursor),
-        Some(Row::Thread(threads[1]))
+        rows.get(rows.len() - 2).copied()
     );
-    cx.simulate_keystrokes(fixture.window.into(), "enter");
+    let middle_row = rows
+        .iter()
+        .position(|row| *row == Row::Thread(threads[1]))
+        .unwrap();
+    press(cx, "home");
+    for _ in 0..middle_row {
+        press(cx, "j");
+    }
+    press(cx, "enter");
     assert_eq!(
         cx.read(|cx| fixture.state.read(cx).selected_thread),
         Some(threads[1])
@@ -3315,14 +3510,14 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         Region::Thread
     );
     for (keys, expected) in [
-        ("ctrl-w l", Some(threads[2])),
-        ("ctrl-w l", Some(threads[2])),
-        ("ctrl-w h", Some(threads[1])),
-        ("ctrl-w h", Some(threads[0])),
-        ("ctrl-w h", None),
-        ("ctrl-w l", Some(threads[0])),
+        ("secondary-alt-l", Some(threads[2])),
+        ("secondary-alt-l", Some(threads[2])),
+        ("secondary-alt-h", Some(threads[1])),
+        ("secondary-alt-h", Some(threads[0])),
+        ("secondary-alt-h", None),
+        ("secondary-alt-l", Some(threads[0])),
     ] {
-        cx.simulate_keystrokes(fixture.window.into(), keys);
+        press(cx, keys);
         assert_eq!(
             update_workspace(
                 cx,
@@ -3367,15 +3562,15 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         .unwrap();
     }
     for (keys, expected) in [
-        ("ctrl-w k", Some(threads[0])),
-        ("ctrl-w l", Some(threads[0])),
-        ("ctrl-w j", Some(threads[1])),
-        ("ctrl-w j", Some(threads[2])),
-        ("ctrl-w j", Some(threads[2])),
-        ("ctrl-w l", Some(threads[2])),
-        ("ctrl-w h", None),
+        ("secondary-alt-k", Some(threads[0])),
+        ("secondary-alt-l", Some(threads[0])),
+        ("secondary-alt-j", Some(threads[1])),
+        ("secondary-alt-j", Some(threads[2])),
+        ("secondary-alt-j", Some(threads[2])),
+        ("secondary-alt-l", Some(threads[2])),
+        ("secondary-alt-h", None),
     ] {
-        cx.simulate_keystrokes(fixture.window.into(), keys);
+        press(cx, keys);
         assert_eq!(
             update_workspace(
                 cx,
@@ -3848,10 +4043,10 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         .unwrap();
     }
     for (keys, expected) in [
-        ("ctrl-w l", Region::Thread),
-        ("ctrl-w h", Region::Projects),
-        ("ctrl-w h", Region::Projects),
-        ("ctrl-w l", Region::Thread),
+        ("secondary-alt-l", Region::Thread),
+        ("secondary-alt-h", Region::Projects),
+        ("secondary-alt-h", Region::Projects),
+        ("secondary-alt-l", Region::Thread),
     ] {
         cx.simulate_keystrokes(fixture.window.into(), keys);
         assert_eq!(

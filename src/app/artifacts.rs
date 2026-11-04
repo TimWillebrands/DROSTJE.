@@ -31,6 +31,8 @@ pub struct ArtifactReceipt {
     pub event: String,
     pub status: ReceiptStatus,
     pub reason: Option<String>,
+    /// The page's final answer reached the agent: its purpose is fulfilled.
+    pub completes: bool,
 }
 
 /// Owns every Conversation's outbox, and the receipt queue the presentation owner drains
@@ -66,7 +68,8 @@ struct Outbox {
 
 struct Attempt {
     id: Uuid,
-    events: Vec<(Uuid, String)>,
+    /// `(browser, event, final)` for every event the attempt carries.
+    events: Vec<(Uuid, String, bool)>,
     /// Dropping this closes admission; already admitted context cannot be recalled.
     _admission: async_channel::Sender<()>,
     /// Dispatched to an idle runtime: the session is reserved until its turn starts.
@@ -95,6 +98,7 @@ fn receipt(
         event,
         status,
         reason,
+        completes: false,
     }
 }
 
@@ -282,7 +286,10 @@ impl AppState {
         let mut receipts: Vec<ArtifactReceipt> = current
             .events
             .into_iter()
-            .map(|(browser, event)| receipt(browser, event, status, reason.clone()))
+            .map(|(browser, event, last)| ArtifactReceipt {
+                completes: last && status == ReceiptStatus::Delivered,
+                ..receipt(browser, event, status, reason.clone())
+            })
             .collect();
         self.pump_artifacts(thread, &mut receipts);
         self.send_receipts(receipts);
@@ -436,7 +443,7 @@ impl AppState {
             id: attempt,
             events: events
                 .into_iter()
-                .map(|queued| (queued.browser, queued.event.id))
+                .map(|queued| (queued.browser, queued.event.id, queued.event.completes))
                 .collect(),
             _admission: admission,
             idle,
@@ -486,7 +493,7 @@ impl AppState {
             return;
         };
         if let Some(attempt) = outbox.attempt {
-            receipts.extend(attempt.events.into_iter().map(|(browser, event)| {
+            receipts.extend(attempt.events.into_iter().map(|(browser, event, _)| {
                 receipt(
                     browser,
                     event,
@@ -603,9 +610,10 @@ mod tests {
         }
     }
 
+    /// A form answer, final like the kit's default form route.
     fn event(id: &str) -> ChannelEvent {
         ChannelEvent::parse(&format!(
-            r#"__DROSTJE_CHANNEL__{{"v":1,"id":"{id}","type":"answer","data":{{"scope":"crate"}}}}"#
+            r#"__DROSTJE_CHANNEL__{{"v":1,"id":"{id}","type":"answer","data":{{"scope":"crate"}},"final":true}}"#
         ))
         .unwrap()
         .unwrap()
@@ -677,6 +685,14 @@ mod tests {
             (delivered_receipt.event.as_str(), delivered_receipt.status),
             ("e1", ReceiptStatus::Delivered)
         );
+        assert!(
+            delivered_receipt.completes,
+            "a delivered final answer fulfils its page"
+        );
+        assert!(
+            !f.receipts.borrow()[0].completes,
+            "a queued answer has not reached the agent yet"
+        );
 
         f.state.update(cx, |state, cx| {
             state.receive_conversation(
@@ -711,6 +727,10 @@ mod tests {
         });
         let last = f.receipts.borrow().last().cloned().unwrap();
         assert_eq!(last.status, ReceiptStatus::Unknown);
+        assert!(
+            !last.completes,
+            "an unconfirmed answer leaves its page open"
+        );
         assert_eq!(last.reason.as_deref(), Some("socket closed"));
         assert!(
             f.native.try_recv().is_err(),

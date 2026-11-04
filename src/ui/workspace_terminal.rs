@@ -5,7 +5,6 @@ pub(in crate::ui) struct ThreadTerminal {
     pub pane: Option<Entity<TerminalPane>>,
     pub error: Option<String>,
     request: uuid::Uuid,
-    pub bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 pub(in crate::ui) fn thread_terminal_location(
@@ -90,7 +89,6 @@ impl Workspace {
                 pane: None,
                 error: location.as_ref().err().cloned(),
                 request,
-                bounds: Rc::default(),
             },
         );
         let Ok((project, worktree, root)) = location else {

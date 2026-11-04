@@ -1276,9 +1276,6 @@ impl Workspace {
                     .get(&id)
                     .is_some_and(|panel| panel_visible(panel, dock, &layout, cx));
             panes.push((pane.clone(), visible));
-            if !visible {
-                entry.bounds.set(None);
-            }
         }
         for (pane, visible) in panes {
             pane.update(cx, |pane, cx| pane.set_visible(visible, cx));
@@ -1975,7 +1972,7 @@ impl Workspace {
         });
     }
 
-    /// A pane that gained focus (click, tab, Ctrl-W) is the selected thread.
+    /// A pane that gained focus (click, tab, directional shortcut) is the selected thread.
     fn thread_focused(
         &mut self,
         id: ThreadId,
@@ -2572,6 +2569,9 @@ impl Workspace {
         {
             pane.update(cx, |pane, cx| pane.focus(window, cx));
         }
+        if tab == SidebarTab::Changes && self.state.read(cx).is_conversation(id) {
+            self.changes_focus(id, cx).focus(window, cx);
+        }
         if tab == SidebarTab::Agents
             && let Some(network) = self.network_sidebar(id, cx)
         {
@@ -2807,32 +2807,71 @@ impl Workspace {
             };
             if let PanelKind::Thread(id) = panel.read(cx).kind
                 && self.state.read(cx).thread_sidebar_open(id)
-                && self.state.read(cx).thread_sidebar_tab(id) == SidebarTab::Terminal
-                && let Some(entry) = self.thread_terminals.get(&id)
-                && let Some(terminal_bounds) = entry.bounds.get()
             {
-                bounds.size.width = (terminal_bounds.left() - bounds.left()).max(px(0.));
-                surfaces.push((panel.clone(), Some(id), terminal_bounds));
+                let tab = self.state.read(cx).thread_sidebar_tab(id);
+                let interactive = match tab {
+                    SidebarTab::Terminal => self.sidebar_terminal(id).is_some(),
+                    SidebarTab::Browser => self.sidebar_browser(id).is_some(),
+                    SidebarTab::Changes => self.state.read(cx).is_conversation(id),
+                    SidebarTab::Output
+                    | SidebarTab::Agents
+                    | SidebarTab::Review
+                    | SidebarTab::Details => false,
+                };
+                if interactive
+                    && let Some(width) = self
+                        .sidebar_sizes
+                        .borrow()
+                        .get(&id)
+                        .and_then(|sizes| sizes.read(cx).sizes().get(1).copied())
+                {
+                    let width = width.clamp(px(0.), bounds.size.width);
+                    let sidebar_bounds = Bounds::new(
+                        point(bounds.right() - width, bounds.top()),
+                        size(width, bounds.size.height),
+                    );
+                    bounds.size.width -= width;
+                    surfaces.push((panel.clone(), Some(tab), sidebar_bounds));
+                }
             }
             surfaces.push((panel, None, bounds));
         }
-        let terminal_focus = self.thread_terminals.iter().find_map(|(&id, entry)| {
-            entry
-                .pane
-                .as_ref()
-                .filter(|pane| pane.read(cx).focus_handle(cx).contains_focused(window, cx))
-                .map(|_| id)
-        });
+        let sidebar_focus = if let PanelKind::Thread(id) = current.read(cx).kind
+            && self.state.read(cx).thread_sidebar_open(id)
+        {
+            match self.state.read(cx).thread_sidebar_tab(id) {
+                SidebarTab::Terminal => self
+                    .sidebar_terminal(id)
+                    .filter(|pane| pane.read(cx).focus_handle(cx).contains_focused(window, cx))
+                    .map(|_| SidebarTab::Terminal),
+                SidebarTab::Browser => self
+                    .sidebar_browser(id)
+                    .filter(|pane| pane.read(cx).contains_focused(window, cx))
+                    .map(|_| SidebarTab::Browser),
+                SidebarTab::Changes => self
+                    .changes_lists
+                    .borrow()
+                    .get(&id)
+                    .is_some_and(|list| list.contains_focused(window, cx))
+                    .then_some(SidebarTab::Changes),
+                SidebarTab::Output
+                | SidebarTab::Agents
+                | SidebarTab::Review
+                | SidebarTab::Details => None,
+            }
+        } else {
+            None
+        };
         let Some(origin) = surfaces
             .iter()
-            .find(|(panel, sidebar, _)| *panel == current && *sidebar == terminal_focus)
+            .find(|(panel, sidebar, _)| *panel == current && *sidebar == sidebar_focus)
             .map(|(_, _, bounds)| *bounds)
         else {
             return;
         };
         let next = surfaces
             .into_iter()
-            .filter(|(panel, sidebar, _)| *panel != current || *sidebar != terminal_focus)
+            .filter(|(panel, sidebar, _)| *panel != current || *sidebar != sidebar_focus)
             .filter_map(|(panel, sidebar, bounds)| {
                 let overlap = origin.intersect(&bounds).size;
                 let delta = bounds.center() - origin.center();
@@ -2859,11 +2898,26 @@ impl Workspace {
             .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)))
             .map(|(panel, _, _)| panel);
         if let Some((next, sidebar)) = next {
+            let kind = next.read(cx).kind;
             self.focus_panel(next, window, cx);
-            if let Some(id) = sidebar
-                && let Some(pane) = self.sidebar_terminal(id)
-            {
-                pane.update(cx, |pane, cx| pane.focus(window, cx));
+            if let (PanelKind::Thread(id), Some(tab)) = (kind, sidebar) {
+                match tab {
+                    SidebarTab::Terminal => {
+                        if let Some(pane) = self.sidebar_terminal(id) {
+                            pane.update(cx, |pane, cx| pane.focus(window, cx));
+                        }
+                    }
+                    SidebarTab::Browser => {
+                        if let Some(pane) = self.sidebar_browser(id) {
+                            pane.update(cx, |pane, cx| pane.focus(window, cx));
+                        }
+                    }
+                    SidebarTab::Changes => self.changes_focus(id, cx).focus(window, cx),
+                    SidebarTab::Output
+                    | SidebarTab::Agents
+                    | SidebarTab::Review
+                    | SidebarTab::Details => {}
+                }
             }
         }
     }
@@ -3179,6 +3233,19 @@ impl Workspace {
             Command::RegenerateTitle => {
                 self.state
                     .update(cx, |state, cx| state.regenerate_title(cx));
+                None
+            }
+            Command::ToggleChangesLayout => {
+                self.state.update(cx, |state, cx| {
+                    state.toggle_changes_layout();
+                    cx.notify();
+                });
+                None
+            }
+            Command::OpenChangeInNeovim => {
+                if self.open_change_reason(cx).is_none() {
+                    self.open_selected_change(window, cx);
+                }
                 None
             }
             Command::RefreshConversationDiff => {
@@ -4500,6 +4567,12 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &RefreshConversationDiff, w, cx| {
                     this.execute(Command::RefreshConversationDiff, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &ToggleChangesLayout, w, cx| {
+                    this.execute(Command::ToggleChangesLayout, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &OpenChangeInNeovim, w, cx| {
+                    this.execute(Command::OpenChangeInNeovim, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &ToggleReview, w, cx| {
                     this.execute(Command::ToggleReview, w, cx)
                 }))
@@ -4842,7 +4915,7 @@ impl WorkspacePanel {
             _ => None,
         };
         if let PanelKind::Thread(id) = kind {
-            // Focus, however it arrived (click, tab, Ctrl-W), is what selects a thread.
+            // Focus, however it arrived (click, tab, shortcut), selects a thread.
             let owner = workspace.clone();
             let entity_id = cx.entity().entity_id();
             subscriptions.push(cx.on_focus_in(&focus, window, move |_, window, cx| {

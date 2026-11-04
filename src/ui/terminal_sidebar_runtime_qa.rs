@@ -81,6 +81,26 @@ async fn terminal_sidebar_retains_shell_and_worktree_until_shutdown(cx: &mut Tes
         )
         .await;
         let native = cx.read(|cx| pane.read(cx).native());
+        for (left, right) in [
+            ("secondary-alt-h", "secondary-alt-l"),
+            ("secondary-alt-left", "secondary-alt-right"),
+        ] {
+            cx.update_window(fixture.window.into(), |_, window, cx| {
+                window.render_frame(cx);
+                pane.update(cx, |pane, cx| pane.focus(window, cx));
+                assert!(pane.read(cx).focus_handle(cx).contains_focused(window, cx));
+                window.press(left, cx);
+                assert!(!pane.read(cx).focus_handle(cx).contains_focused(window, cx));
+                assert_ne!(window.find("Projects").focused(), Some(true));
+                window.press(left, cx);
+                assert_eq!(window.find("Projects").focused(), Some(true));
+                window.press(right, cx);
+                assert!(!pane.read(cx).focus_handle(cx).contains_focused(window, cx));
+                window.press(right, cx);
+                assert!(pane.read(cx).focus_handle(cx).contains_focused(window, cx));
+            })
+            .unwrap();
+        }
         cx.dispatch_action(fixture.window.into(), commands::FocusOutput);
         cx.run_until_parked();
         cx.dispatch_action(fixture.window.into(), commands::ToggleTerminal);

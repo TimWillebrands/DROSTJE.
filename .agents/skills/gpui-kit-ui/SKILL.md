@@ -8,7 +8,7 @@ description: Design and review GPUI desktop UI with gpui-kit components (Button,
 Thesis, in priority order (gpui-kit design guides): clarity before
 personality; **composition before invention**; tokens before values; desktop
 before web convention; every state (hover, focus, selected, disabled, loading,
-error) visibly distinct. A project `AGENTS.md`/`CLAUDE.md` UI section wins
+error) visibly distinct. A project's own UI rules (here `docs/agents/ui.md`) win
 over this skill where they differ.
 
 ## Quick start

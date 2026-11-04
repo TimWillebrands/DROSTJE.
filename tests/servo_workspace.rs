@@ -156,6 +156,7 @@ mod macos {
         endpoint: &str,
         thread: Uuid,
         browser: &str,
+        in_sidebar: bool,
     ) {
         tool(
             cx,
@@ -165,13 +166,18 @@ mod macos {
             "browser",
             json!({
                 "action":"evaluate", "id":browser,
-                "script":"document.body.innerHTML = '<input id=\"pane-input\" value=\"keep\">'; window.chordKeys = []; document.addEventListener('keydown', e => window.chordKeys.push(e.key)); true"
+                "script":"document.body.innerHTML = '<input id=\"pane-input\" value=\"keep\">'; window.chordKeys = []; for (const type of ['keydown', 'keyup']) document.addEventListener(type, e => window.chordKeys.push(e.key)); true"
             }),
         );
-        let panel = SharedString::from(format!("Browser:{browser}"));
+        let panel = SharedString::from(if in_sidebar {
+            format!("Thread:{thread}")
+        } else {
+            format!("Browser:{browser}")
+        });
         for page_focused in [false, true] {
-            for held_control in [false, true] {
+            for [left, down, up, right] in [["h", "j", "k", "l"], ["left", "down", "up", "right"]] {
                 cx.update_window(window.into(), |_, window, cx| {
+                    window.click("servo-surface", cx);
                     window.press("secondary-l", cx);
                     if page_focused {
                         window.click("servo-surface", cx);
@@ -191,27 +197,37 @@ mod macos {
                     }),
                 );
                 cx.update_window(window.into(), |_, window, cx| {
-                    // There are no panes above, below or to the right of this tab.
-                    for direction in ["j", "k", "l"] {
-                        window.press("ctrl-w", cx);
-                        let key = if held_control {
-                            format!("ctrl-{direction}")
-                        } else {
-                            direction.into()
-                        };
-                        window.press(&key, cx);
+                    // There are no panes above, below or to the right of this browser.
+                    for direction in [down, up, right] {
+                        window.press(&format!("secondary-alt-{direction}"), cx);
                         assert_eq!(window.find(panel.clone()).focused(), Some(true));
                         assert_eq!(window.find("servo-surface").focused(), Some(page_focused));
                     }
-                    window.press("ctrl-w", cx);
-                    window.press(if held_control { "ctrl-h" } else { "h" }, cx);
+                    window.press(&format!("secondary-alt-{left}"), cx);
+                    if in_sidebar {
+                        assert_eq!(
+                            window.find(panel.clone()).focused(),
+                            Some(true),
+                            "Browser sidebar must move to Conversation before Projects"
+                        );
+                        assert_eq!(window.find("servo-surface").focused(), Some(false));
+                        window.press(&format!("secondary-alt-{left}"), cx);
+                    }
                     assert_eq!(
                         window.find("Projects").focused(),
                         Some(true),
-                        "Ctrl-W must leave both browser address and page focus"
+                        "Pane shortcuts must leave both browser address and page focus"
                     );
-                    window.press("ctrl-w", cx);
-                    window.press(if held_control { "ctrl-l" } else { "l" }, cx);
+                    window.press(&format!("secondary-alt-{right}"), cx);
+                    if in_sidebar {
+                        assert_eq!(
+                            window.find(panel.clone()).focused(),
+                            Some(true),
+                            "Projects must move to Conversation before its browser sidebar"
+                        );
+                        assert_eq!(window.find("servo-surface").focused(), Some(false));
+                        window.press(&format!("secondary-alt-{right}"), cx);
+                    }
                     assert_eq!(window.find(panel.clone()).focused(), Some(true));
                     assert_eq!(window.find("servo-surface").focused(), Some(true));
                 })
@@ -230,16 +246,33 @@ mod macos {
                 assert_eq!(
                     page,
                     json!({"value":"keep","keys":[]}),
-                    "Pane chords must not type into or dispatch keydowns to the page"
+                    "Pane shortcuts must not type into or dispatch key events to the page"
                 );
             }
         }
-        // Reserving the pane chord must not turn bare Vim motion letters into app actions.
+        // Raw Ctrl-W belongs to the native page, not an app prefix. Subsequent bare
+        // motion letters must still edit the input rather than move to another pane.
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({
+                "action":"evaluate", "id":browser,
+                "script":"{ const input = document.getElementById('pane-input'); input.value = ''; input.focus(); window.chordKeys = []; } true"
+            }),
+        );
         cx.update_window(window.into(), |_, window, cx| {
-            for key in ["h", "j", "k", "l", "backspace"] {
+            for key in ["ctrl-w", "h", "j", "k", "l", "backspace"] {
                 window.press(key, cx);
+                assert_eq!(window.find(panel.clone()).focused(), Some(true));
+                assert_eq!(
+                    window.find("servo-surface").focused(),
+                    Some(true),
+                    "Raw Ctrl-W and bare motion letters must not leave the page"
+                );
             }
-            assert_eq!(window.find(panel).focused(), Some(true));
         })
         .unwrap();
         let text = tool(
@@ -250,11 +283,23 @@ mod macos {
             "browser",
             json!({
                 "action":"evaluate", "id":browser,
-                "script":"document.getElementById('pane-input').value"
+                "script":"({value:document.getElementById('pane-input').value, keys:window.chordKeys})"
             }),
         );
-        assert_eq!(text, "keephjk");
-        screenshot(cx, window, "workspace-browser-pane-navigation.png");
+        assert_eq!(text["value"], "hjk");
+        assert!(
+            text["keys"].as_array().unwrap().contains(&json!("w")),
+            "Raw Ctrl-W must reach the native page: {text}"
+        );
+        screenshot(
+            cx,
+            window,
+            if in_sidebar {
+                "workspace-browser-sidebar-pane-navigation.png"
+            } else {
+                "workspace-browser-pane-navigation.png"
+            },
+        );
     }
     fn artifact_height(
         cx: &mut HeadlessAppContext,
@@ -461,6 +506,245 @@ mod macos {
         })
         .unwrap();
         for id in [first_id, second_id] {
+            tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({"action":"close","id":id}),
+            );
+        }
+        pump(cx, window);
+    }
+
+    fn sessions(cx: &mut HeadlessAppContext, state: &Entity<AppState>) -> Vec<Value> {
+        state.read_with(cx, |state, _| {
+            state.snapshot.settings["browser_sessions"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+    }
+
+    /// A docked form's final answer travels the real path (kit, Servo, app outbox, native
+    /// command), and only the runtime's acceptance fulfils it: the page then collapses,
+    /// marked answered, leaves the dock and hands focus back to the composer.
+    fn assert_answered_artifact_collapses(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        workspace: &Entity<Workspace>,
+        state: &Entity<AppState>,
+        endpoint: &str,
+        thread: Uuid,
+        directory: &Path,
+    ) {
+        use drostje::harness::{
+            ConversationCommand, ConversationEvent, ConversationState, PeerDeliveryOutcome,
+        };
+        // A stand-in native runtime: commands land here, outcomes go back as harness events.
+        let (commands, native) = async_channel::bounded(8);
+        let generation = state.update(cx, |state, _| {
+            let session = state.conversations.get_mut(&thread).unwrap();
+            session.commands = Some(commands);
+            session.state = ConversationState::Ready;
+            session.persisted = true;
+            session.peer_delivery = true;
+            session.requests.clear();
+            // As a runtime that reported Ready and is idle.
+            session.preparing = false;
+            let generation = session.generation;
+            state.active_threads.remove(&thread);
+            generation
+        });
+        // Accept the answer, then act out the short turn it woke: start, settle, idle.
+        let accept = |cx: &mut HeadlessAppContext, attempt| {
+            let events = state.read_with(cx, |state, _| state.events.clone());
+            for event in [
+                ConversationEvent::PeerDelivery {
+                    attempt,
+                    outcome: PeerDeliveryOutcome::Accepted,
+                },
+                ConversationEvent::PeerTurnStarted {
+                    request_id: attempt,
+                },
+                ConversationEvent::TurnSettled {
+                    request_id: attempt,
+                    outcome: drostje::harness::TurnOutcome::Completed,
+                },
+                ConversationEvent::StateChanged(ConversationState::Ready),
+            ] {
+                events
+                    .try_send(drostje::app::AppEvent::Harness(thread, generation, event))
+                    .unwrap();
+            }
+        };
+        let submit = |cx: &mut HeadlessAppContext, id: &str| {
+            tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({"action":"evaluate","id":id,"script":"document.querySelector('button').click(); true"}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                pump(cx, window);
+                if let Ok(ConversationCommand::DeliverPeer(delivery)) = native.try_recv() {
+                    return delivery;
+                }
+                if Instant::now() >= deadline {
+                    let page = tool(
+                        cx,
+                        window,
+                        endpoint,
+                        thread,
+                        "browser",
+                        json!({"action":"evaluate","id":id,
+                            "script":"(document.querySelector('[data-drostje-status]') || {}).textContent || 'no status'"}),
+                    );
+                    let session = state.read_with(cx, |state, _| {
+                        let session = &state.conversations[&thread];
+                        format!(
+                            "state {:?}, commands {}, preparing {}, requests {}",
+                            session.state,
+                            session.commands.is_some(),
+                            session.preparing,
+                            session.requests.len()
+                        )
+                    });
+                    panic!("the answer never reached the runtime: page {page}, {session}");
+                }
+            }
+        };
+
+        // A multi-step page answers without closing.
+        let step = directory.join("step.html");
+        std::fs::write(&step, "<!doctype html><title>Step</title><main data-drostje-artifact><form data-drostje=\"step\" data-drostje-keep-open><button>Next</button></form></main>").unwrap();
+        let open = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "show_artifact",
+            json!({"path":step,"title":"Step one","placement":"composer"}),
+        );
+        let open_id = open["id"].as_str().unwrap().to_owned();
+        pump(cx, window);
+        let delivery = submit(cx, &open_id);
+        assert!(delivery.messages[0].body.contains(r#""type":"step""#));
+        assert!(!delivery.messages[0].body.contains("final"));
+        accept(cx, delivery.attempt);
+        for _ in 0..5 {
+            pump(cx, window);
+        }
+        assert_eq!(
+            docked_sessions(cx, state),
+            [open_id.clone()],
+            "keep-open stays docked"
+        );
+
+        // A final answer fulfils the page.
+        let page = directory.join("ask.html");
+        let shown = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "show_artifact",
+            json!({"path":page,"title":"Pick a scope","placement":"composer"}),
+        );
+        let id = shown["id"].as_str().unwrap().to_owned();
+        state.update(cx, |state, cx| {
+            let session = state.conversations.get_mut(&thread).unwrap();
+            session.messages.push(Arc::new(Message {
+                id: "answered-qa-message".into(),
+                role: "assistant".into(),
+                content: vec![ContentBlock::ToolCall {
+                    id: "answered-qa-call".into(),
+                    name: "show_artifact".into(),
+                    intent: None,
+                    input: json!({"title":"Pick a scope","placement":"composer"}),
+                }],
+                raw: None,
+                tool_call_id: None,
+                error: false,
+                exit_code: None,
+            }));
+            session.tools.insert(
+                "answered-qa-call".into(),
+                Arc::new(ToolActivity {
+                    id: "answered-qa-call".into(),
+                    name: "show_artifact".into(),
+                    intent: None,
+                    input: json!({}),
+                    result: vec![ContentBlock::Text(shown.to_string())],
+                    error: false,
+                    exit_code: None,
+                    complete: true,
+                    raw: None,
+                }),
+            );
+            cx.notify();
+        });
+        pump(cx, window);
+        assert_eq!(docked_sessions(cx, state), [id.clone()]);
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute(Command::FocusComposerArtifact, window, cx)
+            });
+        })
+        .unwrap();
+        pump(cx, window);
+        let delivery = submit(cx, &id);
+        assert!(delivery.messages[0].body.contains(r#""final":true"#));
+        // Dispatch is not delivery: the page waits for the runtime.
+        assert_eq!(docked_sessions(cx, state), [id.clone()]);
+        accept(cx, delivery.attempt);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !docked_sessions(cx, state).is_empty() {
+            pump(cx, window);
+            assert!(
+                Instant::now() < deadline,
+                "a delivered final answer undocks its page"
+            );
+        }
+        pump(cx, window);
+        let record = sessions(cx, state)
+            .into_iter()
+            .find(|session| session["id"] == id.as_str())
+            .unwrap();
+        assert_eq!(
+            record["answered"], true,
+            "answered state survives a restart"
+        );
+        assert_eq!(record["placement"], "conversation");
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(window.try_find("composer-artifact").is_none());
+            assert!(window.find("artifact-answered").visible());
+            assert!(
+                window.try_find("docked-artifact-surface").is_none(),
+                "the answered page is collapsed, not docked"
+            );
+            assert_eq!(
+                window.find("prompt-editor").focused(),
+                Some(true),
+                "focus returns to the composer"
+            );
+        })
+        .unwrap();
+        screenshot(cx, window, "workspace-answered-artifact.png");
+        let page_state = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"evaluate","id":id,"script":"document.querySelector('form').dataset.drostjeState"}),
+        );
+        assert_eq!(page_state, "sent", "the page was told its answer arrived");
+        for id in [open_id, id] {
             tool(
                 cx,
                 window,
@@ -1214,6 +1498,13 @@ mod macos {
             store.set_setting("factory_data_root".into(), json!(directory.join("factory"))),
         )
         .unwrap();
+        // No real harness may start here: a live runtime could take an injected artifact
+        // answer and start a provider turn. The open fails visibly instead.
+        smol::block_on(store.set_setting(
+            "executables".into(),
+            json!({"omp": directory.join("no-harness/omp")}),
+        ))
+        .unwrap();
         let snapshot = smol::block_on(store.snapshot()).unwrap();
         let server = BrowserToolServer::start().unwrap();
         let endpoint = server.endpoint();
@@ -1380,6 +1671,9 @@ mod macos {
         assert_docked_artifact(
             &mut cx, window, &workspace, &state, &endpoint, thread, &directory,
         );
+        assert_answered_artifact_collapses(
+            &mut cx, window, &workspace, &state, &endpoint, thread, &directory,
+        );
         let png = directory.join("tool.png");
         let saved = tool(
             &mut cx,
@@ -1391,6 +1685,7 @@ mod macos {
         );
         let image = image::open(&png).unwrap();
         assert_eq!(image.width(), saved["width"].as_u64().unwrap() as u32);
+        assert_browser_pane_navigation(&mut cx, window, &endpoint, thread, &sidebar, true);
         cx.update_window(window.into(), |_, window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.execute(Command::NewBrowser, window, cx)
@@ -1412,7 +1707,7 @@ mod macos {
                 .unwrap()
                 .to_owned()
         });
-        assert_browser_pane_navigation(&mut cx, window, &endpoint, thread, &browser);
+        assert_browser_pane_navigation(&mut cx, window, &endpoint, thread, &browser, false);
         cx.update_window(window.into(), |_, window, cx| {
             let close = SharedString::from(format!("close-browser-{browser}"));
             assert!(
@@ -1494,7 +1789,7 @@ mod macos {
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
         println!(
-            "Servo workspace proof: HTML tool, separate artifact/sidebar sessions, real evaluate and PNG, keyboard sidebar resize, rendered browser tab close, address/page keyboard close, runtime removal and Conversation focus restoration"
+            "Servo workspace proof: HTML tool, separate artifact/sidebar sessions, real evaluate and PNG, keyboard sidebar resize, direct address/page pane navigation with Option-Command letters and arrows, browser-sidebar/Conversation/Projects focus order, preserved page input and native Ctrl-W, rendered browser tab close, address/page keyboard close, runtime removal and Conversation focus restoration"
         );
     }
 }

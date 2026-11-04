@@ -20,6 +20,9 @@ pub(super) struct BrowserRecord {
     /// Where the artifact shows now. Invariant: at most one `Composer` per thread.
     #[serde(default)]
     placement: ArtifactPlacement,
+    /// The artifact's final answer reached the agent; it restores collapsed.
+    #[serde(default)]
+    answered: bool,
 }
 /// Session lifetime is independent of virtualised transcript rows and dock attachments.
 pub(in crate::ui) struct Browsers {
@@ -71,6 +74,9 @@ impl Browsers {
                         cx,
                     );
                     pane.set_docked(record.placement == ArtifactPlacement::Composer, cx);
+                    if record.answered {
+                        pane.complete(cx);
+                    }
                     pane
                 } else {
                     BrowserPane::new(record.id, record.url.clone(), runtime.clone(), window, cx)
@@ -370,6 +376,44 @@ impl Workspace {
         self.state
             .update(cx, |_, cx| cx.emit(PresentationChange::Thread(thread)));
     }
+    /// An artifact's final answer reached the agent: its purpose is fulfilled. It collapses
+    /// to its header, marked answered, and a docked one moves into the transcript so the
+    /// prompt area is free. Focus inside it returns to the composer, never to a hidden page.
+    pub(super) fn complete_artifact(
+        &mut self,
+        id: BrowserId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self
+            .browsers
+            .records
+            .get_mut(&id)
+            .filter(|record| record.artifact.is_some())
+        else {
+            return;
+        };
+        record.answered = true;
+        let thread = record.thread;
+        let Some(pane) = self.browsers.panes.get(&id).cloned() else {
+            return;
+        };
+        let focused = pane.read(cx).contains_focused(window, cx);
+        pane.update(cx, |pane, cx| pane.complete(cx));
+        // The collapsed header is visible wherever the pane lands; the hidden page is not.
+        if focused {
+            pane.update(cx, |pane, cx| pane.focus(window, cx));
+        }
+        if let Some(thread) = thread {
+            self.place_artifact(thread, id, ArtifactPlacement::Conversation, cx);
+            if focused && self.state.read(cx).selected_thread == Some(thread) {
+                self.focus_composer(window, cx);
+            }
+            self.state
+                .update(cx, |_, cx| cx.emit(PresentationChange::Thread(thread)));
+        }
+        self.save_browsers(cx);
+    }
     pub(super) fn move_docked_artifact_into_conversation(
         &mut self,
         thread: ThreadId,
@@ -455,6 +499,7 @@ impl Workspace {
             thread,
             artifact: artifact.clone(),
             placement: ArtifactPlacement::Conversation,
+            answered: false,
         };
         self.browsers.records.insert(id, record);
         self.browsers.panes.insert(id, pane.clone());
@@ -617,10 +662,13 @@ impl Workspace {
     pub(super) fn start_browser_tools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Receipts tell each artifact page what happened to its events.
         let receipts = self.state.read(cx).artifact_receipts();
-        cx.spawn(async move |workspace, cx| {
+        cx.spawn_in(window, async move |workspace, cx| {
             while let Ok(batch) = receipts.recv().await {
-                let delivered = workspace.update(cx, |workspace, _| {
+                let delivered = workspace.update_in(cx, |workspace, window, cx| {
                     for receipt in batch {
+                        if receipt.completes {
+                            workspace.complete_artifact(receipt.browser, window, cx);
+                        }
                         workspace.browsers.runtime.receipt(
                             receipt.browser,
                             receipt.event,
@@ -811,6 +859,7 @@ mod tests {
             thread,
             artifact: artifact.then(|| "/tmp/a.html".into()),
             placement,
+            answered: false,
         }
     }
 
@@ -881,5 +930,9 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.placement, ArtifactPlacement::Conversation);
+        assert!(
+            !legacy.answered,
+            "older layouts restore their artifacts open"
+        );
     }
 }

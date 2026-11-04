@@ -1024,6 +1024,7 @@ mod tests {
         let event = |n: usize| ChannelEvent {
             id: format!("e{n}"),
             kind: "answer".into(),
+            completes: false,
             body: "{}".into(),
         };
         apply_event(

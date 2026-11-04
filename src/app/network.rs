@@ -1132,6 +1132,7 @@ mod tests {
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
     fn claimed_messages_wait_when_native_readiness_changes(cx: &mut gpui_kit::TestAppContext) {
+        cx.dispatcher.allow_parking();
         use super::*;
 
         struct Directory(std::path::PathBuf);

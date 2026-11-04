@@ -1,7 +1,7 @@
 //! Keyboard ownership for embedded native input surfaces.
 //!
-//! NativeSurface opts out of workspace Vim/list/chord navigation, not explicit
-//! app actions. Cmd-Escape leaves the surface; plain Escape belongs to it.
+//! NativeSurface opts out of workspace Vim/list navigation, not explicit app
+//! actions or directional pane shortcuts. Cmd-Escape remains an optional escape hatch.
 //! Printable text (including shifted and Option text) and IME commits must enter
 //! through EntityInputHandler exactly once, never by replaying a raw key. Each
 //! backend decides how committed text is encoded, separately from clipboard paste.

@@ -90,6 +90,8 @@ gpui_kit::actions!(
         ToggleTaskList,
         ToggleBackgroundJobs,
         RefreshConversationDiff,
+        ToggleChangesLayout,
+        OpenChangeInNeovim,
         ToggleReview,
         RefreshReview,
         OpenPullRequest,
@@ -220,6 +222,8 @@ pub enum Command {
     ToggleTaskList,
     ToggleBackgroundJobs,
     RefreshConversationDiff,
+    ToggleChangesLayout,
+    OpenChangeInNeovim,
     ToggleReview,
     RefreshReview,
     OpenPullRequest,
@@ -233,7 +237,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 87] = [
+    pub const ALL: [Self; 89] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -309,6 +313,8 @@ impl Command {
         Self::ToggleTaskList,
         Self::ToggleBackgroundJobs,
         Self::RefreshConversationDiff,
+        Self::ToggleChangesLayout,
+        Self::OpenChangeInNeovim,
         Self::ToggleReview,
         Self::RefreshReview,
         Self::OpenPullRequest,
@@ -400,6 +406,8 @@ impl Command {
             Self::ToggleTaskList => "Toggle task list",
             Self::ToggleBackgroundJobs => "Toggle background jobs",
             Self::RefreshConversationDiff => "Refresh conversation changes",
+            Self::ToggleChangesLayout => "Toggle side-by-side changes",
+            Self::OpenChangeInNeovim => "Open change in Neovim",
             Self::ToggleReview => "Toggle pull request review",
             Self::RefreshReview => "Refresh pull request review",
             Self::OpenPullRequest => "Open pull request in browser",
@@ -493,6 +501,8 @@ impl Command {
             Self::ToggleTaskList => Box::new(ToggleTaskList),
             Self::ToggleBackgroundJobs => Box::new(ToggleBackgroundJobs),
             Self::RefreshConversationDiff => Box::new(RefreshConversationDiff),
+            Self::ToggleChangesLayout => Box::new(ToggleChangesLayout),
+            Self::OpenChangeInNeovim => Box::new(OpenChangeInNeovim),
             Self::ToggleReview => Box::new(ToggleReview),
             Self::RefreshReview => Box::new(RefreshReview),
             Self::OpenPullRequest => Box::new(OpenPullRequest),
@@ -678,6 +688,8 @@ impl Command {
             | Self::ToggleTaskList
             | Self::ToggleBackgroundJobs
             | Self::RefreshConversationDiff
+            | Self::ToggleChangesLayout
+            | Self::OpenChangeInNeovim
                 if state.conversation_thread().is_none() =>
             {
                 Some("Select a conversation first.".into())
@@ -759,6 +771,7 @@ impl Command {
                 || Some("Choose a configured Host in Settings first.".into()),
                 |host| state.remove_remote_host_reason(&host),
             ),
+            Self::OpenChangeInNeovim => workspace.open_change_reason(cx),
             Self::WidenSidebar | Self::NarrowSidebar if state.thread().is_none() => {
                 Some("Select a thread first".into())
             }
@@ -849,8 +862,8 @@ fn picker_row(
 }
 
 // Workspace chords use GPUI's `secondary-` modifier: Cmd on macOS, Ctrl elsewhere.
-// Two chords cannot follow that rule on Linux, where Ctrl also belongs to Vim and
-// to the Ctrl-W pane chord; they keep the terminal convention Ctrl-Shift instead.
+// Close and paste keep the terminal convention Ctrl-Shift on Linux, where
+// Ctrl-W and Ctrl-V belong to native editors and shells.
 
 /// The native paste chord: Cmd-V on macOS; Ctrl-Shift-V elsewhere, where
 /// Ctrl-V is Vim's blockwise visual and literal-insert key.
@@ -860,8 +873,8 @@ pub const PASTE_IMAGE_KEY: &str = if cfg!(target_os = "macos") {
     "ctrl-shift-v"
 };
 
-/// Close the active thread tab: Cmd-W on macOS; Ctrl-Shift-W elsewhere, because
-/// a lone Ctrl-W is the pending prefix of the Ctrl-W h/j/k/l pane chord.
+/// Close the active thread tab: Cmd-W on macOS; Ctrl-Shift-W elsewhere so
+/// Ctrl-W stays available to native editors and shells.
 pub const CLOSE_THREAD_KEY: &str = if cfg!(target_os = "macos") {
     "cmd-w"
 } else {
@@ -875,13 +888,14 @@ pub fn bind_keys(cx: &mut App) {
     let navigation = Some(
         "Workspace && !Input && !NativeInput && !Browser && !Command && !PopupMenu && !Sheet && !Dialog",
     );
-    // Native editors own Ctrl-W and following keys. Browser panes retain their
-    // existing app chord; unfocused terminal chrome can still navigate panes.
-    let editor_navigation = Some(
-        "(TerminalPane || BrowserPane) && !NativeSurface && !Command && !PopupMenu && !Sheet && !Dialog",
+    let pane_navigation = Some(
+        "Workspace && !Command && !DrostjePalette && !SpacePicker && !HarnessPicker && !HostPicker && !PopupMenu && !Sheet && !Dialog",
     );
     let list =
         Some("List && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
+    let changes = Some(
+        "ChangesList && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog",
+    );
     let projects = Some(
         "ProjectsList && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog",
     );
@@ -914,10 +928,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleOutput, workspace),
         KeyBinding::new("secondary-n", NewConversation, workspace),
         KeyBinding::new("secondary-alt-n", NewConversationInWorktree, workspace),
-        KeyBinding::new("secondary-alt-h", SwitchHarness, workspace),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
         KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
-        KeyBinding::new("secondary-alt-j", ToggleTerminal, workspace),
         KeyBinding::new("secondary-alt-o", OpenConversationFile, workspace),
         KeyBinding::new("secondary-l", BrowserAddress, Some("BrowserPane || Browser")),
         KeyBinding::new("secondary-r", BrowserReload, Some("BrowserPane || Browser")),
@@ -935,10 +947,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-j", ToggleOutput, command),
         KeyBinding::new("secondary-n", NewConversation, command),
         KeyBinding::new("secondary-alt-n", NewConversationInWorktree, command),
-        KeyBinding::new("secondary-alt-h", SwitchHarness, command),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, command),
         KeyBinding::new("secondary-alt-t", NewTerminal, command),
-        KeyBinding::new("secondary-alt-j", ToggleTerminal, command),
         KeyBinding::new("secondary-alt-o", OpenConversationFile, command),
         KeyBinding::new("secondary-,", Settings, command),
         KeyBinding::new("ctrl-tab", NextThread, command),
@@ -953,22 +963,14 @@ pub fn bind_keys(cx: &mut App) {
             Some("Terminal || (PromptEditor && !CaretPopup)"),
         ),
         KeyBinding::new("shift-tab", NoAction, Some("Terminal || PromptEditor")),
-        KeyBinding::new("ctrl-w h", FocusLeft, navigation),
-        KeyBinding::new("ctrl-w j", FocusDown, navigation),
-        KeyBinding::new("ctrl-w k", FocusUp, navigation),
-        KeyBinding::new("ctrl-w l", FocusRight, navigation),
-        KeyBinding::new("ctrl-w ctrl-h", FocusLeft, navigation),
-        KeyBinding::new("ctrl-w ctrl-j", FocusDown, navigation),
-        KeyBinding::new("ctrl-w ctrl-k", FocusUp, navigation),
-        KeyBinding::new("ctrl-w ctrl-l", FocusRight, navigation),
-        KeyBinding::new("ctrl-w h", FocusLeft, editor_navigation),
-        KeyBinding::new("ctrl-w j", FocusDown, editor_navigation),
-        KeyBinding::new("ctrl-w k", FocusUp, editor_navigation),
-        KeyBinding::new("ctrl-w l", FocusRight, editor_navigation),
-        KeyBinding::new("ctrl-w ctrl-h", FocusLeft, editor_navigation),
-        KeyBinding::new("ctrl-w ctrl-j", FocusDown, editor_navigation),
-        KeyBinding::new("ctrl-w ctrl-k", FocusUp, editor_navigation),
-        KeyBinding::new("ctrl-w ctrl-l", FocusRight, editor_navigation),
+        KeyBinding::new("secondary-alt-h", FocusLeft, pane_navigation),
+        KeyBinding::new("secondary-alt-j", FocusDown, pane_navigation),
+        KeyBinding::new("secondary-alt-k", FocusUp, pane_navigation),
+        KeyBinding::new("secondary-alt-l", FocusRight, pane_navigation),
+        KeyBinding::new("secondary-alt-left", FocusLeft, pane_navigation),
+        KeyBinding::new("secondary-alt-down", FocusDown, pane_navigation),
+        KeyBinding::new("secondary-alt-up", FocusUp, pane_navigation),
+        KeyBinding::new("secondary-alt-right", FocusRight, pane_navigation),
         KeyBinding::new("j", SelectNext, list),
         KeyBinding::new("down", SelectNext, list),
         KeyBinding::new("k", SelectPrevious, list),
@@ -997,6 +999,10 @@ pub fn bind_keys(cx: &mut App) {
             Some("ProjectSearch && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new("enter", OpenSelection, list),
+        // The Changes list opens its cursor in Neovim instead of a generic selection.
+        KeyBinding::new("enter", OpenChangeInNeovim, changes),
+        KeyBinding::new("o", OpenChangeInNeovim, changes),
+        KeyBinding::new("s", ToggleChangesLayout, changes),
         KeyBinding::new("escape", Dismiss, Some("Network && !Command && !PopupMenu && !Sheet && !Dialog")),
         KeyBinding::new("h", Dismiss, Some("Network && !Command && !PopupMenu && !Sheet && !Dialog")),
         KeyBinding::new("left", Dismiss, Some("Network && !Command && !PopupMenu && !Sheet && !Dialog")),
@@ -2246,6 +2252,12 @@ impl Render for Palette {
             .on_action(cx.listener(|this, _: &ToggleAgents, w, cx| {
                 this.run(PaletteTarget::Command(Command::ToggleAgents), w, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleChangesLayout, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleChangesLayout), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenChangeInNeovim, w, cx| {
+                this.run(PaletteTarget::Command(Command::OpenChangeInNeovim), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &JoinSpaceNetwork, w, cx| {
                 this.run(PaletteTarget::Command(Command::JoinSpaceNetwork), w, cx)
             }))
@@ -2313,8 +2325,8 @@ pub fn region_action(region: Region) -> &'static str {
 mod tests {
     use super::picker_row;
 
-    /// Native inputs keep Tab, Vim chords and printable keys even under a workspace
-    /// list ancestor; explicit app shortcuts and the escape hatch still dispatch.
+    /// Native inputs retain their editing keys while direct pane shortcuts move
+    /// focus without an escape hatch; overlays suppress workspace navigation.
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
     fn native_surface_keys_bypass_workspace_navigation(cx: &mut gpui_kit::TestAppContext) {
@@ -2327,7 +2339,8 @@ mod tests {
         struct NativeInputs {
             context: &'static str,
             input: FocusHandle,
-            neighbour: FocusHandle,
+            neighbours: [FocusHandle; 4],
+            navigation: Vec<&'static str>,
             keys: Vec<String>,
         }
         impl Render for NativeInputs {
@@ -2341,8 +2354,25 @@ mod tests {
                     .on_action(cx.listener(|this, _: &super::OpenPalette, _, _| {
                         this.keys.push("palette".into());
                     }))
-                    .on_action(cx.listener(|this, _: &super::LeaveEditor, _, _| {
+                    .on_action(cx.listener(|this, _: &super::LeaveEditor, window, cx| {
                         this.keys.push("leave".into());
+                        this.neighbours[0].focus(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &super::FocusLeft, window, cx| {
+                        this.navigation.push("left");
+                        this.neighbours[0].focus(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &super::FocusDown, window, cx| {
+                        this.navigation.push("down");
+                        this.neighbours[1].focus(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &super::FocusUp, window, cx| {
+                        this.navigation.push("up");
+                        this.neighbours[2].focus(window, cx);
+                    }))
+                    .on_action(cx.listener(|this, _: &super::FocusRight, window, cx| {
+                        this.navigation.push("right");
+                        this.neighbours[3].focus(window, cx);
                     }))
                     .on_action(cx.listener(|this, _: &super::Submit, _, _| {
                         this.keys.push("submit".into());
@@ -2361,12 +2391,12 @@ mod tests {
                                 cx.stop_propagation();
                             })),
                     )
-                    .child(
+                    .children(self.neighbours.iter().enumerate().map(|(index, focus)| {
                         div()
-                            .id("neighbour")
+                            .id(("neighbour", index))
                             .test_support()
-                            .track_focus(&self.neighbour),
-                    )
+                            .track_focus(focus)
+                    }))
             }
         }
 
@@ -2375,26 +2405,73 @@ mod tests {
             crate::ui::theme::initialize(None, None, cx);
             super::bind_keys(cx);
         });
-        for (context, tab) in [
-            ("Terminal NativeInput NativeSurface", "tab"),
-            ("NativeInput NativeSurface PromptEditor", "tab"),
+        let shortcuts = [
+            ("secondary-alt-h", "left", 0),
+            ("secondary-alt-j", "down", 1),
+            ("secondary-alt-k", "up", 2),
+            ("secondary-alt-l", "right", 3),
+            ("secondary-alt-left", "left", 0),
+            ("secondary-alt-down", "down", 1),
+            ("secondary-alt-up", "up", 2),
+            ("secondary-alt-right", "right", 3),
+        ];
+        for (context, tab, navigation_allowed) in [
+            ("Terminal NativeInput NativeSurface", "tab", true),
+            ("NativeInput NativeSurface PromptEditor", "tab", true),
             (
                 "NativeInput NativeSurface PromptEditor CaretPopup",
                 "accept",
+                true,
             ),
+            ("NativeInput NativeSurface Command", "tab", false),
+            ("NativeInput NativeSurface DrostjePalette", "tab", false),
+            ("NativeInput NativeSurface SpacePicker", "tab", false),
+            ("NativeInput NativeSurface HarnessPicker", "tab", false),
+            ("NativeInput NativeSurface HostPicker", "tab", false),
+            ("NativeInput NativeSurface PopupMenu", "tab", false),
+            ("NativeInput NativeSurface Sheet", "tab", false),
+            ("NativeInput NativeSurface Dialog", "tab", false),
         ] {
             let mut view = None;
             let window = cx.add_window(|window, cx| {
                 let inputs = cx.new(|cx| NativeInputs {
                     context,
                     input: cx.focus_handle().tab_stop(true),
-                    neighbour: cx.focus_handle().tab_stop(true),
+                    neighbours: std::array::from_fn(|_| cx.focus_handle().tab_stop(true)),
+                    navigation: Vec::new(),
                     keys: Vec::new(),
                 });
                 view = Some(inputs.clone());
                 Root::new(inputs, window, cx)
             });
             let view = view.unwrap();
+            if !navigation_allowed {
+                cx.update_window(window.into(), |_, window, cx| {
+                    window.render_frame(cx);
+                    let input = view.read(cx).input.clone();
+                    input.focus(window, cx);
+                    for (key, _, _) in shortcuts {
+                        window.press(key, cx);
+                        assert!(
+                            !window.has_pending_keystrokes(),
+                            "{context}: {key} started a chord"
+                        );
+                        assert!(
+                            input.is_focused(window),
+                            "{context}: {key} moved overlay focus"
+                        );
+                    }
+                    assert!(view.read(cx).navigation.is_empty(), "{context}");
+                    assert_eq!(
+                        view.read(cx).keys,
+                        shortcuts
+                            .map(|(key, _, _)| gpui_kit::Keystroke::parse(key).unwrap().unparse()),
+                        "{context}: navigation keystrokes must remain overlay-owned"
+                    );
+                })
+                .unwrap();
+                continue;
+            }
             cx.update_window(window.into(), |_, window, cx| {
                 window.render_frame(cx);
                 let input = view.read(cx).input.clone();
@@ -2410,7 +2487,6 @@ mod tests {
                     "shift-g",
                     "secondary-enter",
                     "secondary-shift-p",
-                    "secondary-escape",
                 ] {
                     window.press(key, cx);
                     assert!(
@@ -2422,6 +2498,43 @@ mod tests {
                         "{key} moved focus out of {context}"
                     );
                 }
+                for (key, direction, neighbour) in shortcuts {
+                    input.focus(window, cx);
+                    let destination = view.read(cx).neighbours[neighbour].clone();
+                    let before = view.read(cx).navigation.len();
+                    let native_keys = view.read(cx).keys.clone();
+                    window.press(key, cx);
+                    assert!(
+                        !window.has_pending_keystrokes(),
+                        "{key} started an app chord"
+                    );
+                    assert!(
+                        destination.is_focused(window),
+                        "{context}: {key} did not focus {direction}"
+                    );
+                    assert!(
+                        !input.is_focused(window),
+                        "{context}: {key} retained native focus"
+                    );
+                    assert_eq!(
+                        &view.read(cx).navigation[before..],
+                        &[direction],
+                        "{context}: {key}"
+                    );
+                    assert_eq!(
+                        view.read(cx).keys,
+                        native_keys,
+                        "{context}: {key} reached native input"
+                    );
+                }
+                input.focus(window, cx);
+                window.press("secondary-escape", cx);
+                assert!(!window.has_pending_keystrokes());
+                assert!(view.read(cx).neighbours[0].is_focused(window));
+                assert!(
+                    !input.is_focused(window),
+                    "explicit escape retained native focus"
+                );
             })
             .unwrap();
             cx.read(|cx| {

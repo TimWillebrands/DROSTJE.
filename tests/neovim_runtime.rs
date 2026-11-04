@@ -604,8 +604,7 @@ fn theme_colors_every_visible_group() {
             .unwrap();
         runtime
             .grid_until("end-of-buffer filler was not themed", |grid| {
-                grid.default_bg == LIGHT.background
-                    && foreground_of(grid, "~") == Some(LIGHT.muted)
+                grid.default_bg == LIGHT.background && foreground_of(grid, "~") == Some(LIGHT.muted)
             })
             .await;
         // Typed only after the theme's redraw, which would clear the message.

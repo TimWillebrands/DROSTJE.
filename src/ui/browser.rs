@@ -13,6 +13,7 @@ use gpui_kit::{
         input::{Input, InputEvent, InputState},
         menu::DropdownMenu,
         spinner::Spinner,
+        tag::Tag,
         v_flex,
     },
     prelude::FluentBuilder,
@@ -49,6 +50,8 @@ pub struct BrowserPane {
     artifact: Option<String>,
     /// Docked above the composer rather than in its transcript row.
     docked: bool,
+    /// The page's final answer reached the agent; it stays collapsed until reopened.
+    answered: bool,
     collapsed: bool,
     content_height: Option<f32>,
     frame: Option<Arc<RenderImage>>,
@@ -184,6 +187,7 @@ impl BrowserPane {
             header_focus,
             artifact: None,
             docked: false,
+            answered: false,
             collapsed: false,
             content_height: None,
             frame: None,
@@ -224,6 +228,26 @@ impl BrowserPane {
             cx.emit(BrowserLayout);
             cx.notify();
         }
+    }
+
+    /// The page's purpose is fulfilled: collapse it to its header, marked answered. The page
+    /// keeps its document and form values, and the user can reopen it. Focus is the
+    /// caller's to move; this never focuses the header.
+    pub(super) fn complete(&mut self, cx: &mut Context<Self>) {
+        if self.artifact.is_none() {
+            return;
+        }
+        self.answered = true;
+        if !self.collapsed {
+            self.collapsed = true;
+            self.composition.clear();
+            self.runtime
+                .command(self.id, BrowserCommand::Focus { focused: false });
+            self.runtime
+                .command(self.id, BrowserCommand::SetContentSizing { enabled: false });
+        }
+        cx.emit(BrowserLayout);
+        cx.notify();
     }
 
     pub(super) fn artifact_title(&self) -> Option<&str> {
@@ -327,6 +351,13 @@ impl BrowserPane {
         }
         self.address
             .update(cx, |address, cx| address.focus(window, cx));
+    }
+    /// Keyboard focus is anywhere in this pane: the page, its address bar or the artifact
+    /// header (including its menu button).
+    pub(super) fn contains_focused(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
+            || self.header_focus.contains_focused(window, cx)
+            || self.address.focus_handle(cx).contains_focused(window, cx)
     }
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.collapsed {
@@ -529,6 +560,16 @@ impl BrowserPane {
         } else {
             key.modifiers.control
         };
+        // Pane shortcuts belong to the app on both key-down and key-up.
+        if shortcut
+            && key.modifiers.alt
+            && matches!(
+                key.key.as_str(),
+                "h" | "j" | "k" | "l" | "left" | "down" | "up" | "right"
+            )
+        {
+            return;
+        }
         if shortcut
             && matches!(
                 key.key.as_str(),
@@ -781,6 +822,15 @@ impl Render for BrowserPane {
                                 })),
                         ),
                 )
+                .when(self.answered, |row| {
+                    row.child(
+                        div()
+                            .id("artifact-answered")
+                            .test_support()
+                            .flex_none()
+                            .child(Tag::secondary().outline().xsmall().child("Answered")),
+                    )
+                })
                 .when(self.loading, |row| row.child(Spinner::new().xsmall()))
                 .child(
                     Button::new("artifact-navigation")

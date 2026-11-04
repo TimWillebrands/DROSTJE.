@@ -385,6 +385,40 @@ impl SidebarTab {
     }
 }
 
+/// How the Changes tab lays out a diff; one preference for every thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChangesLayout {
+    /// One column: removed lines above the added lines that replace them.
+    #[default]
+    Inline,
+    /// Old file left, new file right, a removal beside its replacement.
+    SideBySide,
+}
+impl ChangesLayout {
+    const KEY: &str = "changes_layout";
+
+    fn from_saved(saved: Option<&str>) -> Self {
+        match saved {
+            Some("side_by_side") => Self::SideBySide,
+            _ => Self::Inline,
+        }
+    }
+
+    fn saved(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::SideBySide => "side_by_side",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Inline => Self::SideBySide,
+            Self::SideBySide => Self::Inline,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoticeLevel {
     Info,
@@ -1145,6 +1179,20 @@ impl AppState {
         )
     }
 
+    pub fn changes_layout(&self) -> ChangesLayout {
+        ChangesLayout::from_saved(
+            self.snapshot
+                .settings
+                .get(ChangesLayout::KEY)
+                .and_then(Value::as_str),
+        )
+    }
+
+    pub fn toggle_changes_layout(&mut self) {
+        let layout = self.changes_layout().toggled();
+        self.set_setting(ChangesLayout::KEY, Value::String(layout.saved().into()));
+    }
+
     /// Show `tab` in the thread's sidebar, or hide the sidebar when `tab` is already shown.
     pub fn toggle_thread_sidebar(&mut self, id: ThreadId, tab: SidebarTab) {
         let (open, tab) = SidebarTab::toggle(
@@ -1328,7 +1376,7 @@ impl AppState {
         open || !self.is_untouched(thread)
     }
 
-    fn is_conversation(&self, id: ThreadId) -> bool {
+    pub fn is_conversation(&self, id: ThreadId) -> bool {
         self.snapshot
             .threads
             .iter()
@@ -1908,7 +1956,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentBlock, ConversationSession, Message, SidebarTab, Value};
+    use super::{ChangesLayout, ContentBlock, ConversationSession, Message, SidebarTab, Value};
 
     #[cfg(feature = "runtime-qa")]
     mod threads {
@@ -2517,6 +2565,19 @@ mod tests {
         assert_eq!(SidebarTab::toggle(true, Output, Output), (false, Output));
         assert_eq!(SidebarTab::toggle(false, Output, Output), (true, Output));
         assert_eq!(SidebarTab::toggle(false, Output, Changes), (true, Changes));
+    }
+
+    #[test]
+    fn changes_layout_round_trips_and_defaults_to_inline() {
+        for layout in [ChangesLayout::Inline, ChangesLayout::SideBySide] {
+            assert_eq!(ChangesLayout::from_saved(Some(layout.saved())), layout);
+            assert_eq!(layout.toggled().toggled(), layout);
+        }
+        assert_eq!(ChangesLayout::from_saved(None), ChangesLayout::Inline);
+        assert_eq!(
+            ChangesLayout::from_saved(Some("bogus")),
+            ChangesLayout::Inline
+        );
     }
 
     fn message(id: &str, role: &str, content: Vec<ContentBlock>) -> Message {

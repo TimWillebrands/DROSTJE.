@@ -13,6 +13,119 @@ type SharedString = std::sync::Arc<str>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Patch {
     pub rows: Vec<Row>,
+    /// The same rows paired for a side-by-side view; every row index appears exactly once,
+    /// in order.
+    pub split: Vec<SplitRow>,
+}
+
+/// One line of the side-by-side view, by index into [`Patch::rows`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitRow {
+    /// A file, hunk or note row spanning both sides.
+    Full(usize),
+    /// The old side and the new side of one line. A context line is both sides; a removed line
+    /// pairs with the added line at the same offset of the change it belongs to.
+    Pair {
+        old: Option<usize>,
+        new: Option<usize>,
+    },
+}
+
+impl SplitRow {
+    /// The first row this line shows, which stands for it when switching layouts.
+    pub fn first(self) -> usize {
+        match self {
+            Self::Full(ix) => ix,
+            Self::Pair { old, new } => match (old, new) {
+                (Some(old), Some(new)) => old.min(new),
+                (Some(ix), None) | (None, Some(ix)) => ix,
+                // `split` never builds an empty pair.
+                (None, None) => 0,
+            },
+        }
+    }
+
+    /// Whether this line shows row `ix`.
+    pub fn contains(self, ix: usize) -> bool {
+        match self {
+            Self::Full(row) => row == ix,
+            Self::Pair { old, new } => old == Some(ix) || new == Some(ix),
+        }
+    }
+}
+
+/// Where a row lands in the new version of its file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    /// The new path, as the file row names it.
+    pub path: String,
+    /// 1-based line in the new file.
+    pub line: u32,
+}
+
+/// Why a row has no place in the working tree.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LocationError {
+    #[error("this row belongs to no file")]
+    NoFile,
+    #[error("{0} was deleted")]
+    Deleted(String),
+}
+
+impl Patch {
+    /// The line in the working tree file that row `ix` shows or, for a removed line, where it
+    /// was removed: the next surviving line of its hunk, else the line after the last one.
+    pub fn location(&self, ix: usize) -> Result<Location, LocationError> {
+        if ix >= self.rows.len() {
+            return Err(LocationError::NoFile);
+        }
+        let Some(file_ix) = self.rows[..=ix]
+            .iter()
+            .rposition(|row| matches!(row.kind, RowKind::File(_)))
+        else {
+            return Err(LocationError::NoFile);
+        };
+        let file = &self.rows[file_ix];
+        let path = file.text.to_string();
+        if let RowKind::File(FileHeader {
+            change: FileChange::Deleted,
+            ..
+        }) = file.kind
+        {
+            return Err(LocationError::Deleted(path));
+        }
+        // This row and the rest of its file.
+        let after = || {
+            self.rows[ix..]
+                .iter()
+                .enumerate()
+                .take_while(|(offset, row)| *offset == 0 || !matches!(row.kind, RowKind::File(_)))
+                .map(|(_, row)| row)
+        };
+        let row = &self.rows[ix];
+        let line = match row.kind {
+            RowKind::Added | RowKind::Context => row.new_line,
+            RowKind::Hunk => Some(hunk_starts(&row.text).1),
+            RowKind::File(_) => after().find_map(|row| row.new_line),
+            RowKind::Removed | RowKind::Note => after()
+                .skip(1)
+                .take_while(|row| row.kind != RowKind::Hunk)
+                .find_map(|row| row.new_line)
+                .or_else(|| {
+                    self.rows[file_ix + 1..ix]
+                        .iter()
+                        .rev()
+                        .find_map(|row| match row.kind {
+                            RowKind::Hunk => Some(hunk_starts(&row.text).1),
+                            _ => row.new_line.map(|line| line + 1),
+                        })
+                }),
+        };
+        Ok(Location {
+            path,
+            line: line.unwrap_or(1).max(1),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,7 +239,49 @@ pub fn parse(text: &str) -> Patch {
         }
         rows.push(row(kind, content, old_line, new_line));
     }
-    Patch { rows }
+    let split = split(&rows);
+    Patch { rows, split }
+}
+
+/// Pairs each run of removed lines with the added lines that follow it, line by line.
+fn split(rows: &[Row]) -> Vec<SplitRow> {
+    let mut split = Vec::with_capacity(rows.len());
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    let flush = |split: &mut Vec<SplitRow>, removed: &mut Vec<usize>, added: &mut Vec<usize>| {
+        for offset in 0..removed.len().max(added.len()) {
+            split.push(SplitRow::Pair {
+                old: removed.get(offset).copied(),
+                new: added.get(offset).copied(),
+            });
+        }
+        removed.clear();
+        added.clear();
+    };
+    for (ix, row) in rows.iter().enumerate() {
+        match row.kind {
+            RowKind::Removed => {
+                // A removal after additions starts a new change.
+                if !added.is_empty() {
+                    flush(&mut split, &mut removed, &mut added);
+                }
+                removed.push(ix);
+            }
+            RowKind::Added => added.push(ix),
+            RowKind::Context => {
+                flush(&mut split, &mut removed, &mut added);
+                split.push(SplitRow::Pair {
+                    old: Some(ix),
+                    new: Some(ix),
+                });
+            }
+            RowKind::File(_) | RowKind::Hunk | RowKind::Note => {
+                flush(&mut split, &mut removed, &mut added);
+                split.push(SplitRow::Full(ix));
+            }
+        }
+    }
+    flush(&mut split, &mut removed, &mut added);
+    split
 }
 
 fn row(kind: RowKind, text: &str, old_line: Option<u32>, new_line: Option<u32>) -> Row {
@@ -312,5 +467,94 @@ mod tests {
         );
         assert_eq!(kinds(&large), ["file", "note"]);
         assert!(parse("").rows.is_empty());
+    }
+
+    #[test]
+    fn side_by_side_pairs_each_removal_with_the_addition_at_its_offset() {
+        let patch = parse(concat!(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,6 +1,6 @@\n",
+            " keep\n-old 1\n-old 2\n-old 3\n+new 1\n+new 2\n same\n+only new\n-only old\n",
+        ));
+        assert_eq!(
+            kinds(&patch),
+            ["file", "hunk", " ", "-", "-", "-", "+", "+", " ", "+", "-"]
+        );
+        let pair = |old: Option<usize>, new: Option<usize>| SplitRow::Pair { old, new };
+        assert_eq!(
+            patch.split,
+            [
+                SplitRow::Full(0),
+                SplitRow::Full(1),
+                pair(Some(2), Some(2)),
+                pair(Some(3), Some(6)),
+                pair(Some(4), Some(7)),
+                pair(Some(5), None),
+                pair(Some(8), Some(8)),
+                // An addition before a removal is a change of its own.
+                pair(None, Some(9)),
+                pair(Some(10), None),
+            ]
+        );
+        let mut shown: Vec<_> = patch
+            .split
+            .iter()
+            .flat_map(|row| match *row {
+                SplitRow::Full(ix) => vec![ix],
+                SplitRow::Pair { old, new } if old == new => old.into_iter().collect(),
+                SplitRow::Pair { old, new } => old.into_iter().chain(new).collect(),
+            })
+            .collect();
+        shown.sort_unstable();
+        assert_eq!(
+            shown,
+            (0..patch.rows.len()).collect::<Vec<_>>(),
+            "every row once"
+        );
+        assert_eq!(patch.split[3].first(), 3);
+        assert!(patch.split[3].contains(6));
+        assert!(!patch.split[3].contains(5));
+    }
+
+    #[test]
+    fn every_row_locates_a_line_in_the_working_tree() {
+        let patch = parse(concat!(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n",
+            "@@ -10,4 +10,3 @@ fn main() {\n keep\n-gone\n+came\n-also gone\n same\n",
+            "@@ -40,2 +39,1 @@\n tail\n-last\n",
+            "diff --git a/b.rs b/b.rs\ndeleted file mode 100644\n--- a/b.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n",
+            "diff --git a/c.rs b/c.rs\n--- a/c.rs\n+++ b/c.rs\n@@ -1 +0,0 @@\n-only\n",
+        ));
+        let at = |ix: usize| {
+            patch
+                .location(ix)
+                .map(|location| (location.path, location.line))
+        };
+        let file = |line: u32| Ok(("src/a.rs".to_owned(), line));
+        assert_eq!(at(0), file(10), "a file opens at its first changed hunk");
+        assert_eq!(at(1), file(10), "a hunk opens at its new start");
+        assert_eq!(at(2), file(10));
+        assert_eq!(
+            at(3),
+            file(11),
+            "a removal opens where the next line survives"
+        );
+        assert_eq!(at(4), file(11));
+        assert_eq!(at(5), file(12));
+        assert_eq!(at(6), file(12));
+        assert_eq!(at(7), file(39));
+        assert_eq!(
+            at(9),
+            file(40),
+            "a removal at a hunk's end opens after its last line"
+        );
+        assert_eq!(at(10), Err(LocationError::Deleted("b.rs".into())));
+        assert_eq!(at(12), Err(LocationError::Deleted("b.rs".into())));
+        assert_eq!(
+            at(15),
+            Ok(("c.rs".to_owned(), 1)),
+            "emptied files open at the top"
+        );
+        assert_eq!(at(99), Err(LocationError::NoFile));
+        assert_eq!(parse("preamble\n").location(0), Err(LocationError::NoFile));
     }
 }
