@@ -50,7 +50,7 @@ pub struct BrowserPane {
     artifact: Option<String>,
     /// Docked above the composer rather than in its transcript row.
     docked: bool,
-    /// The page's final answer reached the agent; it stays collapsed until reopened.
+    /// The agent has what it needed; the page stays collapsed until reopened.
     answered: bool,
     collapsed: bool,
     content_height: Option<f32>,
@@ -230,7 +230,7 @@ impl BrowserPane {
         }
     }
 
-    /// The page's purpose is fulfilled: collapse it to its header, marked answered. The page
+    /// The agent has what it needed: collapse to the header, marked answered. The page
     /// keeps its document and form values, and the user can reopen it. Focus is the
     /// caller's to move; this never focuses the header.
     pub(super) fn complete(&mut self, cx: &mut Context<Self>) {

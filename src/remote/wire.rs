@@ -18,11 +18,17 @@ pub struct Capabilities {
     /// Shows `Response::ArtifactRequest` and returns artifact-origin context.
     #[serde(default)]
     pub artifacts: bool,
+    /// Handles `Response::ArtifactComplete`.
+    #[serde(default)]
+    pub artifact_completion: bool,
 }
 
 impl Capabilities {
     /// Everything this desktop build supports.
-    pub const DESKTOP: Self = Self { artifacts: true };
+    pub const DESKTOP: Self = Self {
+        artifacts: true,
+        artifact_completion: true,
+    };
 }
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -160,6 +166,14 @@ pub enum Response {
         /// Absent from hosts that predate placement: the transcript.
         #[serde(default)]
         placement: crate::browser_tools::ArtifactPlacement,
+    },
+    /// A remote runtime completed an artifact it showed. Answered like a Network call.
+    /// Sent only to desktops that declare `Capabilities::artifact_completion`.
+    ArtifactComplete {
+        thread: Uuid,
+        generation: Uuid,
+        call: Uuid,
+        browser: Uuid,
     },
     Data {
         id: Uuid,
@@ -389,6 +403,7 @@ mod tests {
         let request: Request = serde_json::from_value(old).unwrap();
         assert_eq!(request.capabilities, Capabilities::default());
         assert!(!request.capabilities.artifacts);
+        assert!(!request.capabilities.artifact_completion);
         // A new desktop stays on version 1, so older hosts keep accepting it.
         let new = serde_json::to_value(Request {
             id: Uuid::new_v4(),
@@ -401,6 +416,7 @@ mod tests {
         .unwrap();
         assert_eq!(new["version"], 1);
         assert_eq!(new["capabilities"]["artifacts"], true);
+        assert_eq!(new["capabilities"]["artifact_completion"], true);
         // Peer context from an older desktop has no origin and stays peer context.
         let command: WireCommand = serde_json::from_value(serde_json::json!({"DeliverPeer":{
             "attempt":Uuid::new_v4(),"messages":[{"id":Uuid::new_v4(),"sender":Uuid::new_v4(),

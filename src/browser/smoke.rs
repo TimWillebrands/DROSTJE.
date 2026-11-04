@@ -884,10 +884,6 @@ fn real_artifact_kit_styles_pages_and_round_trips_channel_events(browser: &Brows
             <button type="submit" id="go" class="primary">Send</button>
             <span data-drostje-status id="status"></span>
           </form>
-          <form data-drostje="step" data-drostje-keep-open id="step">
-            <button type="submit" id="next">Next step</button>
-          </form>
-          <div data-drostje-once><button id="pick" data-drostje-send="pick" value="b">B</button></div>
         </main>"#,
     )
     .unwrap();
@@ -936,7 +932,6 @@ fn real_artifact_kit_styles_pages_and_round_trips_channel_events(browser: &Brows
         panic!("one submission is one event: {events:?}");
     };
     assert_eq!(event.kind, "answer");
-    assert!(event.completes, "a form submit is the page's final answer");
     let body: Value = serde_json::from_str(&event.body).unwrap();
     assert_eq!(body["data"]["scope"], "crate");
     assert_eq!(
@@ -973,33 +968,6 @@ fn real_artifact_kit_styles_pages_and_round_trips_channel_events(browser: &Brows
         browser.evaluate(id, "window.rejected") == "TypeError"
     });
     assert!(browser.runtime.take_channel(id).is_empty());
-
-    // Which answers fulfil a page: forms and choices by default, keep-open never,
-    // scripts only when they say so.
-    browser.evaluate(
-        id,
-        "document.getElementById('next').click(); document.getElementById('pick').click(); \
-         drostje.send('progress', 1); drostje.send('done', 2, {final: true}); true",
-    );
-    let sent = std::cell::RefCell::new(Vec::new());
-    browser.until("four channel events", || {
-        sent.borrow_mut().extend(browser.runtime.take_channel(id));
-        sent.borrow().len() >= 4
-    });
-    let finals: Vec<(String, bool)> = sent
-        .into_inner()
-        .into_iter()
-        .map(|event| (event.kind, event.completes))
-        .collect();
-    assert_eq!(
-        finals,
-        [
-            ("step".to_owned(), false),
-            ("pick".to_owned(), true),
-            ("progress".to_owned(), false),
-            ("done".to_owned(), true),
-        ]
-    );
 
     browser.runtime.command(
         id,

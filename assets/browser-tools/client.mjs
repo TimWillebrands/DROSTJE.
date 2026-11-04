@@ -12,7 +12,7 @@ export function registerBrowserTools(api, schema) {
   for (const tool of tools) {
     api.registerTool({
       name: tool.name,
-      label: tool.name === "browser" ? "DROSTJE Browser" : tool.name === "network" ? "Space network" : "Show Artifact",
+      label: { browser: "DROSTJE Browser", network: "Space network", complete_artifact: "Complete Artifact" }[tool.name] ?? "Show Artifact",
       description: tool.description,
       parameters: schema(tool.inputSchema),
       // OMP otherwise defers discovery of new names until a tool search.

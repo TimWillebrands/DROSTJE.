@@ -1166,37 +1166,11 @@ fn process_response(
             html,
             placement,
         } => {
-            let refuse = |reason: &str| {
-                let _ = send(
-                    outgoing,
-                    Request {
-                        version: wire::VERSION,
-                        capabilities: wire::Capabilities::DESKTOP,
-                        id: Uuid::new_v4(),
-                        thread,
-                        epoch,
-                        operation: Operation::NetworkResponse {
-                            call,
-                            result: Err(reason.into()),
-                        },
-                    },
-                );
-            };
-            let Some(runtime) = runtimes
-                .get_mut(&thread)
-                .filter(|r| r.recovered && r.generation == Some(generation))
+            let Some(runtime) =
+                admit_desktop_call(runtimes, outgoing, epoch, thread, generation, call)
             else {
-                refuse("Remote Conversation is not attached and authorized");
                 return;
             };
-            if runtime.network_pending >= 64
-                || runtime.network_calls.len() >= 4096
-                || !runtime.network_calls.insert(call)
-            {
-                refuse("Duplicate remote artifact request or admission capacity reached");
-                return;
-            }
-            runtime.network_pending += 1;
             let server = runtime.artifacts.clone();
             let directory = runtime.image_dir.join("artifacts");
             let sender = sender.clone();
@@ -1217,7 +1191,105 @@ fn process_response(
             })
             .detach();
         }
+        Response::ArtifactComplete {
+            thread,
+            generation,
+            call,
+            browser,
+        } => {
+            let Some(runtime) =
+                admit_desktop_call(runtimes, outgoing, epoch, thread, generation, call)
+            else {
+                return;
+            };
+            let server = runtime.artifacts.clone();
+            let sender = sender.clone();
+            smol::spawn(async move {
+                let result = desktop_tool(
+                    server,
+                    thread,
+                    BrowserToolOperation::CompleteArtifact { id: browser },
+                )
+                .await;
+                let _ = sender
+                    .send(ClientRequest::NetworkReply {
+                        thread,
+                        epoch,
+                        generation,
+                        call,
+                        result,
+                    })
+                    .await;
+            })
+            .detach();
+        }
     }
+}
+
+/// Admit one host-originated desktop call for the current runtime generation, or answer
+/// it with the refusal right away. Bounded like Network calls; a call ID is never reused.
+fn admit_desktop_call<'a>(
+    runtimes: &'a mut HashMap<Uuid, Runtime>,
+    outgoing: &Sender<Value>,
+    epoch: Uuid,
+    thread: Uuid,
+    generation: Uuid,
+    call: Uuid,
+) -> Option<&'a mut Runtime> {
+    let refuse = |reason: &str| {
+        let _ = send(
+            outgoing,
+            Request {
+                version: wire::VERSION,
+                capabilities: wire::Capabilities::DESKTOP,
+                id: Uuid::new_v4(),
+                thread,
+                epoch,
+                operation: Operation::NetworkResponse {
+                    call,
+                    result: Err(reason.into()),
+                },
+            },
+        );
+    };
+    let Some(runtime) = runtimes
+        .get_mut(&thread)
+        .filter(|r| r.recovered && r.generation == Some(generation))
+    else {
+        refuse("Remote Conversation is not attached and authorized");
+        return None;
+    };
+    if runtime.network_pending >= 64
+        || runtime.network_calls.len() >= 4096
+        || !runtime.network_calls.insert(call)
+    {
+        refuse("Duplicate remote artifact request or admission capacity reached");
+        return None;
+    }
+    runtime.network_pending += 1;
+    Some(runtime)
+}
+
+/// Run one operation on the desktop tool server for a remote runtime's Conversation.
+async fn desktop_tool(
+    server: Option<BrowserToolServer>,
+    thread: Uuid,
+    operation: BrowserToolOperation,
+) -> std::result::Result<Value, String> {
+    let server =
+        server.ok_or("Artifacts are unavailable: the desktop browser tools did not start")?;
+    smol::unblock(move || {
+        let (reply, response) = std::sync::mpsc::channel();
+        server.submit(BrowserToolRequest {
+            thread,
+            operation,
+            reply,
+        })?;
+        response
+            .recv_timeout(Duration::from_secs(20))
+            .map_err(|_| "The desktop did not answer in time; the outcome is unknown".to_owned())?
+    })
+    .await
 }
 
 /// Write a remote artifact's HTML beside this runtime's other remote media and show
@@ -1236,12 +1308,13 @@ async fn show_remote_artifact(
     html: String,
     placement: crate::browser_tools::ArtifactPlacement,
 ) -> std::result::Result<Value, String> {
-    let server =
-        server.ok_or("Artifacts are unavailable: the desktop browser tools did not start")?;
+    if server.is_none() {
+        return Err("Artifacts are unavailable: the desktop browser tools did not start".into());
+    }
     if html.len() > crate::browser_tools::MAX_REMOTE_ARTIFACT {
         return Err("Remote artifact exceeds 2 MiB".into());
     }
-    smol::unblock(move || {
+    let path = smol::unblock(move || {
         let mut stem: String = name
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -1255,26 +1328,20 @@ async fn show_remote_artifact(
         let path = directory.join(format!("{call}-{stem}"));
         std::fs::write(&path, html)
             .map_err(|error| format!("Could not store the remote artifact: {error}"))?;
-        let path = path
-            .to_str()
-            .ok_or("Remote artifact path is not valid UTF-8")?
-            .to_owned();
-        let (reply, response) = std::sync::mpsc::channel();
-        server.submit(BrowserToolRequest {
-            thread,
-            operation: BrowserToolOperation::ShowArtifact {
-                path,
-                title,
-                placement,
-            },
-            reply,
-        })?;
-        response
-            .recv_timeout(Duration::from_secs(20))
-            .map_err(|_| {
-                "The desktop did not show the artifact in time; its outcome is unknown".to_owned()
-            })?
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| "Remote artifact path is not valid UTF-8".to_owned())
     })
+    .await?;
+    desktop_tool(
+        server,
+        thread,
+        BrowserToolOperation::ShowArtifact {
+            path,
+            title,
+            placement,
+        },
+    )
     .await
 }
 

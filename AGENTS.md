@@ -29,7 +29,21 @@ Desktop app (Rust 2024, GPUI through `gpui-kit`) that drives local coding agents
 
 - Changing anything under `src/ui/`: read `docs/agents/ui.md` and use the `gpui-kit-ui` skill (`.agents/skills/gpui-kit-ui/`, including `scripts/audit.sh`).
 - Writing or reviewing Rust: follow `CODING_STANDARDS.md` (layering, errors, naming, test layers).
-- Naming anything a user sees: use the terms in `GLOSSARY.md`.
+- Naming anything a user sees: use the terms in `CONTEXT.md`.
 - Running `#[ignore]` window tests (`--features runtime-qa`): they need `DROSTJE_RUNTIME_FIXTURE`; `README.md` › Ontwikkelen has the throwaway-repo recipe. Tests only ever touch `mktemp -d` fixtures, never the user's repositories.
 
 Keep this file short: add a line only when an agent can't find the fact by looking and every session needs it. Everything else goes behind a pointer above or into a check.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `TimWillebrands/DROSTJE.` via `gh`; external PRs are a triage surface too. The Azure DevOps remote is a code mirror only. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` (glossary) and `docs/adr/` at the repo root. See `docs/agents/domain.md`.

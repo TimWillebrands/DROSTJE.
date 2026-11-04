@@ -110,9 +110,7 @@ pub struct ChannelEvent {
     /// The page's event ID, echoed back in its receipt.
     pub id: String,
     pub kind: String,
-    /// The page's purpose is fulfilled once this event is delivered (`"final": true`).
-    pub completes: bool,
-    /// The complete `{v,id,type,data,final?}` JSON object.
+    /// The complete `{v,id,type,data}` JSON object.
     pub body: String,
 }
 
@@ -146,7 +144,6 @@ impl ChannelEvent {
             Ok(Self {
                 id: id.to_owned(),
                 kind: kind.to_owned(),
-                completes: value["final"] == true,
                 body: encoded.to_owned(),
             })
         })())
@@ -338,22 +335,6 @@ mod tests {
         .unwrap();
         assert_eq!(event.id, "5f0c-ab");
         assert_eq!(event.kind, "scope.pick");
-        assert!(
-            !event.completes,
-            "only an explicit final answer completes a page"
-        );
-        let last = ChannelEvent::parse(
-            r#"__DROSTJE_CHANNEL__{"v":1,"id":"a","type":"answer","data":null,"final":true}"#,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(last.completes);
-        let truthy = ChannelEvent::parse(
-            r#"__DROSTJE_CHANNEL__{"v":1,"id":"a","type":"answer","data":null,"final":"yes"}"#,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!truthy.completes, "final is the boolean true, nothing else");
         assert!(event.body.starts_with(r#"{"v":1"#));
         for (message, reason) in [
             (r#"{"v":2,"id":"a","type":"x"}"#, "version"),

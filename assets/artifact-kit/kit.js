@@ -7,7 +7,7 @@
 // never breaks the page.
 //
 // Wire contract (the host parses exactly this):
-//   page -> host  console.warn("__DROSTJE_CHANNEL__" + JSON {v:1, id, type, data, final?}), at most 32 KiB
+//   page -> host  console.warn("__DROSTJE_CHANNEL__" + JSON {v:1, id, type, data}), at most 32 KiB
 //   host -> page  drostje.__receipt(id, "delivered" | "queued" | "failed" | "unknown", reason?)
 //   host -> page  drostje.__theme(cssText) replaces the unlayered #drostje-theme tokens
 // "queued" is not final: the event waits (for example behind a permission
@@ -92,9 +92,7 @@
 
     // progress(receipt) hears intermediate "queued" receipts; the promise only
     // resolves with a final status.
-    // final: the page's purpose is fulfilled once this event is delivered, so DROSTJE
-    // collapses the artifact (a docked one moves into the transcript).
-    function transmit(type, data, progress, final) {
+    function transmit(type, data, progress) {
       try {
         if (typeof type !== "string" || !TYPE.test(type)) {
           return Promise.reject(new TypeError("Invalid event type: " + String(type).slice(0, 80)));
@@ -102,8 +100,8 @@
         const body = JSON.stringify(data === undefined ? null : data);
         if (body === undefined) return Promise.reject(new TypeError("Event data is not JSON-serialisable"));
         const id = uuid();
-        // Same bytes as JSON.stringify({v: 1, id, type, data, final}); final only when true.
-        const encoded = '{"v":1,"id":' + JSON.stringify(id) + ',"type":' + JSON.stringify(type) + ',"data":' + body + (final ? ',"final":true' : "") + "}";
+        // Same bytes as JSON.stringify({v: 1, id, type, data}).
+        const encoded = '{"v":1,"id":' + JSON.stringify(id) + ',"type":' + JSON.stringify(type) + ',"data":' + body + "}";
         if (byteLength(encoded) > MAX_BYTES) return Promise.reject(new RangeError("Event exceeds 32 KiB"));
         return new Promise(resolve => {
           const timer = setTimeout(() => settle(id, "unknown", "No receipt from DROSTJE"), RECEIPT_TIMEOUT_MS);
@@ -119,9 +117,8 @@
       }
     }
 
-    // Script sends keep the page open unless they say the answer is final.
-    function send(type, data, options) {
-      return transmit(type, data, null, !!(options && options.final === true));
+    function send(type, data) {
+      return transmit(type, data, null);
     }
 
     function __receipt(id, status, reason) {
@@ -225,8 +222,8 @@
     }
 
     // Resolves with the final receipt; onQueued hears intermediate queued receipts.
-    function deliver(type, data, onQueued, final) {
-      return transmit(type, data, onQueued, final).catch(error => ({ status: "failed", reason: (error && error.message) || null }));
+    function deliver(type, data, onQueued) {
+      return transmit(type, data, onQueued).catch(error => ({ status: "failed", reason: (error && error.message) || null }));
     }
 
     function showStatus(el, state, text) {
@@ -297,7 +294,6 @@
       if (inFlight(form)) return;
       const type = form.getAttribute("data-drostje") || "submit";
       const data = serialize(form, event.submitter || null);
-      const final = !keepsOpen(form) && !keepsOpen(event.submitter);
       const submits = Array.from(form.elements).filter(isSubmitButton);
       const disabled = submits.filter(button => !button.disabled);
       let status = form.querySelector("[data-drostje-status]");
@@ -321,7 +317,7 @@
         form.setAttribute("data-drostje-state", result.state);
         showStatus(status, result.state, result.text);
       });
-      deliver(type, data, progress, final).then(guard(receipt => {
+      deliver(type, data, progress).then(guard(receipt => {
         const result = outcome(receipt);
         form.setAttribute("data-drostje-state", result.state);
         form.removeAttribute("aria-busy");
@@ -356,11 +352,6 @@
       return null;
     }
 
-    // Multi-step pages mark answers that should leave the page open.
-    function keepsOpen(el) {
-      return !!(el && el.closest && el.closest("[data-drostje-keep-open]"));
-    }
-
     function choose(el) {
       const type = el.getAttribute("data-drostje-send") || "choose";
       const value = (typeof el.value === "string" && el.value) || el.dataset.value || null;
@@ -390,7 +381,7 @@
         el.setAttribute("data-drostje-state", result.state);
         showStatus(status, result.state, result.text);
       });
-      deliver(type, { value, label }, progress, !keepsOpen(el)).then(guard(receipt => {
+      deliver(type, { value, label }, progress).then(guard(receipt => {
         const result = outcome(receipt);
         el.setAttribute("data-drostje-state", result.state);
         showStatus(status, result.state, result.text);

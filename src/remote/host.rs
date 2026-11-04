@@ -1018,6 +1018,9 @@ impl Host {
         {
             return self.artifact(thread, name, title, html, placement, reply);
         }
+        if let BrowserToolOperation::CompleteArtifact { id } = operation {
+            return self.complete_artifact(thread, id, reply);
+        }
         let result = (|| -> Result<(Uuid, Value)> {
             let BrowserToolOperation::Network { token, action } = operation else {
                 bail!(
@@ -1084,6 +1087,53 @@ impl Host {
         placement: crate::browser_tools::ArtifactPlacement,
         reply: std::sync::mpsc::Sender<std::result::Result<Value, String>>,
     ) {
+        let supported = self.desktop.artifacts;
+        self.desktop_call(
+            thread,
+            supported,
+            "The attached desktop DROSTJE cannot show remote artifacts; update DROSTJE on the desktop, or ask in plain text",
+            reply,
+            |generation, call| Response::ArtifactRequest {
+                thread,
+                generation,
+                call,
+                name,
+                title,
+                html,
+                placement,
+            },
+        );
+    }
+    /// Forward an artifact completion to the attached desktop, which owns the page.
+    fn complete_artifact(
+        &mut self,
+        thread: Uuid,
+        browser: Uuid,
+        reply: std::sync::mpsc::Sender<std::result::Result<Value, String>>,
+    ) {
+        let supported = self.desktop.artifact_completion;
+        self.desktop_call(
+            thread,
+            supported,
+            "The attached desktop DROSTJE cannot complete artifacts; update DROSTJE on the desktop",
+            reply,
+            |generation, call| Response::ArtifactComplete {
+                thread,
+                generation,
+                call,
+                browser,
+            },
+        );
+    }
+    /// A desktop-side artifact operation for this runtime, answered like a Network call.
+    fn desktop_call(
+        &mut self,
+        thread: Uuid,
+        supported: bool,
+        unsupported: &str,
+        reply: std::sync::mpsc::Sender<std::result::Result<Value, String>>,
+        request: impl FnOnce(Uuid, Uuid) -> Response,
+    ) {
         let result = (|| -> Result<Uuid> {
             let runtime = self
                 .runtimes
@@ -1091,12 +1141,9 @@ impl Host {
                 .context("Remote runtime is not live")?;
             ensure!(
                 runtime.attached && self.epoch.is_some() && self.last_seen.elapsed() <= LEASE,
-                "The desktop is disconnected; artifacts show only while it is attached"
+                "The desktop is disconnected; artifacts work only while it is attached"
             );
-            ensure!(
-                self.desktop.artifacts,
-                "The attached desktop DROSTJE cannot show remote artifacts; update DROSTJE on the desktop, or ask in plain text"
-            );
+            ensure!(supported, "{unsupported}");
             ensure!(
                 self.network.len() < 64,
                 "Remote artifact request queue is full"
@@ -1115,15 +1162,7 @@ impl Host {
                         deadline: Instant::now() + Duration::from_secs(25),
                     },
                 );
-                self.send(Response::ArtifactRequest {
-                    thread,
-                    generation,
-                    call,
-                    name,
-                    title,
-                    html,
-                    placement,
-                });
+                self.send(request(generation, call));
             }
             Err(error) => {
                 let _ = reply.send(Err(format!("{error:#}")));
@@ -1973,6 +2012,55 @@ mod tests {
         );
         host.request(message).unwrap();
         assert_eq!(response.recv().unwrap().unwrap(), json!({"id":"shown"}));
+
+        // Completion is the agent's call, forwarded to the desktop that owns the page.
+        let browser = Uuid::new_v4();
+        let (reply, response) = mpsc::channel();
+        host.tool(BrowserToolRequest {
+            thread,
+            operation: BrowserToolOperation::CompleteArtifact { id: browser },
+            reply,
+        });
+        let Response::ArtifactComplete {
+            call,
+            browser: forwarded,
+            ..
+        } = serde_json::from_value(responses.try_recv().unwrap()).unwrap()
+        else {
+            panic!("expected a forwarded completion")
+        };
+        assert_eq!(forwarded, browser);
+        let message = request(
+            &host,
+            thread,
+            Operation::NetworkResponse {
+                call,
+                result: Ok(json!({"completed":true})),
+            },
+        );
+        host.request(message).unwrap();
+        assert_eq!(response.recv().unwrap().unwrap(), json!({"completed":true}));
+
+        // A desktop with artifacts but without completion is refused, never sent it.
+        let mut partial =
+            serde_json::to_value(request(&host, thread, Operation::Heartbeat)).unwrap();
+        partial["capabilities"] = json!({"artifacts": true});
+        host.request(serde_json::from_value(partial).unwrap())
+            .unwrap();
+        let (reply, response) = mpsc::channel();
+        host.tool(BrowserToolRequest {
+            thread,
+            operation: BrowserToolOperation::CompleteArtifact { id: browser },
+            reply,
+        });
+        assert!(
+            response
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("cannot complete artifacts")
+        );
+        assert!(responses.try_recv().is_err());
 
         // A desktop from before artifacts omits the capability: nothing is forwarded.
         let mut old = serde_json::to_value(request(&host, thread, Operation::Heartbeat)).unwrap();

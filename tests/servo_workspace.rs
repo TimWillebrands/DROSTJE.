@@ -527,10 +527,11 @@ mod macos {
         })
     }
 
-    /// A docked form's final answer travels the real path (kit, Servo, app outbox, native
-    /// command), and only the runtime's acceptance fulfils it: the page then collapses,
-    /// marked answered, leaves the dock and hands focus back to the composer.
-    fn assert_answered_artifact_collapses(
+    /// A docked form's answer travels the real path (kit, Servo, app outbox, native command)
+    /// and the page stays open for corrections. Only the agent's complete_artifact call,
+    /// through the real tool endpoint, collapses it, marks it answered, frees the dock and
+    /// hands focus back to the composer.
+    fn assert_agent_completes_artifact(
         cx: &mut HeadlessAppContext,
         window: WindowHandle<Root>,
         workspace: &Entity<Workspace>,
@@ -619,33 +620,7 @@ mod macos {
             }
         };
 
-        // A multi-step page answers without closing.
-        let step = directory.join("step.html");
-        std::fs::write(&step, "<!doctype html><title>Step</title><main data-drostje-artifact><form data-drostje=\"step\" data-drostje-keep-open><button>Next</button></form></main>").unwrap();
-        let open = tool(
-            cx,
-            window,
-            endpoint,
-            thread,
-            "show_artifact",
-            json!({"path":step,"title":"Step one","placement":"composer"}),
-        );
-        let open_id = open["id"].as_str().unwrap().to_owned();
-        pump(cx, window);
-        let delivery = submit(cx, &open_id);
-        assert!(delivery.messages[0].body.contains(r#""type":"step""#));
-        assert!(!delivery.messages[0].body.contains("final"));
-        accept(cx, delivery.attempt);
-        for _ in 0..5 {
-            pump(cx, window);
-        }
-        assert_eq!(
-            docked_sessions(cx, state),
-            [open_id.clone()],
-            "keep-open stays docked"
-        );
-
-        // A final answer fulfils the page.
+        // The user answers; the agent decides when it has what it needs.
         let page = directory.join("ask.html");
         let shown = tool(
             cx,
@@ -698,27 +673,64 @@ mod macos {
         .unwrap();
         pump(cx, window);
         let delivery = submit(cx, &id);
-        assert!(delivery.messages[0].body.contains(r#""final":true"#));
-        // Dispatch is not delivery: the page waits for the runtime.
-        assert_eq!(docked_sessions(cx, state), [id.clone()]);
+        assert!(delivery.messages[0].body.contains(r#""type":"answer""#));
         accept(cx, delivery.attempt);
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !docked_sessions(cx, state).is_empty() {
+        loop {
             pump(cx, window);
+            let page = tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({"action":"evaluate","id":id,"script":"document.querySelector('form').dataset.drostjeState"}),
+            );
+            if page == "sent" {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "a delivered final answer undocks its page"
+                "the page hears its answer arrived: {page}"
             );
         }
+        assert_eq!(
+            docked_sessions(cx, state),
+            [id.clone()],
+            "a delivered answer leaves the page open for corrections"
+        );
+
+        // Only this Conversation's own artifacts can be completed.
+        let stranger = request(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "complete_artifact",
+            json!({"id":Uuid::new_v4()}),
+        );
+        assert!(
+            stranger
+                .to_string()
+                .contains("not an open artifact of this Conversation"),
+            "{stranger}"
+        );
+        let completed = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "complete_artifact",
+            json!({"id":id}),
+        );
+        assert_eq!(completed["completed"], true);
+        assert!(docked_sessions(cx, state).is_empty());
         pump(cx, window);
         let record = sessions(cx, state)
             .into_iter()
             .find(|session| session["id"] == id.as_str())
             .unwrap();
-        assert_eq!(
-            record["answered"], true,
-            "answered state survives a restart"
-        );
+        assert_eq!(record["answered"], true, "completion survives a restart");
         assert_eq!(record["placement"], "conversation");
         cx.update_window(window.into(), |_, window, _| {
             assert!(window.try_find("composer-artifact").is_none());
@@ -744,16 +756,14 @@ mod macos {
             json!({"action":"evaluate","id":id,"script":"document.querySelector('form').dataset.drostjeState"}),
         );
         assert_eq!(page_state, "sent", "the page was told its answer arrived");
-        for id in [open_id, id] {
-            tool(
-                cx,
-                window,
-                endpoint,
-                thread,
-                "browser",
-                json!({"action":"close","id":id}),
-            );
-        }
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"close","id":id}),
+        );
         pump(cx, window);
     }
 
@@ -1671,7 +1681,7 @@ mod macos {
         assert_docked_artifact(
             &mut cx, window, &workspace, &state, &endpoint, thread, &directory,
         );
-        assert_answered_artifact_collapses(
+        assert_agent_completes_artifact(
             &mut cx, window, &workspace, &state, &endpoint, thread, &directory,
         );
         let png = directory.join("tool.png");

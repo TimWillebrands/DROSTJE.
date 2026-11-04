@@ -238,9 +238,10 @@ Failed en Unknown worden nooit vanzelf opnieuw verstuurd.
 
 ### Browser en artifacts
 
-**Open browser** opent een Servo-tab; weblinks in een Conversation ook. `Cmd-L` focust de adresbalk, `Cmd-R` herlaadt. Agents krijgen twee tools:
+**Open browser** opent een Servo-tab; weblinks in een Conversation ook. `Cmd-L` focust de adresbalk, `Cmd-R` herlaadt. Agents krijgen drie tools:
 
-- `show_artifact` toont een HTML-bestand als interactieve pagina in de Conversation of boven de composer. Zo stelt een agent je vragen: een formulier op de pagina stuurt je antwoord terug naar de agent. Beantwoorde artifacts klappen in; `Cmd-Shift-A` klapt ze weer uit.
+- `show_artifact` toont een HTML-bestand als interactieve pagina in de Conversation of boven de composer. Zo stelt een agent je vragen: een formulier op de pagina stuurt je antwoord terug naar de agent.
+- `complete_artifact` sluit zo'n vraag af zodra de agent weet wat hij moet weten. Tot dan blijft de pagina open, zodat je een antwoord kunt verbeteren en opnieuw versturen. Daarna klapt hij in met **Answered** en verlaat hij de plek boven de composer; `Cmd-Shift-A` klapt hem weer uit.
 - `browser` opent en bedient een pagina: observeren, klikken, typen, scrollen, wachten op een voorwaarde, screenshots en console- en netwerkfouten. Handig om een agent zijn eigen webapp te laten testen.
 
 > ⚠️ **Geen sandbox.** Pagina's draaien JavaScript en netwerkverzoeken met de rechten van de app. Servo draait in hetzelfde proces: een crash daar sluit de hele app. Geen WebGL, downloads of extensies; maximaal 16 pagina's tegelijk.
@@ -336,7 +337,7 @@ Eigen thema's zet je in `<datamap>/themes` als GPUI Kit `ThemeSet`-JSON (een obj
 
 ## Ontwikkelen
 
-Lees eerst [`AGENTS.md`](AGENTS.md): definition of done en de regels die overal gelden. Verder: [`CODING_STANDARDS.md`](CODING_STANDARDS.md) voor lagen, Rust-conventies en testniveaus, [`docs/agents/ui.md`](docs/agents/ui.md) voor UI en toetsenbord, en [`GLOSSARY.md`](GLOSSARY.md) voor de vaste termen.
+Lees eerst [`AGENTS.md`](AGENTS.md): definition of done en de regels die overal gelden. Verder: [`CODING_STANDARDS.md`](CODING_STANDARDS.md) voor lagen, Rust-conventies en testniveaus, [`docs/agents/ui.md`](docs/agents/ui.md) voor UI en toetsenbord, en [`CONTEXT.md`](CONTEXT.md) voor de vaste termen.
 
 ```sh
 cargo check --all-targets          # na elke stap

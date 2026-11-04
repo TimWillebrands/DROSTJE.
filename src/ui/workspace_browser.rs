@@ -20,7 +20,7 @@ pub(super) struct BrowserRecord {
     /// Where the artifact shows now. Invariant: at most one `Composer` per thread.
     #[serde(default)]
     placement: ArtifactPlacement,
-    /// The artifact's final answer reached the agent; it restores collapsed.
+    /// The agent completed the artifact; it restores collapsed.
     #[serde(default)]
     answered: bool,
 }
@@ -376,9 +376,9 @@ impl Workspace {
         self.state
             .update(cx, |_, cx| cx.emit(PresentationChange::Thread(thread)));
     }
-    /// An artifact's final answer reached the agent: its purpose is fulfilled. It collapses
-    /// to its header, marked answered, and a docked one moves into the transcript so the
-    /// prompt area is free. Focus inside it returns to the composer, never to a hidden page.
+    /// The agent has what it needed from this artifact: it collapses to its header, marked
+    /// answered, and a docked one moves into the transcript so the prompt area is free.
+    /// Focus inside it returns to the composer, never to a hidden page.
     pub(super) fn complete_artifact(
         &mut self,
         id: BrowserId,
@@ -662,13 +662,10 @@ impl Workspace {
     pub(super) fn start_browser_tools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Receipts tell each artifact page what happened to its events.
         let receipts = self.state.read(cx).artifact_receipts();
-        cx.spawn_in(window, async move |workspace, cx| {
+        cx.spawn(async move |workspace, cx| {
             while let Ok(batch) = receipts.recv().await {
-                let delivered = workspace.update_in(cx, |workspace, window, cx| {
+                let delivered = workspace.update(cx, |workspace, _| {
                     for receipt in batch {
-                        if receipt.completes {
-                            workspace.complete_artifact(receipt.browser, window, cx);
-                        }
                         workspace.browsers.runtime.receipt(
                             receipt.browser,
                             receipt.event,
@@ -785,6 +782,19 @@ impl Workspace {
             // The remote client writes a local copy and submits it as ShowArtifact.
             BrowserToolOperation::ShowRemoteArtifact { .. } => {
                 Err("Remote artifacts are shown through their remote host connection".into())
+            }
+            BrowserToolOperation::CompleteArtifact { id } => {
+                let owned = self.browsers.records.get(&id).is_some_and(|record| {
+                    record.thread == Some(thread) && record.artifact.is_some()
+                });
+                if owned {
+                    self.complete_artifact(id, window, cx);
+                    Ok(json!({"id":id,"completed":true}))
+                } else {
+                    Err(format!(
+                        "{id} is not an open artifact of this Conversation; use the ID show_artifact returned"
+                    ))
+                }
             }
             BrowserToolOperation::Open { url, placement } => {
                 match super::super::browser::navigation_url(&url) {
