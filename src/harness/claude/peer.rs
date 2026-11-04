@@ -167,8 +167,12 @@ impl Inbox {
         // Bind the real, owned return address before connecting or writing any delivery.
         // No sender-authored permission mode or own-child identity is asserted.
         let from = self.status_address(&path)?.to_owned();
+        let name = match delivery.messages.first().map(|message| message.origin) {
+            Some(ContextOrigin::Artifact) => "DROSTJE artifact",
+            Some(ContextOrigin::Peer) | None => "Space network",
+        };
         let content = format!(
-            "<cross-session-message from=\"{from}\" from-name=\"Space network\">\n{body}\n</cross-session-message>"
+            "<cross-session-message from=\"{from}\" from-name=\"{name}\">\n{body}\n</cross-session-message>"
         );
         let mut bytes = serde_json::to_vec(&json!({
             "msgV":1, "msg_id":delivery.attempt, "type":"user",

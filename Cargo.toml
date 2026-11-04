@@ -79,6 +79,11 @@ name = "servo_content_process"
 harness = false
 required-features = ["runtime-qa"]
 
+[[test]]
+name = "native_terminal_input"
+harness = false
+required-features = ["runtime-qa"]
+
 # Keep GPUI pinned while sharing Servo's FreeType ABI. The vendored crate changes
 # only its FreeType dependency requirements; both upstream licenses are retained.
 [patch.crates-io]

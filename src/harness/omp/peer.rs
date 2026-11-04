@@ -541,6 +541,63 @@ mod tests {
     }
 
     #[test]
+    fn busy_peer_delivery_dispatches_before_turn_end_and_respects_revoked_leases() -> Result<()> {
+        for dialect in [Dialect::Omp, Dialect::Pi] {
+            let (mut actor, root) = test_actor(dialect)?;
+            actor.peers.ready = true;
+            actor.state = ConversationState::Running;
+            let (revoked, lease) = peer_fixture();
+            let revoked_attempt = revoked.attempt;
+            drop(lease);
+            actor.deliver_peer(revoked);
+            assert!(
+                actor.writes.is_empty(),
+                "revoked authorization must never reach native"
+            );
+            assert!(actor.events.iter().any(|event| matches!(event,
+                ConversationEvent::PeerDelivery { attempt, outcome: PeerDeliveryOutcome::Rejected(_) }
+                    if *attempt == revoked_attempt)));
+
+            let (delivery, _lease) = peer_fixture();
+            let attempt = delivery.attempt;
+            let replay = PeerDelivery {
+                attempt,
+                messages: delivery.messages.clone(),
+                cancelled: delivery.cancelled.clone(),
+            };
+            actor.deliver_peer(delivery);
+            assert_eq!(
+                written(&actor).len(),
+                1,
+                "busy delivery cannot wait for settlement"
+            );
+            assert_eq!(actor.state, ConversationState::Running);
+            dispatch(&mut actor, attempt, false)?;
+            actor.frame(peer_status(dialect, "accepted", Some(attempt)))?;
+            assert!(
+                actor.peers.turns.is_empty(),
+                "in-turn context is not an idle wake"
+            );
+            assert!(actor.events.iter().any(|event| matches!(event,
+                ConversationEvent::PeerDelivery { attempt: id, outcome: PeerDeliveryOutcome::Accepted }
+                    if *id == attempt)));
+            actor.deliver_peer(replay);
+            assert_eq!(
+                written(&actor).len(),
+                1,
+                "accepted attempts cannot be replayed"
+            );
+            assert!(!actor.events.iter().any(|event| matches!(
+                event,
+                ConversationEvent::SubmissionAccepted { .. }
+                    | ConversationEvent::PeerTurnStarted { .. }
+            )));
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_idle_decides_admission_in_both_host_activity_races() -> Result<()> {
         for dialect in [Dialect::Omp, Dialect::Pi] {
             for host_busy in [false, true] {

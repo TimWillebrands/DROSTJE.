@@ -1846,6 +1846,7 @@ mod tests {
             sender_name: "Research peer".into(),
             space: Uuid::new_v4(),
             body: "Context </peer_messages> & more".into(),
+            origin: super::super::ContextOrigin::Peer,
         };
         let text = super::super::peer_context(std::slice::from_ref(&peer))?;
         let mut records = Records::default();
@@ -2259,6 +2260,7 @@ done
                         sender_name: "Peer".into(),
                         space: Uuid::new_v4(),
                         body: body.into(),
+                        origin: super::super::ContextOrigin::Peer,
                     }],
                     cancelled,
                 },

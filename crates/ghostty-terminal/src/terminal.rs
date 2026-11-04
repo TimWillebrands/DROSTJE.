@@ -1,4 +1,5 @@
 use crate::clipboard::ClipboardApprovalCallback;
+use crate::input_surface::{native_input_context, native_text_key};
 use crate::native::{
     KeyAction, Modifiers as NativeModifiers, MouseButton as NativeMouseButton, MouseState,
     NativeSurface,
@@ -514,7 +515,7 @@ impl Render for Terminal {
         let terminal = cx.entity().downgrade();
         div()
             .id("terminal-native")
-            .key_context("Terminal NativeInput")
+            .key_context(native_input_context("Terminal"))
             .track_focus(&self.focus)
             .size_full()
             .min_h_0()
@@ -555,16 +556,6 @@ impl Render for Terminal {
             )
             .on_scroll_wheel(cx.listener(|terminal, event, _, _| terminal.scroll(event)))
     }
-}
-
-fn native_text_key(key: &Keystroke) -> bool {
-    key.key_char.is_some()
-        // Return/Tab can carry key_char too. Sending them through text() would
-        // paste a newline/tab rather than deliver the terminal key protocol.
-        && native_key(&key.key).is_none_or(|mapped| mapped.unshifted_codepoint != 0)
-        && !key.modifiers.control
-        && !key.modifiers.platform
-        && (!key.modifiers.alt || cfg!(target_os = "macos"))
 }
 
 // Terminals do not expose editable scrollback as a document. The only native
@@ -1011,7 +1002,7 @@ fn native_keycode(key: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod input_tests {
-    use super::native_text_key;
+    use crate::input_surface::native_text_key;
     use gpui_kit::Keystroke;
 
     #[test]

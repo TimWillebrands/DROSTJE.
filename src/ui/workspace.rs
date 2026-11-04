@@ -2,6 +2,8 @@
 mod browser_workspace;
 #[path = "workspace_neovim.rs"]
 mod neovim_workspace;
+#[path = "workspace_terminal.rs"]
+mod terminal_workspace;
 use super::browser::{BrowserPane, OpenBrowserUrl};
 use super::{
     activity,
@@ -46,6 +48,8 @@ use std::{
     rc::Rc,
     time::{Duration, Instant},
 };
+use terminal_workspace::ThreadTerminal;
+pub(super) use terminal_workspace::thread_terminal_location;
 
 /// A list or scroll motion, shared by the Projects list, thread panels and the transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,9 +278,12 @@ pub struct Workspace {
     /// Shared with the panel registry so a restored layout rebuilds into the same map.
     threads: ThreadPanels,
     terminals: TerminalPanels,
+    pub(super) thread_terminals: BTreeMap<ThreadId, ThreadTerminal>,
     pub(super) browsers: Browsers,
     pub(super) sidebar_sizes:
         Rc<RefCell<BTreeMap<ThreadId, Entity<gpui_kit::component::resizable::ResizableState>>>>,
+    pub(super) composer_sizes:
+        BTreeMap<ThreadId, Entity<gpui_kit::component::resizable::ResizableState>>,
     pub(super) changes_lists: super::changes::ChangesLists,
     /// Live layouts reattach retained terminals; durable layouts reopen them with a new shell.
     live_layouts: BTreeMap<SpaceId, DockAreaState>,
@@ -417,8 +424,10 @@ impl Workspace {
             projects,
             threads,
             terminals,
+            thread_terminals: BTreeMap::new(),
             browsers,
             sidebar_sizes: Rc::default(),
+            composer_sizes: BTreeMap::new(),
             changes_lists: Rc::default(),
             live_layouts: BTreeMap::new(),
             active_terminal: None,
@@ -578,6 +587,7 @@ impl Workspace {
                         workspace.sync_permission_mode_picker(window, cx);
                         workspace.sync_selection_panels(window, cx);
                         workspace.sync_visible_threads(cx);
+                        workspace.sync_sidebar_terminals(window, cx);
                     }
                     PresentationChange::Thread(id)
                         if workspace.state.read(cx).selected_thread == Some(id) =>
@@ -610,6 +620,7 @@ impl Workspace {
                     workspace.normalize_layout(workspace.reopening, window, cx);
                     workspace.schedule_layout_save(window, cx);
                     workspace.sync_visible_threads(cx);
+                    workspace.sync_sidebar_terminals(window, cx);
                     workspace.sync_terminal_visibility(window, cx);
                 }
             },
@@ -1186,9 +1197,18 @@ impl Workspace {
                 .terminal
                 .as_ref()
                 .is_some_and(|pane| pane.read(cx).is_alive(cx))
-        })
+        }) || self
+            .thread_terminals
+            .values()
+            .filter_map(|entry| entry.pane.as_ref())
+            .any(|pane| pane.read(cx).is_alive(cx))
     }
     pub(super) fn close_all_terminals(&mut self, cx: &mut Context<Self>) {
+        for (_, entry) in std::mem::take(&mut self.thread_terminals) {
+            if let Some(pane) = entry.pane {
+                pane.update(cx, |pane, cx| pane.close(cx));
+            }
+        }
         for (_, panel) in std::mem::take(&mut *self.terminals.borrow_mut()) {
             if let Some(pane) = panel.read(cx).terminal.clone() {
                 pane.update(cx, |pane, cx| pane.close(cx));
@@ -1213,6 +1233,13 @@ impl Workspace {
             .collect()
     }
     fn hide_terminals(&self, cx: &mut App) {
+        for pane in self
+            .thread_terminals
+            .values()
+            .filter_map(|entry| entry.pane.as_ref())
+        {
+            pane.update(cx, |pane, cx| pane.set_visible(false, cx));
+        }
         for panel in self.terminals.borrow().values() {
             if let Some(pane) = panel.read(cx).terminal.clone() {
                 pane.update(cx, |pane, cx| pane.set_visible(false, cx));
@@ -1224,7 +1251,7 @@ impl Workspace {
         // Only inactive tabs/Spaces are occluded; focus independently gates input.
         let dock = self.dock.read(cx);
         let layout = dock.dump(cx);
-        let panes: Vec<_> = self
+        let mut panes: Vec<_> = self
             .terminals
             .borrow()
             .values()
@@ -1235,6 +1262,24 @@ impl Workspace {
                 Some((pane, visible))
             })
             .collect();
+        let state = self.state.read(cx);
+        for (&id, entry) in &self.thread_terminals {
+            let Some(pane) = &entry.pane else {
+                continue;
+            };
+            let visible = pane.read(cx).space_id == self.presented_space
+                && state.thread_sidebar_open(id)
+                && state.thread_sidebar_tab(id) == SidebarTab::Terminal
+                && self
+                    .threads
+                    .borrow()
+                    .get(&id)
+                    .is_some_and(|panel| panel_visible(panel, dock, &layout, cx));
+            panes.push((pane.clone(), visible));
+            if !visible {
+                entry.bounds.set(None);
+            }
+        }
         for (pane, visible) in panes {
             pane.update(cx, |pane, cx| pane.set_visible(visible, cx));
         }
@@ -1418,6 +1463,19 @@ impl Workspace {
     pub(super) fn restart_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.active_terminal {
             self.confirm_terminal_stop(id, true, window, cx);
+        } else if let Some((id, _)) = self.selected_sidebar_terminal(cx) {
+            self.confirm_sidebar_terminal_stop(id, true, window, cx);
+        } else if let Some(id) = self
+            .state
+            .read(cx)
+            .thread()
+            .filter(|thread| {
+                self.state.read(cx).thread_sidebar_tab(thread.id) == SidebarTab::Terminal
+            })
+            .map(|thread| thread.id)
+        {
+            self.drop_sidebar_terminal(id, cx);
+            self.show_sidebar_tab(id, SidebarTab::Terminal, window, cx);
         }
     }
     fn close_terminal_tab(&mut self, id: TerminalId, window: &mut Window, cx: &mut Context<Self>) {
@@ -1816,6 +1874,7 @@ impl Workspace {
             }
         }
         self.sync_browser_tabs(window, cx);
+        self.sync_sidebar_terminals(window, cx);
         if lost_focus {
             // The closed pane held focus; keyboard control continues in the next thread.
             if let Some(target) = self.thread_target(cx) {
@@ -1980,6 +2039,7 @@ impl Workspace {
             return;
         }
         self.threads.borrow_mut().remove(&id);
+        self.drop_sidebar_terminal(id, cx);
         if self.state.read(cx).open_threads.contains(&id) {
             self.state.update(cx, |state, cx| {
                 state.close_thread(id);
@@ -2265,6 +2325,10 @@ impl Workspace {
         {
             return;
         }
+        if self.confirm_sidebar_terminal_stop(id, false, window, cx) {
+            return;
+        }
+        self.drop_sidebar_terminal(id, cx);
         self.state.update(cx, |state, cx| {
             state.close_thread(id);
             cx.notify();
@@ -2490,6 +2554,9 @@ impl Workspace {
         if tab == SidebarTab::Browser {
             self.ensure_sidebar_browser(id, window, cx);
         }
+        if tab == SidebarTab::Terminal {
+            self.ensure_sidebar_terminal(id, window, cx);
+        }
         self.state.update(cx, |state, cx| {
             state.show_thread_sidebar(id, tab);
             cx.emit(PresentationChange::Thread(id));
@@ -2498,6 +2565,12 @@ impl Workspace {
         let panel = self.threads.borrow().get(&id).cloned();
         if let Some(panel) = panel {
             self.focus_panel(panel, window, cx);
+        }
+        self.sync_terminal_visibility(window, cx);
+        if tab == SidebarTab::Terminal
+            && let Some(pane) = self.sidebar_terminal(id)
+        {
+            pane.update(cx, |pane, cx| pane.focus(window, cx));
         }
         if tab == SidebarTab::Agents
             && let Some(network) = self.network_sidebar(id, cx)
@@ -2543,12 +2616,28 @@ impl Workspace {
         }
     }
     /// Show `tab` in a thread's sidebar, or hide the sidebar when `tab` is on screen.
-    fn toggle_sidebar_tab(&mut self, id: ThreadId, tab: SidebarTab, cx: &mut Context<Self>) {
+    fn toggle_sidebar_tab(
+        &mut self,
+        id: ThreadId,
+        tab: SidebarTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let leave_terminal = self
+            .sidebar_terminal(id)
+            .is_some_and(|pane| pane.read(cx).focus_handle(cx).contains_focused(window, cx));
         self.state.update(cx, |state, cx| {
             state.toggle_thread_sidebar(id, tab);
             cx.emit(PresentationChange::Thread(id));
         });
         self.sync_visible_threads(cx);
+        self.sync_terminal_visibility(window, cx);
+        if leave_terminal {
+            let panel = self.threads.borrow().get(&id).cloned();
+            if let Some(panel) = panel {
+                self.focus_panel(panel, window, cx);
+            }
+        }
     }
     /// Fold or unfold one of the conversation's sticky docks (task list, background jobs).
     fn toggle_dock(&mut self, dock: &str, cx: &mut Context<Self>) {
@@ -2711,15 +2800,40 @@ impl Workspace {
                 && dock.bounds().contains(&bounds.center()))
             .then_some(bounds)
         };
-        let Some(origin) = visible_bounds(&current) else {
+        let mut surfaces = Vec::new();
+        for panel in self.all_panels() {
+            let Some(mut bounds) = visible_bounds(&panel) else {
+                continue;
+            };
+            if let PanelKind::Thread(id) = panel.read(cx).kind
+                && self.state.read(cx).thread_sidebar_open(id)
+                && self.state.read(cx).thread_sidebar_tab(id) == SidebarTab::Terminal
+                && let Some(entry) = self.thread_terminals.get(&id)
+                && let Some(terminal_bounds) = entry.bounds.get()
+            {
+                bounds.size.width = (terminal_bounds.left() - bounds.left()).max(px(0.));
+                surfaces.push((panel.clone(), Some(id), terminal_bounds));
+            }
+            surfaces.push((panel, None, bounds));
+        }
+        let terminal_focus = self.thread_terminals.iter().find_map(|(&id, entry)| {
+            entry
+                .pane
+                .as_ref()
+                .filter(|pane| pane.read(cx).focus_handle(cx).contains_focused(window, cx))
+                .map(|_| id)
+        });
+        let Some(origin) = surfaces
+            .iter()
+            .find(|(panel, sidebar, _)| *panel == current && *sidebar == terminal_focus)
+            .map(|(_, _, bounds)| *bounds)
+        else {
             return;
         };
-        let next = self
-            .all_panels()
+        let next = surfaces
             .into_iter()
-            .filter(|panel| *panel != current)
-            .filter_map(|panel| {
-                let bounds = visible_bounds(&panel)?;
+            .filter(|(panel, sidebar, _)| *panel != current || *sidebar != terminal_focus)
+            .filter_map(|(panel, sidebar, bounds)| {
                 let overlap = origin.intersect(&bounds).size;
                 let delta = bounds.center() - origin.center();
                 let (gap, overlap, cross) = match direction {
@@ -2735,7 +2849,7 @@ impl Workspace {
                 // Neighbours must lie beyond this edge, not merely have a centre
                 // somewhere in that direction. Allow one pixel of layout rounding.
                 (gap >= px(-1.) && overlap > px(1.)).then_some((
-                    panel,
+                    (panel, sidebar),
                     f32::from(gap).max(0.),
                     f32::from(cross).abs(),
                 ))
@@ -2744,8 +2858,13 @@ impl Workspace {
             // because a farther pane's centre happens to line up better.
             .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)))
             .map(|(panel, _, _)| panel);
-        if let Some(next) = next {
+        if let Some((next, sidebar)) = next {
             self.focus_panel(next, window, cx);
+            if let Some(id) = sidebar
+                && let Some(pane) = self.sidebar_terminal(id)
+            {
+                pane.update(cx, |pane, cx| pane.focus(window, cx));
+            }
         }
     }
 
@@ -2840,7 +2959,7 @@ impl Workspace {
                     if self.sidebar_browser(id).is_none() {
                         self.ensure_sidebar_browser(id, window, cx);
                     } else {
-                        self.toggle_sidebar_tab(id, SidebarTab::Browser, cx);
+                        self.toggle_sidebar_tab(id, SidebarTab::Browser, window, cx);
                     }
                 }
                 None
@@ -2855,8 +2974,31 @@ impl Workspace {
                 }
                 None
             }
+            Command::FocusComposerArtifact => {
+                if let Some(pane) = self
+                    .state
+                    .read(cx)
+                    .conversation_thread()
+                    .and_then(|thread| self.docked_artifact(thread.id))
+                {
+                    pane.update(cx, |pane, cx| pane.focus(window, cx));
+                }
+                None
+            }
+            Command::MoveArtifactIntoConversation => {
+                if let Some(thread) = self.state.read(cx).conversation_thread().map(|t| t.id) {
+                    self.move_docked_artifact_into_conversation(thread, cx);
+                }
+                None
+            }
             Command::NewTerminal => {
                 self.new_terminal(window, cx);
+                None
+            }
+            Command::ToggleTerminal => {
+                if let Some(id) = self.state.read(cx).thread().map(|thread| thread.id) {
+                    self.toggle_terminal_sidebar(id, window, cx);
+                }
                 None
             }
             Command::RestartTerminal => {
@@ -2966,13 +3108,13 @@ impl Workspace {
                     } else {
                         SidebarTab::Changes
                     };
-                    self.toggle_sidebar_tab(id, tab, cx);
+                    self.toggle_sidebar_tab(id, tab, window, cx);
                 }
                 None
             }
             Command::ToggleAgents => {
                 if let Some(id) = self.state.read(cx).conversation_thread().map(|t| t.id) {
-                    self.toggle_sidebar_tab(id, SidebarTab::Agents, cx);
+                    self.toggle_sidebar_tab(id, SidebarTab::Agents, window, cx);
                 }
                 None
             }
@@ -3025,6 +3167,15 @@ impl Workspace {
                 self.toggle_dock("dock-jobs", cx);
                 None
             }
+            Command::GrowComposer | Command::ShrinkComposer => {
+                let delta = if command == Command::GrowComposer {
+                    48.
+                } else {
+                    -48.
+                };
+                self.resize_composer(delta, window, cx);
+                None
+            }
             Command::RegenerateTitle => {
                 self.state
                     .update(cx, |state, cx| state.regenerate_title(cx));
@@ -3040,7 +3191,7 @@ impl Workspace {
             }
             Command::ToggleReview => {
                 if let Some(id) = self.state.read(cx).conversation_thread().map(|t| t.id) {
-                    self.toggle_sidebar_tab(id, SidebarTab::Review, cx);
+                    self.toggle_sidebar_tab(id, SidebarTab::Review, window, cx);
                 }
                 None
             }
@@ -3295,7 +3446,7 @@ impl Workspace {
             }
             Command::ToggleOutput => {
                 if let Some(id) = self.state.read(cx).thread().map(|thread| thread.id) {
-                    self.toggle_sidebar_tab(id, SidebarTab::Output, cx);
+                    self.toggle_sidebar_tab(id, SidebarTab::Output, window, cx);
                 }
                 None
             }
@@ -4115,6 +4266,9 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &NewTerminal, w, cx| {
                     this.execute(Command::NewTerminal, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &ToggleTerminal, w, cx| {
+                    this.execute(Command::ToggleTerminal, w, cx)
+                }))
                 .on_action(cx.listener(|this, _: &RestartTerminal, w, cx| {
                     this.execute(Command::RestartTerminal, w, cx)
                 }))
@@ -4142,6 +4296,14 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &ToggleArtifact, w, cx| {
                     this.execute(Command::ToggleArtifact, w, cx)
                 }))
+                .on_action(cx.listener(|this, _: &FocusComposerArtifact, w, cx| {
+                    this.execute(Command::FocusComposerArtifact, w, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &MoveArtifactIntoConversation, w, cx| {
+                        this.execute(Command::MoveArtifactIntoConversation, w, cx)
+                    }),
+                )
                 .on_action(cx.listener(|this, _: &WidenSidebar, w, cx| {
                     this.execute(Command::WidenSidebar, w, cx)
                 }))
@@ -4325,6 +4487,12 @@ impl Render for Workspace {
                 }))
                 .on_action(cx.listener(|this, _: &ToggleBackgroundJobs, w, cx| {
                     this.execute(Command::ToggleBackgroundJobs, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &GrowComposer, w, cx| {
+                    this.execute(Command::GrowComposer, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShrinkComposer, w, cx| {
+                    this.execute(Command::ShrinkComposer, w, cx)
                 }))
                 .on_action(cx.listener(|this, _: &RegenerateTitle, w, cx| {
                     this.execute(Command::RegenerateTitle, w, cx)
@@ -4808,8 +4976,16 @@ impl BasePanel for WorkspacePanel {
     fn panel_name(&self) -> &'static str {
         self.kind.name()
     }
-    fn closable(&self, _: &App) -> bool {
-        matches!(self.kind, PanelKind::Thread(_) | PanelKind::Browser(_))
+    fn closable(&self, cx: &App) -> bool {
+        match self.kind {
+            PanelKind::Thread(id) => !self
+                .workspace
+                .upgrade()
+                .and_then(|workspace| workspace.read(cx).sidebar_terminal(id))
+                .is_some_and(|pane| pane.read(cx).is_alive(cx)),
+            PanelKind::Browser(_) => true,
+            _ => false,
+        }
     }
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(terminal) = &self.terminal {
@@ -4957,6 +5133,18 @@ impl Panel for WorkspacePanel {
         let state = self.state.read(cx);
         let activity = state.thread_activity(id);
         let titling = state.is_titling(id);
+        let project = state
+            .snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.id == id)
+            .and_then(|thread| {
+                state
+                    .snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.id == thread.project_id)
+            });
         let group = SharedString::from(format!("thread-tab-{id}"));
         let (middle, close) = (self.workspace.clone(), self.workspace.clone());
         let rename_input = self.workspace.upgrade().and_then(|workspace| {
@@ -4990,6 +5178,18 @@ impl Panel for WorkspacePanel {
                 activity,
                 cx,
             ))
+            .when_some(project, |tab, project| {
+                tab.child(
+                    div()
+                        .id(SharedString::from(format!("thread-tab-project-{id}")))
+                        .debug_selector(move || format!("thread-tab-project-{id}"))
+                        .max_w(rems(12.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("{} ·", project.name)),
+                )
+            })
             .map(|tab| match rename_input {
                 Some((input, error)) => {
                     tab.child(sidebar::inline_editor(&input, error, &self.workspace, cx))

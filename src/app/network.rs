@@ -521,8 +521,16 @@ impl AppState {
                     && self.thread_in_space(thread, member.space)
             })
     }
+    /// A peer attempt is being claimed, dispatched or admitted for this runtime.
+    pub(super) fn network_delivery_in_flight(&self, thread: ThreadId) -> bool {
+        self.network.runtimes.get(&thread).is_some_and(|runtime| {
+            runtime.claiming || runtime.lease.is_some() || runtime.preparing.is_some()
+        })
+    }
     fn network_can_receive(&self, thread: ThreadId) -> bool {
         self.network_delivery_enabled(thread)
+            // Native runtimes admit one injected attempt at a time.
+            && !self.artifact_delivery_in_flight(thread)
             && self.conversations.get(&thread).is_some_and(|session| {
                 session.persisted
                     && !session.preparing
@@ -853,6 +861,7 @@ impl AppState {
                 sender_name: message.sender_name,
                 space: message.space,
                 body: message.body,
+                origin: harness::ContextOrigin::Peer,
             })
             .collect();
         let idle = !self.active_threads.contains(&thread);
@@ -1311,6 +1320,47 @@ mod tests {
                     state.conversations.get_mut(&thread).unwrap().state = ConversationState::Ready;
                 }
             }
+            state.conversations.get_mut(&thread).unwrap().state = ConversationState::Running;
+            assert!(
+                state.network_can_receive(thread),
+                "Busy-turn injection needs no terminal event"
+            );
+            state.network.runtimes.get_mut(&thread).unwrap().enabled = false;
+            assert!(
+                !state.network_can_receive(thread),
+                "A stopped runtime cannot be woken"
+            );
+            state.network.runtimes.get_mut(&thread).unwrap().enabled = true;
+            state.network.snapshot.members[0].automatic = false;
+            assert!(
+                !state.network_can_receive(thread),
+                "Membership without wake consent is insufficient"
+            );
+            state.network.snapshot.members[0].automatic = true;
+            state.network.runtimes.get_mut(&thread).unwrap().generation = Uuid::new_v4();
+            assert!(
+                !state.network_can_receive(thread),
+                "Old runtime authorization cannot cross a generation"
+            );
+            state.network.runtimes.get_mut(&thread).unwrap().generation = generation;
+            let membership = state.network.snapshot.members.pop().unwrap();
+            assert!(
+                !state.network_can_receive(thread),
+                "Leaving revokes busy-turn injection"
+            );
+            state.network.snapshot.members.push(membership);
+            state.network.runtimes.get_mut(&thread).unwrap().pause();
+            assert!(
+                !state.network_can_receive(thread),
+                "A new incoming message cannot reactivate Stop"
+            );
+            state.authorize_network_user_turn(thread);
+            assert!(
+                state.network_can_receive(thread),
+                "Explicit user work can reactivate prior consent"
+            );
+            while work.try_recv().is_ok() {}
+            state.conversations.get_mut(&thread).unwrap().state = ConversationState::Ready;
             let batch = smol::block_on(mailbox.claim(generation)).unwrap().unwrap();
             let attempt = batch.attempt;
             state.dispatch_network_claim(thread, generation, Ok(Some(batch)));

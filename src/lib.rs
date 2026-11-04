@@ -8,6 +8,7 @@ pub mod diff;
 #[cfg(feature = "desktop")]
 pub mod factory;
 pub mod file_refs;
+pub mod fonts;
 pub mod harness;
 pub mod model;
 #[cfg(feature = "desktop")]

@@ -38,6 +38,9 @@ gpui_kit::actions!(
         RemoveRemoteHost,
         NewFactoryThread,
         NewTerminal,
+        ToggleTerminal,
+        GrowComposer,
+        ShrinkComposer,
         RestartTerminal,
         NewNeovim,
         OpenConversationFile,
@@ -48,6 +51,8 @@ gpui_kit::actions!(
         BrowserReload,
         BrowserAddress,
         ToggleArtifact,
+        FocusComposerArtifact,
+        MoveArtifactIntoConversation,
         WidenSidebar,
         NarrowSidebar,
         RenameProject,
@@ -162,6 +167,9 @@ pub enum Command {
     RemoveRemoteHost,
     NewFactoryThread,
     NewTerminal,
+    ToggleTerminal,
+    GrowComposer,
+    ShrinkComposer,
     RestartTerminal,
     NewNeovim,
     OpenConversationFile,
@@ -172,6 +180,8 @@ pub enum Command {
     BrowserReload,
     BrowserAddress,
     ToggleArtifact,
+    FocusComposerArtifact,
+    MoveArtifactIntoConversation,
     WidenSidebar,
     NarrowSidebar,
     RenameProject,
@@ -223,7 +233,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 82] = [
+    pub const ALL: [Self; 87] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -247,6 +257,9 @@ impl Command {
         Self::RemoveRemoteHost,
         Self::NewFactoryThread,
         Self::NewTerminal,
+        Self::ToggleTerminal,
+        Self::GrowComposer,
+        Self::ShrinkComposer,
         Self::RestartTerminal,
         Self::NewNeovim,
         Self::OpenConversationFile,
@@ -257,6 +270,8 @@ impl Command {
         Self::BrowserReload,
         Self::BrowserAddress,
         Self::ToggleArtifact,
+        Self::FocusComposerArtifact,
+        Self::MoveArtifactIntoConversation,
         Self::WidenSidebar,
         Self::NarrowSidebar,
         Self::RenameProject,
@@ -333,6 +348,9 @@ impl Command {
             Self::RemoveRemoteHost => "Remove configured Host…",
             Self::NewFactoryThread => "New Factory thread",
             Self::NewTerminal => "New terminal",
+            Self::ToggleTerminal => "Toggle terminal sidebar",
+            Self::GrowComposer => "Increase prompt area",
+            Self::ShrinkComposer => "Decrease prompt area",
             Self::RestartTerminal => "Restart terminal",
             Self::NewNeovim => "New Neovim tab",
             Self::OpenConversationFile => "Open file from conversation…",
@@ -343,6 +361,8 @@ impl Command {
             Self::BrowserReload => "Reload browser",
             Self::BrowserAddress => "Focus browser address",
             Self::ToggleArtifact => "Collapse or expand artifact",
+            Self::FocusComposerArtifact => "Focus artifact above the prompt",
+            Self::MoveArtifactIntoConversation => "Move artifact into conversation",
             Self::WidenSidebar => "Widen thread sidebar",
             Self::NarrowSidebar => "Narrow thread sidebar",
             Self::RenameProject => "Rename project…",
@@ -420,6 +440,9 @@ impl Command {
             Self::RemoveRemoteHost => Box::new(RemoveRemoteHost),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::NewTerminal => Box::new(NewTerminal),
+            Self::ToggleTerminal => Box::new(ToggleTerminal),
+            Self::GrowComposer => Box::new(GrowComposer),
+            Self::ShrinkComposer => Box::new(ShrinkComposer),
             Self::RestartTerminal => Box::new(RestartTerminal),
             Self::NewNeovim => Box::new(NewNeovim),
             Self::OpenConversationFile => Box::new(OpenConversationFile),
@@ -430,6 +453,8 @@ impl Command {
             Self::BrowserReload => Box::new(BrowserReload),
             Self::BrowserAddress => Box::new(BrowserAddress),
             Self::ToggleArtifact => Box::new(ToggleArtifact),
+            Self::FocusComposerArtifact => Box::new(FocusComposerArtifact),
+            Self::MoveArtifactIntoConversation => Box::new(MoveArtifactIntoConversation),
             Self::WidenSidebar => Box::new(WidenSidebar),
             Self::NarrowSidebar => Box::new(NarrowSidebar),
             Self::RenameProject => Box::new(RenameProject),
@@ -487,7 +512,14 @@ impl Command {
             return Some("Application is shutting down.".into());
         }
         if self == Self::RestartTerminal {
-            return Some("Select a terminal first.".into());
+            return if state.thread().is_some_and(|thread| {
+                state.thread_sidebar_tab(thread.id) == crate::app::SidebarTab::Terminal
+                    && super::workspace::thread_terminal_location(state, thread.id).is_ok()
+            }) {
+                None
+            } else {
+                Some("Select a terminal first.".into())
+            };
         }
         match self {
             Self::DeleteSpace if state.active_space == state.default_space_id() => {
@@ -575,6 +607,32 @@ impl Command {
             Self::RemoveWorktree => state.remove_worktree_reason(),
             Self::SwitchBranch => state.switch_branch_reason(),
             Self::CommitChanges => state.commit_reason(),
+            Self::ToggleTerminal => state.thread().map_or_else(
+                || Some("Select a thread first".into()),
+                |thread| {
+                    if state.thread_sidebar_open(thread.id)
+                        && state.thread_sidebar_tab(thread.id) == crate::app::SidebarTab::Terminal
+                    {
+                        None
+                    } else {
+                        super::workspace::thread_terminal_location(state, thread.id).err()
+                    }
+                },
+            ),
+            Self::GrowComposer | Self::ShrinkComposer => {
+                match state.conversation_thread() {
+                    None => Some("Select a conversation first".into()),
+                    Some(thread)
+                        if thread.archived
+                            || state.snapshot.projects.iter().any(|project| {
+                                project.id == thread.project_id && project.archived
+                            }) =>
+                    {
+                        Some("Archived conversations have no prompt area".into())
+                    }
+                    Some(_) => None,
+                }
+            }
             Self::CloseThread | Self::FocusOutput | Self::ToggleOutput
                 if state.thread().is_none() =>
             {
@@ -713,11 +771,46 @@ impl Command {
                 Some(pane) => pane.read(cx).disabled_reason(self),
                 None => Some("Open a browser first".into()),
             },
+            Self::FocusComposerArtifact | Self::MoveArtifactIntoConversation => {
+                match state.conversation_thread() {
+                    None => Some("Select a Conversation first".into()),
+                    Some(thread) => workspace
+                        .docked_artifact(thread.id)
+                        .is_none()
+                        .then(|| "No artifact is shown above the prompt".into()),
+                }
+            }
             Self::CloseThread if workspace.has_active_terminal(cx) => None,
             Self::NextThread | Self::PreviousThread => {
                 (workspace.center_panel_count(cx) < 2).then(|| "Open at least two tabs.".into())
             }
-            Self::RestartTerminal if workspace.has_active_terminal(cx) => None,
+            Self::RestartTerminal
+                if workspace.has_active_terminal(cx)
+                    || state.thread().is_some_and(|thread| {
+                        state.thread_sidebar_tab(thread.id) == crate::app::SidebarTab::Terminal
+                            && workspace.thread_terminals.contains_key(&thread.id)
+                    }) =>
+            {
+                None
+            }
+            Self::ToggleTerminal => state.thread().map_or_else(
+                || Some("Select a thread first".into()),
+                |thread| {
+                    if workspace.sidebar_terminal(thread.id).is_some()
+                        || (state.thread_sidebar_open(thread.id)
+                            && state.thread_sidebar_tab(thread.id)
+                                == crate::app::SidebarTab::Terminal)
+                    {
+                        None
+                    } else {
+                        workspace
+                            .thread_terminals
+                            .get(&thread.id)
+                            .and_then(|entry| entry.error.clone())
+                            .or_else(|| self.disabled_reason(state))
+                    }
+                },
+            ),
             _ => self.disabled_reason(state),
         }
     }
@@ -782,10 +875,10 @@ pub fn bind_keys(cx: &mut App) {
     let navigation = Some(
         "Workspace && !Input && !NativeInput && !Browser && !Command && !PopupMenu && !Sheet && !Dialog",
     );
-    // Embedded editors, terminals and browsers reserve the same pane-navigation prefix,
-    // including the browser's native address field. Other native inputs stay excluded.
+    // Native editors own Ctrl-W and following keys. Browser panes retain their
+    // existing app chord; unfocused terminal chrome can still navigate panes.
     let editor_navigation = Some(
-        "(PromptEditor || Terminal || TerminalPane || BrowserPane) && !Command && !PopupMenu && !Sheet && !Dialog",
+        "(TerminalPane || BrowserPane) && !NativeSurface && !Command && !PopupMenu && !Sheet && !Dialog",
     );
     let list =
         Some("List && !Input && !NativeInput && !Command && !PopupMenu && !Sheet && !Dialog");
@@ -796,7 +889,7 @@ pub fn bind_keys(cx: &mut App) {
         "Thread && !Input && !NativeInput && !Browser && !Command && !PopupMenu && !Sheet && !Dialog",
     );
     let submit = Some(
-        "(Thread || PromptEditor || FactoryThreadForm) && !Browser && !BrowserPane && !Command && !PopupMenu && !Sheet && !Dialog",
+        "(Thread || PromptEditor || FactoryThreadForm) && (!NativeSurface || PromptEditor) && !Terminal && !TerminalPane && !Browser && !BrowserPane && !Command && !PopupMenu && !Sheet && !Dialog",
     );
     let caret_popup = Some("PromptEditor && CaretPopup && !Command && !Sheet && !Dialog");
     cx.bind_keys(vec![
@@ -824,6 +917,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-h", SwitchHarness, workspace),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
         KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
+        KeyBinding::new("secondary-alt-j", ToggleTerminal, workspace),
         KeyBinding::new("secondary-alt-o", OpenConversationFile, workspace),
         KeyBinding::new("secondary-l", BrowserAddress, Some("BrowserPane || Browser")),
         KeyBinding::new("secondary-r", BrowserReload, Some("BrowserPane || Browser")),
@@ -844,6 +938,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-alt-h", SwitchHarness, command),
         KeyBinding::new("secondary-shift-n", NewFactoryThread, command),
         KeyBinding::new("secondary-alt-t", NewTerminal, command),
+        KeyBinding::new("secondary-alt-j", ToggleTerminal, command),
         KeyBinding::new("secondary-alt-o", OpenConversationFile, command),
         KeyBinding::new("secondary-,", Settings, command),
         KeyBinding::new("ctrl-tab", NextThread, command),
@@ -924,7 +1019,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(
             "secondary-escape",
             LeaveEditor,
-            Some("(PromptEditor || Terminal) && !Dialog && !Sheet"),
+            Some("NativeSurface && !Command && !PopupMenu && !Dialog && !Sheet"),
         ),
         KeyBinding::new("secondary-enter", Submit, submit),
         // The composer's caret popup follows Vim's insert-mode completion menu. Its context
@@ -2026,6 +2121,15 @@ impl Render for Palette {
             .on_action(cx.listener(|this, _: &NewTerminal, w, cx| {
                 this.run(PaletteTarget::Command(Command::NewTerminal), w, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, w, cx| {
+                this.run(PaletteTarget::Command(Command::ToggleTerminal), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GrowComposer, w, cx| {
+                this.run(PaletteTarget::Command(Command::GrowComposer), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShrinkComposer, w, cx| {
+                this.run(PaletteTarget::Command(Command::ShrinkComposer), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &RestartTerminal, w, cx| {
                 this.run(PaletteTarget::Command(Command::RestartTerminal), w, cx)
             }))
@@ -2056,6 +2160,22 @@ impl Render for Palette {
             .on_action(cx.listener(|this, _: &ToggleArtifact, w, cx| {
                 this.run(PaletteTarget::Command(Command::ToggleArtifact), w, cx)
             }))
+            .on_action(cx.listener(|this, _: &FocusComposerArtifact, w, cx| {
+                this.run(
+                    PaletteTarget::Command(Command::FocusComposerArtifact),
+                    w,
+                    cx,
+                )
+            }))
+            .on_action(
+                cx.listener(|this, _: &MoveArtifactIntoConversation, w, cx| {
+                    this.run(
+                        PaletteTarget::Command(Command::MoveArtifactIntoConversation),
+                        w,
+                        cx,
+                    )
+                }),
+            )
             .on_action(cx.listener(|this, _: &WidenSidebar, w, cx| {
                 this.run(PaletteTarget::Command(Command::WidenSidebar), w, cx)
             }))
@@ -2193,12 +2313,11 @@ pub fn region_action(region: Region) -> &'static str {
 mod tests {
     use super::picker_row;
 
-    /// Tab and Shift-Tab reach a native input's key handler instead of Root's focus
-    /// navigation, which GPUI would dispatch first and which moves focus away. An open
-    /// caret popup still accepts with Tab.
+    /// Native inputs keep Tab, Vim chords and printable keys even under a workspace
+    /// list ancestor; explicit app shortcuts and the escape hatch still dispatch.
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
-    fn tab_reaches_native_inputs_instead_of_moving_focus(cx: &mut gpui_kit::TestAppContext) {
+    fn native_surface_keys_bypass_workspace_navigation(cx: &mut gpui_kit::TestAppContext) {
         use gpui_kit::{
             AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
             ParentElement, Render, TestSupportExt, Window, component::Root, div,
@@ -2214,6 +2333,20 @@ mod tests {
         impl Render for NativeInputs {
             fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 div()
+                    .key_context(if self.context.starts_with("Terminal") {
+                        "Workspace Thread List TerminalPane"
+                    } else {
+                        "Workspace Thread List"
+                    })
+                    .on_action(cx.listener(|this, _: &super::OpenPalette, _, _| {
+                        this.keys.push("palette".into());
+                    }))
+                    .on_action(cx.listener(|this, _: &super::LeaveEditor, _, _| {
+                        this.keys.push("leave".into());
+                    }))
+                    .on_action(cx.listener(|this, _: &super::Submit, _, _| {
+                        this.keys.push("submit".into());
+                    }))
                     .child(
                         div()
                             .id("native-input")
@@ -2242,12 +2375,12 @@ mod tests {
             crate::ui::theme::initialize(None, None, cx);
             super::bind_keys(cx);
         });
-        for (context, expected) in [
-            ("Terminal NativeInput", ["tab", "shift-tab"]),
-            ("NativeInput PromptEditor", ["tab", "shift-tab"]),
+        for (context, tab) in [
+            ("Terminal NativeInput NativeSurface", "tab"),
+            ("NativeInput NativeSurface PromptEditor", "tab"),
             (
-                "NativeInput PromptEditor CaretPopup",
-                ["accept", "shift-tab"],
+                "NativeInput NativeSurface PromptEditor CaretPopup",
+                "accept",
             ),
         ] {
             let mut view = None;
@@ -2266,8 +2399,24 @@ mod tests {
                 window.render_frame(cx);
                 let input = view.read(cx).input.clone();
                 input.focus(window, cx);
-                for key in ["tab", "shift-tab"] {
+                for key in [
+                    "tab",
+                    "shift-tab",
+                    "ctrl-w",
+                    "h",
+                    "ctrl-w",
+                    "ctrl-h",
+                    ":",
+                    "shift-g",
+                    "secondary-enter",
+                    "secondary-shift-p",
+                    "secondary-escape",
+                ] {
                     window.press(key, cx);
+                    assert!(
+                        !window.has_pending_keystrokes(),
+                        "{key} started an app chord"
+                    );
                     assert!(
                         input.is_focused(window),
                         "{key} moved focus out of {context}"
@@ -2275,7 +2424,33 @@ mod tests {
                 }
             })
             .unwrap();
-            cx.read(|cx| assert_eq!(view.read(cx).keys, expected, "{context}"));
+            cx.read(|cx| {
+                let submit_key = gpui_kit::Keystroke::parse("secondary-enter")
+                    .unwrap()
+                    .unparse();
+                let submit = if context.starts_with("Terminal") {
+                    submit_key.as_str()
+                } else {
+                    "submit"
+                };
+                assert_eq!(
+                    view.read(cx).keys,
+                    [
+                        tab,
+                        "shift-tab",
+                        "ctrl-w",
+                        "h",
+                        "ctrl-w",
+                        "ctrl-h",
+                        ":",
+                        "shift-g",
+                        submit,
+                        "palette",
+                        "leave"
+                    ],
+                    "{context}"
+                );
+            });
         }
     }
 

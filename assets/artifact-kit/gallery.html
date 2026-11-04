@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Artifact kit gallery</title>
+
+<!-- ===== Standalone preview stub: debug only, not part of the kit ===================
+     Opened as file://…/gallery.html?preview there is no DROSTJE host to answer, so
+     this stands in for it: each channel message gets drostje.__receipt(id, "delivered")
+     after 400 ms. ?preview=failed|unknown picks another final receipt; ?preview=queued
+     sends "queued" first and "delivered" 2 s later; ?preview=silent sends none (the kit
+     resolves "unknown" after 15 s). It has to run before kit.js,
+     which captures console.warn when it starts. Inside DROSTJE the real kit.js has
+     already captured console.warn, so this wrapper never sees a message. -->
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  if (location.protocol !== "file:" || !params.has("preview")) return;
+  const PREFIX = "__DROSTJE_CHANNEL__";
+  const mode = params.get("preview") || "delivered";
+  const status = ["delivered", "queued", "failed", "unknown"].includes(mode) ? mode : "delivered";
+  const warn = console.warn;
+  console.warn = function (...args) {
+    const first = args[0];
+    if (typeof first === "string" && first.startsWith(PREFIX)) {
+      const message = JSON.parse(first.slice(PREFIX.length));
+      const log = document.querySelector("[data-preview-log]");
+      if (log) {
+        log.hidden = false;
+        log.querySelector("pre").textContent = JSON.stringify(message, null, 2);
+      }
+      const receipt = (kind, reason, ms) => setTimeout(() => window.drostje.__receipt(message.id, kind, reason), ms);
+      if (status === "queued") {
+        receipt("queued", "the agent is waiting on a permission prompt", 400);
+        receipt("delivered", null, 2400);
+      } else if (mode !== "silent") {
+        receipt(status, status === "failed" ? "Preview: no agent is listening" : null, 400);
+      }
+    }
+    return warn.apply(this, args);
+  };
+})();
+</script>
+<!-- ===== End of preview stub ======================================================= -->
+
+<!-- DROSTJE injects the kit into every artifact itself; these two lines only make the
+     gallery work when opened on its own. kit.js does nothing when already injected. -->
+<link rel="stylesheet" href="kit.css">
+<script src="kit.js"></script>
+</head>
+<body>
+<main data-drostje-artifact>
+  <h1>Artifact kit</h1>
+  <div class="meta">
+    <span>v1</span>
+    <span><code>kit.css</code> · <code>kit.js</code></span>
+    <span><span class="pill">layout</span> <span class="pill ok">ok</span> <span class="pill warn">warn</span> <span class="pill bad">bad</span> <span class="pill info">info</span></span>
+    <span><span class="tag">tag</span> <span class="tag accent">accent</span> <span class="tag ok">ok</span></span>
+  </div>
+  <p>Every component and both send routes on one page, for checking the kit in light and dark themes, at narrow widths and by keyboard alone. Plain elements are styled too: <a href="#routes">links</a>, <code>inline code</code>, <kbd>Cmd</kbd> <kbd>Return</kbd>, <strong>strong text</strong> and <mark>marked text</mark>.</p>
+
+  <h2>Callouts</h2>
+  <div class="callout" data-label="note">A callout without a tone draws a muted rule. Give it <code>data-label</code> for the small heading above.</div>
+  <div class="callout ok" data-label="ok">Delivered is the only receipt that counts as sent. Queued means the event waits, and its controls stay disabled until the final receipt.</div>
+  <div class="callout warn" data-label="warn">Unknown means DROSTJE sent no receipt within 15 seconds. Check the conversation before sending again.</div>
+  <div class="callout bad" data-label="bad">Never ask for secrets, tokens or permission approvals through a page.</div>
+  <div class="callout info" data-label="info">Kit styles sit in a low-priority layer, so any rule a page writes wins.</div>
+  <div class="verdict">A verdict states the conclusion in one or two sentences.</div>
+  <blockquote>A blockquote quotes someone else's words.</blockquote>
+
+  <h2 id="routes">Ask</h2>
+  <form class="ask" data-drostje="answer">
+    <p><strong>Does this gallery render correctly in the current theme?</strong></p>
+    <div class="choices">
+      <label><input type="radio" name="verdict" value="right" checked> Looks right</label>
+      <label><input type="radio" name="verdict" value="off"> Something is off</label>
+      <label><input type="radio" name="verdict" value="unsure"> Not sure</label>
+    </div>
+    <label>What did you notice?
+      <textarea name="note" placeholder="Spacing, colour, focus, wrapping…"></textarea>
+    </label>
+    <div class="row">
+      <button class="primary" type="submit" name="intent" value="answer">Send answer</button>
+      <button type="submit" name="intent" value="skip">Skip</button>
+      <span class="spacer"></span>
+      <span class="status" data-drostje-status></span>
+    </div>
+  </form>
+  <p class="muted">In the choices: <kbd>j</kbd> <kbd>k</kbd> move, <kbd>g</kbd><kbd>g</kbd> <kbd>G</kbd> jump, <kbd>Space</kbd> picks, <kbd>Cmd</kbd> <kbd>Return</kbd> sends from anywhere in the form.</p>
+
+  <form data-drostje="checked">
+    <fieldset>
+      <legend>Checked states</legend>
+      <ul class="choices">
+        <li><label><input type="checkbox" name="states" value="light"> Light theme</label></li>
+        <li><label><input type="checkbox" name="states" value="dark"> Dark theme</label></li>
+        <li><label><input type="checkbox" name="states" value="keyboard"> Keyboard only</label></li>
+        <li><label><input type="checkbox" name="states" value="narrow"> Narrow width</label></li>
+      </ul>
+      <div class="choices">
+        <label><input type="checkbox" name="all_good"> Everything I checked looked right</label>
+      </div>
+      <label>Theme name
+        <input type="text" name="theme" placeholder="Delft Light">
+      </label>
+      <label>Engine
+        <select name="engine">
+          <option value="servo">Servo (DROSTJE)</option>
+          <option value="other">Another browser</option>
+        </select>
+      </label>
+    </fieldset>
+    <button type="submit">Send checks</button>
+  </form>
+
+  <h2>Choose</h2>
+  <p>Buttons that send one choice. Inside <code>data-drostje-once</code> the row locks after a delivered receipt.</p>
+  <div class="row" data-drostje-once>
+    <button data-drostje-send="choose" value="approve">Approve the kit</button>
+    <button data-drostje-send="choose" value="changes">Needs changes</button>
+    <button data-drostje-send="choose" value="discuss">Discuss first</button>
+    <span class="status" data-drostje-status></span>
+  </div>
+
+  <h2>Receipts</h2>
+  <table>
+    <caption><code>drostje.send</code> resolves with the final status; <code>drostje:receipt</code> events also report queued</caption>
+    <thead><tr><th>Status</th><th>Meaning</th><th>Shown as</th></tr></thead>
+    <tbody>
+      <tr><td class="mono ok">delivered</td><td>The agent received the event</td><td>Sent to the agent</td></tr>
+      <tr><td class="mono info">queued</td><td>Waiting, for example behind a permission prompt; a final status follows</td><td>Queued — and the reason, when given</td></tr>
+      <tr><td class="mono bad">failed</td><td>DROSTJE could not deliver it; the reason says why</td><td>The reason, or Not delivered</td></tr>
+      <tr><td class="mono warn">unknown</td><td>No receipt within 15 seconds</td><td>Delivery unknown — check the conversation</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Code</h2>
+  <div class="code">
+    <div class="head"><span>answer.html</span><span class="spacer"></span><span>html</span></div>
+    <pre><code>&lt;form class="ask" data-drostje="answer"&gt;
+  &lt;div class="choices"&gt;
+    &lt;label&gt;&lt;input type="radio" name="verdict" value="right"&gt; Looks right&lt;/label&gt;
+  &lt;/div&gt;
+  &lt;button class="primary"&gt;Send answer&lt;/button&gt;
+  &lt;span class="status" data-drostje-status&gt;&lt;/span&gt;
+&lt;/form&gt;</code></pre>
+    <p>The agent receives <code>{"v":1,"id":"…","type":"answer","data":{"verdict":"right","intent":"answer"}}</code></p>
+  </div>
+
+  <h2>Mix</h2>
+  <figure>
+    <div class="bar" role="img" aria-label="Sample split: 45 styles, 30 routes, 15 keyboard, 10 docs">
+      <span style="flex: 45" title="Styles 45%"></span>
+      <span style="flex: 30" title="Routes 30%"></span>
+      <span style="flex: 15" title="Keyboard 15%"></span>
+      <span style="flex: 10" title="Docs 10%"></span>
+    </div>
+    <ul class="legend">
+      <li><strong>Styles</strong> 45%</li>
+      <li><strong>Routes</strong> 30%</li>
+      <li><strong>Keyboard</strong> 15%</li>
+      <li><strong>Docs</strong> 10%</li>
+    </ul>
+    <figcaption>Sample data: segments take series colours in order unless given a tone class</figcaption>
+  </figure>
+  <p><progress value="0.6">60%</progress> <span class="mono muted">progress 60%</span></p>
+
+  <h2>Cards</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>Styles</h3>
+      <p>Semantic HTML looks native. Colours and fonts follow the app theme through <code>--dk-*</code> tokens.</p>
+      <div class="meta"><span>kit.css</span></div>
+    </div>
+    <div class="card">
+      <h3>Send routes</h3>
+      <p>Forms and choose buttons send events. Each send resolves with a receipt.</p>
+      <div class="meta"><span>kit.js</span></div>
+    </div>
+    <div class="card">
+      <h3>Keyboard</h3>
+      <p>Choice lists answer to <kbd>j</kbd> <kbd>k</kbd> <kbd>g</kbd><kbd>g</kbd> <kbd>G</kbd>. Focus stays visible and apart from the selection.</p>
+      <div class="meta"><span>.choices</span></div>
+    </div>
+  </div>
+
+  <details>
+    <summary>What the agent receives</summary>
+    <p>Every send arrives as one JSON message: <code>v</code> is the version, <code>id</code> a fresh UUID, <code>type</code> the route's type and <code>data</code> the serialised fields or choice.</p>
+    <pre><code>{"v":1,"id":"7b0c…","type":"choose","data":{"value":"approve","label":"Approve the kit"}}</code></pre>
+  </details>
+
+  <hr>
+
+  <div class="done">
+    <strong>Finished?</strong> Send done and the agent continues in the conversation.
+    <div class="row">
+      <button class="primary" data-drostje-send="done" value="done">I'm done</button>
+      <span class="status" data-drostje-status></span>
+    </div>
+  </div>
+
+  <section data-preview-log hidden>
+    <h2>Preview log</h2>
+    <p class="muted">Last message the stub host received</p>
+    <pre></pre>
+  </section>
+</main>
+</body>
+</html>

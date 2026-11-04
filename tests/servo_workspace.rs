@@ -283,6 +283,196 @@ mod macos {
         }
     }
 
+    fn docked_sessions(cx: &mut HeadlessAppContext, state: &Entity<AppState>) -> Vec<String> {
+        state.read_with(cx, |state, _| {
+            state.snapshot.settings["browser_sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|session| session["placement"] == "composer")
+                .map(|session| session["id"].as_str().unwrap().to_owned())
+                .collect()
+        })
+    }
+
+    /// Input artifacts dock above the composer through the real tool, one at a time, with a
+    /// capped height; the transcript keeps a pointer, and the commands move and focus them.
+    fn assert_docked_artifact(
+        cx: &mut HeadlessAppContext,
+        window: WindowHandle<Root>,
+        workspace: &Entity<Workspace>,
+        state: &Entity<AppState>,
+        endpoint: &str,
+        thread: Uuid,
+        directory: &Path,
+    ) {
+        use gpui_kit::component::{Theme, ThemeMode};
+        let page = directory.join("ask.html");
+        std::fs::write(&page, "<!doctype html><title>Ask</title><main data-drostje-artifact><form data-drostje=\"answer\"><p>Pick a scope</p><label><input type=radio name=scope value=crate checked> crate</label><button class=primary>Send</button></form></main>").unwrap();
+        let first = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "show_artifact",
+            json!({"path":page,"title":"Pick a scope","placement":"composer"}),
+        );
+        assert_eq!(first["placement"], "composer");
+        let first_id = first["id"].as_str().unwrap().to_owned();
+        state.update(cx, |state, cx| {
+            let session = state.conversations.get_mut(&thread).unwrap();
+            session.messages.push(Arc::new(Message {
+                id: "docked-qa-message".into(),
+                role: "assistant".into(),
+                content: vec![ContentBlock::ToolCall {
+                    id: "docked-qa-call".into(),
+                    name: "show_artifact".into(),
+                    intent: None,
+                    input: json!({"title":"Pick a scope","placement":"composer"}),
+                }],
+                raw: None,
+                tool_call_id: None,
+                error: false,
+                exit_code: None,
+            }));
+            session.tools.insert(
+                "docked-qa-call".into(),
+                Arc::new(ToolActivity {
+                    id: "docked-qa-call".into(),
+                    name: "show_artifact".into(),
+                    intent: None,
+                    input: json!({}),
+                    result: vec![ContentBlock::Text(first.to_string())],
+                    error: false,
+                    exit_code: None,
+                    complete: true,
+                    raw: None,
+                }),
+            );
+            session.generation = Uuid::new_v4();
+            cx.notify();
+        });
+        pump(cx, window);
+        assert_eq!(docked_sessions(cx, state), [first_id.clone()]);
+        // A tall page stays at most 45% of the 900 px window and scrolls inside.
+        tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"evaluate","id":first_id,
+                "script":"document.querySelector('main').style.height='2000px'; true"}),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            pump(cx, window);
+            let measured = cx
+                .update_window(window.into(), |_, window, _| {
+                    let surface = window.try_find("docked-artifact-surface")?.bounds();
+                    let band = window.find("composer-artifact").bounds();
+                    let composer = window.find("composer-row").bounds();
+                    Some((surface, band, composer))
+                })
+                .unwrap();
+            if let Some((surface, band, composer)) = measured
+                && (f32::from(surface.size.height) - 405.).abs() <= 2.
+            {
+                assert!(
+                    band.bottom() <= composer.top() + px(1.),
+                    "the docked page sits above the composer: {band:?} vs {composer:?}"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "docked height cap: {measured:?}");
+        }
+        cx.update_window(window.into(), |_, window, cx| {
+            assert!(
+                window.find("docked-artifact-stub-docked-qa-call").visible(),
+                "transcript keeps a pointer"
+            );
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute(Command::FocusComposerArtifact, window, cx)
+            });
+        })
+        .unwrap();
+        pump(cx, window);
+        cx.update_window(window.into(), |_, window, _| {
+            assert_eq!(window.find("docked-artifact-surface").focused(), Some(true));
+        })
+        .unwrap();
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            cx.update_window(window.into(), |_, window, cx| {
+                Theme::change(mode, Some(window), cx);
+            })
+            .unwrap();
+            pump(cx, window);
+            screenshot(
+                cx,
+                window,
+                &format!(
+                    "workspace-docked-artifact-{}.png",
+                    if mode == ThemeMode::Light {
+                        "light"
+                    } else {
+                        "dark"
+                    }
+                ),
+            );
+        }
+
+        // Docking another moves the first into the transcript; it stays live.
+        let second = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "show_artifact",
+            json!({"path":page,"title":"Follow-up","placement":"composer"}),
+        );
+        let second_id = second["id"].as_str().unwrap().to_owned();
+        pump(cx, window);
+        assert_eq!(docked_sessions(cx, state), [second_id.clone()]);
+        let alive = tool(
+            cx,
+            window,
+            endpoint,
+            thread,
+            "browser",
+            json!({"action":"evaluate","id":first_id,"script":"document.title"}),
+        );
+        assert_eq!(alive, "Ask", "the undocked page keeps its document");
+
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.execute(Command::MoveArtifactIntoConversation, window, cx)
+            });
+        })
+        .unwrap();
+        pump(cx, window);
+        assert!(docked_sessions(cx, state).is_empty());
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(window.try_find("composer-artifact").is_none());
+            assert!(
+                window
+                    .try_find("docked-artifact-stub-docked-qa-call")
+                    .is_none()
+            );
+        })
+        .unwrap();
+        for id in [first_id, second_id] {
+            tool(
+                cx,
+                window,
+                endpoint,
+                thread,
+                "browser",
+                json!({"action":"close","id":id}),
+            );
+        }
+        pump(cx, window);
+    }
+
     fn assert_inline_artifact(
         cx: &mut HeadlessAppContext,
         window: WindowHandle<Root>,
@@ -1186,6 +1376,9 @@ mod macos {
             state.read_with(&cx, |state, _| state.thread_sidebar_tab(thread)),
             SidebarTab::Browser,
             "Closing an artifact must not hide a different browser session"
+        );
+        assert_docked_artifact(
+            &mut cx, window, &workspace, &state, &endpoint, thread, &directory,
         );
         let png = directory.join("tool.png");
         let saved = tool(

@@ -1,0 +1,776 @@
+/* DROSTJE. artifact kit v1: default styles for agent-written artifact pages.
+ *
+ * DROSTJE inserts this file at document start as
+ * <style id="drostje-kit">@layer drostje-kit { ... }</style>, a low-priority
+ * cascade layer: every unlayered page rule wins whatever its specificity, so
+ * these are defaults a page may override. Keep it valid inside a layer block:
+ * no @import, no @charset. Non-ASCII glyphs are written as CSS escapes.
+ *
+ * Colours and fonts come only from --dk-* tokens. The host sets real values on
+ * :root in an unlayered <style id="drostje-theme">. The fallbacks below use
+ * :where(:root), zero specificity, so that block also wins when this file is
+ * linked unlayered (the standalone gallery).
+ *
+ * Servo 0.7 constraints that shape these rules:
+ * - :focus-visible never matches (Servo does not set the focus-ring state), so
+ *   focus styles key on :focus and stay neutral enough for pointer focus too.
+ * - :has() matches when an element is styled but is not re-evaluated on later
+ *   state changes. kit.js mirrors choice inputs onto their labels as
+ *   data-drostje-checked/-choice/-focus; :has() rules only cover labels kit.js
+ *   has not touched yet, and each sits in a rule of its own because an
+ *   unsupported selector drops its whole rule.
+ * - color-mix() variants sit in @supports at the end; a plain rule comes first.
+ */
+
+/* Tokens: fallbacks for standalone use; the host's #drostje-theme overrides. */
+:where(:root) {
+  color-scheme: light;
+  --dk-bg: #f7f9fc;
+  --dk-fg: #2b3750;
+  --dk-strong: #111a2e;
+  --dk-muted: #5a6680;
+  --dk-line: #dde3ec;
+  --dk-surface: #ecf0f6;
+  --dk-tint: rgba(36, 83, 166, 0.06);
+  --dk-accent: #2453a6;
+  --dk-ok: #3a7545;
+  --dk-warn: #8a630f;
+  --dk-bad: #b53a3a;
+  --dk-info: #2f6f8a;
+  --dk-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --dk-serif: "Libron", "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --dk-mono: "Lilex", "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --dk-size: 15px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :where(:root) {
+    color-scheme: dark;
+    --dk-bg: #121b2e;
+    --dk-fg: #c6cfdf;
+    --dk-strong: #eef2f8;
+    --dk-muted: #8c98b0;
+    --dk-line: #243049;
+    --dk-surface: #18233a;
+    --dk-tint: rgba(138, 172, 235, 0.08);
+    --dk-accent: #8aaceb;
+    --dk-ok: #8cc796;
+    --dk-warn: #e3bd62;
+    --dk-bad: #e07a76;
+    --dk-info: #7fbfd6;
+  }
+}
+
+/* ---------------------------------------------------------------- base */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  font-size: var(--dk-size);
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--dk-bg);
+  color: var(--dk-fg);
+  font-family: var(--dk-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Inline artifacts size to their content: no viewport heights, no shells. */
+main {
+  display: block;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 20px 24px 24px;
+}
+
+main > :first-child { margin-top: 0; }
+main > :last-child { margin-bottom: 0; }
+
+::selection { background: var(--dk-line); }
+
+h1, h2, h3, h4 { color: var(--dk-strong); }
+
+h1 {
+  margin: 0.5em 0 0.35em;
+  font: 400 1.9rem/1.2 var(--dk-serif);
+  color: var(--dk-accent);
+}
+
+h2 {
+  margin: 1.9em 0 0.55em;
+  font: 400 1.35rem/1.3 var(--dk-serif);
+}
+
+h2::before {
+  content: "\A7\00A0";
+  font-family: var(--dk-mono);
+  font-size: 0.78em;
+  color: var(--dk-muted);
+}
+
+h3 {
+  margin: 1.5em 0 0.4em;
+  font: 600 1rem/1.4 var(--dk-sans);
+}
+
+h4 {
+  margin: 1.4em 0 0.4em;
+  font: 400 0.72rem/1.4 var(--dk-mono);
+  color: var(--dk-muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+p { margin: 0 0 0.85em; }
+
+ul, ol { margin: 0 0 0.85em; padding-left: 1.35em; }
+li + li { margin-top: 0.2em; }
+li > ul, li > ol { margin: 0.2em 0 0; }
+li::marker { color: var(--dk-muted); }
+
+dl { margin: 0 0 0.85em; }
+dt { color: var(--dk-strong); font-weight: 600; }
+dd { margin: 0 0 0.5em; }
+
+strong, b { color: var(--dk-strong); font-weight: 600; }
+small { font-size: 0.85em; }
+
+mark {
+  padding: 0 0.15em;
+  border-radius: 2px;
+  background: var(--dk-surface);
+  color: var(--dk-strong);
+}
+
+a {
+  color: var(--dk-accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
+a:hover { text-decoration-color: currentColor; }
+
+/* Focus: neutral, always visible, distinct from the selected state. */
+:focus {
+  outline: 1px solid var(--dk-muted);
+  outline-offset: 2px;
+}
+
+a:focus, summary:focus { border-radius: 2px; }
+
+hr {
+  height: 0;
+  margin: 1.6em 0;
+  border: 0;
+  border-top: 1px solid var(--dk-line);
+}
+
+blockquote {
+  margin: 0 0 0.85em;
+  padding: 2px 0 2px 16px;
+  border-left: 2px solid var(--dk-line);
+  color: var(--dk-muted);
+}
+
+code, kbd, samp, pre { font-family: var(--dk-mono); }
+
+code {
+  padding: 0.05em 0.35em;
+  border: 1px solid var(--dk-line);
+  border-radius: 3px;
+  background: var(--dk-surface);
+  color: var(--dk-strong);
+  font-size: 0.86em;
+}
+
+kbd {
+  padding: 0.1em 0.4em;
+  border: 1px solid var(--dk-line);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  background: var(--dk-surface);
+  color: var(--dk-strong);
+  font-size: 0.78em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* Code wraps instead of scrolling: no nested scroll areas, nothing hidden. */
+pre {
+  margin: 0 0 1em;
+  padding: 12px 14px;
+  border: 1px solid var(--dk-line);
+  border-radius: 4px;
+  background: var(--dk-surface);
+  color: var(--dk-fg);
+  font-size: 0.82rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
+  tab-size: 4;
+}
+
+pre code {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font-size: inherit;
+}
+
+table {
+  width: 100%;
+  margin: 0 0 1.2em;
+  border-collapse: collapse;
+  border-spacing: 0;
+  font-size: 0.92rem;
+}
+
+th, td {
+  padding: 8px 12px 8px 0;
+  border-bottom: 1px solid var(--dk-line);
+  text-align: left;
+  vertical-align: top;
+}
+
+th:last-child, td:last-child { padding-right: 0; }
+
+th {
+  font: 400 0.74rem/1.5 var(--dk-mono);
+  color: var(--dk-muted);
+}
+
+thead th { vertical-align: bottom; }
+
+caption {
+  caption-side: bottom;
+  padding-top: 6px;
+  text-align: left;
+  font: 400 0.72rem/1.5 var(--dk-mono);
+  color: var(--dk-muted);
+}
+
+img, video, canvas { max-width: 100%; height: auto; }
+svg { max-width: 100%; }
+
+figure { margin: 1.2em 0; }
+
+figcaption {
+  margin-top: 6px;
+  font: 400 0.72rem/1.5 var(--dk-mono);
+  color: var(--dk-muted);
+}
+
+details { margin: 0 0 0.85em; }
+
+summary {
+  cursor: pointer;
+  font: 400 0.8rem/1.6 var(--dk-mono);
+  color: var(--dk-accent);
+}
+
+summary:hover { color: var(--dk-strong); }
+details[open] > summary { margin-bottom: 0.45em; }
+
+/* ---------------------------------------------------------------- forms */
+
+button,
+input[type="button"],
+input[type="submit"],
+input[type="reset"] {
+  margin: 0;
+  padding: 5px 11px;
+  border: 1px solid var(--dk-line);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--dk-fg);
+  font: 400 0.75rem/1.4 var(--dk-mono);
+  text-align: center;
+  vertical-align: middle;
+  cursor: pointer;
+}
+
+:where(button, input[type="button"], input[type="submit"], input[type="reset"]):hover {
+  border-color: var(--dk-muted);
+  color: var(--dk-strong);
+}
+
+:where(button, input[type="button"], input[type="submit"], input[type="reset"]):active {
+  background: var(--dk-surface);
+}
+
+:where(button, input[type="submit"]).primary {
+  border-color: var(--dk-accent);
+  color: var(--dk-accent);
+}
+
+:where(button, input[type="submit"]).primary:hover { background: var(--dk-tint); }
+
+/* Chosen through the choose route: a neutral selected state, not a focus look. */
+:where(button, input[type="button"])[aria-pressed="true"] {
+  border-color: var(--dk-strong);
+  background: var(--dk-surface);
+  color: var(--dk-strong);
+}
+
+:where(button, input[type="button"], input[type="submit"], input[type="reset"]):disabled {
+  border-color: var(--dk-line);
+  background: transparent;
+  color: var(--dk-muted);
+  cursor: default;
+}
+
+input:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="image"], [type="range"], [type="color"], [type="file"], [type="hidden"]),
+textarea,
+select {
+  max-width: 100%;
+  margin: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--dk-line);
+  border-radius: 3px;
+  background: var(--dk-bg);
+  color: var(--dk-strong);
+  font-family: var(--dk-sans);
+  font-size: 0.95rem;
+  line-height: 1.5;
+  vertical-align: middle;
+}
+
+:where(input:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="image"], [type="range"], [type="color"], [type="file"]), textarea, select):focus {
+  outline: none;
+  border-color: var(--dk-muted);
+}
+
+:where(input:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="image"], [type="range"], [type="color"], [type="file"]), textarea, select):disabled {
+  background: var(--dk-surface);
+  color: var(--dk-muted);
+  cursor: default;
+}
+
+textarea {
+  display: block;
+  width: 100%;
+  min-height: 5.5em;
+  resize: vertical;
+}
+
+::placeholder { color: var(--dk-muted); opacity: 1; }
+
+input[type="checkbox"], input[type="radio"] {
+  margin: 0 0.4em 0 0;
+  vertical-align: -0.1em;
+  accent-color: var(--dk-strong);
+}
+
+input[type="range"] { accent-color: var(--dk-strong); }
+
+label { color: var(--dk-fg); }
+
+/* <label>Name <input></label> stacks the field under its label. */
+label > :is(textarea, select, input:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="image"], [type="hidden"])) {
+  display: block;
+  margin: 4px 0 0.75em;
+}
+
+fieldset {
+  min-width: 0;
+  margin: 0 0 1em;
+  padding: 10px 0 0;
+  border: 0;
+  border-top: 1px solid var(--dk-line);
+}
+
+legend {
+  padding: 0 8px 0 0;
+  font: 400 0.72rem/1.4 var(--dk-mono);
+  color: var(--dk-muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* <meter> is left alone: Servo 0.7 draws its fill in a UA shadow tree that
+ * page styles cannot reach. Use <progress> for a themed bar. */
+progress {
+  width: 12em;
+  max-width: 100%;
+  height: 6px;
+  border: 0;
+  border-radius: 3px;
+  background: var(--dk-line);
+  vertical-align: middle;
+}
+
+progress { -webkit-appearance: none; appearance: none; }
+
+/* One engine-specific pseudo-element per rule: an unknown one drops its rule. */
+progress::-moz-progress-bar { border-radius: 3px; background: var(--dk-accent); }
+progress::-webkit-progress-bar { border-radius: 3px; background: var(--dk-line); }
+progress::-webkit-progress-value { border-radius: 3px; background: var(--dk-accent); }
+
+/* ---------------------------------------------------------------- components */
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 18px;
+  margin: 0 0 1.1em;
+  font: 400 0.78rem/1.5 var(--dk-mono);
+  color: var(--dk-muted);
+}
+
+.meta a { color: inherit; }
+.meta a:hover { color: var(--dk-strong); }
+
+.pill {
+  font: 400 0.72rem/1.4 var(--dk-mono);
+  color: var(--dk-muted);
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.pill::before { content: "["; }
+.pill::after { content: "]"; }
+
+.tag {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--dk-line);
+  border-radius: 3px;
+  font: 400 0.7rem/1.5 var(--dk-mono);
+  color: var(--dk-muted);
+  white-space: nowrap;
+  vertical-align: 0.1em;
+}
+
+.status, [data-drostje-status] {
+  font: 400 0.72rem/1.4 var(--dk-mono);
+  color: var(--dk-muted);
+}
+
+:is(button, input) + :is(.status, [data-drostje-status]) { margin-left: 0.75em; }
+
+.card {
+  margin: 0 0 0.6em;
+  padding: 16px 0 4px;
+  border-top: 1px solid var(--dk-line);
+}
+
+.ask {
+  --dk-tone: var(--dk-accent);
+  margin: 1.2em 0;
+  padding: 14px 16px;
+  border-left: 2px solid var(--dk-tone);
+  background: var(--dk-tint);
+}
+
+.callout {
+  --dk-tone: var(--dk-muted);
+  margin: 1.1em 0;
+  padding: 2px 0 2px 16px;
+  border-left: 2px solid var(--dk-tone);
+}
+
+.verdict {
+  --dk-tone: var(--dk-strong);
+  margin: 0.9em 0 1.3em;
+  padding: 2px 0 2px 14px;
+  border-left: 2px solid var(--dk-tone);
+  font-family: var(--dk-serif);
+  font-size: 1.08rem;
+}
+
+.done {
+  --dk-tone: var(--dk-muted);
+  margin: 2em 0 0.25em;
+  padding: 14px 18px;
+  border: 1px solid var(--dk-line);
+  border-radius: 4px;
+}
+
+:is(.callout, .ask, .verdict, .done)[data-label]::before {
+  content: attr(data-label);
+  display: block;
+  margin-bottom: 2px;
+  font: 400 0.7rem/1.5 var(--dk-mono);
+  color: var(--dk-tone);
+}
+
+:is(.card, .ask, .callout, .verdict, .done, details, td, th, li) > :first-child { margin-top: 0; }
+:is(.card, .ask, .callout, .verdict, .done, details, td, th, li) > :last-child { margin-bottom: 0; }
+
+.code {
+  margin: 0 0 1em;
+  border: 1px solid var(--dk-line);
+  border-radius: 4px;
+  background: var(--dk-surface);
+}
+
+.code > .head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--dk-line);
+  font: 400 0.72rem/1.5 var(--dk-mono);
+  color: var(--dk-muted);
+}
+
+.code > .head a { color: inherit; }
+.code > .head button { padding: 1px 8px; border-color: transparent; font-size: 0.7rem; }
+
+.code > pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.code > :not(.head, pre) {
+  margin: 0;
+  padding: 8px 14px;
+  border-top: 1px solid var(--dk-line);
+  color: var(--dk-muted);
+  font-size: 0.85rem;
+}
+
+/* Stacked bar: one child per segment, sized by an inline style="flex: 40". */
+.bar {
+  display: flex;
+  gap: 2px;
+  height: 8px;
+  margin: 14px 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.bar > * {
+  display: block;
+  flex: 1 1 0;
+  min-width: 3px;
+  margin: 0;
+  background: var(--dk-tone);
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin: 0 0 1em;
+  padding: 0;
+  list-style: none;
+  font: 400 0.78rem/1.5 var(--dk-mono);
+}
+
+.legend > * { margin: 0; }
+
+.legend > *::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  background: var(--dk-tone);
+}
+
+/* Bar segments and legend items take series colours in order unless toned.
+ * --dk-info is left out: themes may set it equal to --dk-accent. */
+:where(.bar, .legend) > :nth-child(5n + 1) { --dk-tone: var(--dk-accent); }
+:where(.bar, .legend) > :nth-child(5n + 2) { --dk-tone: var(--dk-ok); }
+:where(.bar, .legend) > :nth-child(5n + 3) { --dk-tone: var(--dk-warn); }
+:where(.bar, .legend) > :nth-child(5n + 4) { --dk-tone: var(--dk-bad); }
+:where(.bar, .legend) > :nth-child(5n + 5) { --dk-tone: var(--dk-muted); }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
+  gap: 8px 24px;
+  margin: 0 0 1em;
+}
+
+.grid > * { min-width: 0; }
+.grid > .card { margin: 0; }
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin: 0.75em 0;
+}
+
+.row > * { margin-top: 0; margin-bottom: 0; }
+.row > :is(.status, [data-drostje-status]) { margin-left: 0; }
+
+.spacer { flex: 1 1 auto; }
+
+/* Choices: ( ) / (dot) radios and [ ] / [x] checkboxes, drawn by the label. The
+ * native input stays focusable and accessible, only visually hidden. */
+.choices {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  min-width: 0;
+  margin: 10px 0 12px;
+  padding: 0;
+  border: 0;
+  list-style: none;
+}
+
+ul.choices, ol.choices { flex-direction: column; flex-wrap: nowrap; gap: 2px; }
+.choices > li { margin: 0; }
+
+.choices label {
+  position: relative;
+  display: inline-block;
+  margin-left: -6px;
+  padding: 2px 6px 2px calc(6px + 4ch);
+  border-radius: 3px;
+  font: 400 0.8rem/1.55 var(--dk-mono);
+  color: var(--dk-muted);
+  cursor: pointer;
+}
+
+ul.choices label, ol.choices label { display: block; }
+.choices label:hover { color: var(--dk-strong); }
+
+.choices label::before {
+  content: "( )";
+  position: absolute;
+  top: 2px;
+  left: 6px;
+}
+
+.choices input[type="radio"],
+.choices input[type="checkbox"] {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  opacity: 0;
+}
+
+.choices label:has(input[type="checkbox"])::before { content: "[ ]"; }
+
+.choices label[data-drostje-choice="checkbox"]::before,
+.choices input[type="checkbox"] + label::before { content: "[ ]"; }
+
+/* Checked before kit.js has mirrored the label. */
+.choices label:not([data-drostje-checked]):has(input[type="radio"]:checked)::before { content: "(\002022)"; color: var(--dk-accent); }
+.choices label:not([data-drostje-checked]):has(input[type="checkbox"]:checked)::before { content: "[x]"; color: var(--dk-accent); }
+.choices label:not([data-drostje-checked]):has(input:checked) { color: var(--dk-strong); }
+
+/* Checked as mirrored by kit.js, or the <input id> + <label for> pattern. */
+.choices label[data-drostje-checked="true"],
+.choices label[aria-pressed="true"],
+.choices input:checked + label { color: var(--dk-strong); }
+
+.choices label[data-drostje-checked="true"]::before,
+.choices label[aria-pressed="true"]::before,
+.choices input[type="radio"]:checked + label::before { content: "(\002022)"; color: var(--dk-accent); }
+
+.choices label[data-drostje-checked="true"][data-drostje-choice="checkbox"]::before,
+.choices input[type="checkbox"]:checked + label::before { content: "[x]"; color: var(--dk-accent); }
+
+/* Focus on the hidden input shows on its label: neutral surface and outline. */
+.choices label[data-drostje-focus],
+.choices input:focus + label {
+  outline: 1px solid var(--dk-muted);
+  outline-offset: 0;
+  background: var(--dk-surface);
+  color: var(--dk-strong);
+}
+
+.choices label:has(input:focus-visible) {
+  outline: 1px solid var(--dk-muted);
+  outline-offset: 0;
+  background: var(--dk-surface);
+  color: var(--dk-strong);
+}
+
+.choices label[aria-disabled="true"],
+.choices input:disabled + label { color: var(--dk-muted); opacity: 0.6; cursor: default; }
+
+.choices label:has(input:disabled) { color: var(--dk-muted); opacity: 0.6; cursor: default; }
+
+/* ---------------------------------------------------------------- tones */
+
+.ok { --dk-tone: var(--dk-ok); }
+.warn { --dk-tone: var(--dk-warn); }
+.bad { --dk-tone: var(--dk-bad); }
+.info { --dk-tone: var(--dk-info); }
+.accent { --dk-tone: var(--dk-accent); }
+.muted { --dk-tone: var(--dk-muted); }
+
+/* Tone classes set colour only, except where a component consumes the tone. */
+:is(.ok, .warn, .bad, .info, .accent, .muted) { color: var(--dk-tone); }
+
+.mono { font-family: var(--dk-mono); font-variant-numeric: tabular-nums; }
+
+/* Components that draw their tone as a rule or swatch keep body-coloured text. */
+.callout, .ask, .done, .card, .legend > * { color: var(--dk-fg); }
+.verdict { color: var(--dk-strong); }
+
+.done:is(.ok, .warn, .bad, .info, .accent) { border-color: var(--dk-tone); }
+.tag:is(.ok, .warn, .bad, .info, .accent) { border-color: currentColor; }
+:where(button):is(.ok, .warn, .bad, .info, .accent) { border-color: var(--dk-tone); }
+
+/* ---------------------------------------------------------------- send states (set by kit.js) */
+/* sending and queued are in flight (queued waits, e.g. behind a permission
+ * prompt); sent and failed are final. */
+
+form[data-drostje-state="sending"] { cursor: progress; }
+form.ask[data-drostje-state="sent"] { border-left-color: var(--dk-ok); }
+form.ask[data-drostje-state="failed"] { border-left-color: var(--dk-bad); }
+
+[data-drostje-status][data-state="sending"],
+[data-drostje-status][data-state="queued"] { color: var(--dk-muted); }
+[data-drostje-status][data-state="sent"] { color: var(--dk-ok); }
+[data-drostje-status][data-state="failed"] { color: var(--dk-bad); }
+
+[data-drostje-send][data-drostje-state="sending"] { color: var(--dk-muted); cursor: progress; }
+[data-drostje-send][data-drostje-state="queued"] { color: var(--dk-muted); }
+[data-drostje-send][data-drostje-state="sent"] { border-color: var(--dk-ok); color: var(--dk-ok); }
+[data-drostje-send][data-drostje-state="failed"] { border-color: var(--dk-bad); color: var(--dk-bad); }
+
+/* ---------------------------------------------------------------- narrow widths */
+
+@media (max-width: 560px) {
+  main { padding: 14px 14px 18px; }
+  h1 { font-size: 1.6rem; }
+  h2 { font-size: 1.2rem; }
+  .ask { padding: 12px; }
+  .done { padding: 12px 14px; }
+}
+
+/* ---------------------------------------------------------------- color-mix refinements */
+
+/* A var() inside color-mix() is only checked at computed time, so a plain
+ * fallback declaration in the same rule would not apply; gate them instead. */
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+  ::selection { background: color-mix(in srgb, var(--dk-muted) 30%, transparent); }
+  mark { background: color-mix(in srgb, var(--dk-warn) 22%, transparent); }
+  a { text-decoration-color: color-mix(in srgb, var(--dk-accent) 40%, transparent); }
+  a:hover { text-decoration-color: currentColor; }
+  .tag:is(.ok, .warn, .bad, .info, .accent) { border-color: color-mix(in srgb, var(--dk-tone) 45%, transparent); }
+}

@@ -9,6 +9,7 @@ use crate::{
     neovim::{NvimConfig, NvimEditor},
     platform,
 };
+use ghostty_terminal::input_surface::native_input_context;
 use gpui_kit::component::{
     ActiveTheme, WindowExt, alert::Alert, dialog::DialogButtonProps, h_flex, label::Label,
 };
@@ -511,7 +512,7 @@ impl Render for PromptEditor {
         div()
             .id("prompt-editor")
             .test_support()
-            .key_context("NativeInput PromptEditor")
+            .key_context(native_input_context("PromptEditor"))
             .track_focus(&self.focus)
             .size_full()
             .relative()

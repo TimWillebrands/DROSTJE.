@@ -187,6 +187,7 @@ pub fn run(mut config: HostConfig) -> Result<()> {
         network: BTreeMap::new(),
         epoch: None,
         last_seen: Instant::now(),
+        desktop: Capabilities::default(),
     };
     loop {
         host.expire();
@@ -250,6 +251,8 @@ struct Host {
     network: BTreeMap<Uuid, PendingNetwork>,
     epoch: Option<Uuid>,
     last_seen: Instant,
+    /// What the attached desktop declared in its latest request.
+    desktop: Capabilities,
 }
 impl Host {
     fn send(&mut self, response: Response) {
@@ -291,6 +294,7 @@ impl Host {
     }
     fn disconnect(&mut self, reason: &str) {
         self.epoch = None;
+        self.desktop = Capabilities::default();
         self.pending_opens.clear();
         for runtime in self.runtimes.values_mut() {
             runtime.attached = false;
@@ -324,6 +328,7 @@ impl Host {
             "Desktop attachment is stale; reconnect before issuing commands"
         );
         self.last_seen = Instant::now();
+        self.desktop = request.capabilities;
         let Request {
             id,
             thread,
@@ -1004,10 +1009,19 @@ impl Host {
             operation,
             reply,
         } = request;
+        if let BrowserToolOperation::ShowRemoteArtifact {
+            name,
+            title,
+            html,
+            placement,
+        } = operation
+        {
+            return self.artifact(thread, name, title, html, placement, reply);
+        }
         let result = (|| -> Result<(Uuid, Value)> {
             let BrowserToolOperation::Network { token, action } = operation else {
                 bail!(
-                    "Browser/artifact operations are unavailable on the remote host; local paths cannot be opened on the desktop"
+                    "The browser tool is unavailable on the remote host; local paths cannot be opened on the desktop"
                 )
             };
             let runtime = self
@@ -1053,6 +1067,62 @@ impl Host {
                     generation,
                     call,
                     action,
+                });
+            }
+            Err(error) => {
+                let _ = reply.send(Err(format!("{error:#}")));
+            }
+        }
+    }
+    /// Forward an artifact's HTML to the attached desktop, which shows a local copy.
+    fn artifact(
+        &mut self,
+        thread: Uuid,
+        name: String,
+        title: Option<String>,
+        html: String,
+        placement: crate::browser_tools::ArtifactPlacement,
+        reply: std::sync::mpsc::Sender<std::result::Result<Value, String>>,
+    ) {
+        let result = (|| -> Result<Uuid> {
+            let runtime = self
+                .runtimes
+                .get(&thread)
+                .context("Remote runtime is not live")?;
+            ensure!(
+                runtime.attached && self.epoch.is_some() && self.last_seen.elapsed() <= LEASE,
+                "The desktop is disconnected; artifacts show only while it is attached"
+            );
+            ensure!(
+                self.desktop.artifacts,
+                "The attached desktop DROSTJE cannot show remote artifacts; update DROSTJE on the desktop, or ask in plain text"
+            );
+            ensure!(
+                self.network.len() < 64,
+                "Remote artifact request queue is full"
+            );
+            Ok(runtime.generation)
+        })();
+        match result {
+            Ok(generation) => {
+                let call = Uuid::new_v4();
+                self.network.insert(
+                    call,
+                    PendingNetwork {
+                        thread,
+                        generation,
+                        reply,
+                        deadline: Instant::now() + Duration::from_secs(25),
+                    },
+                );
+                self.send(Response::ArtifactRequest {
+                    thread,
+                    generation,
+                    call,
+                    name,
+                    title,
+                    html,
+                    placement,
                 });
             }
             Err(error) => {
@@ -1700,6 +1770,7 @@ mod tests {
             network: BTreeMap::new(),
             epoch: Some(epoch),
             last_seen: Instant::now(),
+            desktop: Capabilities::DESKTOP,
             pending_opens: BTreeMap::new(),
             attachment_bytes: 0,
         };
@@ -1708,6 +1779,7 @@ mod tests {
     fn request(host: &Host, thread: Uuid, operation: Operation) -> Request {
         Request {
             version: VERSION,
+            capabilities: Capabilities::DESKTOP,
             id: Uuid::new_v4(),
             thread,
             epoch: host.epoch.unwrap(),
@@ -1859,6 +1931,97 @@ mod tests {
         });
         host.disconnect("test lost desktop");
         assert!(response.recv().unwrap().is_err());
+    }
+
+    #[test]
+    fn remote_artifacts_travel_as_html_to_the_attached_desktop_only() {
+        let temp = Temp::new();
+        let (mut host, thread, _, responses) = fixture(&temp.0);
+        let generation = host.runtimes[&thread].generation;
+        let (reply, response) = mpsc::channel();
+        host.tool(BrowserToolRequest {
+            thread,
+            operation: BrowserToolOperation::ShowRemoteArtifact {
+                name: "scope.html".into(),
+                title: Some("Scope".into()),
+                html: "<main data-drostje-artifact>Pick</main>".into(),
+                placement: crate::browser_tools::ArtifactPlacement::Composer,
+            },
+            reply,
+        });
+        let Response::ArtifactRequest {
+            call,
+            generation: actual,
+            name,
+            html,
+            placement,
+            ..
+        } = serde_json::from_value(responses.try_recv().unwrap()).unwrap()
+        else {
+            panic!("expected a forwarded artifact")
+        };
+        assert_eq!((actual, name.as_str()), (generation, "scope.html"));
+        assert_eq!(placement, crate::browser_tools::ArtifactPlacement::Composer);
+        assert!(html.contains("Pick"));
+        let message = request(
+            &host,
+            thread,
+            Operation::NetworkResponse {
+                call,
+                result: Ok(json!({"id":"shown"})),
+            },
+        );
+        host.request(message).unwrap();
+        assert_eq!(response.recv().unwrap().unwrap(), json!({"id":"shown"}));
+
+        // A desktop from before artifacts omits the capability: nothing is forwarded.
+        let mut old = serde_json::to_value(request(&host, thread, Operation::Heartbeat)).unwrap();
+        old.as_object_mut().unwrap().remove("capabilities");
+        host.request(serde_json::from_value(old).unwrap()).unwrap();
+        let (reply, response) = mpsc::channel();
+        host.tool(BrowserToolRequest {
+            thread,
+            operation: BrowserToolOperation::ShowRemoteArtifact {
+                name: "old.html".into(),
+                title: None,
+                html: String::new(),
+                placement: crate::browser_tools::ArtifactPlacement::Composer,
+            },
+            reply,
+        });
+        assert!(
+            response
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("update DROSTJE")
+        );
+        assert!(
+            responses.try_recv().is_err(),
+            "an old desktop never receives ArtifactRequest"
+        );
+        host.request(request(&host, thread, Operation::Heartbeat))
+            .unwrap();
+
+        host.disconnect("test lost desktop");
+        let (reply, response) = mpsc::channel();
+        host.tool(BrowserToolRequest {
+            thread,
+            operation: BrowserToolOperation::ShowRemoteArtifact {
+                name: "late.html".into(),
+                title: None,
+                html: String::new(),
+                placement: crate::browser_tools::ArtifactPlacement::Composer,
+            },
+            reply,
+        });
+        assert!(
+            response
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("disconnected")
+        );
     }
 
     #[test]

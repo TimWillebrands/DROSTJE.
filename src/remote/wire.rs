@@ -9,6 +9,21 @@ use std::path::Path;
 use uuid::Uuid;
 
 pub const VERSION: u32 = 1;
+
+/// What the sending desktop supports beyond protocol version 1. Older desktops omit
+/// it, so every capability defaults to unsupported; older hosts ignore it. Additions
+/// stay optional so desktops and hosts of different versions keep working together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// Shows `Response::ArtifactRequest` and returns artifact-origin context.
+    #[serde(default)]
+    pub artifacts: bool,
+}
+
+impl Capabilities {
+    /// Everything this desktop build supports.
+    pub const DESKTOP: Self = Self { artifacts: true };
+}
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
@@ -25,6 +40,8 @@ pub struct RemoteConversationConfig {
 pub struct Request {
     pub id: Uuid,
     pub version: u32,
+    #[serde(default)]
+    pub capabilities: Capabilities,
     pub thread: Uuid,
     pub epoch: Uuid,
     pub operation: Operation,
@@ -129,6 +146,20 @@ pub enum Response {
         generation: Uuid,
         call: Uuid,
         action: Value,
+    },
+    /// Show a remote runtime's self-contained HTML file as an artifact on the desktop.
+    /// Answered like a Network call, with `Operation::NetworkResponse`. Sent only to
+    /// desktops whose requests declare `Capabilities::artifacts`.
+    ArtifactRequest {
+        thread: Uuid,
+        generation: Uuid,
+        call: Uuid,
+        name: String,
+        title: Option<String>,
+        html: String,
+        /// Absent from hosts that predate placement: the transcript.
+        #[serde(default)]
+        placement: crate::browser_tools::ArtifactPlacement,
     },
     Data {
         id: Uuid,
@@ -349,6 +380,37 @@ pub fn event_images(event: &mut ConversationEvent) -> Result<Vec<WireImage>> {
 mod tests {
     use super::*;
     use crate::harness::{CommandSource, SlashCommand};
+
+    #[test]
+    fn desktops_and_hosts_of_either_version_still_understand_each_other() {
+        // A request from a desktop that predates capabilities.
+        let old = serde_json::json!({"id":Uuid::new_v4(),"version":1,"thread":Uuid::new_v4(),
+            "epoch":Uuid::new_v4(),"operation":"Heartbeat"});
+        let request: Request = serde_json::from_value(old).unwrap();
+        assert_eq!(request.capabilities, Capabilities::default());
+        assert!(!request.capabilities.artifacts);
+        // A new desktop stays on version 1, so older hosts keep accepting it.
+        let new = serde_json::to_value(Request {
+            id: Uuid::new_v4(),
+            version: VERSION,
+            capabilities: Capabilities::DESKTOP,
+            thread: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+            operation: Operation::Heartbeat,
+        })
+        .unwrap();
+        assert_eq!(new["version"], 1);
+        assert_eq!(new["capabilities"]["artifacts"], true);
+        // Peer context from an older desktop has no origin and stays peer context.
+        let command: WireCommand = serde_json::from_value(serde_json::json!({"DeliverPeer":{
+            "attempt":Uuid::new_v4(),"messages":[{"id":Uuid::new_v4(),"sender":Uuid::new_v4(),
+            "sender_name":"Peer","space":Uuid::new_v4(),"body":"hello"}]}}))
+        .unwrap();
+        let WireCommand::DeliverPeer { messages, .. } = command else {
+            panic!("expected peer context");
+        };
+        assert_eq!(messages[0].origin, crate::harness::ContextOrigin::Peer);
+    }
 
     #[test]
     fn unknown_command_refusal_survives_wire_roundtrip() {

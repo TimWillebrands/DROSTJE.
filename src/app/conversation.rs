@@ -50,6 +50,7 @@ impl AppState {
         });
         let remote_client = self.remote_client.clone();
         let network = self.network.client.clone();
+        let artifacts = self.browser_tools.clone();
         let mut session = ConversationSession::new(thread.model.clone());
         let (finished, drain) = async_channel::bounded(1);
         session.finished = Some(drain);
@@ -107,6 +108,7 @@ impl AppState {
                                 allow_empty_session: thread.submission.is_none(),
                             },
                             network,
+                            artifacts,
                             resume,
                         )
                         .await;
@@ -199,6 +201,7 @@ impl AppState {
         {
             let _ = commands.try_send(ConversationCommand::Close);
         }
+        self.close_artifacts(id);
         self.open_conversation(id, true);
     }
 
@@ -1243,7 +1246,9 @@ impl AppState {
                 outcome,
             } => {
                 peer_settled = Some((request_id, outcome.clone()));
-                if !self.network_has_other_turn(id, request_id) {
+                if !self.network_has_other_turn(id, request_id)
+                    && !self.artifact_has_other_turn(id, request_id)
+                {
                     self.active_threads.remove(&id);
                     session.preparing = false;
                     session.outcome = Some(outcome.clone());
@@ -1407,15 +1412,23 @@ impl AppState {
         if pause_network {
             self.pause_network_delivery(id);
         }
-        if let Some((attempt, outcome)) = peer_delivery {
+        // Artifact attempts share the native injection path; settle them first so the
+        // network never sees an attempt it did not make.
+        if let Some((attempt, outcome)) = peer_delivery
+            && let Some(outcome) = self.artifact_delivery_event(id, attempt, outcome)
+        {
             self.network_delivery_event(id, attempt, outcome);
         }
-        if let Some(request_id) = peer_turn {
+        if let Some(request_id) = peer_turn
+            && !self.artifact_turn_started(id, request_id)
+        {
             self.network_peer_turn_started(id, request_id);
         }
         if let Some((request_id, outcome)) = peer_settled {
+            self.artifact_turn_settled(id, request_id);
             self.network_peer_turn_settled(id, request_id, &outcome);
         }
+        self.artifact_runtime_changed(id);
         if network_changed {
             self.sync_network();
             self.schedule_network_delivery();

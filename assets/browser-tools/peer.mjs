@@ -83,11 +83,14 @@ export function registerPeerDelivery(api, dialect) {
       seen.set(attempt, envelope.trigger_turn);
       status(ctx, { event: "dispatching", attempt, idle: envelope.trigger_turn && nativeIdle });
       try {
+        // Steering uses native tool-call boundaries (and interruptible waits),
+        // rather than OMP's aside queue, which waits for a whole agent step.
+        // Never abort a tool or implement our own wake/retry loop here.
         api.sendMessage({
           customType: TYPE, content, display: true,
           ...(dialect === "omp" ? { attribution: "agent" } : {}),
           details: { v: 1, origin: "peer", attempt, messages },
-        }, { deliverAs: dialect === "omp" && !nativeIdle ? "aside" : "steer", triggerTurn: envelope.trigger_turn });
+        }, { deliverAs: "steer", triggerTurn: envelope.trigger_turn });
       } catch (error) {
         // Even synchronous failure can follow native admission. The lifecycle
         // observer remains armed for a correlated late echo, never a retry.

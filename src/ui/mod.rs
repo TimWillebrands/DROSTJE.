@@ -4,6 +4,7 @@ pub mod browser;
 mod changes;
 mod color;
 pub mod commands;
+mod composer;
 pub mod conversation;
 pub mod editor;
 pub mod factory;

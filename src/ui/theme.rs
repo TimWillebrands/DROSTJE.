@@ -23,32 +23,12 @@ const RENAMED_THEMES: [(&str, &str); 2] = [
     ("DROSTJE. Dark", "Delft Dark"),
 ];
 /// The faces bundled themes name, embedded so every platform renders the same type.
-/// Each family's licence sits beside its files in `assets/fonts`.
-const FONTS: [&[u8]; 22] = [
-    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Medium.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-Bold.ttf"),
-    include_bytes!("../../assets/fonts/ibm-plex-sans/IBMPlexSans-BoldItalic.ttf"),
-    include_bytes!("../../assets/fonts/lilex/Lilex-Regular.ttf"),
-    include_bytes!("../../assets/fonts/lilex/Lilex-Italic.ttf"),
-    include_bytes!("../../assets/fonts/lilex/Lilex-Bold.ttf"),
-    include_bytes!("../../assets/fonts/libron/Libron-Regular.ttf"),
-    include_bytes!("../../assets/fonts/libron/Libron-Italic.ttf"),
-    include_bytes!("../../assets/fonts/libron/Libron-Bold.ttf"),
-    include_bytes!("../../assets/fonts/libron/Libron-BoldItalic.ttf"),
-    include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Regular.otf"),
-    include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Italic.otf"),
-    include_bytes!("../../assets/fonts/monaspace-xenon/MonaspaceXenon-Bold.otf"),
-    // No Regular: normal text falls to Medium, which keeps the narrow Dosis from going thin.
-    include_bytes!("../../assets/fonts/dosis/Dosis-Medium.ttf"),
-    include_bytes!("../../assets/fonts/dosis/Dosis-SemiBold.ttf"),
-    include_bytes!("../../assets/fonts/dosis/Dosis-Bold.ttf"),
-    include_bytes!("../../assets/fonts/maple-mono-nl/MapleMonoNL-Regular.ttf"),
-    include_bytes!("../../assets/fonts/maple-mono-nl/MapleMonoNL-Italic.ttf"),
-    include_bytes!("../../assets/fonts/maple-mono-nl/MapleMonoNL-Bold.ttf"),
-];
+fn bundled_fonts() -> Vec<Cow<'static, [u8]>> {
+    crate::fonts::FACES
+        .iter()
+        .map(|face| Cow::Borrowed(face.bytes))
+        .collect()
+}
 /// The brand face: the wordmark and the Welcome screen, in every theme.
 pub const DISPLAY_FONT: &str = "Dosis";
 /// Base UI size when a theme sets no `font.size`. Kit uses it as the window's
@@ -534,7 +514,7 @@ pub fn initialize(
         Some(coordinator) => coordinator.fonts_error.clone(),
         None => cx
             .text_system()
-            .add_fonts(FONTS.iter().map(|font| Cow::Borrowed(*font)).collect())
+            .add_fonts(bundled_fonts())
             .err()
             .map(|error| {
                 format!("Could not load the bundled fonts: {error:#}. Text uses system fonts.")
@@ -593,6 +573,72 @@ pub fn prose(cx: &App) -> Prose {
     cx.try_global::<Coordinator>()
         .map(|coordinator| coordinator.extensions.prose.clone())
         .unwrap_or_default()
+}
+
+/// The theme in effect as artifact kit tokens: one `:root` rule that artifact pages read
+/// through `var(--dk-*)`, so inline artifacts follow the app's colours, type and mode.
+pub fn artifact_tokens(cx: &App) -> String {
+    let theme = Theme::global(cx);
+    let color = |color: Hsla| hex(Rgba::from(color));
+    let family = |name: &str, fallback: &str| {
+        let name = name.replace(['"', '\\', ';', '{', '}', '<', '>'], "");
+        if name.trim().is_empty() {
+            fallback.to_owned()
+        } else {
+            format!("\"{name}\", {fallback}")
+        }
+    };
+    let prose = prose(cx);
+    // Headings use the theme's prose face, else the bundled book serif.
+    let serif_family = prose
+        .family
+        .as_ref()
+        .map_or("Libron", |name| name.as_ref())
+        .to_owned();
+    let serif = family(&serif_family, "Georgia, serif");
+    let tokens = [
+        ("--dk-bg", color(theme.background)),
+        ("--dk-fg", color(theme.foreground)),
+        ("--dk-strong", color(theme.foreground)),
+        ("--dk-muted", color(theme.muted_foreground)),
+        ("--dk-line", color(theme.border)),
+        ("--dk-surface", color(theme.muted)),
+        ("--dk-tint", color(theme.primary.opacity(0.07))),
+        ("--dk-accent", color(theme.primary)),
+        ("--dk-ok", color(theme.success)),
+        ("--dk-warn", color(theme.warning)),
+        ("--dk-bad", color(theme.danger)),
+        ("--dk-info", color(theme.info)),
+        (
+            "--dk-sans",
+            family(&theme.font_family, "system-ui, sans-serif"),
+        ),
+        ("--dk-serif", serif),
+        (
+            "--dk-mono",
+            family(&theme.mono_font_family, "ui-monospace, Menlo, monospace"),
+        ),
+        ("--dk-size", format!("{}px", f32::from(theme.font_size))),
+    ];
+    // Bundled faces reach artifact pages through the engine; system fonts stay system.
+    let mut css = crate::fonts::artifact_font_faces(&[
+        theme.font_family.as_ref(),
+        theme.mono_font_family.as_ref(),
+        &serif_family,
+    ]);
+    css.push_str(":root{");
+    for (name, value) in tokens {
+        css.push_str(name);
+        css.push(':');
+        css.push_str(&value);
+        css.push(';');
+    }
+    css.push_str(if theme.is_dark() {
+        "color-scheme:dark}"
+    } else {
+        "color-scheme:light}"
+    });
+    css
 }
 
 /// The full stop's color in the theme in effect.
@@ -980,13 +1026,12 @@ mod tests {
     // Not `use super::*`: the Kit facade exports a `test` macro that would
     // shadow `#[test]`.
     use super::{
-        Accent, Adjustments, DISPLAY_FONT, FONTS, Prose, parse_bundled, saved_theme_name,
+        Accent, Adjustments, DISPLAY_FONT, Prose, bundled_fonts, parse_bundled, saved_theme_name,
         with_accent,
     };
     use crate::ui::color::Oklch;
     use gpui_kit::{FontStyle, FontWeight, Hsla, Rgba, component::ThemeMode, font, px};
     use serde_json::json;
-    use std::borrow::Cow;
 
     fn oklch(color: Option<&str>) -> Oklch {
         Oklch::from_rgba(Rgba::try_from(color.expect("color is set")).unwrap())
@@ -1159,7 +1204,7 @@ mod tests {
     fn every_family_a_bundled_theme_names_is_embedded() {
         let text_system = gpui_kit::platform::current_platform(true).text_system();
         text_system
-            .add_fonts(FONTS.iter().map(|font| Cow::Borrowed(*font)).collect())
+            .add_fonts(bundled_fonts())
             .expect("bundled fonts load");
         let installed = text_system.all_font_names();
         let mut families = vec![DISPLAY_FONT.to_owned()];

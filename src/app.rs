@@ -1,4 +1,6 @@
 mod activity;
+mod artifacts;
+pub use artifacts::ArtifactReceipt;
 mod commit;
 mod conversation;
 mod factory;
@@ -349,6 +351,7 @@ enum Write {
 pub enum SidebarTab {
     Changes,
     Output,
+    Terminal,
     /// Space network membership and the Conversation's local agent activity.
     Agents,
     Browser,
@@ -358,6 +361,19 @@ pub enum SidebarTab {
     Details,
 }
 impl SidebarTab {
+    fn from_saved(conversation: bool, saved: Option<&str>) -> Self {
+        match saved {
+            Some("terminal") => Self::Terminal,
+            Some("output") => Self::Output,
+            _ if !conversation => Self::Output,
+            Some("agents") => Self::Agents,
+            Some("browser") => Self::Browser,
+            Some("review") => Self::Review,
+            Some("details") => Self::Details,
+            _ => Self::Changes,
+        }
+    }
+
     /// The sidebar `(open, tab)` after asking for `requested`: a hidden sidebar or
     /// another tab switches to it; the tab already on screen hides the sidebar.
     pub fn toggle(open: bool, current: Self, requested: Self) -> (bool, Self) {
@@ -431,6 +447,7 @@ pub struct AppState {
     pub diagnostics: BTreeMap<String, String>,
     pub browser_tools: Option<crate::browser_tools::BrowserToolServer>,
     pub network: NetworkState,
+    artifacts: artifacts::ArtifactChannels,
     pub remote_client: crate::remote::Client,
     pub remote_file: Option<RemoteFileView>,
     /// Models the title providers have locally; `None` until first inspected.
@@ -669,6 +686,7 @@ impl AppState {
             diagnostics,
             browser_tools,
             network: NetworkState::default(),
+            artifacts: Default::default(),
             remote_client: crate::remote::Client::new(),
             remote_file: None,
             title_models: None,
@@ -1116,24 +1134,15 @@ impl AppState {
 
     /// The sidebar tab a thread shows. Factory threads have no Changes tab.
     pub fn thread_sidebar_tab(&self, id: ThreadId) -> SidebarTab {
-        if !self.is_conversation(id) {
-            return SidebarTab::Output;
-        }
-        match self
-            .snapshot
-            .settings
-            .get("thread_sidebar_tab")
-            .and_then(Value::as_object)
-            .and_then(|threads| threads.get(&id.to_string()))
-            .and_then(Value::as_str)
-        {
-            Some("output") => SidebarTab::Output,
-            Some("agents") => SidebarTab::Agents,
-            Some("browser") => SidebarTab::Browser,
-            Some("review") => SidebarTab::Review,
-            Some("details") => SidebarTab::Details,
-            _ => SidebarTab::Changes,
-        }
+        SidebarTab::from_saved(
+            self.is_conversation(id),
+            self.snapshot
+                .settings
+                .get("thread_sidebar_tab")
+                .and_then(Value::as_object)
+                .and_then(|threads| threads.get(&id.to_string()))
+                .and_then(Value::as_str),
+        )
     }
 
     /// Show `tab` in the thread's sidebar, or hide the sidebar when `tab` is already shown.
@@ -1170,7 +1179,7 @@ impl AppState {
         {
             self.set_setting("conversation_diff_open", Value::Object(threads));
         }
-        if self.is_conversation(id) && self.thread_sidebar_tab(id) != tab {
+        if self.thread_sidebar_tab(id) != tab {
             let mut tabs = self
                 .snapshot
                 .settings
@@ -1181,6 +1190,7 @@ impl AppState {
             match tab {
                 SidebarTab::Changes => tabs.remove(&key),
                 SidebarTab::Output => tabs.insert(key, Value::String("output".into())),
+                SidebarTab::Terminal => tabs.insert(key, Value::String("terminal".into())),
                 SidebarTab::Agents => tabs.insert(key, Value::String("agents".into())),
                 SidebarTab::Browser => tabs.insert(key, Value::String("browser".into())),
                 SidebarTab::Review => tabs.insert(key, Value::String("review".into())),
@@ -1213,6 +1223,36 @@ impl AppState {
         widths.insert(id.to_string(), json!(width.clamp(180., 1600.)));
         self.set_setting("thread_sidebar_width", Value::Object(widths));
     }
+    /// User-resized composer height in logical pixels; absent keeps content-aware sizing.
+    pub fn thread_composer_height(&self, id: ThreadId) -> Option<f32> {
+        self.snapshot
+            .settings
+            .get("thread_composer_height")
+            .and_then(|heights| heights.get(id.to_string()))
+            .and_then(Value::as_f64)
+            .filter(|height| height.is_finite())
+            .map(|height| height.clamp(128., 1600.) as f32)
+    }
+
+    pub fn set_thread_composer_height(&mut self, id: ThreadId, height: f32) {
+        if !height.is_finite() {
+            return;
+        }
+        let height = height.clamp(128., 1600.);
+        if self.thread_composer_height(id) == Some(height) {
+            return;
+        }
+        let mut heights = self
+            .snapshot
+            .settings
+            .get("thread_composer_height")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        heights.insert(id.to_string(), json!(height));
+        self.set_setting("thread_composer_height", Value::Object(heights));
+    }
+
     pub fn thread_activity(&self, id: ThreadId) -> ThreadActivity {
         self.unseen_turns
             .activity(id, self.active_threads.contains(&id))
@@ -1549,6 +1589,7 @@ impl AppState {
         }
         if self.is_conversation(id) && !self.active_threads.contains(&id) {
             if let Some(session) = self.conversations.remove(&id) {
+                self.close_artifacts(id);
                 if let Some(commands) = session.commands {
                     let _ = commands.try_send(ConversationCommand::Close);
                 }
@@ -1916,6 +1957,39 @@ mod tests {
             let state = cx.new(|cx| AppState::new(bootstrap, cx));
             state.update(cx, |state, _| state.select_project(id));
             (dir, state, id)
+        }
+
+        #[gpui_kit::test]
+        fn terminal_sidebar_persists_for_conversation_and_factory(cx: &mut TestAppContext) {
+            let (_dir, state, _) = open(cx);
+            state.update(cx, |state, _| {
+                for kind in [ThreadKind::Conversation, ThreadKind::Factory] {
+                    state.new_thread(kind).unwrap();
+                    let id = state.selected_thread.unwrap();
+                    state.show_thread_sidebar(id, crate::app::SidebarTab::Terminal);
+                    assert_eq!(
+                        state.thread_sidebar_tab(id),
+                        crate::app::SidebarTab::Terminal
+                    );
+                    state.toggle_thread_sidebar(id, crate::app::SidebarTab::Terminal);
+                    assert!(!state.thread_sidebar_open(id));
+                    assert_eq!(
+                        state.thread_sidebar_tab(id),
+                        crate::app::SidebarTab::Terminal
+                    );
+                    assert_eq!(
+                        state.snapshot.settings["thread_sidebar_tab"][id.to_string()],
+                        "terminal"
+                    );
+                    state.show_thread_sidebar(id, crate::app::SidebarTab::Output);
+                    state.show_thread_sidebar(id, crate::app::SidebarTab::Terminal);
+                    assert!(state.thread_sidebar_open(id));
+                    assert_eq!(
+                        state.thread_sidebar_tab(id),
+                        crate::app::SidebarTab::Terminal
+                    );
+                }
+            });
         }
 
         fn new_conversation(state: &Entity<AppState>, cx: &mut TestAppContext) -> Uuid {

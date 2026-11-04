@@ -1,4 +1,5 @@
 import { Type } from "@sinclair/typebox";
+import { registerArtifactQuestions } from "./ask.mjs";
 import { registerBrowserTools } from "./client.mjs";
 import { registerPeerDelivery } from "./peer.mjs";
 
@@ -20,5 +21,6 @@ export default function (api) {
     return Type.String(options);
   }
   registerBrowserTools(api, schema);
+  registerArtifactQuestions(api);
   registerPeerDelivery(api, "pi");
 }

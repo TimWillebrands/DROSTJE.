@@ -18,8 +18,8 @@ use serde_json::Value;
 mod command;
 mod diagnostics;
 mod engine;
-pub use command::BrowserCommand;
 pub(crate) use command::frame_len;
+pub use command::{BrowserCommand, ChannelEvent, ReceiptStatus};
 use command::{Event, MAX_PENDING, PageState, Request};
 use diagnostics::Diagnostics;
 
@@ -77,9 +77,17 @@ pub struct BrowserFrame {
 struct Session {
     wire_id: BrowserId,
     content_sizing: bool,
+    /// Theme tokens for an artifact surface. Only artifacts get the kit and a channel;
+    /// fixed when the surface opens, because the engine injects it at WebView creation.
+    artifact: Option<String>,
+    /// Channel events not yet taken by the presentation owner.
+    channel: VecDeque<ChannelEvent>,
     snapshot: BrowserSnapshot,
     diagnostics: Diagnostics,
 }
+
+/// Unread channel events per artifact; the pane drains them every frame.
+const MAX_CHANNEL_BACKLOG: usize = 64;
 
 struct Evaluation {
     id: BrowserId,
@@ -137,6 +145,16 @@ impl BrowserRuntime {
     }
 
     pub fn open(&self, id: BrowserId, url: String) {
+        self.open_surface(id, url, None);
+    }
+
+    /// Open an artifact surface: the engine injects the artifact kit with these theme
+    /// tokens and accepts `drostje.send` channel events from its file documents.
+    pub fn open_artifact(&self, id: BrowserId, url: String, theme: String) {
+        self.open_surface(id, url, Some(theme));
+    }
+
+    fn open_surface(&self, id: BrowserId, url: String, artifact: Option<String>) {
         let shared = &self.0.0;
         let mut memory = shared.memory.lock();
         if memory.sessions.contains_key(&id) {
@@ -155,6 +173,8 @@ impl BrowserRuntime {
             Session {
                 wire_id,
                 content_sizing: false,
+                artifact,
+                channel: VecDeque::new(),
                 diagnostics: Diagnostics::default(),
                 snapshot: BrowserSnapshot {
                     url: url.clone(),
@@ -260,6 +280,14 @@ impl BrowserRuntime {
             && let Some(session) = memory.sessions.get_mut(&id)
         {
             session.content_sizing = *enabled;
+        }
+        if let BrowserCommand::ArtifactTheme { css } = &command
+            && let Some(session) = memory.sessions.get_mut(&id)
+        {
+            if session.artifact.is_none() {
+                return;
+            }
+            session.artifact = Some(css.clone());
         }
         enqueue(
             &mut memory,
@@ -413,6 +441,44 @@ impl BrowserRuntime {
                 "width": frame.width, "height": frame.height, "scale": frame.scale,
             })),
         }))
+    }
+
+    /// Channel events an artifact sent since the last call, oldest first.
+    pub fn take_channel(&self, id: BrowserId) -> Vec<ChannelEvent> {
+        let mut memory = self.0.0.memory.lock();
+        memory
+            .sessions
+            .get_mut(&id)
+            .map(|session| session.channel.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Tell an artifact page what happened to one of its events.
+    pub fn receipt(
+        &self,
+        id: BrowserId,
+        event: String,
+        status: ReceiptStatus,
+        reason: Option<String>,
+    ) {
+        self.command(
+            id,
+            BrowserCommand::Receipt {
+                event,
+                status,
+                reason,
+            },
+        );
+    }
+
+    pub fn is_artifact(&self, id: BrowserId) -> bool {
+        self.0
+            .0
+            .memory
+            .lock()
+            .sessions
+            .get(&id)
+            .is_some_and(|session| session.artifact.is_some())
     }
 
     pub fn diagnostics(&self, id: BrowserId, after: u64) -> Option<Value> {
@@ -657,6 +723,35 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
                 session.diagnostics.push(kind, level, message);
             }
         }
+        Event::Channel { id, event } => {
+            let Some(id) = memory.wire_ids.get(&id).copied() else {
+                return Ok(());
+            };
+            let Some(session) = memory.sessions.get_mut(&id) else {
+                return Ok(());
+            };
+            if session.artifact.is_none() {
+                return Ok(());
+            }
+            if session.channel.len() < MAX_CHANNEL_BACKLOG {
+                session.channel.push_back(event);
+            } else {
+                let wire_id = session.wire_id;
+                enqueue(
+                    memory,
+                    Request::Command {
+                        id: wire_id,
+                        command: BrowserCommand::Receipt {
+                            event: event.id,
+                            status: ReceiptStatus::Failed,
+                            reason: Some(
+                                "Too many unsent events; wait for earlier ones to settle".into(),
+                            ),
+                        },
+                    },
+                );
+            }
+        }
         Event::Fatal { error } => return Err(io::Error::other(error)),
     }
     Ok(())
@@ -701,6 +796,8 @@ mod tests {
             Session {
                 wire_id,
                 content_sizing: false,
+                artifact: None,
+                channel: VecDeque::new(),
                 diagnostics: Diagnostics::default(),
                 snapshot: BrowserSnapshot {
                     url: "about:blank".into(),
@@ -919,6 +1016,49 @@ mod tests {
         assert!(runtime.evaluation("missing").unwrap().is_err());
         assert!(runtime.evaluation("missing").is_none());
         assert!(!runtime.0.0.memory.lock().started);
+    }
+
+    #[test]
+    fn only_artifacts_hold_channel_events_and_a_full_backlog_tells_the_page() {
+        let (mut memory, id, wire_id) = memory_with_session();
+        let event = |n: usize| ChannelEvent {
+            id: format!("e{n}"),
+            kind: "answer".into(),
+            body: "{}".into(),
+        };
+        apply_event(
+            &mut memory,
+            Event::Channel {
+                id: wire_id,
+                event: event(0),
+            },
+            vec![],
+        )
+        .unwrap();
+        assert!(
+            memory.sessions[&id].channel.is_empty(),
+            "ordinary pages have no channel"
+        );
+        memory.sessions.get_mut(&id).unwrap().artifact = Some(":root{}".into());
+        for n in 0..=MAX_CHANNEL_BACKLOG {
+            apply_event(
+                &mut memory,
+                Event::Channel {
+                    id: wire_id,
+                    event: event(n),
+                },
+                vec![],
+            )
+            .unwrap();
+        }
+        assert_eq!(memory.sessions[&id].channel.len(), MAX_CHANNEL_BACKLOG);
+        assert!(matches!(
+            memory.queue.back(),
+            Some(Request::Command {
+                command: BrowserCommand::Receipt { event, status: ReceiptStatus::Failed, .. },
+                ..
+            }) if event == &format!("e{MAX_CHANNEL_BACKLOG}")
+        ));
     }
 
     #[test]

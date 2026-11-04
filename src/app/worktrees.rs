@@ -813,6 +813,7 @@ impl AppState {
             {
                 let _ = commands.try_send(ConversationCommand::Close);
             }
+            self.close_artifacts(thread);
         }
         let request = Uuid::new_v4();
         self.worktree_request = Some(WorktreeRequest {

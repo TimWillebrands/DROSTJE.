@@ -6,6 +6,7 @@
 #import <string.h>
 #import <ghostty.h>
 #include "process_activity.h"
+#include "native_input.h"
 
 extern bool drost_ghostty_config_command(ghostty_config_t, const char *const *, size_t);
 extern void drost_ghostty_config_theme(ghostty_config_t, const uint8_t *);
@@ -364,7 +365,7 @@ bool gpui_ghostty_surface_key(
 }
 
 void gpui_ghostty_surface_text(gpui_ghostty_surface *state, const char *text, size_t length) {
-    if (state != NULL && state->surface != NULL) ghostty_surface_text(state->surface, text, length);
+    if (state != NULL) gpui_ghostty_commit_text(state->surface, text, length);
 }
 
 void gpui_ghostty_surface_preedit(gpui_ghostty_surface *state, const char *text, size_t length) {

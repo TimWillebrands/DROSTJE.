@@ -20,6 +20,7 @@ use super::{
     },
 };
 use crate::{
+    browser_tools::{BrowserToolOperation, BrowserToolRequest, BrowserToolServer},
     harness::{
         ContentBlock, ConversationCommand, ConversationEvent, ConversationHandle,
         ConversationState, PeerDeliveryOutcome, TurnOutcome,
@@ -54,6 +55,7 @@ enum ClientRequest {
         project: String,
         config: RemoteConversationConfig,
         network: Network,
+        artifacts: Option<BrowserToolServer>,
         resume: bool,
         reply: Reply<ConversationHandle>,
     },
@@ -74,6 +76,8 @@ struct Runtime {
     project: String,
     config: RemoteConversationConfig,
     network: Network,
+    /// The desktop's tool server, which shows this runtime's artifacts locally.
+    artifacts: Option<BrowserToolServer>,
     capability: Uuid,
     generation: Option<Uuid>,
     open_id: Uuid,
@@ -132,6 +136,7 @@ impl Client {
         project: String,
         config: RemoteConversationConfig,
         network: Network,
+        artifacts: Option<BrowserToolServer>,
         resume: bool,
     ) -> Result<ConversationHandle> {
         ensure!(!project.trim().is_empty(), "Remote project key is required");
@@ -144,6 +149,7 @@ impl Client {
                 project,
                 config,
                 network,
+                artifacts,
                 resume,
                 reply,
             })
@@ -300,6 +306,7 @@ fn run(
                     project,
                     config,
                     network,
+                    artifacts,
                     resume,
                     reply,
                 } => {
@@ -309,6 +316,7 @@ fn run(
                                 &connection.outgoing,
                                 Request {
                                     version: wire::VERSION,
+                                    capabilities: wire::Capabilities::DESKTOP,
                                     id: Uuid::new_v4(),
                                     thread,
                                     epoch: current,
@@ -336,6 +344,7 @@ fn run(
                         project,
                         config,
                         network,
+                        artifacts,
                         capability: generation,
                         generation: None,
                         open_id,
@@ -381,6 +390,7 @@ fn run(
                                 &connection.outgoing,
                                 Request {
                                     version: wire::VERSION,
+                                    capabilities: wire::Capabilities::DESKTOP,
                                     id,
                                     thread,
                                     epoch: current,
@@ -426,6 +436,7 @@ fn run(
                             &connection.outgoing,
                             Request {
                                 version: wire::VERSION,
+                                capabilities: wire::Capabilities::DESKTOP,
                                 id: Uuid::new_v4(),
                                 thread,
                                 epoch: expected,
@@ -486,6 +497,7 @@ fn run(
                             &connection.outgoing,
                             Request {
                                 version: wire::VERSION,
+                                capabilities: wire::Capabilities::DESKTOP,
                                 id,
                                 thread,
                                 epoch: current,
@@ -539,6 +551,7 @@ fn run(
                         &connection.outgoing,
                         Request {
                             version: wire::VERSION,
+                            capabilities: wire::Capabilities::DESKTOP,
                             id: Uuid::new_v4(),
                             thread,
                             epoch: current,
@@ -557,6 +570,7 @@ fn run(
                     &connection.outgoing,
                     Request {
                         version: wire::VERSION,
+                        capabilities: wire::Capabilities::DESKTOP,
                         id: Uuid::new_v4(),
                         thread,
                         epoch: current,
@@ -578,6 +592,7 @@ fn run(
                         &connection.outgoing,
                         Request {
                             version: wire::VERSION,
+                            capabilities: wire::Capabilities::DESKTOP,
                             id: Uuid::new_v4(),
                             thread,
                             epoch: current,
@@ -636,6 +651,7 @@ fn send_open(
         outgoing,
         Request {
             version: wire::VERSION,
+            capabilities: wire::Capabilities::DESKTOP,
             id,
             thread,
             epoch,
@@ -978,6 +994,7 @@ fn process_response(
                         outgoing,
                         Request {
                             version: wire::VERSION,
+                            capabilities: wire::Capabilities::DESKTOP,
                             id: Uuid::new_v4(),
                             thread,
                             epoch,
@@ -1083,7 +1100,8 @@ fn process_response(
                     || runtime.network_calls.len() >= 4096
                     || !runtime.network_calls.insert(call)
                 {
-                    let _ = send(outgoing, Request { version: wire::VERSION, id: Uuid::new_v4(), thread, epoch, operation: Operation::NetworkResponse { call, result: Err("Duplicate remote Network request or admission capacity reached".into()) } });
+                    let _ = send(outgoing, Request { version: wire::VERSION,
+ capabilities: wire::Capabilities::DESKTOP, id: Uuid::new_v4(), thread, epoch, operation: Operation::NetworkResponse { call, result: Err("Duplicate remote Network request or admission capacity reached".into()) } });
                     return;
                 }
                 runtime.network_pending += 1;
@@ -1127,6 +1145,7 @@ fn process_response(
                     outgoing,
                     Request {
                         version: wire::VERSION,
+                        capabilities: wire::Capabilities::DESKTOP,
                         id: Uuid::new_v4(),
                         thread,
                         epoch,
@@ -1138,7 +1157,125 @@ fn process_response(
                 );
             }
         }
+        Response::ArtifactRequest {
+            thread,
+            generation,
+            call,
+            name,
+            title,
+            html,
+            placement,
+        } => {
+            let refuse = |reason: &str| {
+                let _ = send(
+                    outgoing,
+                    Request {
+                        version: wire::VERSION,
+                        capabilities: wire::Capabilities::DESKTOP,
+                        id: Uuid::new_v4(),
+                        thread,
+                        epoch,
+                        operation: Operation::NetworkResponse {
+                            call,
+                            result: Err(reason.into()),
+                        },
+                    },
+                );
+            };
+            let Some(runtime) = runtimes
+                .get_mut(&thread)
+                .filter(|r| r.recovered && r.generation == Some(generation))
+            else {
+                refuse("Remote Conversation is not attached and authorized");
+                return;
+            };
+            if runtime.network_pending >= 64
+                || runtime.network_calls.len() >= 4096
+                || !runtime.network_calls.insert(call)
+            {
+                refuse("Duplicate remote artifact request or admission capacity reached");
+                return;
+            }
+            runtime.network_pending += 1;
+            let server = runtime.artifacts.clone();
+            let directory = runtime.image_dir.join("artifacts");
+            let sender = sender.clone();
+            smol::spawn(async move {
+                let result = show_remote_artifact(
+                    server, directory, thread, call, name, title, html, placement,
+                )
+                .await;
+                let _ = sender
+                    .send(ClientRequest::NetworkReply {
+                        thread,
+                        epoch,
+                        generation,
+                        call,
+                        result,
+                    })
+                    .await;
+            })
+            .detach();
+        }
     }
+}
+
+/// Write a remote artifact's HTML beside this runtime's other remote media and show
+/// the local copy through the desktop tool server, exactly as a local artifact.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each artifact identity and presentation field stays explicit across the relay"
+)]
+async fn show_remote_artifact(
+    server: Option<BrowserToolServer>,
+    directory: PathBuf,
+    thread: Uuid,
+    call: Uuid,
+    name: String,
+    title: Option<String>,
+    html: String,
+    placement: crate::browser_tools::ArtifactPlacement,
+) -> std::result::Result<Value, String> {
+    let server =
+        server.ok_or("Artifacts are unavailable: the desktop browser tools did not start")?;
+    if html.len() > crate::browser_tools::MAX_REMOTE_ARTIFACT {
+        return Err("Remote artifact exceeds 2 MiB".into());
+    }
+    smol::unblock(move || {
+        let mut stem: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            .take(64)
+            .collect();
+        if !(stem.ends_with(".html") || stem.ends_with(".htm")) {
+            stem.push_str(".html");
+        }
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("Could not store the remote artifact: {error}"))?;
+        let path = directory.join(format!("{call}-{stem}"));
+        std::fs::write(&path, html)
+            .map_err(|error| format!("Could not store the remote artifact: {error}"))?;
+        let path = path
+            .to_str()
+            .ok_or("Remote artifact path is not valid UTF-8")?
+            .to_owned();
+        let (reply, response) = std::sync::mpsc::channel();
+        server.submit(BrowserToolRequest {
+            thread,
+            operation: BrowserToolOperation::ShowArtifact {
+                path,
+                title,
+                placement,
+            },
+            reply,
+        })?;
+        response
+            .recv_timeout(Duration::from_secs(20))
+            .map_err(|_| {
+                "The desktop did not show the artifact in time; its outcome is unknown".to_owned()
+            })?
+    })
+    .await
 }
 
 fn localize_images(
@@ -1212,6 +1349,7 @@ mod tests {
         let (sender, receiver) = async_channel::bounded(1);
         let request = || Request {
             version: wire::VERSION,
+            capabilities: wire::Capabilities::DESKTOP,
             id: Uuid::new_v4(),
             thread: Uuid::new_v4(),
             epoch: Uuid::new_v4(),
@@ -1306,6 +1444,7 @@ mod tests {
                     allow_empty_session: true,
                 },
                 network,
+                artifacts: None,
                 capability: Uuid::new_v4(),
                 generation: None,
                 open_id,

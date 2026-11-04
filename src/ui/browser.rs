@@ -3,7 +3,7 @@ use super::commands::{
     BrowserAddress, BrowserBack, BrowserForward, BrowserReload, Command, LeaveEditor,
     ToggleArtifact,
 };
-use crate::browser::{BrowserCommand, BrowserId, BrowserRuntime};
+use crate::browser::{BrowserCommand, BrowserId, BrowserRuntime, ChannelEvent};
 use gpui_kit::{
     component::{
         ActiveTheme, Disableable, IconName, Sizable,
@@ -26,12 +26,19 @@ pub struct OpenBrowserUrl {
     pub url: String,
 }
 
+/// Largest share of the window height a docked artifact takes above the composer.
+const DOCKED_SHARE: f32 = 0.45;
+
 pub(super) struct BrowserNavigation;
 impl EventEmitter<BrowserNavigation> for BrowserPane {}
 pub(super) struct BrowserFocus;
 impl EventEmitter<BrowserFocus> for BrowserPane {}
 pub(super) struct BrowserLayout;
 impl EventEmitter<BrowserLayout> for BrowserPane {}
+/// Channel events an artifact page sent, in order; the workspace routes them to the
+/// artifact's Conversation.
+pub(super) struct BrowserChannel(pub Vec<ChannelEvent>);
+impl EventEmitter<BrowserChannel> for BrowserPane {}
 
 pub struct BrowserPane {
     pub id: BrowserId,
@@ -40,6 +47,8 @@ pub struct BrowserPane {
     focus: FocusHandle,
     header_focus: FocusHandle,
     artifact: Option<String>,
+    /// Docked above the composer rather than in its transcript row.
+    docked: bool,
     collapsed: bool,
     content_height: Option<f32>,
     frame: Option<Arc<RenderImage>>,
@@ -70,7 +79,37 @@ impl BrowserPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        runtime.open(id, url.clone());
+        Self::open(id, url, None, runtime, window, cx)
+    }
+
+    /// An inline artifact: the engine injects the artifact kit with `theme` tokens and
+    /// accepts its channel events. Artifact-ness is fixed for the session's lifetime.
+    pub fn artifact(
+        id: BrowserId,
+        url: String,
+        title: String,
+        theme: String,
+        runtime: BrowserRuntime,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut pane = Self::open(id, url, Some(theme), runtime, window, cx);
+        pane.set_artifact(title);
+        pane
+    }
+
+    fn open(
+        id: BrowserId,
+        url: String,
+        artifact_theme: Option<String>,
+        runtime: BrowserRuntime,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        match artifact_theme {
+            Some(theme) => runtime.open_artifact(id, url.clone(), theme),
+            None => runtime.open(id, url.clone()),
+        }
         let dimensions = runtime
             .snapshot(id)
             .map(|snapshot| {
@@ -144,6 +183,7 @@ impl BrowserPane {
             focus,
             header_focus,
             artifact: None,
+            docked: false,
             collapsed: false,
             content_height: None,
             frame: None,
@@ -174,6 +214,20 @@ impl BrowserPane {
                 .command(self.id, BrowserCommand::SetContentSizing { enabled: true });
         }
         self.artifact = Some(title);
+    }
+
+    /// Docked artifacts stay at most a share of the window tall, so the composer stays in
+    /// view; taller pages scroll inside the surface.
+    pub(super) fn set_docked(&mut self, docked: bool, cx: &mut Context<Self>) {
+        if self.docked != docked {
+            self.docked = docked;
+            cx.emit(BrowserLayout);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn artifact_title(&self) -> Option<&str> {
+        self.artifact.as_deref()
     }
 
     fn toggle_artifact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -255,6 +309,11 @@ impl BrowserPane {
             .floor()
             .clamp(1., 1600.)
             .min((8192. / scale).floor());
+        let cap = if self.docked {
+            cap.min((f32::from(window.viewport_size().height) * DOCKED_SHARE).max(120.))
+        } else {
+            cap
+        };
         self.content_height
             .unwrap_or(240.)
             .ceil()
@@ -307,6 +366,12 @@ impl BrowserPane {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
             self.copy_request = None;
+        }
+        if self.artifact.is_some() {
+            let events = self.runtime.take_channel(self.id);
+            if !events.is_empty() {
+                cx.emit(BrowserChannel(events));
+            }
         }
         let Some(snapshot) = self.runtime.snapshot(self.id) else {
             return;
@@ -730,6 +795,14 @@ impl Render for BrowserPane {
                             };
                             pane.update(cx, |_, cx| cx.emit(BrowserFocus));
                             menu = menu.action_context(pane.read(cx).header_focus.clone());
+                            if pane.read(cx).docked {
+                                menu = menu
+                                    .menu(
+                                        Command::MoveArtifactIntoConversation.label(),
+                                        Command::MoveArtifactIntoConversation.action(),
+                                    )
+                                    .separator();
+                            }
                             for command in [
                                 Command::BrowserBack,
                                 Command::BrowserForward,
@@ -751,7 +824,9 @@ impl Render for BrowserPane {
                 )
         });
         let surface = div()
-            .id(if self.artifact.is_some() {
+            .id(if self.docked {
+                "docked-artifact-surface"
+            } else if self.artifact.is_some() {
                 "artifact-surface"
             } else {
                 "servo-surface"

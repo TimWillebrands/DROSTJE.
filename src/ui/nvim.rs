@@ -4,6 +4,7 @@ use super::commands::{
 use crate::model::{DraftKey, DraftRevision, DraftSnapshot};
 use crate::neovim::grid::{Cell, GridSnapshot, Highlight, HighlightedChunk};
 use crate::neovim::{ClipboardContent, NvimCommand, NvimEditor, NvimEvent, NvimTheme};
+use ghostty_terminal::input_surface::{native_input_context, native_text_key};
 use gpui_kit::{
     component::{ActiveTheme, Theme, alert::Alert, label::Label},
     prelude::*,
@@ -1532,17 +1533,17 @@ impl Render for NvimView {
             && self.bounds.is_some()
             && self.enabled()
             && self.focus_handle.is_focused(window);
+        let mut input_context = native_input_context("PromptEditor");
+        if popup_shown {
+            input_context.add("CaretPopup");
+        }
         let mut surface = div()
             .size_full()
             .min_h_0()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .key_context(if popup_shown {
-                "NativeInput PromptEditor CaretPopup"
-            } else {
-                "NativeInput PromptEditor"
-            })
+            .key_context(input_context)
             .track_focus(&self.focus_handle)
             .when(popup_shown, |surface| {
                 surface
@@ -1784,6 +1785,9 @@ fn clipboard_chord(key: &Keystroke) -> Option<ClipboardChord> {
 }
 
 fn key_notation(key: &Keystroke) -> Option<String> {
+    if native_text_key(key) {
+        return None;
+    }
     let name = match key.key.as_str() {
         "escape" => "Esc",
         "enter" | "return" => "CR",
@@ -2585,7 +2589,7 @@ mod tests {
         let view = view.unwrap();
         until(cx, &view, |view| view.enabled()).await;
         let mut expected = String::new();
-        for burst in ["gghjkl", "burst", "visible"] {
+        for burst in ["gghjkl", "burst", "visible", ":?{}~", "é"] {
             // No waits, snapshots or extra key are needed to make the final
             // character visible. Dispatch reaches the native input handler.
             for character in burst.chars() {
@@ -2618,6 +2622,65 @@ mod tests {
                 assert!(view.recovery_text().is_empty());
             });
         }
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_keystroke(gpui_kit::Keystroke::parse("escape").unwrap(), cx);
+        })
+        .unwrap();
+        until(cx, &view, |view| view.mode() == "normal").await;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_keystroke(gpui_kit::Keystroke::parse(":").unwrap(), cx);
+        })
+        .unwrap();
+        until(cx, &view, |view| !view.grid.cmdline.is_empty()).await;
+        for (key, text, modifiers) in [
+            (
+                "g",
+                "G",
+                gpui_kit::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "e",
+                "é",
+                gpui_kit::Modifiers {
+                    alt: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_keystroke(
+                    gpui_kit::Keystroke {
+                        key: key.into(),
+                        key_char: Some(text.into()),
+                        modifiers,
+                    },
+                    cx,
+                );
+                assert!(!window.has_pending_keystrokes());
+            })
+            .unwrap();
+        }
+        until(cx, &view, |view| {
+            view.grid
+                .cmdline
+                .last_key_value()
+                .is_some_and(|(_, command)| {
+                    command
+                        .content
+                        .iter()
+                        .map(|chunk| chunk.text.as_str())
+                        .collect::<String>()
+                        == "Gé"
+                })
+        })
+        .await;
+        cx.read(|cx| {
+            assert_eq!(view.read(cx).draft.as_ref().unwrap().text, expected);
+            assert!(!view.read(cx).has_composition());
+        });
         editor.shutdown().await.unwrap();
     }
 

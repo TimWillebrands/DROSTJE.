@@ -1,5 +1,5 @@
-//! Retained, resizable thread sidebar: Changes, Output, Browser and Agents
-//! for Conversations; Output for Factory threads. AppState owns tab, open state and width.
+//! Retained, resizable thread sidebar. Terminal is available for Conversations and
+//! Factory threads; AppState owns tab, open state and width.
 
 use super::{
     agents::{Activity, Event, EventKind, Outcome},
@@ -126,7 +126,7 @@ impl RenderOnce for SidebarSplit {
 /// Review and Details appear only while their content exists; Agents always offers opt-in.
 fn tabs(conversation: bool, review: bool, details: bool) -> Vec<SidebarTab> {
     if !conversation {
-        return vec![SidebarTab::Output];
+        return vec![SidebarTab::Output, SidebarTab::Terminal];
     }
     let mut tabs = vec![SidebarTab::Changes];
     if details {
@@ -136,6 +136,7 @@ fn tabs(conversation: bool, review: bool, details: bool) -> Vec<SidebarTab> {
         tabs.push(SidebarTab::Review);
     }
     tabs.push(SidebarTab::Output);
+    tabs.push(SidebarTab::Terminal);
     tabs.push(SidebarTab::Agents);
     tabs.push(SidebarTab::Browser);
     tabs
@@ -146,6 +147,7 @@ fn label(tab: SidebarTab) -> &'static str {
         SidebarTab::Changes => "Changes",
         SidebarTab::Details => "Details",
         SidebarTab::Output => "Output",
+        SidebarTab::Terminal => "Terminal",
         SidebarTab::Agents => "Agents",
         SidebarTab::Browser => "Browser",
         SidebarTab::Review => "Review",
@@ -157,6 +159,7 @@ fn toggle_command(tab: SidebarTab) -> Command {
     match tab {
         SidebarTab::Changes | SidebarTab::Details => Command::ToggleConversationDiffs,
         SidebarTab::Output => Command::ToggleOutput,
+        SidebarTab::Terminal => Command::ToggleTerminal,
         SidebarTab::Agents => Command::ToggleAgents,
         SidebarTab::Browser => Command::ToggleBrowser,
         SidebarTab::Review => Command::ToggleReview,
@@ -217,22 +220,44 @@ pub(super) fn render(
     }
     let selected = tabs.iter().position(|tab| *tab == active).unwrap_or(0);
     let tab_owner = owner.clone();
+    let terminal_reason = owner.upgrade().and_then(|workspace| {
+        let workspace = workspace.read(cx);
+        if workspace.sidebar_terminal(id).is_some() {
+            return None;
+        }
+        workspace
+            .thread_terminals
+            .get(&id)
+            .and_then(|entry| entry.error.clone())
+            .or_else(|| super::workspace::thread_terminal_location(state, id).err())
+    });
     let loading = match active {
         SidebarTab::Changes => state.conversation_diff(id).is_none_or(|diff| diff.loading),
         SidebarTab::Review => state.review_state(id).is_some_and(|review| review.loading),
-        SidebarTab::Details | SidebarTab::Output | SidebarTab::Agents | SidebarTab::Browser => {
-            false
-        }
+        SidebarTab::Terminal
+        | SidebarTab::Details
+        | SidebarTab::Output
+        | SidebarTab::Agents
+        | SidebarTab::Browser => false,
     };
     let header = TabBar::new("thread-sidebar-tabs")
+        .menu(true)
         .selected_index(selected)
-        .children(tabs.iter().map(|tab| Tab::new().label(label(*tab))))
+        .children(tabs.iter().map(|tab| {
+            Tab::new()
+                .label(label(*tab))
+                .disabled(*tab == SidebarTab::Terminal && terminal_reason.is_some())
+        }))
         .on_click(move |ix, window, cx| {
             let Some(tab) = tabs.get(*ix).copied() else {
                 return;
             };
             let _ = tab_owner.update(cx, |workspace, cx| {
-                workspace.show_sidebar_tab(id, tab, window, cx)
+                if tab == SidebarTab::Terminal {
+                    workspace.dispatch_sidebar_terminal(id, window, cx);
+                } else {
+                    workspace.show_sidebar_tab(id, tab, window, cx);
+                }
             });
         })
         .suffix(
@@ -306,6 +331,7 @@ pub(super) fn render(
                     )
                     .into_any_element()
             }),
+        SidebarTab::Terminal => terminal_body(id, owner, state, cx),
         SidebarTab::Output => div()
             .flex_1()
             .min_h_0()
@@ -333,7 +359,74 @@ pub(super) fn render(
         .border_color(cx.theme().border)
         .bg(cx.theme().sidebar)
         .child(header)
+        .when_some(terminal_reason, |panel, reason| {
+            panel.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(reason),
+            )
+        })
         .child(body)
+        .into_any_element()
+}
+
+fn terminal_body(
+    id: ThreadId,
+    owner: &WeakEntity<Workspace>,
+    state: &AppState,
+    cx: &App,
+) -> AnyElement {
+    let Some(workspace) = owner.upgrade() else {
+        return div().into_any_element();
+    };
+    let workspace = workspace.read(cx);
+    if let Some(entry) = workspace.thread_terminals.get(&id) {
+        if let Some(pane) = &entry.pane {
+            let bounds = entry.bounds.clone();
+            return div()
+                .id("thread-terminal")
+                .debug_selector(|| "thread-terminal".into())
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(pane.clone())
+                .child(
+                    canvas(
+                        move |measured, _, _| bounds.set(Some(measured)),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                )
+                .into_any_element();
+        }
+        if let Some(error) = &entry.error {
+            return v_flex()
+                .p_3()
+                .gap_2()
+                .child(error.clone())
+                .child(
+                    button(
+                        "retry-thread-terminal",
+                        Command::RestartTerminal,
+                        owner,
+                        state,
+                    )
+                    .label("Retry terminal"),
+                )
+                .into_any_element();
+        }
+    }
+    v_flex()
+        .p_3()
+        .gap_2()
+        .child(Spinner::new().small())
+        .child("Opening terminal…")
         .into_any_element()
 }
 

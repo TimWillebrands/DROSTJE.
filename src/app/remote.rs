@@ -170,6 +170,7 @@ impl AppState {
         {
             let _ = commands.try_send(ConversationCommand::Close);
         }
+        self.close_artifacts(id);
         thread.remote = location;
         thread.session_ref = None;
         self.save_thread(thread);

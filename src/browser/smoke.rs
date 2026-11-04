@@ -509,6 +509,8 @@ fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
     real_webgpu_canvas_survives_resizing_every_frame(&browser);
     real_webgpu_releases_devices_of_documents_that_navigate_away(&browser);
     real_indexeddb_is_deleted_when_the_last_surface_on_its_origin_closes(&browser);
+    real_artifact_kit_styles_pages_and_round_trips_channel_events(&browser);
+    real_artifact_gallery_renders_in_both_theme_modes(&browser);
     browser.runtime.command(
         id,
         BrowserCommand::Navigate {
@@ -863,4 +865,209 @@ fn real_has_selector_lists_apply() {
         "7px"
     );
     browser.runtime.close(id);
+}
+
+fn real_artifact_kit_styles_pages_and_round_trips_channel_events(browser: &Browser) {
+    std::fs::write(
+        browser.directory.join("artifact.html"),
+        r#"<!doctype html><title>Artifact kit</title>
+        <style>#own { color: rgb(1, 2, 3); }</style>
+        <main data-drostje-artifact>
+          <p id="own">Page styles win over the kit layer</p>
+          <span id="bundled" style="font: 40px 'Lilex', serif">iiiiiiiiii</span>
+          <span id="system" style="font: 40px serif">iiiiiiiiii</span>
+          <form data-drostje="answer">
+            <fieldset class="choices">
+              <label><input type="radio" name="scope" value="crate" checked> crate</label>
+              <label><input type="radio" name="scope" value="workspace"> workspace</label>
+            </fieldset>
+            <button type="submit" id="go" class="primary">Send</button>
+            <span data-drostje-status id="status"></span>
+          </form>
+        </main>"#,
+    )
+    .unwrap();
+    let url = url::Url::from_file_path(browser.directory.join("artifact.html"))
+        .unwrap()
+        .to_string();
+    let id = BrowserId::new_v4();
+    browser.runtime.open_artifact(
+        id,
+        url.clone(),
+        format!(
+            "{}:root{{--dk-accent:#123456;color-scheme:dark}}",
+            crate::fonts::artifact_font_faces(&["Lilex"])
+        ),
+    );
+    browser.until("artifact load", || !browser.snapshot(id).loading);
+    assert_eq!(
+        browser.evaluate(
+            id,
+            "({api: typeof window.drostje.send, kit: !!document.getElementById('drostje-kit'), \
+              accent: getComputedStyle(document.documentElement).getPropertyValue('--dk-accent').trim(), \
+              own: getComputedStyle(document.getElementById('own')).color})"
+        ),
+        serde_json::json!({"api":"function","kit":true,"accent":"#123456","own":"rgb(1, 2, 3)"})
+    );
+    // Servo cannot see faces GPUI registered; the engine serves them to artifacts.
+    browser.until(
+        "the bundled monospace face renders, not the serif fallback",
+        || {
+            browser.evaluate(
+                id,
+                "document.getElementById('bundled').getBoundingClientRect().width > \
+             1.5 * document.getElementById('system').getBoundingClientRect().width",
+            ) == true
+        },
+    );
+
+    browser.evaluate(id, "document.getElementById('go').click(), true");
+    let events = std::cell::RefCell::new(Vec::new());
+    browser.until("form submission reaches the channel", || {
+        events.borrow_mut().extend(browser.runtime.take_channel(id));
+        !events.borrow().is_empty()
+    });
+    let events = events.into_inner();
+    let [event] = events.as_slice() else {
+        panic!("one submission is one event: {events:?}");
+    };
+    assert_eq!(event.kind, "answer");
+    let body: Value = serde_json::from_str(&event.body).unwrap();
+    assert_eq!(body["data"]["scope"], "crate");
+    assert_eq!(
+        browser.evaluate(id, "document.querySelector('form').dataset.drostjeState"),
+        "sending"
+    );
+    browser.runtime.receipt(
+        id,
+        event.id.clone(),
+        ReceiptStatus::Queued,
+        Some("Answer the agent's pending request first".into()),
+    );
+    browser.until("queued is shown but not final", || {
+        browser.evaluate(id, "document.querySelector('form').dataset.drostjeState") == "queued"
+    });
+    assert_eq!(
+        browser.evaluate(id, "document.getElementById('go').disabled"),
+        true,
+        "a queued event cannot be sent twice"
+    );
+    browser
+        .runtime
+        .receipt(id, event.id.clone(), ReceiptStatus::Delivered, None);
+    browser.until("receipt settles the page", || {
+        browser.evaluate(id, "document.querySelector('form').dataset.drostjeState") == "sent"
+    });
+
+    browser.evaluate(
+        id,
+        "window.rejected = null; try { drostje.send('Not valid') } catch (e) { window.rejected = e.name }; \
+         drostje.send('Not valid').catch(e => { window.rejected = e.name }); true",
+    );
+    browser.until("invalid types are refused in the page", || {
+        browser.evaluate(id, "window.rejected") == "TypeError"
+    });
+    assert!(browser.runtime.take_channel(id).is_empty());
+
+    browser.runtime.command(
+        id,
+        BrowserCommand::ArtifactTheme {
+            css: ":root{--dk-accent:#654321}".into(),
+        },
+    );
+    browser.until("theme tokens update in place", || {
+        browser.evaluate(
+            id,
+            "getComputedStyle(document.documentElement).getPropertyValue('--dk-accent').trim()",
+        ) == "#654321"
+    });
+
+    let ordinary = BrowserId::new_v4();
+    browser.runtime.open(ordinary, url);
+    browser.until("ordinary load", || !browser.snapshot(ordinary).loading);
+    assert_eq!(
+        browser.evaluate(
+            ordinary,
+            "({api: typeof window.drostje, kit: !!document.getElementById('drostje-kit')})"
+        ),
+        serde_json::json!({"api":"undefined","kit":false}),
+        "ordinary pages never get the kit or a channel"
+    );
+    assert_eq!(
+        browser.evaluate(
+            ordinary,
+            "document.getElementById('bundled').getBoundingClientRect().width === \
+             document.getElementById('system').getBoundingClientRect().width",
+        ),
+        true,
+        "without the kit, the bundled face is not available to the page"
+    );
+    browser.runtime.close(id);
+    browser.runtime.close(ordinary);
+}
+
+/// Renders the kit gallery with the injected kit in both Delft modes and saves PNGs for
+/// review; fails on page script errors. Not a pixel assertion.
+fn real_artifact_gallery_renders_in_both_theme_modes(browser: &Browser) {
+    let gallery = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/artifact-kit");
+    // The gallery's own <link> to kit.css is for standalone preview; drop it so this
+    // renders exactly what DROSTJE injects.
+    let page = std::fs::read_to_string(gallery.join("gallery.html"))
+        .unwrap()
+        .replace(r#"<link rel="stylesheet" href="kit.css">"#, "")
+        .replace(r#"<script src="kit.js"></script>"#, "");
+    std::fs::write(browser.directory.join("gallery.html"), page).unwrap();
+    let url = url::Url::from_file_path(browser.directory.join("gallery.html"))
+        .unwrap()
+        .to_string();
+    let themes = [
+        (
+            "light",
+            ":root{--dk-bg:#f7f9fc;--dk-fg:#1b2740;--dk-strong:#1b2740;--dk-muted:#5a6680;--dk-line:#dde3ec;--dk-surface:#ecf0f6;--dk-tint:#2453a612;--dk-accent:#2453a6;--dk-ok:#3a7545;--dk-warn:#8a630f;--dk-bad:#b53a3a;--dk-info:#2453a6;--dk-sans:\"IBM Plex Sans\", system-ui, sans-serif;--dk-serif:\"Libron\", Georgia, serif;--dk-mono:\"Lilex\", ui-monospace, Menlo, monospace;--dk-size:15px;color-scheme:light}",
+        ),
+        (
+            "dark",
+            ":root{--dk-bg:#121b2e;--dk-fg:#dce3f0;--dk-strong:#dce3f0;--dk-muted:#8c98b0;--dk-line:#243049;--dk-surface:#18233a;--dk-tint:#8aaceb12;--dk-accent:#8aaceb;--dk-ok:#8cc796;--dk-warn:#e3bd62;--dk-bad:#e07a76;--dk-info:#8aaceb;--dk-sans:\"IBM Plex Sans\", system-ui, sans-serif;--dk-serif:\"Libron\", Georgia, serif;--dk-mono:\"Lilex\", ui-monospace, Menlo, monospace;--dk-size:15px;color-scheme:dark}",
+        ),
+    ];
+    for (mode, theme) in themes {
+        let id = BrowserId::new_v4();
+        let theme = format!(
+            "{}{theme}",
+            crate::fonts::artifact_font_faces(&["IBM Plex Sans", "Lilex", "Libron"])
+        );
+        browser.runtime.open_artifact(id, url.clone(), theme);
+        browser.runtime.command(
+            id,
+            BrowserCommand::Resize {
+                width: 760,
+                height: 2600,
+                scale: 1.0,
+            },
+        );
+        browser.until("gallery frame", || {
+            let snapshot = browser.snapshot(id);
+            !snapshot.loading && snapshot.viewport_height == 2600 && snapshot.frame.is_some()
+        });
+        thread::sleep(Duration::from_millis(400));
+        let frame = browser.snapshot(id).frame.expect("frame after settling");
+        let output = std::env::temp_dir().join(format!("drostje-artifact-gallery-{mode}.png"));
+        image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone())
+            .unwrap()
+            .save(&output)
+            .unwrap();
+        println!("{mode}: {}", output.display());
+        let diagnostics = browser.runtime.diagnostics(id, 0).unwrap();
+        let errors: Vec<_> = diagnostics["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|event| event["kind"] == "runtime")
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{mode} gallery script errors: {errors:?}"
+        );
+        browser.runtime.close(id);
+    }
 }

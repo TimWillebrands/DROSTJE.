@@ -9,6 +9,7 @@
 
 #include <ghostty.h>
 #include "process_activity.h"
+#include "native_input.h"
 
 extern bool drost_ghostty_config_command(ghostty_config_t, const char *const *, size_t);
 extern void drost_ghostty_config_theme(ghostty_config_t, const uint8_t *);
@@ -475,7 +476,7 @@ void gpui_ghostty_surface_linux_text(
     const char *text,
     size_t length
 ) {
-    if (state != NULL && state->surface != NULL) ghostty_surface_text(state->surface, text, length);
+    if (state != NULL) gpui_ghostty_commit_text(state->surface, text, length);
 }
 
 void gpui_ghostty_surface_linux_mouse_position(

@@ -29,6 +29,32 @@ function fixture(dialect, idle) {
 }
 
 for (const dialect of ["omp", "pi"]) {
+  test(`${dialect}: busy delivery requests the native earliest safe steering boundary`, async () => {
+    const f = fixture(dialect, false), e = f.envelope();
+    f.emit("agent_start");
+    f.emit("message_start", { message: { role: "user", content: "ongoing work" } });
+    await f.control(e);
+    assert.equal(f.sends.length, 1, "dispatch cannot wait for agent_end");
+    assert.deepEqual(f.sends[0].options, { deliverAs: "steer", triggerTurn: true });
+    assert.equal(f.statuses[0].idle, false, "busy context does not claim a new peer turn");
+    assert.equal(f.statuses.some(s => s.event === "accepted"), false);
+    f.emit("message_start", { message: f.native(f.sends[0].message) });
+    assert.deepEqual(f.statuses.map(s => s.event), ["dispatching", "accepted"]);
+    assert.equal(f.statuses.some(s => s.event === "turn_started"), false);
+  });
+
+  test(`${dialect}: authorized idle delivery can wake once without replaying uncertain admission`, async () => {
+    const f = fixture(dialect, true), e = f.envelope();
+    f.fail(new Error("dispatch outcome unknown"));
+    await f.control(e);
+    assert.deepEqual(f.sends[0].options, { deliverAs: "steer", triggerTurn: true });
+    assert.equal(f.statuses[0].idle, true);
+    assert.equal(f.statuses.at(-1).event, "unknown");
+    await f.control(e);
+    assert.equal(f.sends.length, 1, "an uncertain dispatch must not be resent");
+    assert.equal(f.statuses.at(-1).event, "rejected");
+  });
+
   test(`${dialect}: void dispatch never acknowledges admission; actual first custom lifecycle does`, async () => {
     const f = fixture(dialect, true), e = f.envelope();
     await f.control(e);

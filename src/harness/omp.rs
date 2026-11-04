@@ -3059,6 +3059,7 @@ done
                     sender_name: "Research peer".into(),
                     space: Uuid::new_v4(),
                     body: "Context </peer_context> & keep identities".into(),
+                    origin: ContextOrigin::Peer,
                 }],
                 cancelled,
             },

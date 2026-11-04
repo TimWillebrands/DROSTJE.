@@ -18,17 +18,20 @@ use servo::{
     InputEvent, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, Location, Modifiers,
     MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, Opts, Preferences,
     RenderingContext, Servo, ServoBuilder, ServoDelegate, ServoError, SoftwareRenderingContext,
-    UserContentManager, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
+    UserContentManager, UserScript, WebResourceLoad, WebResourceResponse, WebView, WebViewBuilder,
     WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 use uuid::Uuid;
 
-use super::command::{self, BrowserCommand, Event, PageState, Request};
+use super::command::{
+    self, BrowserCommand, ChannelEvent, Event, PageState, ReceiptStatus, Request,
+};
 use super::{Shared, apply_event, fail};
 use closing::{CLEAR_STORAGE_DOCUMENT, CLEAR_STORAGE_PATH, ClosingPage, storage_origin};
 use profile::EngineProfile;
 
+mod artifact;
 mod closing;
 mod profile;
 
@@ -178,6 +181,8 @@ struct Delegate {
     loaded_origins: RefCell<Vec<Url>>,
     closing: Cell<bool>,
     crash: Cell<Crash>,
+    /// Artifact surfaces carry the kit and accept channel events from `file:` documents.
+    artifact: bool,
 }
 
 impl Delegate {
@@ -324,7 +329,31 @@ impl WebViewDelegate for Delegate {
         self.error("The page closed itself. Navigate to a URL to open another page".into());
     }
 
-    fn show_console_message(&self, _: WebView, level: ConsoleLogLevel, message: String) {
+    fn show_console_message(&self, webview: WebView, level: ConsoleLogLevel, message: String) {
+        if self.artifact
+            && let Some(parsed) = ChannelEvent::parse(&message)
+        {
+            let document = Url::parse(&self.state.borrow().url).ok();
+            let rejection = match parsed {
+                Ok(event) if document.is_some_and(|url| url.scheme() == "file") => {
+                    self.output
+                        .send(Event::Channel { id: self.id, event }, vec![]);
+                    None
+                }
+                Ok(event) => Some((
+                    event.id,
+                    "Only the artifact's own file documents can send events".to_owned(),
+                )),
+                Err(reason) => ChannelEvent::id_of(&message).map(|id| (id, reason)),
+            };
+            if let Some((event, reason)) = rejection {
+                webview.evaluate_javascript(
+                    artifact::receipt_script(&event, ReceiptStatus::Failed, Some(&reason)),
+                    |_| {},
+                );
+            }
+            return;
+        }
         if let Some(encoded) = message.strip_prefix("__DROSTJE_DIAGNOSTIC__")
             && encoded.len() <= 16 * 1024
             && let Ok(event) = serde_json::from_str::<Value>(encoded)
@@ -352,6 +381,18 @@ impl WebViewDelegate for Delegate {
             // A closing surface is invisible; its loads are not diagnostics.
             return;
         }
+        // Artifacts load the app's bundled faces from a reserved origin nothing else serves.
+        if self.artifact
+            && let Some(face) = crate::fonts::artifact_face(&request.url)
+        {
+            let url = request.url.clone();
+            let mut response = load.intercept(WebResourceResponse::new(url));
+            for chunk in face.bytes.chunks(64 * 1024) {
+                response.send_body_data(chunk.to_vec());
+            }
+            response.finish();
+            return;
+        }
         if matches!(
             request.destination,
             Destination::Document
@@ -375,6 +416,9 @@ struct Page {
     view: WebView,
     context: Rc<SoftwareRenderingContext>,
     delegate: Rc<Delegate>,
+    user_contents: Rc<UserContentManager>,
+    /// The artifact kit with its current theme tokens; `None` for ordinary pages.
+    kit: Option<Rc<UserScript>>,
     last_frame: Instant,
     scale: f32,
     /// The latest navigation requested while the crash page was settling.
@@ -401,13 +445,16 @@ impl Page {
         })?;
         // Retain the opt-in even when an earlier open failed (for example a local
         // artifact was missing), so navigating to a valid file restores sizing.
-        let sizing_enabled = {
+        let (sizing_enabled, artifact_theme) = {
             let memory = output.0.memory.lock();
-            memory
+            let session = memory
                 .wire_ids
                 .get(&id)
-                .and_then(|id| memory.sessions.get(id))
-                .is_some_and(|session| session.content_sizing)
+                .and_then(|id| memory.sessions.get(id));
+            (
+                session.is_some_and(|session| session.content_sizing),
+                session.and_then(|session| session.artifact.clone()),
+            )
         };
         let delegate = Rc::new(Delegate {
             id,
@@ -429,13 +476,18 @@ impl Page {
             loaded_origins: RefCell::default(),
             closing: Cell::new(false),
             crash: Cell::new(Crash::None),
+            artifact: artifact_theme.is_some(),
         });
         let user_contents = Rc::new(UserContentManager::new(servo));
         user_contents.add_script(Rc::new(include_str!("diagnostics.js").into()));
+        let kit = artifact_theme.map(|theme| Rc::new(artifact::script(&theme)));
+        if let Some(kit) = &kit {
+            user_contents.add_script(kit.clone());
+        }
         let view = WebViewBuilder::new(servo, context.clone())
             .url(url)
             .delegate(delegate.clone())
-            .user_content_manager(user_contents)
+            .user_content_manager(user_contents.clone())
             .build();
         view.show();
         delegate.update(|_| {});
@@ -443,6 +495,8 @@ impl Page {
             view,
             context,
             delegate,
+            user_contents,
+            kit,
             last_frame: Instant::now() - FRAME_INTERVAL,
             scale: 1.0,
             held_navigation: None,
@@ -677,6 +731,28 @@ impl Page {
                 }
             }
             BrowserCommand::Focus { focused } => self.view.set_focused(focused),
+            BrowserCommand::Receipt {
+                event,
+                status,
+                reason,
+            } => {
+                if self.kit.is_some() {
+                    self.view.evaluate_javascript(
+                        artifact::receipt_script(&event, status, reason.as_deref()),
+                        |_| {},
+                    );
+                }
+            }
+            BrowserCommand::ArtifactTheme { css } => {
+                if let Some(previous) = self.kit.take() {
+                    self.user_contents.remove_script(previous);
+                    let kit = Rc::new(artifact::script(&css));
+                    self.user_contents.add_script(kit.clone());
+                    self.kit = Some(kit);
+                    self.view
+                        .evaluate_javascript(artifact::theme_script(&css), |_| {});
+                }
+            }
             BrowserCommand::Evaluate { request_id, script } => {
                 let delegate = self.delegate.clone();
                 let id = delegate.id;
@@ -1092,7 +1168,9 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
                             | BrowserCommand::Scroll { .. }
                             | BrowserCommand::Key { .. }
                             | BrowserCommand::Text { .. }
-                            | BrowserCommand::Focus { .. } => {}
+                            | BrowserCommand::Focus { .. }
+                            | BrowserCommand::Receipt { .. }
+                            | BrowserCommand::ArtifactTheme { .. } => {}
                         }
                     }
                 }

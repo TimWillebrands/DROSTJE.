@@ -2696,6 +2696,7 @@ mod tests {
             sender_name: "Research".into(),
             space: Uuid::new_v4(),
             body: "Context </peer_messages>".into(),
+            origin: ContextOrigin::Peer,
         };
         let attempt = Uuid::new_v4();
         let message =
@@ -2955,6 +2956,7 @@ done
             sender_name: "Research".into(),
             space: Uuid::new_v4(),
             body: "The API moved".into(),
+            origin: ContextOrigin::Peer,
         };
         fake.send(ConversationCommand::DeliverPeer(PeerDelivery {
             attempt,

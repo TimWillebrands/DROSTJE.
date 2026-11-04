@@ -224,6 +224,9 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session, Opti
             "host",
             "--permission-prompt-tool",
             "stdio",
+            // Interactive questions are HTML artifacts with a channel back to the agent.
+            "--disallowedTools",
+            ASK_USER_QUESTION,
         ])
         .current_dir(&config.cwd)
         .stdin(Stdio::piped())
@@ -336,9 +339,6 @@ struct Permission {
     /// Labelled `permission_suggestions` from the CLI; the chosen one goes back verbatim as
     /// `updatedPermissions` so Claude Code stops asking.
     choices: Vec<(String, Value)>,
-    /// `AskUserQuestion` travels through the same channel; `Some` names the question whose
-    /// answer goes into `updatedInput`.
-    question: Option<String>,
 }
 
 struct PeerStop {
@@ -1664,18 +1664,21 @@ fn permission_text(tool_name: &str, input: &Value) -> String {
 const ALLOW: &str = "Allow";
 const DENY: &str = "Deny";
 const DENIED: &str = "The user denied this tool request.";
+const ASK_USER_QUESTION: &str = "AskUserQuestion";
+const ASK_WITH_ARTIFACT: &str = "AskUserQuestion is not available in DROSTJE. To ask the user, write an HTML page with a <form data-drostje=\"answer\"> (or data-drostje-send buttons) and call show_artifact; the user's answers arrive as artifact events. For a simple question, ask in plain text instead.";
 
 /// Maps a `can_use_tool` request to the choices shown to the user: allow once, one entry per
-/// usable `permission_suggestions` item, deny. `AskUserQuestion` becomes a plain selection.
-/// `Err` carries the reason a request cannot be presented here.
+/// usable `permission_suggestions` item, deny. `Err` carries the reason a request cannot be
+/// presented here; it is declined with that reason.
 fn permission_request(
     request_id: String,
     request: &Value,
 ) -> std::result::Result<(UserRequest, Permission), String> {
     let tool_name = request["tool_name"].as_str().unwrap_or("tool");
     let input = request["input"].clone();
-    if tool_name == "AskUserQuestion" {
-        return question_request(request_id, input);
+    // Disallowed at launch; a resumed or reconfigured session may still ask.
+    if tool_name == ASK_USER_QUESTION {
+        return Err(ASK_WITH_ARTIFACT.into());
     }
     let display_name = request["display_name"]
         .as_str()
@@ -1721,73 +1724,7 @@ fn permission_request(
             placeholder: None,
             deadline: None,
         },
-        Permission {
-            input,
-            choices,
-            question: None,
-        },
-    ))
-}
-
-/// One single-choice question with options is a selection; anything else is declined so the
-/// model asks again in that form rather than DROSTJE guessing an answer.
-fn question_request(
-    request_id: String,
-    input: Value,
-) -> std::result::Result<(UserRequest, Permission), String> {
-    let questions = input["questions"].as_array().cloned().unwrap_or_default();
-    let [question] = questions.as_slice() else {
-        return Err(format!(
-            "DROSTJE answers one question at a time; this request carried {}. \
-             Ask again with one single-choice question per request.",
-            questions.len()
-        ));
-    };
-    if question["multiSelect"].as_bool().unwrap_or(false) {
-        return Err(
-            "DROSTJE answers single-choice questions only. Ask again without multiSelect.".into(),
-        );
-    }
-    let options: Vec<UserOption> = question["options"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|option| {
-            Some(UserOption {
-                value: option["label"]
-                    .as_str()
-                    .filter(|label| !label.is_empty())?
-                    .to_owned(),
-                description: option["description"].as_str().map(str::to_owned),
-            })
-        })
-        .collect();
-    if options.is_empty() {
-        return Err(
-            "DROSTJE answers questions with labelled options only. Ask again with options.".into(),
-        );
-    }
-    let text = question["question"].as_str().unwrap_or_default().to_owned();
-    let title = question["header"]
-        .as_str()
-        .filter(|header| !header.is_empty())
-        .unwrap_or("Question")
-        .to_owned();
-    Ok((
-        UserRequest {
-            id: request_id,
-            kind: UserRequestKind::Question,
-            title,
-            options,
-            text: text.clone(),
-            placeholder: None,
-            deadline: None,
-        },
-        Permission {
-            input,
-            choices: Vec::new(),
-            question: Some(text),
-        },
+        Permission { input, choices },
     ))
 }
 
@@ -1801,35 +1738,26 @@ fn permission_response(permission: &Permission, answer: &UserAnswer) -> Option<V
         }
         response
     };
-    match (answer, &permission.question) {
-        (UserAnswer::Cancelled { .. }, Some(_)) => Some(deny("The user dismissed the question.")),
-        (UserAnswer::Cancelled { .. } | UserAnswer::Confirmed(false), None) => Some(deny(DENIED)),
-        (UserAnswer::Confirmed(true), None) => Some(allow(None)),
-        (UserAnswer::Confirmed(_), Some(_)) => None,
-        (UserAnswer::Value(value), Some(question)) => {
-            let mut input = permission.input.clone();
-            input["answers"] = json!({ question.as_str(): value });
-            Some(json!({"behavior":"allow","updatedInput":input}))
-        }
-        (UserAnswer::PermissionAuto, None) => {
+    match answer {
+        UserAnswer::Cancelled { .. } | UserAnswer::Confirmed(false) => Some(deny(DENIED)),
+        UserAnswer::Confirmed(true) => Some(allow(None)),
+        UserAnswer::PermissionAuto => {
             let mut response = allow(None);
             response["updatedPermissions"] =
                 json!([{"type":"setMode","mode":"auto","destination":"session"}]);
             Some(response)
         }
-        (UserAnswer::Value(value), None) if value == ALLOW => Some(allow(None)),
-        (UserAnswer::Value(value), None) if value == DENY => Some(deny(DENIED)),
-        (UserAnswer::Value(value), None) => permission
+        UserAnswer::Value(value) if value == ALLOW => Some(allow(None)),
+        UserAnswer::Value(value) if value == DENY => Some(deny(DENIED)),
+        UserAnswer::Value(value) => permission
             .choices
             .iter()
             .find(|(label, _)| label == value)
             .map(|(_, suggestion)| allow(Some(suggestion))),
-        (UserAnswer::PermissionAuto, Some(_)) => None,
     }
 }
 
-/// Removes and answers one request. Auto approval also clears every other pending permission,
-/// while AskUserQuestion entries remain for the user.
+/// Removes and answers one request. Auto approval also clears every other pending permission.
 fn permission_responses(
     permissions: &mut HashMap<String, Permission>,
     request_id: &str,
@@ -1842,11 +1770,7 @@ fn permission_responses(
     };
     let mut responses = vec![(request_id.to_owned(), response)];
     if matches!(answer, UserAnswer::PermissionAuto) {
-        let mut pending: Vec<String> = permissions
-            .iter()
-            .filter(|(_, permission)| permission.question.is_none())
-            .map(|(id, _)| id.clone())
-            .collect();
+        let mut pending: Vec<String> = permissions.keys().cloned().collect();
         pending.sort();
         for id in pending {
             if let Some(permission) = permissions.remove(&id)
@@ -2279,14 +2203,13 @@ mod tests {
     }
 
     #[test]
-    fn auto_permission_approves_pending_permissions_but_leaves_questions_open() {
+    fn auto_permission_approves_every_pending_permission() {
         let mut permissions = HashMap::from([
             (
                 "current".into(),
                 Permission {
                     input: json!({"command":"cargo check"}),
                     choices: Vec::new(),
-                    question: None,
                 },
             ),
             (
@@ -2294,15 +2217,6 @@ mod tests {
                 Permission {
                     input: json!({"command":"cargo test"}),
                     choices: Vec::new(),
-                    question: None,
-                },
-            ),
-            (
-                "question".into(),
-                Permission {
-                    input: json!({"questions":[]}),
-                    choices: Vec::new(),
-                    question: Some("Which option?".into()),
                 },
             ),
         ]);
@@ -2318,74 +2232,17 @@ mod tests {
         );
         assert_eq!(responses[1].0, "other");
         assert!(responses[1].1.get("updatedPermissions").is_none());
-        assert_eq!(
-            permissions.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["question"]
-        );
+        assert!(permissions.is_empty());
     }
 
     #[test]
-    fn single_choice_questions_accept_offered_and_custom_answers() {
-        let question = |questions: Value| {
-            json!({"subtype":"can_use_tool","tool_name":"AskUserQuestion",
-                "input":{"questions":questions},"tool_use_id":"tool-1"})
-        };
-        let (shown, permission) = permission_request(
-            "q-1".into(),
-            &question(
-                json!([{"question":"Which colour?","header":"Colour","multiSelect":false,
-                "options":[{"label":"Red","description":"Warm"},{"label":"Blue"}]}]),
-            ),
-        )
-        .expect("presentable");
-        assert_eq!(shown.kind, UserRequestKind::Question);
-        assert_eq!(shown.title, "Colour");
-        assert_eq!(shown.text, "Which colour?");
-        assert_eq!(shown.options.len(), 2);
-        assert_eq!(shown.options[0].description.as_deref(), Some("Warm"));
-        let answer = permission_response(&permission, &UserAnswer::Value("Blue".into())).unwrap();
-        assert_eq!(answer["behavior"], "allow");
-        assert_eq!(
-            answer["updatedInput"]["answers"],
-            json!({"Which colour?":"Blue"})
-        );
-        assert_eq!(
-            answer["updatedInput"]["questions"].as_array().map(Vec::len),
-            Some(1)
-        );
-        assert!(permission_response(&permission, &UserAnswer::PermissionAuto).is_none());
-        let custom =
-            permission_response(&permission, &UserAnswer::Value("Something else".into())).unwrap();
-        assert_eq!(
-            custom["updatedInput"]["answers"],
-            json!({"Which colour?":"Something else"})
-        );
-        assert!(permission_response(&permission, &UserAnswer::Confirmed(true)).is_none());
-        assert_eq!(
-            permission_response(&permission, &UserAnswer::Cancelled { timed_out: true }).unwrap()["behavior"],
-            "deny"
-        );
-
-        let two = question(json!([{"question":"A","options":[{"label":"1"}]},
-            {"question":"B","options":[{"label":"2"}]}]));
-        assert!(
-            permission_request("q-2".into(), &two)
-                .unwrap_err()
-                .contains("carried 2")
-        );
-        let multi =
-            question(json!([{"question":"A","multiSelect":true,"options":[{"label":"1"}]}]));
-        assert!(
-            permission_request("q-3".into(), &multi)
-                .unwrap_err()
-                .contains("multiSelect")
-        );
-        let free = question(json!([{"question":"A","options":[]}]));
-        assert!(
-            permission_request("q-4".into(), &free)
-                .unwrap_err()
-                .contains("options")
-        );
+    fn ask_user_question_is_declined_toward_artifacts() {
+        let request = json!({"subtype":"can_use_tool","tool_name":"AskUserQuestion",
+            "input":{"questions":[{"question":"Which colour?","header":"Colour","multiSelect":false,
+            "options":[{"label":"Red"},{"label":"Blue"}]}]},"tool_use_id":"tool-1"});
+        let reason = permission_request("q-1".into(), &request).unwrap_err();
+        assert!(reason.contains("show_artifact"));
+        assert!(reason.contains("data-drostje"));
     }
 
     #[test]
@@ -2672,6 +2529,10 @@ done
         assert!(
             args.contains("--permission-prompt-tool\nstdio\n"),
             "argv: {args}"
+        );
+        assert!(
+            args.contains("--disallowedTools\nAskUserQuestion\n"),
+            "questions are artifacts, never the native tool; argv: {args}"
         );
         assert!(
             args.contains("--permission-mode\nacceptEdits\n"),

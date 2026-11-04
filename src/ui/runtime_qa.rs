@@ -3034,14 +3034,41 @@ fn has_focus_outline(window: &Window, cx: &App, id: impl Into<gpui_kit::ElementI
 async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let first = new_conversation(cx, &fixture).await;
-    let second = new_conversation(cx, &fixture).await;
+    // Generic New conversation reuses an untouched Conversation through its picker.
+    // This fixture needs two distinct panes, so choose an explicit harness action.
+    cx.dispatch_action(fixture.window.into(), commands::NewOmpConversation);
+    let second = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
+    assert_ne!(first, second);
+    until(
+        cx,
+        "second Conversation buffer",
+        Duration::from_secs(15),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .editor
+                .as_ref()
+                .is_some_and(|editor| {
+                    editor.read(cx).active_key() == Some(&DraftKey::Thread(second))
+                })
+        },
+    )
+    .await;
+    let press = |cx: &mut TestAppContext, keys: &str| {
+        for key in keys.split_whitespace() {
+            cx.update_window(fixture.window.into(), |_, window, cx| window.press(key, cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    };
     cx.update_window(fixture.window.into(), |_, window, _| {
         window.activate_window()
     })
     .unwrap();
     let first_row = gpui_kit::SharedString::from(format!("thread-{first}"));
     let second_row = gpui_kit::SharedString::from(format!("thread-{second}"));
-    cx.simulate_keystrokes(fixture.window.into(), "secondary-2 i a b c");
+    press(cx, "secondary-2 i a b c");
     until(
         cx,
         "draft before pane navigation",
@@ -3050,6 +3077,8 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
     )
     .await;
 
+    let editor = cx.read(|cx| fixture.state.read(cx).editor.clone().unwrap());
+    let mut retained = None;
     for mode in ["light", "dark"] {
         fixture.state.update(cx, |state, cx| {
             state.set_setting("theme_mode", json!(mode));
@@ -3057,7 +3086,7 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
         });
         for (width, height) in [(1440., 900.), (900., 600.)] {
             cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
-            cx.simulate_keystrokes(fixture.window.into(), "secondary-2 i");
+            press(cx, "secondary-2 i");
             cx.run_until_parked();
             cx.update_window(fixture.window.into(), |_, window, cx| {
                 window.render_frame(cx);
@@ -3065,26 +3094,20 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
                 assert!(!has_focus_outline(window, cx, second_row.clone()));
             })
             .unwrap();
-            cx.simulate_keystrokes(fixture.window.into(), "ctrl-w l ctrl-w ctrl-l");
+            press(cx, "escape ctrl-w l ctrl-w ctrl-l");
             cx.run_until_parked();
             cx.update_window(fixture.window.into(), |_, window, cx| {
                 window.render_frame(cx);
                 assert_eq!(
                     window.find("prompt-editor").focused(),
                     Some(true),
-                    "moving right at the edge must leave Neovim focused"
+                    "native Ctrl-W chords must stay with Neovim"
                 );
             })
             .unwrap();
+            retained = Some(editor.snapshot(DraftKey::Thread(second)).await.unwrap());
 
-            cx.simulate_keystrokes(
-                fixture.window.into(),
-                if width == 900. {
-                    "ctrl-w h"
-                } else {
-                    "secondary-escape ctrl-w h"
-                },
-            );
+            press(cx, "secondary-escape ctrl-w h");
             cx.run_until_parked();
             cx.update_window(fixture.window.into(), |_, window, cx| {
                 window.render_frame(cx);
@@ -3093,7 +3116,19 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
                 assert!(has_focus_outline(window, cx, second_row.clone()));
             })
             .unwrap();
-            cx.simulate_keystrokes(fixture.window.into(), "k");
+            let motion = cx.read(|cx| {
+                let rows = crate::ui::sidebar::rows(fixture.state.read(cx), "");
+                let from = rows
+                    .iter()
+                    .position(|row| *row == Row::Thread(second))
+                    .unwrap();
+                let to = rows
+                    .iter()
+                    .position(|row| *row == Row::Thread(first))
+                    .unwrap();
+                if to < from { "k" } else { "j" }
+            });
+            press(cx, motion);
             cx.run_until_parked();
             assert_eq!(
                 cx.read(|cx| fixture.state.read(cx).selected_thread),
@@ -3107,7 +3142,7 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
             .unwrap();
 
             // Native search owns its own focus cue, not the remembered list cursor.
-            cx.simulate_keystrokes(fixture.window.into(), "/");
+            press(cx, "/");
             cx.run_until_parked();
             cx.update_window(fixture.window.into(), |_, window, cx| {
                 window.render_frame(cx);
@@ -3115,17 +3150,26 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
                 assert!(!has_focus_outline(window, cx, "prompt-editor"));
             })
             .unwrap();
-            cx.simulate_keystrokes(fixture.window.into(), "escape");
+            press(cx, "escape");
         }
     }
-    // Pane navigation must not type into the retained Neovim buffer or reset
-    // insert mode; returning to the editor resumes at the same cursor.
-    cx.simulate_keystrokes(fixture.window.into(), "secondary-2 i d");
+    // Native Escape legitimately moves Neovim's insert cursor. App pane navigation
+    // must preserve the resulting draft and cursor, not assume an end-of-line cursor.
+    let retained = retained.unwrap();
+    press(cx, "secondary-2 i");
+    let returned = editor.snapshot(DraftKey::Thread(second)).await.unwrap();
+    assert_eq!(returned.text, "abc");
+    assert_eq!(returned.text, retained.text);
+    assert_eq!(returned.cursor, retained.cursor);
+    let mut expected = retained.text;
+    expected.insert(retained.cursor.1, 'd');
+    // Focus preserves the native Normal mode entered above; this i belongs to Neovim.
+    press(cx, "i d");
     until(
         cx,
         "draft after pane navigation",
         Duration::from_secs(5),
-        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == "abcd",
+        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == expected,
     )
     .await;
     VisualTestContext::from_window(fixture.window.into(), cx).deactivate_window();
@@ -5883,3 +5927,9 @@ async fn remote_host_settings_selection_and_failure_are_keyboard_safe(cx: &mut T
 
 #[path = "network_runtime_qa.rs"]
 mod network_runtime_qa;
+
+#[path = "composer_runtime_qa.rs"]
+mod composer_runtime_qa;
+
+#[path = "terminal_sidebar_runtime_qa.rs"]
+mod terminal_sidebar_runtime_qa;

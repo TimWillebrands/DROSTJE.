@@ -1,3 +1,4 @@
+import { registerArtifactQuestions } from "./ask.mjs";
 import { registerBrowserTools } from "./client.mjs";
 import { registerPeerDelivery } from "./peer.mjs";
 
@@ -25,5 +26,6 @@ export default function (api) {
     return value.description ? result.describe(value.description) : result;
   }
   registerBrowserTools(api, schema);
+  registerArtifactQuestions(api);
   registerPeerDelivery(api, "omp");
 }
