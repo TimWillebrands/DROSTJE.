@@ -5073,6 +5073,114 @@ mod tests {
 
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
+    fn streaming_output_follows_only_a_reader_at_the_latest_message(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::{RowChanges, update_rows};
+        use gpui_kit::{
+            AppContext, Context, FollowMode, IntoElement, ListAlignment, ListState, Pixels,
+            PlatformInput, Render, ScrollDelta, ScrollWheelEvent, Styled, Window, component::Root,
+            div, list, point, px,
+        };
+        use std::{cell::Cell, rc::Rc};
+
+        const ROW: Pixels = px(40.);
+        // The newest row streams: its height grows while the others stay put.
+        struct Rows(ListState, Rc<Cell<(usize, Pixels)>>);
+        impl Render for Rows {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let (count, latest) = self.1.get();
+                list(self.0.clone(), move |index, _, _| {
+                    let height = if index + 1 == count { latest } else { ROW };
+                    div().h(height).w_full().into_any_element()
+                })
+                .size_full()
+            }
+        }
+
+        cx.update(gpui_kit::init);
+        let rows = ListState::new(0, ListAlignment::Bottom, px(500.));
+        rows.set_follow_mode(FollowMode::Tail);
+        let estimated = Rc::new(Cell::new(None));
+        let latest = Rc::new(Cell::new((50, ROW)));
+        update_rows(&rows, &estimated, 0, 50, RowChanges::Reset);
+        let window = cx.add_window({
+            let (rows, latest) = (rows.clone(), latest.clone());
+            |window, cx| Root::new(cx.new(|_| Rows(rows, latest)), window, cx)
+        });
+        let draw = |cx: &mut gpui_kit::TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+        let wheel = |cx: &mut gpui_kit::TestAppContext, up: Pixels| {
+            cx.update_window(window.into(), |_, window, cx| {
+                let size = window.viewport_size();
+                window.dispatch_event(
+                    PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position: point(size.width / 2., size.height / 2.),
+                        delta: ScrollDelta::Pixels(point(px(0.), up)),
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        };
+        // Output streams into the newest row, then a new row starts, as during a turn.
+        let stream = |cx: &mut gpui_kit::TestAppContext, count: usize| {
+            latest.set((count, latest.get().1 + ROW * 3.));
+            update_rows(
+                &rows,
+                &estimated,
+                count,
+                count,
+                RowChanges::Rows(vec![count - 1]),
+            );
+            draw(cx);
+            latest.set((count + 1, ROW));
+            update_rows(&rows, &estimated, count, count + 1, RowChanges::All);
+            draw(cx);
+            count + 1
+        };
+        draw(cx);
+        let count = stream(cx, 50);
+        assert!(
+            rows.is_following_tail(),
+            "output follows a reader at the end"
+        );
+
+        wheel(cx, px(60.));
+        draw(cx);
+        assert!(!rows.is_following_tail());
+        let top = |rows: &ListState| {
+            let top = rows.logical_scroll_top();
+            (top.item_ix, top.offset_in_item)
+        };
+        let reader = top(&rows);
+        let count = stream(cx, count);
+        let count = stream(cx, count);
+        assert_eq!(
+            top(&rows),
+            reader,
+            "output must not move a reader who scrolled back"
+        );
+        assert!(!rows.is_following_tail());
+
+        wheel(cx, px(-10_000.));
+        draw(cx);
+        assert!(
+            rows.is_following_tail(),
+            "scrolling to the end rejoins the output"
+        );
+        stream(cx, count);
+        assert!(rows.is_following_tail());
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
     fn inline_code_paths_open_in_neovim_and_identifiers_stay_code(
         cx: &mut gpui_kit::TestAppContext,
     ) {

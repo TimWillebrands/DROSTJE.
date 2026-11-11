@@ -223,8 +223,12 @@ impl ConversationSession {
         self.notice_indices.clear();
         self.record_transcript_change(None);
     }
+    /// Only the call's row shows its activity. Activity can arrive before the message that
+    /// carries the call; that message adds the row later, so nothing rendered changes yet.
     pub(super) fn mark_tool_changed(&mut self, call_id: &str) {
-        self.record_transcript_change(self.tool_calls.get(call_id).copied());
+        if let Some(index) = self.tool_calls.get(call_id).copied() {
+            self.record_transcript_change(Some(index));
+        }
     }
 
     /// True once the assistant message that issued this call has been seen.
@@ -2699,5 +2703,43 @@ mod tests {
         let current = session.transcript_revision;
         session.reset_history();
         assert!(session.transcript_changes_since(current).is_none());
+    }
+
+    /// Harnesses report a call's activity before the message that carries it. A full
+    /// reset there would snap a reader who scrolled back to the latest output.
+    #[test]
+    fn tool_activity_before_its_call_keeps_the_rendered_rows() {
+        let mut session = ConversationSession::new(None);
+        session.message(message(
+            "assistant:1",
+            "assistant",
+            vec![ContentBlock::Text("Looking.".into())],
+        ));
+        let rendered = session.transcript_revision;
+        session.mark_tool_changed("call_1");
+        assert_eq!(
+            session
+                .transcript_changes_since(rendered)
+                .map(Iterator::collect::<Vec<_>>),
+            Some(Vec::new()),
+            "no row shows the call yet"
+        );
+        session.message(message(
+            "assistant:2",
+            "assistant",
+            vec![ContentBlock::ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                intent: None,
+                input: Value::Null,
+            }],
+        ));
+        session.mark_tool_changed("call_1");
+        assert_eq!(
+            session
+                .transcript_changes_since(rendered)
+                .map(Iterator::collect::<Vec<_>>),
+            Some(vec![1, 1])
+        );
     }
 }
