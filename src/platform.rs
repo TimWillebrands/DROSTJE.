@@ -807,7 +807,17 @@ pub fn delete_branch(project_root: &Path, branch: &str) -> Result<()> {
 }
 
 pub fn now() -> String {
-    let seconds = std::time::SystemTime::now()
+    timestamp(std::time::SystemTime::now())
+}
+
+/// The moment `age` ago, comparable with [`now`] values as plain strings.
+pub fn timestamp_before(age: std::time::Duration) -> String {
+    let now = std::time::SystemTime::now();
+    timestamp(now.checked_sub(age).unwrap_or(now))
+}
+
+fn timestamp(time: std::time::SystemTime) -> String {
+    let seconds = time
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as libc::time_t;
@@ -830,8 +840,18 @@ pub fn now() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{APPLICATION_ICON, working_tree_diff};
+    use super::{APPLICATION_ICON, timestamp, timestamp_before, working_tree_diff};
     use std::{fs, path::Path, process::Command};
+
+    #[test]
+    fn timestamps_format_utc_and_order_as_strings() {
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        assert_eq!(
+            timestamp(std::time::UNIX_EPOCH + day),
+            "1970-01-02T00:00:00Z"
+        );
+        assert!(timestamp_before(day) < super::now());
+    }
 
     struct TempRepository(std::path::PathBuf);
 

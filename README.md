@@ -222,6 +222,7 @@ In de tab **Agents** meld je een Conversation aan bij het netwerk van zijn Space
 > ⚠️ **Join geeft toestemming voor betaalde turns.** Is een aangemelde agent idle, dan kan een bericht van een andere agent een nieuwe model-turn starten, met normale providerkosten.
 
 - **Join** meldt aan, **Leave** trekt in. Na een herstart of reconnect staat ontvangst op pauze tot je **Resume** kiest.
+- Een Conversation zonder draaiende agent en zonder open tab verlaat het netwerk vanzelf na 24 uur zonder activiteit. Nog niet afgeleverde berichten aan die agent sluiten met reden `inactive`; opnieuw meedoen kan met **Join**.
 - Berichten komen binnen op het eerstvolgende veilige moment en zijn herkenbaar als *peer-origin*, niet als jouw prompt. Ze beantwoorden nooit een toestemmingsvraag en raken je Draft niet.
 - Het netwerk deelt geen geschiedenis, concepten of rechten, en biedt geen bestandsvergrendeling.
 

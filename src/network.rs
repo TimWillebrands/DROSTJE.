@@ -21,6 +21,9 @@ pub const MAX_MESSAGES: usize = 256;
 pub const MAX_PENDING: usize = 1024;
 pub const MAX_PENDING_PER_RECIPIENT: usize = 128;
 pub const MAX_BATCH_BYTES: usize = 64 * 1024;
+/// A Conversation with no runtime and no open tab leaves the network after this long without
+/// activity. Open tabs are exempt: every restored tab looks offline right after a restart.
+pub const DORMANT_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const MAX_CONTEXT_BYTES: usize = 8192;
 const MAX_RESPONSE_BYTES: usize = 384 * 1024;
 
@@ -45,6 +48,8 @@ pub struct Peer {
     pub delivery_enabled: bool,
     /// Temporary readiness, independent of consent or runtime authorization.
     pub can_receive: bool,
+    /// Left behind by the user; see [`DORMANT_AFTER`]. Ends membership like Leave does.
+    pub dormant: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,7 +371,7 @@ impl Actor {
         let membership_changed = self.snapshot.members.iter().any(|member| {
             contexts
                 .get(&member.thread)
-                .is_none_or(|peer| !peer.eligible || peer.space != member.space)
+                .is_none_or(|peer| !peer.eligible || peer.dormant || peer.space != member.space)
         });
         let revoked_attempt = self
             .snapshot
@@ -399,9 +404,13 @@ impl Actor {
         let mut next = self.snapshot.clone();
         next.members.retain_mut(|member| {
             let peer = match contexts.get(&member.thread) {
-                Some(peer) if peer.eligible && peer.space == member.space => peer,
+                Some(peer) if peer.eligible && !peer.dormant && peer.space == member.space => peer,
                 Some(peer) if peer.space != member.space => {
                     close_deliveries(&mut next.messages, member.thread, "moved");
+                    return false;
+                }
+                Some(peer) if peer.dormant => {
+                    close_deliveries(&mut next.messages, member.thread, "inactive");
                     return false;
                 }
                 _ => {
@@ -1125,6 +1134,7 @@ mod tests {
             eligible: true,
             delivery_enabled: true,
             can_receive: true,
+            dormant: false,
         }
     }
 
@@ -1795,6 +1805,74 @@ mod tests {
                     .messages[0]
                     .body,
                 "new membership"
+            );
+        });
+    }
+
+    #[test]
+    fn a_dormant_member_leaves_durably_and_its_unread_mail_closes_without_touching_history() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let a = peer(Uuid::new_v4(), "Alice");
+            let mut b = peer(a.space, "Bob");
+            fixture.join(&[a.clone(), b.clone()]).await;
+            let delivered = fixture.send(&a, &b, "read").await;
+            deliver_all(&fixture.network, &b).await;
+            let queued = fixture.send(&a, &b, "unread").await;
+            b.token = None;
+            b.delivery_enabled = false;
+            b.can_receive = false;
+            b.status = "Offline".into();
+            fixture
+                .network
+                .sync(vec![a.clone(), b.clone()])
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.saved().await.members.len(),
+                2,
+                "Being offline alone keeps consent and the mailbox"
+            );
+
+            b.dormant = true;
+            fixture
+                .network
+                .sync(vec![a.clone(), b.clone()])
+                .await
+                .unwrap();
+            let saved = fixture.saved().await;
+            assert_eq!(
+                saved
+                    .members
+                    .iter()
+                    .map(|member| member.thread)
+                    .collect::<Vec<_>>(),
+                vec![a.thread]
+            );
+            let state = |id| {
+                saved
+                    .messages
+                    .iter()
+                    .find(|message| message.id == id)
+                    .unwrap()
+                    .deliveries[0]
+                    .state
+                    .clone()
+            };
+            assert_eq!(state(delivered), DeliveryState::Delivered);
+            assert_eq!(
+                state(queued),
+                DeliveryState::Closed {
+                    reason: "inactive".into()
+                }
+            );
+
+            b.dormant = false;
+            fixture.network.sync(vec![a, b]).await.unwrap();
+            assert_eq!(
+                fixture.saved().await.members.len(),
+                1,
+                "Only an explicit Join restores consent"
             );
         });
     }

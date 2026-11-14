@@ -1371,13 +1371,17 @@ impl AppState {
         if !self.thread_in_space(thread.id, space) {
             return false;
         }
-        let open = if space == self.active_space {
-            self.open_threads.contains(&thread.id)
+        self.thread_open_in(thread.id, space) || !self.is_untouched(thread)
+    }
+
+    /// Whether `id` has a tab in `space`, active or not.
+    pub(crate) fn thread_open_in(&self, id: ThreadId, space: SpaceId) -> bool {
+        if space == self.active_space {
+            self.open_threads.contains(&id)
         } else {
             self.space_session(space)
-                .is_some_and(|session| session.open_threads.contains(&thread.id))
-        };
-        open || !self.is_untouched(thread)
+                .is_some_and(|session| session.open_threads.contains(&id))
+        }
     }
 
     pub fn is_conversation(&self, id: ThreadId) -> bool {

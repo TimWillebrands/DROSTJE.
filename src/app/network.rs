@@ -354,6 +354,7 @@ impl AppState {
     }
 
     fn network_peers(&self) -> Vec<Peer> {
+        let cutoff = platform::timestamp_before(crate::network::DORMANT_AFTER);
         self.snapshot
             .threads
             .iter()
@@ -415,6 +416,10 @@ impl AppState {
                     eligible,
                     delivery_enabled: self.network_delivery_enabled(thread.id),
                     can_receive: self.network_can_receive(thread.id),
+                    dormant: session.is_none()
+                        && !self.active_threads.contains(&thread.id)
+                        && !self.thread_open_in(thread.id, space)
+                        && thread.updated_at < cutoff,
                 })
             })
             .collect()
@@ -1127,6 +1132,91 @@ mod tests {
         runtime.pause();
         assert!(cancelled.is_closed());
         assert!(!runtime.enabled);
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn only_a_closed_runtimeless_inactive_conversation_is_dormant(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.dispatcher.allow_parking();
+        use super::*;
+
+        let directory = std::env::temp_dir().join(format!("drost-dormant-{}", Uuid::new_v4()));
+        let store = Store::open(directory.join("data")).unwrap();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Dormant".into(),
+            root: directory.join("repo"),
+            archived: false,
+            defaults: ProjectDefaults::default(),
+        };
+        let project_id = project.id;
+        smol::block_on(store.save_project(project)).unwrap();
+        let snapshot = smol::block_on(store.snapshot()).unwrap();
+        let state = cx.new(|cx| {
+            AppState::new(
+                Bootstrap {
+                    data_dir: directory.clone(),
+                    store,
+                    snapshot,
+                    diagnostics: BTreeMap::new(),
+                    repositories: BTreeMap::new(),
+                    browser_tools: None,
+                },
+                cx,
+            )
+        });
+        state.update(cx, |state, _| {
+            let dormant = |state: &AppState, id| {
+                state
+                    .network_peers()
+                    .into_iter()
+                    .find(|peer| peer.thread == id)
+                    .unwrap()
+                    .dormant
+            };
+            let touched = |state: &mut AppState, id, at: &str| {
+                let thread = state.snapshot.threads.iter_mut();
+                thread.filter(|t| t.id == id).for_each(|t| {
+                    t.updated_at = at.into();
+                });
+            };
+            state.select_project(project_id);
+            state.new_thread(ThreadKind::Conversation).unwrap();
+            let id = state.selected_thread.unwrap();
+            let old = "2000-01-01T00:00:00Z";
+            touched(state, id, old);
+            assert!(!dormant(state, id), "An open tab keeps its member");
+
+            state.close_thread(id);
+            assert!(dormant(state, id));
+
+            touched(state, id, &platform::now());
+            assert!(!dormant(state, id), "Recent activity keeps its member");
+            touched(state, id, old);
+
+            state
+                .conversations
+                .insert(id, ConversationSession::new(None));
+            assert!(!dormant(state, id), "A live runtime keeps its member");
+            state.conversations.remove(&id);
+
+            state.active_threads.insert(id);
+            assert!(!dormant(state, id), "An unresolved turn keeps its member");
+            state.active_threads.remove(&id);
+            assert!(dormant(state, id));
+
+            state.select_thread(id);
+            let other = state.create_space("Elsewhere").unwrap();
+            state.switch_space(other).unwrap();
+            assert!(!state.open_threads.contains(&id));
+            assert!(
+                !dormant(state, id),
+                "A tab in an inactive Space keeps its member"
+            );
+        });
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[cfg(feature = "runtime-qa")]
