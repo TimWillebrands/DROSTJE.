@@ -43,12 +43,12 @@ unsafe extern "C" {
     fn gpui_ghostty_surface_linux_is_alive(surface: *const RawSurface) -> bool;
     fn gpui_ghostty_surface_linux_snapshot(
         surface: *mut RawSurface,
-        pixels: *mut *mut u8,
+        pixels: *mut u8,
+        capacity: usize,
         width: *mut u32,
         height: *mut u32,
         length: *mut usize,
     ) -> bool;
-    fn gpui_ghostty_surface_linux_snapshot_free(pixels: *mut u8);
     fn gpui_ghostty_surface_linux_take_clipboard_read(
         surface: *mut RawSurface,
         selection: *mut bool,
@@ -124,6 +124,8 @@ pub struct NativeSurface {
     wakeup: NativeWakeup,
     state: NativeSurfaceState,
     expected_program: Option<Arc<CStr>>,
+    /// Byte length of the last readback, so the next one reads into an exact fit.
+    snapshot_capacity: usize,
 }
 
 impl NativeSurface {
@@ -177,6 +179,7 @@ impl NativeSurface {
             wakeup,
             state: NativeSurfaceState::default(),
             expected_program,
+            snapshot_capacity: 0,
         })
     }
 
@@ -244,29 +247,28 @@ impl NativeSurface {
     }
 
     pub fn snapshot(&mut self) -> Result<Option<NativeSnapshot>, String> {
-        let mut pixels = std::ptr::null_mut();
-        let mut width = 0;
-        let mut height = 0;
-        let mut length = 0;
-        // SAFETY: The shim initializes all outputs and returns a malloc-owned
-        // buffer which remains valid until the matching free call below.
-        let captured = unsafe {
-            gpui_ghostty_surface_linux_snapshot(
-                self.raw.as_ptr(),
-                &mut pixels,
-                &mut width,
-                &mut height,
-                &mut length,
-            )
+        let raw = self.raw;
+        let read = |pixels: *mut u8,
+                    capacity: usize,
+                    width: &mut u32,
+                    height: &mut u32,
+                    length: &mut usize| {
+            // SAFETY: `raw` is live on the GPUI thread, the outputs are writable
+            // for this call and `pixels` has `capacity` writable bytes.
+            unsafe {
+                gpui_ghostty_surface_linux_snapshot(
+                    raw.as_ptr(),
+                    pixels,
+                    capacity,
+                    width,
+                    height,
+                    length,
+                )
+            }
         };
-        if !captured {
-            return Err("capture native terminal frame".to_owned());
-        }
-        // SAFETY: A successful shim call returns `length` readable bytes in `pixels`.
-        let result = unsafe { NativeSnapshot::copy_from_raw(pixels, width, height, length, true) };
-        // SAFETY: `pixels` is either null or the allocation returned by the shim.
-        unsafe { gpui_ghostty_surface_linux_snapshot_free(pixels) }
-        result.map(Some)
+        // SAFETY: The shim writes at most `capacity` bytes; glReadPixels fills all
+        // `length` bytes whenever it succeeds with a buffer that fits.
+        unsafe { NativeSnapshot::capture(&mut self.snapshot_capacity, true, read) }
     }
 
     pub fn set_frame(&mut self, x: f64, y: f64, width: f64, height: f64, scale_factor: f64) {

@@ -1,6 +1,6 @@
 # Bundled fonts
 
-`src/ui/theme.rs` embeds these faces so every platform renders the bundled themes
+`crates/fonts` embeds these faces (registered by `src/ui/theme/mod.rs`) so every platform renders the bundled themes
 the same. Each family is licensed under the SIL Open Font License 1.1; the
 licence sits beside its files as `OFL.txt`.
 Delft uses Zed's default faces: IBM Plex Sans for the UI and Lilex for code.

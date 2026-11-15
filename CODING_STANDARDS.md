@@ -4,14 +4,18 @@ Read when writing or reviewing Rust in this repo. Repo-wide invariants live in `
 
 ## Layering
 
-Dependencies point downward; a lower layer never imports a higher one.
+The repo is a Cargo workspace. Each domain seam is its own crate under `crates/<feature>/` (package `drostje-<feature>`); the GPUI app is the root `drostje` package. Dependencies point downward; a lower layer never imports a higher one, and Cargo rejects cycles.
 
-| Layer | Modules | Owns |
+| Layer | Where | Owns |
 |---|---|---|
-| UI | `src/ui/*` | GPUI views, focus, actions, presentation. Reads `AppState` and mutates it only through its methods. |
-| App | `src/app.rs`, `src/app/*` | `AppState`, orchestration, persistence scheduling, shutdown. |
-| Domain seams | `src/harness`, `src/factory`, `src/store`, `src/attachments`, `src/diff.rs` | One capability each behind a small typed API. Draft identities and revisions live in `src/model.rs`. |
-| Platform | `src/platform.rs`, `src/platform/*` | Process groups, locks, paths, Git plumbing. |
+| UI | `src/ui/<feature>/` | GPUI views, focus, actions, presentation, one folder per feature (`conversation`, `workspace`, `changes`, `browser`, `terminal`, `nvim`, `factory`, `network`, `settings`, `theme`). Reads `AppState` and mutates it only through its methods. |
+| App | `src/app/` | `AppState`, orchestration, persistence scheduling, shutdown; one file per feature. |
+| Domain seams | `crates/harness` (+ `attachments`), `crates/remote` (+ the `drostje-host` binary), `crates/browser-tools`, `crates/browser` (the only Servo crate), `crates/factory`, `crates/neovim`, `crates/network`, `crates/store`, `crates/tracker`, `crates/titles`, `crates/worktrees`, `crates/file-refs`, `crates/fonts`, `crates/diff` | One capability each behind a small typed API. Draft identities and revisions live in `crates/model`. |
+| Platform | `crates/platform` | Process groups and sessions, locks, paths, Git plumbing, and every `unsafe` block outside transports. |
+
+- Only the root crate and `crates/ghostty-terminal` depend on `gpui-kit`; only `crates/browser` names Servo types. Domain crates build and test without either, which keeps the headless host (`cargo build -p drostje-remote --bin drostje-host`) free of GPUI and Servo. Convert to GPUI types at the UI edge (`drostje_diff::RowText` is an `Arc<str>`; the view uses the zero-copy `SharedString::from(&row.text)`).
+- `src/lib.rs` re-exports each crate under its feature name (`pub use drostje_harness as harness;`), so app and UI code reads `crate::harness::…`. A new seam gets a crate, an entry in `[workspace.dependencies]`, and one alias line.
+- External versions live once in `[workspace.dependencies]`; member crates use `dep.workspace = true`. Tests for a crate live in that crate (`crates/<feature>/tests/`); `tests/` at the root holds only window tests that need the app.
 
 - The harness seam is the concrete handle `harness::open` → `ConversationHandle`. Add a harness beside the existing ones rather than a plugin registry, generic transport or second abstraction.
 - Parse and derive data off the GPUI thread, next to where it is read (for example `diff::parse` builds both diff layouts in the background), so `render` only indexes.
@@ -32,8 +36,8 @@ Dependencies point downward; a lower layer never imports a higher one.
 
 Test at the lowest layer that proves the behaviour:
 
-1. **Pure tests** for parsers, reducers and state machines (`src/diff.rs`, `src/factory/events.rs`, `src/harness/omp.rs` framing). Use real temp files and pipes; assert on behaviour, not on command strings.
-2. **Integration tests** in `tests/` for the store, Factory launch and events, attachments.
+1. **Pure tests** for parsers, reducers and state machines (`crates/diff`, `crates/factory/src/events.rs`, `crates/harness/src/omp.rs` framing). Use real temp files and pipes; assert on behaviour, not on command strings.
+2. **Integration tests** in `crates/<feature>/tests/` for the store, Factory launch and events, attachments, Neovim runtime. `cargo test` at the root runs every workspace member.
 3. **UI tests** with `#[gpui_kit::test]` and `gpui_kit::test::{TestWindowExt, TestAppContextExt, TestSupportExt}`: stable element IDs plus `.test_support()` (before `.track_focus`), then `click`/`press`/`input` and snapshots. These compile only with `--features runtime-qa`, so logic that plain `cargo test` must cover goes in a struct with no GPUI handles (see `ui::changes::RowList`).
 4. **Native runtime tests** (`runtime-qa`, `#[ignore]`) for editor composition, real windows and pane focus. Drive them with `simulate_keystrokes`, draw a few frames before asserting on bounds or pane navigation, and restore the fixture repo at the end. Opt-in real-process OMP tests never use provider credentials from fixtures.
 

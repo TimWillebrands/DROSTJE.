@@ -12,6 +12,8 @@ pub struct ProjectDiffs {
 /// releasing its slot: reopening cannot overlap that read.
 pub struct ProjectDiffState {
     pub result: Option<Result<platform::RepositoryDiff, String>>,
+    /// Identifies `result` without comparing whole diffs on the UI thread.
+    fingerprint: Option<DiffFingerprint>,
     pub loading: bool,
     root: PathBuf,
     interested: HashSet<ThreadId>,
@@ -26,10 +28,53 @@ struct DiffCompletion {
     refresh_again: bool,
 }
 
+/// A diff read, with the fingerprint computed beside it off the UI thread.
+type DiffRead = (Result<platform::RepositoryDiff, String>, DiffFingerprint);
+
+/// Everything a diff shows except `rows`, which are parsed from `patch`: equal
+/// fingerprints mean the result on screen is still current.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiffFingerprint {
+    patch_len: usize,
+    hash: u64,
+}
+
+impl DiffFingerprint {
+    fn of(result: &Result<platform::RepositoryDiff, String>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let patch_len = match result {
+            Ok(diff) => {
+                true.hash(&mut hasher);
+                diff.head_branch.hash(&mut hasher);
+                diff.patch.hash(&mut hasher);
+                (diff.changed_files, diff.additions, diff.deletions).hash(&mut hasher);
+                diff.truncated.hash(&mut hasher);
+                diff.patch.len()
+            }
+            Err(error) => {
+                false.hash(&mut hasher);
+                error.hash(&mut hasher);
+                error.len()
+            }
+        };
+        Self {
+            patch_len,
+            hash: hasher.finish(),
+        }
+    }
+}
+
+fn read_with_fingerprint(result: Result<platform::RepositoryDiff, String>) -> DiffRead {
+    let fingerprint = DiffFingerprint::of(&result);
+    (result, fingerprint)
+}
+
 impl ProjectDiffState {
     fn new(root: PathBuf) -> Self {
         Self {
             result: None,
+            fingerprint: None,
             loading: false,
             root,
             interested: HashSet::new(),
@@ -53,6 +98,7 @@ impl ProjectDiffState {
         if root_changed && let Some(root) = root {
             self.root = root;
             self.result = None;
+            self.fingerprint = None;
         }
         self.interested = interested;
         visible && (!was_visible || root_changed)
@@ -77,7 +123,7 @@ impl ProjectDiffState {
     fn complete(
         &mut self,
         generation: Uuid,
-        result: Result<platform::RepositoryDiff, String>,
+        (result, fingerprint): DiffRead,
     ) -> Option<DiffCompletion> {
         if self.in_flight != Some(generation) {
             return None;
@@ -89,16 +135,24 @@ impl ProjectDiffState {
                 refresh_again: !self.interested.is_empty(),
             });
         }
-        let result_changed = self.result.as_ref() != Some(&result);
+        let result_changed = self.fingerprint != Some(fingerprint);
         let changed = self.loading || result_changed;
         self.loading = false;
         if result_changed {
             self.result = Some(result);
+            self.fingerprint = Some(fingerprint);
         }
         Some(DiffCompletion {
             changed,
             refresh_again: std::mem::take(&mut self.dirty),
         })
+    }
+
+    /// Something may have changed the tree: read it again after the settle delay, once,
+    /// however often this is called meanwhile.
+    fn queue(&mut self) -> Option<Uuid> {
+        self.dirty = true;
+        self.schedule()
     }
 
     fn schedule(&mut self) -> Option<Uuid> {
@@ -248,8 +302,9 @@ impl AppState {
 
     pub(super) fn queue_conversation_diff(&mut self, id: ThreadId, cx: &mut Context<Self>) {
         if let Some(diff) = self.project_diffs.remote.get_mut(&id) {
-            diff.dirty = true;
-            self.refresh_remote_diff(id, false, cx);
+            if let Some(token) = diff.queue() {
+                self.schedule_remote_diff(id, token, cx);
+            }
             return;
         }
         let Some(key) = self.conversation_tree(id) else {
@@ -286,22 +341,33 @@ impl AppState {
         };
         let client = self.remote_client.clone();
         cx.spawn(async move |this, cx| {
-            let result = match client.read_diff(&location.host, id, None).await {
-                Ok(value) => smol::unblock(move || decode_remote_diff(value)).await,
-                Err(error) => Err(format!("Remote Changes unavailable: {error:#}")),
+            let read = match client.read_diff(&location.host, id, None).await {
+                Ok(value) => {
+                    smol::unblock(move || read_with_fingerprint(decode_remote_diff(value))).await
+                }
+                Err(error) => {
+                    read_with_fingerprint(Err(format!("Remote Changes unavailable: {error:#}")))
+                }
             };
             let _ = this.update(cx, |state, cx| {
                 let Some(diff) = state.project_diffs.remote.get_mut(&id) else {
                     return;
                 };
-                let Some(completion) = diff.complete(generation, result) else {
+                let Some(completion) = diff.complete(generation, read) else {
                     return;
                 };
+                // As for local trees: an explicit refresh still pending runs now, changes
+                // seen during the read wait for the settle delay.
+                let restart_now = completion.refresh_again && diff.loading;
                 if completion.changed {
                     cx.emit(PresentationChange::Thread(id));
                 }
-                if completion.refresh_again {
-                    state.refresh_remote_diff(id, false, cx);
+                if restart_now {
+                    state.refresh_remote_diff(id, true, cx);
+                } else if completion.refresh_again
+                    && let Some(token) = diff.schedule()
+                {
+                    state.schedule_remote_diff(id, token, cx);
                 }
             });
         })
@@ -328,19 +394,21 @@ impl AppState {
             return;
         };
         cx.spawn(async move |this, cx| {
-            let result = smol::unblock(move || {
-                platform::working_tree_diff(&root).map_err(|error| format!("{error:#}"))
+            let read = smol::unblock(move || {
+                read_with_fingerprint(
+                    platform::working_tree_diff(&root).map_err(|error| format!("{error:#}")),
+                )
             })
             .await;
             let _ = this.update(cx, |state, cx| {
-                let head = result.as_ref().ok().map(|diff| diff.head_branch.clone());
+                let head = read.0.as_ref().ok().map(|diff| diff.head_branch.clone());
                 if let Some(head) = head {
                     state.record_head(id, head);
                 }
                 let Some(diff) = state.project_diffs.trees.get_mut(&id) else {
                     return;
                 };
-                let Some(completion) = diff.complete(generation, result) else {
+                let Some(completion) = diff.complete(generation, read) else {
                     return;
                 };
                 let restart_now = completion.refresh_again && diff.loading;
@@ -377,7 +445,7 @@ impl AppState {
             return;
         };
         cx.spawn(async move |this, cx| {
-            smol::Timer::after(std::time::Duration::from_millis(750)).await;
+            smol::Timer::after(DIFF_SETTLE).await;
             let _ = this.update(cx, |state, cx| {
                 if state
                     .project_diffs
@@ -392,6 +460,31 @@ impl AppState {
         .detach();
     }
 }
+
+impl AppState {
+    fn schedule_remote_diff(&mut self, id: ThreadId, token: Uuid, cx: &mut Context<Self>) {
+        if self.shutting_down {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            smol::Timer::after(DIFF_SETTLE).await;
+            let _ = this.update(cx, |state, cx| {
+                if state
+                    .project_diffs
+                    .remote
+                    .get_mut(&id)
+                    .is_some_and(|diff| diff.take_scheduled(token))
+                {
+                    state.refresh_remote_diff(id, false, cx);
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+/// How long a tree must stay quiet after a tool changed it before it is read again.
+const DIFF_SETTLE: std::time::Duration = std::time::Duration::from_millis(750);
 
 fn decode_remote_diff(value: Value) -> Result<platform::RepositoryDiff, String> {
     #[derive(serde::Deserialize)]
@@ -419,7 +512,7 @@ fn decode_remote_diff(value: Value) -> Result<platform::RepositoryDiff, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::ProjectDiffState;
+    use super::{DiffFingerprint, ProjectDiffState};
     use crate::platform;
     use std::{collections::HashSet, path::PathBuf};
     use uuid::Uuid;
@@ -437,6 +530,64 @@ mod tests {
         assert_eq!(diff.changed_files, 1);
         assert!(!diff.rows.rows.is_empty());
         assert!(super::decode_remote_diff(serde_json::json!({"patch": patch})).is_err());
+    }
+
+    fn read(result: Result<platform::RepositoryDiff, String>) -> super::DiffRead {
+        super::read_with_fingerprint(result)
+    }
+
+    #[test]
+    fn fingerprints_tell_apart_every_shown_field() {
+        let diff = |patch: &str| {
+            Ok(platform::RepositoryDiff {
+                patch: patch.into(),
+                ..Default::default()
+            })
+        };
+        let base = DiffFingerprint::of(&diff("+a\n"));
+        assert_eq!(base, DiffFingerprint::of(&diff("+a\n")));
+        assert_ne!(base, DiffFingerprint::of(&diff("+b\n")), "same length");
+        assert_ne!(base, DiffFingerprint::of(&diff("+a\n+b\n")));
+        let truncated = Ok(platform::RepositoryDiff {
+            patch: "+a\n".into(),
+            truncated: true,
+            ..Default::default()
+        });
+        assert_ne!(base, DiffFingerprint::of(&truncated));
+        let branch = Ok(platform::RepositoryDiff {
+            patch: "+a\n".into(),
+            head_branch: Some("main".into()),
+            ..Default::default()
+        });
+        assert_ne!(base, DiffFingerprint::of(&branch));
+        assert_ne!(
+            DiffFingerprint::of(&Err("+a\n".into())),
+            base,
+            "an error is never the diff"
+        );
+    }
+
+    #[test]
+    fn queued_refreshes_settle_into_one_read() {
+        let mut diff = visible_diff();
+        let token = diff.queue().unwrap();
+        assert!(diff.queue().is_none(), "already scheduled");
+        assert!(diff.take_scheduled(token));
+        let (generation, _) = diff.begin_refresh(false).0.unwrap();
+        // A change during the read is read again afterwards, not immediately.
+        assert!(diff.queue().is_none());
+        let completion = diff
+            .complete(generation, read(Ok(Default::default())))
+            .unwrap();
+        assert!(completion.refresh_again);
+        assert!(
+            !diff.loading,
+            "so the caller schedules rather than restarts"
+        );
+        assert!(diff.schedule().is_some());
+        // Hidden trees are not read at all.
+        let mut hidden = ProjectDiffState::new(PathBuf::from("project"));
+        assert!(hidden.queue().is_none());
     }
 
     fn visible_diff() -> ProjectDiffState {
@@ -460,7 +611,7 @@ mod tests {
         assert!(!diff.set_interest(None, HashSet::from([Uuid::from_u128(2)])));
         assert!(diff.begin_refresh(true).0.is_none());
         assert!(
-            diff.complete(generation, Ok(platform::RepositoryDiff::default()))
+            diff.complete(generation, read(Ok(platform::RepositoryDiff::default())))
                 .unwrap()
                 .changed
         );
@@ -477,7 +628,9 @@ mod tests {
         assert!(diff.begin_refresh(true).0.is_none());
         assert!(diff.set_interest(None, HashSet::from([Uuid::from_u128(1)])));
         assert!(diff.begin_refresh(true).0.is_none());
-        let completion = diff.complete(generation, Err("obsolete".into())).unwrap();
+        let completion = diff
+            .complete(generation, read(Err("obsolete".into())))
+            .unwrap();
         assert!(!completion.changed);
         assert!(completion.refresh_again);
         assert!(diff.loading);
@@ -485,10 +638,10 @@ mod tests {
         let (reopened, _) = diff.begin_refresh(true).0.unwrap();
         assert_ne!(generation, reopened);
         assert!(
-            diff.complete(generation, Err("late duplicate".into()))
+            diff.complete(generation, read(Err("late duplicate".into())))
                 .is_none()
         );
-        diff.complete(reopened, Ok(platform::RepositoryDiff::default()))
+        diff.complete(reopened, read(Ok(platform::RepositoryDiff::default())))
             .unwrap();
         assert!(matches!(diff.result, Some(Ok(_))));
         assert!(!diff.loading);
@@ -499,23 +652,39 @@ mod tests {
         let mut diff = visible_diff();
         let clean = Ok(platform::RepositoryDiff::default());
         let (generation, _) = diff.begin_refresh(true).0.unwrap();
-        assert!(diff.complete(generation, clean.clone()).unwrap().changed);
+        assert!(
+            diff.complete(generation, read(clean.clone()))
+                .unwrap()
+                .changed
+        );
         let (request, loading_changed) = diff.begin_refresh(false);
         assert!(!loading_changed);
-        assert!(!diff.complete(request.unwrap().0, clean).unwrap().changed);
+        assert!(
+            !diff
+                .complete(request.unwrap().0, read(clean))
+                .unwrap()
+                .changed
+        );
         let failure = Err("working tree unavailable".to_owned());
         let (generation, _) = diff.begin_refresh(false).0.unwrap();
-        assert!(diff.complete(generation, failure.clone()).unwrap().changed);
+        assert!(
+            diff.complete(generation, read(failure.clone()))
+                .unwrap()
+                .changed
+        );
         let (generation, _) = diff.begin_refresh(false).0.unwrap();
-        assert!(!diff.complete(generation, failure).unwrap().changed);
+        assert!(!diff.complete(generation, read(failure)).unwrap().changed);
         let (request, loading_changed) = diff.begin_refresh(true);
         assert!(loading_changed);
         assert!(diff.loading);
         assert!(matches!(&diff.result, Some(Err(error)) if error == "working tree unavailable"));
         assert!(
-            diff.complete(request.unwrap().0, Ok(platform::RepositoryDiff::default()))
-                .unwrap()
-                .changed
+            diff.complete(
+                request.unwrap().0,
+                read(Ok(platform::RepositoryDiff::default()))
+            )
+            .unwrap()
+            .changed
         );
         assert!(!diff.loading);
         assert!(matches!(diff.result, Some(Ok(_))));
@@ -538,7 +707,7 @@ mod tests {
         ));
         assert!(diff.begin_refresh(true).0.is_none());
         assert!(
-            diff.complete(generation, Err("old root".into()))
+            diff.complete(generation, read(Err("old root".into())))
                 .unwrap()
                 .refresh_again
         );
@@ -554,7 +723,7 @@ mod tests {
         diff.dirty = true;
         assert!(diff.schedule().is_none());
         assert!(
-            diff.complete(generation, Ok(platform::RepositoryDiff::default()))
+            diff.complete(generation, read(Ok(platform::RepositoryDiff::default())))
                 .unwrap()
                 .refresh_again
         );
@@ -564,7 +733,7 @@ mod tests {
         let (generation, _) = diff.begin_refresh(false).0.unwrap();
         assert!(
             !diff
-                .complete(generation, Ok(platform::RepositoryDiff::default()))
+                .complete(generation, read(Ok(platform::RepositoryDiff::default())))
                 .unwrap()
                 .refresh_again
         );

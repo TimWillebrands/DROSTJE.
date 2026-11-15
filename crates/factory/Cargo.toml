@@ -1,0 +1,21 @@
+[package]
+name = "drostje-factory"
+description = "Launches detached Compliance Software Factory runs and tracks their event logs."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+drostje-model.workspace = true
+drostje-platform.workspace = true
+drostje-store.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+uuid.workspace = true

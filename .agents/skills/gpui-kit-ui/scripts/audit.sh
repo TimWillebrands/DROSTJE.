@@ -13,7 +13,7 @@ count=0
 run() { out=$(rg_or_grep "$1" | grep -Ev "${2:-__never__}"); if [ -n "$out" ]; then echo "$out"; count=$((count + $(echo "$out" | wc -l | tr -d ' '))); else echo "(none)"; fi; }
 
 rule "1 raw colours (must come from cx.theme() by role)"
-run '\b(rgb|rgba|hsla|hsl)\(|0x[0-9a-fA-F]{6}\b' 'to_rgb\(\)|// theme bridge|/theme\.rs:'
+run '\b(rgb|rgba|hsla|hsl)\(|0x[0-9a-fA-F]{6}\b' 'to_rgb\(\)|// theme bridge|/theme/mod\.rs:'
 
 rule "2 px(..) outside hairline / window minimum / bitmap / external geometry (needs a comment naming which)"
 run '\bpx\(' 'px\(0\.\)|px\(1\.\)|// px:|simulate_window_resize'

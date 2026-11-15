@@ -8,7 +8,7 @@ COPY assets ./assets
 COPY crates ./crates
 COPY vendor ./vendor
 COPY tests ./tests
-RUN cargo build --locked --release --no-default-features --features remote-host --bin drostje-host
+RUN cargo build --locked --release -p drostje-remote --bin drostje-host
 
 FROM node:24.13.1-bookworm-slim
 ARG PI_VERSION=1.2.0

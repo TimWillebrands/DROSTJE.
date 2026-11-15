@@ -1,11 +1,11 @@
 # DROSTJE.
 
-Desktop app (Rust 2024, GPUI through `gpui-kit`) that drives local coding agents, edits prompts in embedded Neovim and launches Compliance Software Factory runs. Code, comments, commits, docs and UI strings are English; `README.md` is Dutch and written for users.
+Desktop app (Rust 2024, GPUI through `gpui-kit`; a Cargo workspace whose domain seams are crates under `crates/`, see `CODING_STANDARDS.md` › Layering) that drives local coding agents, edits prompts in embedded Neovim and launches Compliance Software Factory runs. Code, comments, commits, docs and UI strings are English; `README.md` is Dutch and written for users.
 
 ## Done means
 
-- `cargo check --all-targets` and `cargo test` pass. `cargo test` makes no provider calls, so run it freely.
-- `cargo fmt -- <files>` on the files you touched only; the tree often holds other people's work in progress.
+- `cargo check --all-targets` and `cargo test` pass for the whole workspace (both cover every crate). `cargo test` makes no provider calls, so run it freely.
+- `rustfmt --edition 2024 <files>` on the files you touched only (`cargo fmt -- <files>` reformats whole packages); the tree often holds other people's work in progress.
 - `cargo clippy --all-targets` shows no warning your change introduced.
 - Every visible control does real work. Mock conversations, fake rows, placeholder data and simulated providers are never acceptable, not even temporarily.
 - New behaviour has a test at the lowest layer that proves it; a deterministic bug gets its failing test before the fix.
@@ -14,9 +14,9 @@ Desktop app (Rust 2024, GPUI through `gpui-kit`) that drives local coding agents
 ## Invariants that break silently
 
 - GPUI is reached only through the `gpui_kit` facade; `gpui`, `gpui-component`, `gpui-base` and Zed crates stay out of `Cargo.toml`, and `gpui-kit` stays pinned with `=`. Look up APIs in the pinned source under `~/.cargo/registry/src/*/gpui-component-0.6.6/src` and `gpui-base-0.6.6/src`.
-- Only `src/harness/omp.rs` knows OMP wire fields; only `src/factory/launch.rs` builds Factory argv.
+- Only `crates/harness/src/omp.rs` knows OMP wire fields; only `crates/factory/src/launch.rs` builds Factory argv.
 - Child processes get separated argv, never a shell string, and never `--yolo`, `--ignore-capacity`, `--clean` or `--tui`.
-- `unsafe` lives only in `src/platform.rs` or a transport module, each block with a `// SAFETY:` comment.
+- `unsafe` lives only in `crates/platform` or a transport module (`crates/ghostty-terminal` FFI), each block with a `// SAFETY:` comment; callers use its safe wrappers (`platform::new_session`, `kill_process_group`, …).
 - Process, file and network I/O run on background executors, never in `render` or on the GPUI thread; results carry a revision or identity so stale ones are dropped.
 - An unknown outcome stays `Unknown`. Exit 0 without a terminal event is not success, and nothing auto-retries, auto-resends or auto-submits, including after a crash or reconnect.
 - Editor buffers stay out of project files and raw keys are never replayed; submitting needs a committed Draft revision.

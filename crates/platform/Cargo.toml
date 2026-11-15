@@ -1,0 +1,24 @@
+[package]
+name = "drostje-platform"
+description = "Process environment, data paths, executable lookup, Git plumbing and the only OS-level unsafe code."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+# The GUI app: sets the AppKit application icon on macOS. Headless builds leave it off.
+desktop = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
+
+[dependencies]
+anyhow.workspace = true
+drostje-diff.workspace = true
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true, optional = true }
+objc2-app-kit = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+
+[dev-dependencies]
+image.workspace = true
+uuid.workspace = true

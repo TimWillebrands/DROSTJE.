@@ -1,0 +1,16 @@
+[package]
+name = "drostje-tracker"
+description = "Issue tracker seam: a worktree branch's pull request, its state, work items and review threads."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+drostje-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+drostje-platform.workspace = true
+uuid.workspace = true

@@ -300,7 +300,7 @@ Een Host is een vooraf ingerichte machine waarop Conversations draaien. DROSTJE.
      drostje-host
    ```
 
-   De container draait als UID 1000; die moet de checkout en `/data` kunnen schrijven. Zonder Docker: `cargo run --no-default-features --features remote-host --bin drostje-host -- /absolute/host.json`.
+   De container draait als UID 1000; die moet de checkout en `/data` kunnen schrijven. Zonder Docker: `cargo run -p drostje-remote --bin drostje-host -- /absolute/host.json`.
 
 4. **Desktop koppelen.** Zet het desktop-token in een omgevingsvariabele, bijvoorbeeld `DROSTJE_DESKTOP_TOKEN`, en herstart DROSTJE. Vul in **Settings → Hosts** de Host-ID, relay-URL, naam van die variabele en de project key (`app`) in. Alleen de variabelenaam wordt opgeslagen.
 
@@ -340,10 +340,12 @@ Eigen thema's zet je in `<datamap>/themes` als GPUI Kit `ThemeSet`-JSON (een obj
 
 Lees eerst [`AGENTS.md`](AGENTS.md): definition of done en de regels die overal gelden. Verder: [`CODING_STANDARDS.md`](CODING_STANDARDS.md) voor lagen, Rust-conventies en testniveaus, [`docs/agents/ui.md`](docs/agents/ui.md) voor UI en toetsenbord, en [`CONTEXT.md`](CONTEXT.md) voor de vaste termen.
 
+De code is een Cargo-workspace: de app (GPUI) staat in `src/`, elke afgebakende functie (harness, remote, browser, store, factory, neovim, …) is een eigen crate in `crates/`. `CODING_STANDARDS.md` beschrijft de lagen.
+
 ```sh
-cargo check --all-targets          # na elke stap
-cargo test                         # geen provider-calls
-cargo fmt                          # op aangeraakte bestanden
+cargo check --all-targets          # na elke stap, hele workspace
+cargo test                         # alle crates, geen provider-calls
+rustfmt --edition 2024 <bestanden> # alleen aangeraakte bestanden
 cargo clippy --all-targets         # geen nieuwe warnings
 cargo run                          # met DROSTJE_DATA_DIR voor een losse datamap
 ```
@@ -352,14 +354,14 @@ Overige testsets, allemaal zonder betaalde provider-turns:
 
 ```sh
 # Host-binary
-cargo check --no-default-features --features remote-host --bin drostje-host
-cargo test --no-default-features --features remote-host --lib remote::
+cargo check -p drostje-remote --bin drostje-host
+cargo test -p drostje-remote
 
 # Terminal-bridge en procesdetectie
 cargo test -p ghostty-terminal
 
 # Neovim, rendering en browser
-cargo test --test neovim_runtime -- --ignored --nocapture
+cargo test -p drostje-neovim --test neovim_runtime -- --ignored --nocapture
 cargo test --features runtime-qa --test markdown_rendering --test job_notices
 cargo test --features runtime-qa --test servo_rendering --test servo_workspace
 node --test assets/browser-tools/peer.test.mjs
@@ -372,10 +374,12 @@ FX=$(mktemp -d) && mkdir "$FX/target-repo" && cd "$FX/target-repo" \
   && git init -q && printf 'before\n' > notes.txt \
   && git add notes.txt && git commit -qm init && cd -
 export DROSTJE_RUNTIME_FIXTURE="$FX"
-cargo test --features runtime-qa --lib <testnaam> -- --ignored --nocapture
+# Debug-builds van diepe scenario's passen niet in de standaard 2 MB teststack.
+export RUST_MIN_STACK=8388608
+cargo test -p drostje --features runtime-qa --lib <testnaam> -- --ignored --nocapture --test-threads=1
 ```
 
-De scenario's staan als `#[ignore]`-tests in `src/ui/runtime_qa.rs`, `src/ui/*_runtime_qa.rs` en `tests/`; de `ignore`-reden noemt wat elk nodig heeft. Een paar scenario's vragen extra omgevingsvariabelen (zoals `DROSTJE_NETWORK_QA_ISOLATED`) en weigeren te draaien zonder. `DROSTJE_QA_SCREENSHOTS=<map>` bewaart screenshots waar een test die maakt.
+De scenario's staan als `#[ignore]`-tests in `src/ui/runtime_qa/` en `tests/`; de `ignore`-reden noemt wat elk nodig heeft. Een paar scenario's vragen extra omgevingsvariabelen (zoals `DROSTJE_NETWORK_QA_ISOLATED`) en weigeren te draaien zonder. `DROSTJE_QA_SCREENSHOTS=<map>` bewaart screenshots waar een test die maakt.
 
 **Bouwnotities.** GPUI Kit staat vast op `=0.6.6`. Servo 0.7.0 wordt direct in de app gelinkt en draait op een eigen worker-thread. `vendor/` bevat twee kleine patches: `zed-font-kit` (FreeType-versies) en `stylo_derive` (een type-inferentieconflict met GPUI). `Cargo.lock` pint `pkcs1 0.8.0-rc.4` voor Servo's `rsa`; gebruik altijd de lockfile.
 

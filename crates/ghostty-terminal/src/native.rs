@@ -199,43 +199,78 @@ pub(crate) struct NativeSnapshot {
     pub(crate) bgra: Vec<u8>,
 }
 
-impl NativeSnapshot {
-    unsafe fn copy_from_raw(
-        pixels: *const u8,
-        width: u32,
-        height: u32,
-        length: usize,
-        bottom_up: bool,
-    ) -> Result<Self, String> {
-        let row_length = usize::try_from(width)
-            .ok()
-            .filter(|width| *width > 0)
-            .and_then(|width| width.checked_mul(4));
-        let expected = row_length.and_then(|row| {
-            usize::try_from(height)
-                .ok()
-                .filter(|height| *height > 0)
-                .and_then(|height| row.checked_mul(height))
-        });
-        let (Some(pixels), Some(row_length), Some(expected)) =
-            (NonNull::new(pixels.cast_mut()), row_length, expected)
-        else {
-            return Err("native terminal snapshot has invalid dimensions".to_owned());
-        };
-        if expected != length {
-            return Err("native terminal snapshot has invalid dimensions".to_owned());
-        }
+/// Bounds retries when the native frame grows between a size report and a read.
+const SNAPSHOT_ATTEMPTS: usize = 3;
 
-        // SAFETY: The caller guarantees that `pixels` references `length` readable bytes.
-        let mut bgra = unsafe { std::slice::from_raw_parts(pixels.as_ptr(), length) }.to_vec();
-        if bottom_up {
-            flip_bgra_rows(&mut bgra, row_length);
+impl NativeSnapshot {
+    /// Reads a native frame straight into the allocation GPUI will own, so a
+    /// captured frame costs one allocation (which `RenderImage` requires, as it
+    /// owns its pixels) and no copy. `capacity` carries the last frame's size
+    /// between calls: in steady state `read` runs once into an exact-fit buffer.
+    ///
+    /// `read(pixels, capacity, width, height, length)` reports the frame size and
+    /// returns false on failure; `length` zero means no frame is ready yet.
+    ///
+    /// # Safety
+    ///
+    /// `read` writes at most `capacity` bytes to `pixels`, and when it returns
+    /// true with `0 < length <= capacity` it has initialized `length` bytes there.
+    pub(crate) unsafe fn capture(
+        capacity: &mut usize,
+        bottom_up: bool,
+        mut read: impl FnMut(*mut u8, usize, &mut u32, &mut u32, &mut usize) -> bool,
+    ) -> Result<Option<Self>, String> {
+        for _ in 0..SNAPSHOT_ATTEMPTS {
+            let mut bgra = Vec::<u8>::with_capacity(*capacity);
+            let (mut width, mut height, mut length) = (0, 0, 0);
+            if !read(
+                bgra.as_mut_ptr(),
+                bgra.capacity(),
+                &mut width,
+                &mut height,
+                &mut length,
+            ) {
+                return Err("capture native terminal frame".to_owned());
+            }
+            if length == 0 {
+                return Ok(None);
+            }
+            let row_length = snapshot_row_length(width, height, length)?;
+            *capacity = length;
+            if length > bgra.capacity() {
+                continue;
+            }
+            // SAFETY: `read` succeeded with `length <= capacity`, so by this
+            // function's contract it initialized the first `length` bytes.
+            unsafe { bgra.set_len(length) };
+            if bottom_up {
+                flip_bgra_rows(&mut bgra, row_length);
+            }
+            return Ok(Some(Self {
+                width,
+                height,
+                bgra,
+            }));
         }
-        Ok(Self {
-            width,
-            height,
-            bgra,
-        })
+        Err("native terminal frame kept resizing during capture".to_owned())
+    }
+}
+
+/// Validates a reported BGRA frame and returns its row length in bytes.
+fn snapshot_row_length(width: u32, height: u32, length: usize) -> Result<usize, String> {
+    let row_length = usize::try_from(width)
+        .ok()
+        .filter(|width| *width > 0)
+        .and_then(|width| width.checked_mul(4));
+    let expected = row_length.and_then(|row| {
+        usize::try_from(height)
+            .ok()
+            .filter(|height| *height > 0)
+            .and_then(|height| row.checked_mul(height))
+    });
+    match (row_length, expected) {
+        (Some(row_length), Some(expected)) if expected == length => Ok(row_length),
+        _ => Err("native terminal snapshot has invalid dimensions".to_owned()),
     }
 }
 
@@ -307,12 +342,12 @@ mod platform {
         fn gpui_ghostty_surface_is_alive(surface: *const RawSurface) -> bool;
         fn gpui_ghostty_surface_snapshot(
             surface: *mut RawSurface,
-            pixels: *mut *mut u8,
+            pixels: *mut u8,
+            capacity: usize,
             width: *mut u32,
             height: *mut u32,
             length: *mut usize,
         ) -> bool;
-        fn gpui_ghostty_surface_snapshot_free(pixels: *mut u8);
         fn gpui_ghostty_surface_set_frame(
             surface: *mut RawSurface,
             x: f64,
@@ -370,6 +405,7 @@ mod platform {
         wakeup: NativeWakeup,
         state: NativeSurfaceState,
         expected_program: Option<Arc<CStr>>,
+        snapshot_capacity: usize,
         _main_thread: PhantomData<Rc<()>>,
     }
 
@@ -418,6 +454,7 @@ mod platform {
                 wakeup,
                 state: NativeSurfaceState::default(),
                 expected_program,
+                snapshot_capacity: 0,
                 _main_thread: PhantomData,
             })
         }
@@ -460,33 +497,28 @@ mod platform {
         }
 
         pub fn snapshot(&mut self) -> Result<Option<NativeSnapshot>, String> {
-            let mut pixels = std::ptr::null_mut();
-            let mut width = 0;
-            let mut height = 0;
-            let mut length = 0;
-            // SAFETY: The shim initializes all outputs and returns a malloc-owned
-            // buffer which remains valid until the matching free call below.
-            let captured = unsafe {
-                gpui_ghostty_surface_snapshot(
-                    self.raw.as_ptr(),
-                    &mut pixels,
-                    &mut width,
-                    &mut height,
-                    &mut length,
-                )
+            let raw = self.raw;
+            let read = |pixels: *mut u8,
+                        capacity: usize,
+                        width: &mut u32,
+                        height: &mut u32,
+                        length: &mut usize| {
+                // SAFETY: `raw` is live on the AppKit main thread, the outputs are
+                // writable for this call and `pixels` has `capacity` writable bytes.
+                unsafe {
+                    gpui_ghostty_surface_snapshot(
+                        raw.as_ptr(),
+                        pixels,
+                        capacity,
+                        width,
+                        height,
+                        length,
+                    )
+                }
             };
-            if !captured {
-                return Err("capture native terminal frame".to_owned());
-            }
-            if pixels.is_null() {
-                return Ok(None);
-            }
-            // SAFETY: A successful shim call returns `length` readable bytes in `pixels`.
-            let result =
-                unsafe { NativeSnapshot::copy_from_raw(pixels, width, height, length, false) };
-            // SAFETY: `pixels` is either null or the allocation returned by the shim.
-            unsafe { gpui_ghostty_surface_snapshot_free(pixels) }
-            result.map(Some)
+            // SAFETY: The shim writes at most `capacity` bytes and copies the whole
+            // `length`-byte frame whenever it succeeds with a buffer that fits.
+            unsafe { NativeSnapshot::capture(&mut self.snapshot_capacity, false, read) }
         }
 
         pub fn set_frame(&mut self, x: f64, y: f64, width: f64, height: f64, scale_factor: f64) {
@@ -747,6 +779,74 @@ mod tests {
         state.commit_frame(NativeFrame::new(0.0, 0.0, 100.0, 100.0, 1.0));
         assert!(state.update_visibility(state.requested_visible));
         assert!(state.visible);
+    }
+
+    /// Reads a 2x2 bottom-up BGRA frame like the shims: size first, pixels only
+    /// into a buffer that fits.
+    fn capture_2x2(
+        capacity: &mut usize,
+        reads: &mut usize,
+    ) -> Result<Option<NativeSnapshot>, String> {
+        let rows: [[u8; 8]; 2] = [[1; 8], [2; 8]];
+        let read = |pixels: *mut u8,
+                    room: usize,
+                    width: &mut u32,
+                    height: &mut u32,
+                    length: &mut usize| {
+            *reads += 1;
+            (*width, *height, *length) = (2, 2, 16);
+            if room >= 16 {
+                // SAFETY: `pixels` has `room >= 16` writable bytes.
+                let out = unsafe { std::slice::from_raw_parts_mut(pixels, 16) };
+                out.copy_from_slice(rows.as_flattened());
+            }
+            true
+        };
+        // SAFETY: `read` writes 16 bytes only when 16 fit, and then all of them.
+        unsafe { NativeSnapshot::capture(capacity, true, read) }
+    }
+
+    #[test]
+    fn capture_reads_into_an_exact_fit_buffer_and_flips_bottom_up_rows() {
+        let (mut capacity, mut reads) = (0, 0);
+        let first = capture_2x2(&mut capacity, &mut reads).unwrap().unwrap();
+        assert_eq!((first.width, first.height), (2, 2));
+        assert_eq!(first.bgra, [[2; 8], [1; 8]].as_flattened());
+        assert_eq!((capacity, reads), (16, 2), "first capture learns the size");
+
+        let second = capture_2x2(&mut capacity, &mut reads).unwrap().unwrap();
+        assert_eq!(second.bgra, first.bgra);
+        assert_eq!(reads, 3, "steady state reads once");
+    }
+
+    #[test]
+    fn capture_reports_pending_failed_invalid_and_unsettled_frames() {
+        let mut capacity = 0;
+        let mut capture = |width: u32, length: usize, ok: bool| {
+            let read = |_: *mut u8, _: usize, w: &mut u32, h: &mut u32, l: &mut usize| {
+                (*w, *h, *l) = (width, 1, length);
+                ok
+            };
+            // SAFETY: `read` never reports a frame that fits, so it writes nothing.
+            unsafe { NativeSnapshot::capture(&mut capacity, false, read) }
+        };
+        assert!(
+            capture(0, 0, true).unwrap().is_none(),
+            "first frame pending"
+        );
+        assert!(capture(1, 4, false).is_err(), "native failure");
+        assert!(capture(2, 4, true).is_err(), "length disagrees with size");
+
+        // A frame that grows on every read never settles into the buffer.
+        let mut capacity = 0;
+        let growing = |_: *mut u8, room: usize, w: &mut u32, h: &mut u32, l: &mut usize| {
+            *w = u32::try_from(room / 4 + 1).unwrap();
+            (*h, *l) = (1, *w as usize * 4);
+            true
+        };
+        // SAFETY: `growing` always reports more than `room`, so it writes nothing.
+        let result = unsafe { NativeSnapshot::capture(&mut capacity, false, growing) };
+        assert!(result.is_err());
     }
 
     fn approve(wakeup: &NativeWakeup, operation: i32, text: &std::ffi::CStr) -> bool {

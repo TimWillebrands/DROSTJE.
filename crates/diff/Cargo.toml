@@ -1,0 +1,9 @@
+[package]
+name = "drostje-diff"
+description = "Pure parser that splits unified Git diff text into unified and side-by-side display rows."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+thiserror.workspace = true

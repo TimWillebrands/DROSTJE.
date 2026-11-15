@@ -1,0 +1,19 @@
+[package]
+name = "drostje-harness"
+description = "Native conversation boundary: drives OMP, Pi, Claude Code, Codex and OpenCode, and stores image attachments."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+base64.workspace = true
+drostje-browser-tools.workspace = true
+drostje-model.workspace = true
+drostje-platform.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+uuid.workspace = true

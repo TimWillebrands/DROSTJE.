@@ -2306,29 +2306,252 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64 0.22.1",
- "content-security-policy",
- "dpi",
- "euclid",
+ "drostje-browser",
+ "drostje-browser-tools",
+ "drostje-diff",
+ "drostje-factory",
+ "drostje-file-refs",
+ "drostje-fonts",
+ "drostje-harness",
+ "drostje-model",
+ "drostje-neovim",
+ "drostje-network",
+ "drostje-platform",
+ "drostje-remote",
+ "drostje-store",
+ "drostje-titles",
+ "drostje-tracker",
+ "drostje-worktrees",
  "ghostty-terminal",
  "gpui-kit",
  "image",
- "libc",
  "log",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "parking_lot",
- "rmpv",
  "rusqlite",
+ "serde",
+ "serde_json",
+ "smol",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-browser"
+version = "0.1.0"
+dependencies = [
+ "content-security-policy",
+ "dpi",
+ "drostje-fonts",
+ "euclid",
+ "image",
+ "parking_lot",
  "rustls",
  "serde",
  "serde_json",
  "servo",
- "smol",
  "stylo_static_prefs",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-browser-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "base64 0.22.1",
+ "drostje-browser",
+ "drostje-network",
+ "image",
+ "serde",
+ "serde_json",
+ "smol",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-diff"
+version = "0.1.0"
+dependencies = [
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "drostje-factory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "drostje-model",
+ "drostje-platform",
+ "drostje-store",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "smol",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-file-refs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-fonts"
+version = "0.1.0"
+dependencies = [
+ "url",
+]
+
+[[package]]
+name = "drostje-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "base64 0.22.1",
+ "drostje-browser-tools",
+ "drostje-model",
+ "drostje-platform",
+ "image",
+ "serde",
+ "serde_json",
+ "smol",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-neovim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "drostje-model",
+ "drostje-platform",
+ "parking_lot",
+ "rmpv",
+ "smol",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-network"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "drostje-platform",
+ "drostje-store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "smol",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-platform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "drostje-diff",
+ "image",
+ "libc",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-remote"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "base64 0.22.1",
+ "drostje-browser-tools",
+ "drostje-diff",
+ "drostje-harness",
+ "drostje-model",
+ "drostje-network",
+ "drostje-platform",
+ "drostje-store",
+ "image",
+ "log",
+ "parking_lot",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "smol",
  "tungstenite",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "drostje-model",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "smol",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-titles"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "drostje-model",
+ "drostje-platform",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-tracker"
+version = "0.1.0"
+dependencies = [
+ "drostje-model",
+ "drostje-platform",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
+name = "drostje-worktrees"
+version = "0.1.0"
+dependencies = [
+ "drostje-model",
+ "drostje-platform",
  "uuid",
 ]
 

@@ -7,7 +7,7 @@ use crate::network::{
 
 #[derive(Default)]
 pub struct NetworkState {
-    pub snapshot: NetworkSnapshot,
+    pub snapshot: Arc<NetworkSnapshot>,
     pub error: Option<String>,
     pub pending: HashSet<ThreadId>,
     pub revision: u64,
@@ -103,7 +103,7 @@ enum Request {
     },
 }
 enum Update {
-    Snapshot(NetworkSnapshot),
+    Snapshot(Arc<NetworkSnapshot>),
     Membership {
         thread: ThreadId,
         joined: bool,
@@ -116,6 +116,36 @@ enum Update {
         result: std::result::Result<Option<DeliveryBatch>, String>,
     },
     Failed(String),
+}
+
+/// Kind, archived, project, worktree, title, remote location, harness, last activity and
+/// submission: see [`peer_context`].
+pub(super) type PeerContext<'a> = (
+    &'a ThreadKind,
+    bool,
+    ProjectId,
+    Option<WorktreeId>,
+    &'a str,
+    &'a Option<RemoteLocation>,
+    &'a str,
+    &'a str,
+    &'a Option<Value>,
+);
+
+/// Every field of a thread that `sync_network` reads, through `network_peers`,
+/// `network_context_eligible` and `network_can_receive`. Keep it in step with them.
+pub(super) fn peer_context(thread: &Thread) -> PeerContext<'_> {
+    (
+        &thread.kind,
+        thread.archived,
+        thread.project_id,
+        thread.worktree_id,
+        &thread.title,
+        &thread.remote,
+        &thread.harness,
+        &thread.updated_at,
+        &thread.submission,
+    )
 }
 
 impl AppState {
@@ -425,6 +455,8 @@ impl AppState {
             .collect()
     }
 
+    /// Publishes the current peers and revokes runtimes that lost their context. A thread
+    /// contributes only its [`peer_context`], so saving a thread syncs only when that changed.
     pub(super) fn sync_network(&mut self) {
         if self.shutting_down || self.storage_error.is_some() {
             self.pause_all_network_delivery();
@@ -1219,6 +1251,224 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    /// `receive_conversation` holds the session outside `conversations` while it handles an
+    /// event; a thread saved meanwhile must not look like a runtime that went away.
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn harness_updates_that_save_the_thread_keep_automatic_delivery(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.dispatcher.allow_parking();
+        use super::*;
+
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            Directory(std::env::temp_dir().join(format!("drost-saves-{}", Uuid::new_v4())));
+        let store = Store::open(directory.0.join("data")).unwrap();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Saves".into(),
+            root: directory.0.join("repo"),
+            archived: false,
+            defaults: ProjectDefaults::default(),
+        };
+        let project_id = project.id;
+        smol::block_on(store.save_project(project)).unwrap();
+        let snapshot = smol::block_on(store.snapshot()).unwrap();
+        let state = cx.new(|cx| {
+            AppState::new(
+                Bootstrap {
+                    data_dir: directory.0.clone(),
+                    store,
+                    snapshot,
+                    diagnostics: BTreeMap::new(),
+                    repositories: BTreeMap::new(),
+                    browser_tools: None,
+                },
+                cx,
+            )
+        });
+        state.update(cx, |state, cx| {
+            state.select_project(project_id);
+            state.new_thread(ThreadKind::Conversation).unwrap();
+            let thread = state.selected_thread.unwrap();
+            let mut session = ConversationSession::new(None);
+            let generation = session.generation;
+            let (commands, _native) = async_channel::bounded(8);
+            session.commands = Some(commands);
+            session.state = ConversationState::Ready;
+            session.persisted = true;
+            session.peer_delivery = true;
+            state.conversations.insert(thread, session);
+            state.runtime_network(thread, generation).enabled = true;
+            let peer = state
+                .network_peers()
+                .into_iter()
+                .find(|peer| peer.thread == thread)
+                .unwrap();
+            let mut member = crate::network::Member::from(&peer);
+            member.automatic = true;
+            Arc::make_mut(&mut state.network.snapshot)
+                .members
+                .push(member);
+            assert!(state.network_delivery_enabled(thread));
+
+            let request_id = Uuid::new_v4();
+            state
+                .snapshot
+                .threads
+                .iter_mut()
+                .find(|candidate| candidate.id == thread)
+                .unwrap()
+                .submission = Some(serde_json::json!({
+                "request_id": request_id.to_string(),
+                "state": "accepted",
+            }));
+            for (name, event) in [
+                (
+                    "title",
+                    ConversationEvent::TitleChanged("Named by the harness".into()),
+                ),
+                (
+                    "model",
+                    ConversationEvent::ModelSelected(ModelKey {
+                        provider: "provider".into(),
+                        id: "model".into(),
+                    }),
+                ),
+                (
+                    "settled",
+                    ConversationEvent::TurnSettled {
+                        request_id,
+                        outcome: TurnOutcome::Completed,
+                    },
+                ),
+            ] {
+                state.receive_conversation(thread, event, cx);
+                assert!(
+                    state.network_delivery_enabled(thread),
+                    "{name}: saving the thread paused automatic delivery"
+                );
+            }
+            let saved = state
+                .snapshot
+                .threads
+                .iter()
+                .find(|candidate| candidate.id == thread)
+                .unwrap();
+            assert_eq!(saved.title, "Named by the harness");
+            assert_eq!(saved.model.as_ref().unwrap().id, "model");
+            assert!(saved.submission.is_none(), "the settled turn was saved");
+        });
+    }
+
+    #[cfg(feature = "runtime-qa")]
+    #[gpui_kit::test]
+    fn saving_a_thread_syncs_the_network_only_when_its_peer_context_changed(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.dispatcher.allow_parking();
+        use super::*;
+
+        struct Directory(std::path::PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            Directory(std::env::temp_dir().join(format!("drost-context-{}", Uuid::new_v4())));
+        let store = Store::open(directory.0.join("data")).unwrap();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Context".into(),
+            root: directory.0.join("repo"),
+            archived: false,
+            defaults: ProjectDefaults::default(),
+        };
+        let project_id = project.id;
+        smol::block_on(store.save_project(project)).unwrap();
+        let snapshot = smol::block_on(store.snapshot()).unwrap();
+        let state = cx.new(|cx| {
+            AppState::new(
+                Bootstrap {
+                    data_dir: directory.0.clone(),
+                    store,
+                    snapshot,
+                    diagnostics: BTreeMap::new(),
+                    repositories: BTreeMap::new(),
+                    browser_tools: None,
+                },
+                cx,
+            )
+        });
+        state.update(cx, |state, _| {
+            state.select_project(project_id);
+            let (requests, work) = async_channel::bounded(64);
+            state.network.requests = Some(requests);
+            let syncs = |work: &async_channel::Receiver<Request>| {
+                std::iter::from_fn(|| work.try_recv().ok())
+                    .filter(|request| matches!(request, Request::Sync(_)))
+                    .count()
+            };
+
+            state.new_thread(ThreadKind::Conversation).unwrap();
+            assert!(syncs(&work) > 0, "a new thread is a new peer");
+            let thread = state.thread().unwrap().clone();
+
+            // Nothing a peer or its eligibility depends on.
+            let mut quiet = thread.clone();
+            quiet.model = Some(ModelKey {
+                provider: "provider".into(),
+                id: "model".into(),
+            });
+            quiet.effort = Some("high".into());
+            quiet.permission_mode = Some("plan".into());
+            quiet.session_ref = Some("session".into());
+            quiet.draft = "draft".into();
+            quiet.execution_started = true;
+            assert_eq!(peer_context(&quiet), peer_context(&thread));
+            state.save_thread(quiet.clone());
+            assert_eq!(syncs(&work), 0, "an unchanged peer context needs no sync");
+            assert_eq!(
+                state.thread().unwrap().model,
+                quiet.model,
+                "the save still applied"
+            );
+
+            type Change = (&'static str, fn(&mut Thread));
+            let changes: [Change; 7] = [
+                ("title", |t| t.title = "Renamed".into()),
+                ("harness", |t| t.harness = "codex".into()),
+                ("updated_at", |t| {
+                    t.updated_at = "2999-01-01T00:00:00Z".into()
+                }),
+                ("submission", |t| {
+                    t.submission = Some(serde_json::json!({"state": "pending"}))
+                }),
+                ("worktree", |t| t.worktree_id = Some(Uuid::new_v4())),
+                ("remote", |t| {
+                    t.remote = Some(RemoteLocation {
+                        host: "host".into(),
+                        project: "mounted".into(),
+                    })
+                }),
+                ("archived", |t| t.archived = true),
+            ];
+            for (field, change) in changes {
+                let mut changed = state.thread().unwrap().clone();
+                change(&mut changed);
+                state.save_thread(changed);
+                assert!(syncs(&work) > 0, "{field} reaches the network");
+            }
+        });
+    }
+
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
     fn claimed_messages_wait_when_native_readiness_changes(cx: &mut gpui_kit::TestAppContext) {
@@ -1277,7 +1527,9 @@ mod tests {
                 .unwrap();
             let mut member = crate::network::Member::from(&peer);
             member.automatic = true;
-            state.network.snapshot.members.push(member);
+            Arc::make_mut(&mut state.network.snapshot)
+                .members
+                .push(member);
             let (requests, work) = async_channel::bounded(8);
             state.network.requests = Some(requests);
             let (mailbox, snapshots) = Network::start(state.store.clone(), None).unwrap();
@@ -1422,24 +1674,29 @@ mod tests {
                 "A stopped runtime cannot be woken"
             );
             state.network.runtimes.get_mut(&thread).unwrap().enabled = true;
-            state.network.snapshot.members[0].automatic = false;
+            Arc::make_mut(&mut state.network.snapshot).members[0].automatic = false;
             assert!(
                 !state.network_can_receive(thread),
                 "Membership without wake consent is insufficient"
             );
-            state.network.snapshot.members[0].automatic = true;
+            Arc::make_mut(&mut state.network.snapshot).members[0].automatic = true;
             state.network.runtimes.get_mut(&thread).unwrap().generation = Uuid::new_v4();
             assert!(
                 !state.network_can_receive(thread),
                 "Old runtime authorization cannot cross a generation"
             );
             state.network.runtimes.get_mut(&thread).unwrap().generation = generation;
-            let membership = state.network.snapshot.members.pop().unwrap();
+            let membership = Arc::make_mut(&mut state.network.snapshot)
+                .members
+                .pop()
+                .unwrap();
             assert!(
                 !state.network_can_receive(thread),
                 "Leaving revokes busy-turn injection"
             );
-            state.network.snapshot.members.push(membership);
+            Arc::make_mut(&mut state.network.snapshot)
+                .members
+                .push(membership);
             state.network.runtimes.get_mut(&thread).unwrap().pause();
             assert!(
                 !state.network_can_receive(thread),

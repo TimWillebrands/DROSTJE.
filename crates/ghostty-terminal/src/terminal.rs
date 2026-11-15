@@ -1,4 +1,5 @@
 use crate::clipboard::ClipboardApprovalCallback;
+use crate::frame::FrameSlot;
 use crate::input_surface::{native_input_context, native_text_key};
 use crate::native::{
     KeyAction, Modifiers as NativeModifiers, MouseButton as NativeMouseButton, MouseState,
@@ -53,9 +54,9 @@ impl TerminalTheme {
         for (color, bytes) in [self.background, self.foreground]
             .iter()
             .chain(self.palette.iter())
-            .zip(bytes.chunks_exact_mut(3))
+            .zip(bytes.as_chunks_mut::<3>().0)
         {
-            bytes.copy_from_slice(&[color.r, color.g, color.b]);
+            *bytes = [color.r, color.g, color.b];
         }
         bytes
     }
@@ -121,7 +122,7 @@ pub struct Terminal {
     selection: Range<usize>,
     backend_error: Option<String>,
     _subscriptions: Vec<Subscription>,
-    frame: Option<Arc<RenderImage>>,
+    frame: FrameSlot,
     frame_dirty: bool,
     default_shell: bool,
 }
@@ -188,6 +189,10 @@ impl Terminal {
                 cx.observe_window_activation(window, |terminal: &mut Self, window, _| {
                     terminal.sync_focus(window)
                 }),
+                // The composed frame lives in this window's atlas until dropped there.
+                cx.on_release_in(window, |terminal: &mut Self, window, _| {
+                    terminal.frame.release(window)
+                }),
             ];
             let mut terminal = Self {
                 surface: Rc::new(RefCell::new(Some(surface))),
@@ -200,7 +205,7 @@ impl Terminal {
                 selection: 0..0,
                 backend_error: None,
                 _subscriptions: subscriptions,
-                frame: None,
+                frame: FrameSlot::default(),
                 frame_dirty: true,
                 default_shell,
             };
@@ -271,12 +276,13 @@ impl Terminal {
     /// Explicit, idempotent teardown; cloned Entity and frame references are inert.
     pub fn close(&mut self) {
         self.tick_task = None;
-        self.frame = None;
+        self.frame.clear();
         self.visible = false;
         self.composition.clear();
         self.surface.borrow_mut().take();
     }
     /// Read Ghostty's completed GPU frame without exposing native ownership.
+    /// The image is the caller's; if they paint it, they drop it from the atlas.
     pub fn snapshot(&mut self) -> Result<Arc<RenderImage>, String> {
         self.capture_frame()?
             .ok_or_else(|| "Terminal frame is not ready".into())
@@ -360,6 +366,7 @@ impl Terminal {
         let visible = self.visible && !bounds.intersect(&window.content_mask().bounds).is_empty();
         if !visible {
             self.with_surface(|surface| surface.set_visible(false));
+            self.frame.release_unreferenced(window);
             return;
         }
         let surface = self.surface.clone();
@@ -390,7 +397,7 @@ impl Terminal {
         if self.frame_dirty {
             match self.capture_frame() {
                 Ok(Some(frame)) => {
-                    self.frame = Some(frame);
+                    self.frame.replace(frame);
                     self.backend_error = None;
                     self.frame_dirty = false;
                 }
@@ -399,11 +406,8 @@ impl Terminal {
                 Err(error) => self.backend_error = Some(error),
             }
         }
-        if let Some(frame) = self.frame.as_ref()
-            && let Err(error) =
-                window.paint_image(bounds, bounds, Default::default(), frame.clone(), 0, false)
-        {
-            self.backend_error = Some(error.to_string());
+        if let Err(error) = self.frame.paint(bounds, window) {
+            self.backend_error = Some(error);
         }
     }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {

@@ -96,8 +96,9 @@ impl AppState {
                         if state.shutting_down || state.factory_text_generation != generation {
                             return false;
                         }
-                        state.factory_text = Some(page);
-                        cx.notify();
+                        if store_text_page(&mut state.factory_text, page) {
+                            cx.notify();
+                        }
                         true
                     })
                     .unwrap_or(false);
@@ -109,5 +110,57 @@ impl AppState {
         })
         .detach();
         cx.notify();
+    }
+}
+
+/// Store a freshly read page; false when it equals the one shown, so an unchanged tail
+/// is neither replaced nor announced again.
+fn store_text_page(
+    shown: &mut Option<Result<Arc<factory::TextPage>, String>>,
+    page: Result<factory::TextPage, String>,
+) -> bool {
+    let unchanged = match (shown.as_ref(), &page) {
+        (Some(Ok(shown)), Ok(page)) => **shown == *page,
+        (Some(Err(shown)), Err(page)) => shown == page,
+        _ => false,
+    };
+    if !unchanged {
+        *shown = Some(page.map(Arc::new));
+    }
+    !unchanged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::store_text_page;
+    use crate::factory::TextPage;
+    use std::{path::PathBuf, sync::Arc};
+
+    fn page(text: &str) -> TextPage {
+        TextPage {
+            path: PathBuf::from("stdout.log"),
+            text: text.into(),
+            start_offset: 0,
+            end_offset: text.len() as u64,
+            has_older: false,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_tail_keeps_the_shown_page() {
+        let mut shown = None;
+        assert!(store_text_page(&mut shown, Ok(page("one\n"))));
+        let Some(Ok(first)) = shown.clone() else {
+            panic!("page stored");
+        };
+        assert!(!store_text_page(&mut shown, Ok(page("one\n"))));
+        assert!(
+            matches!(&shown, Some(Ok(kept)) if Arc::ptr_eq(kept, &first)),
+            "the same page stays shared"
+        );
+        assert!(store_text_page(&mut shown, Ok(page("one\ntwo\n"))));
+        assert!(store_text_page(&mut shown, Err("gone".into())));
+        assert!(!store_text_page(&mut shown, Err("gone".into())));
+        assert!(store_text_page(&mut shown, Ok(page("one\ntwo\n"))));
     }
 }

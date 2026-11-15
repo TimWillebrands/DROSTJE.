@@ -1,0 +1,27 @@
+[package]
+name = "drostje-browser-tools"
+description = "The loopback MCP bridge that gives harnesses DROSTJE's artifact, browser and network tools."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+# The desktop's embedded-browser tool. Without it (the headless host) browser operations
+# are refused and neither Servo nor image encoding is built.
+browser = ["dep:drostje-browser", "dep:base64", "dep:image", "dep:smol"]
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+base64 = { workspace = true, optional = true }
+drostje-browser = { workspace = true, optional = true }
+drostje-network.workspace = true
+image = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+smol = { workspace = true, optional = true }
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+smol.workspace = true

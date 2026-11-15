@@ -1,0 +1,16 @@
+[package]
+name = "drostje-neovim"
+description = "One isolated embedded Neovim per window: msgpack-RPC transport, Draft sessions and the redraw grid."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+drostje-model.workspace = true
+drostje-platform.workspace = true
+parking_lot.workspace = true
+rmpv.workspace = true
+smol.workspace = true
+uuid.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "drostje-titles"
+description = "Conversation titles and commit subjects from local llama.cpp or an optional Ollama server."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+drostje-model.workspace = true
+drostje-platform.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

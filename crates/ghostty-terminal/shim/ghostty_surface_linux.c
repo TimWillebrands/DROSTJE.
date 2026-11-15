@@ -317,22 +317,33 @@ void gpui_ghostty_surface_linux_theme(gpui_ghostty_surface *state, const uint8_t
     ghostty_surface_refresh(state->surface);
 }
 
+// Reports the surface size in `width`, `height` and `length` and, only when
+// `capacity` covers `length`, draws the frame and reads it bottom-up into the
+// caller's `pixels`. A short buffer returns true with nothing read or drawn so the
+// caller can grow it; the shim never allocates or retains pixel memory.
 bool gpui_ghostty_surface_linux_snapshot(
     gpui_ghostty_surface *state,
-    uint8_t **pixels,
+    uint8_t *pixels,
+    size_t capacity,
     uint32_t *width,
     uint32_t *height,
     size_t *length
 ) {
-    if (pixels == NULL || width == NULL || height == NULL || length == NULL) return false;
-    *pixels = NULL;
+    if (width == NULL || height == NULL || length == NULL) return false;
     *width = 0;
     *height = 0;
     *length = 0;
     if (state == NULL || state->surface == NULL || state->width == 0 || state->height == 0 ||
-        state->width > INT_MAX || state->height > INT_MAX) {
+        state->width > INT_MAX || state->height > INT_MAX ||
+        state->width > SIZE_MAX / 4 / state->height) {
         return false;
     }
+
+    size_t byte_length = (size_t)state->width * state->height * 4;
+    *width = state->width;
+    *height = state->height;
+    *length = byte_length;
+    if (pixels == NULL || capacity < byte_length) return true;
 
     gl_pixel_store_i_fn pixel_store = NULL;
     gl_read_buffer_fn read_buffer = NULL;
@@ -346,14 +357,8 @@ bool gpui_ghostty_surface_linux_snapshot(
     memcpy(&read_pixels, &symbol, sizeof(read_pixels));
     symbol = opengl_get_proc_address("glGetError");
     memcpy(&get_error, &symbol, sizeof(get_error));
-    if (pixel_store == NULL || read_buffer == NULL || read_pixels == NULL || get_error == NULL) {
-        return false;
-    }
-
-    size_t byte_length = (size_t)state->width * state->height * 4;
-    uint8_t *copy = malloc(byte_length);
-    if (copy == NULL || !state->make_current(state->platform_userdata)) {
-        free(copy);
+    if (pixel_store == NULL || read_buffer == NULL || read_pixels == NULL || get_error == NULL ||
+        !state->make_current(state->platform_userdata)) {
         return false;
     }
     ghostty_surface_draw(state->surface);
@@ -367,24 +372,11 @@ bool gpui_ghostty_surface_linux_snapshot(
         (int)state->height,
         GPUI_GL_BGRA,
         GPUI_GL_UNSIGNED_BYTE,
-        copy
+        pixels
     );
     unsigned int error = get_error();
     state->clear_current(state->platform_userdata);
-    if (error != 0) {
-        free(copy);
-        return false;
-    }
-
-    *pixels = copy;
-    *width = state->width;
-    *height = state->height;
-    *length = byte_length;
-    return true;
-}
-
-void gpui_ghostty_surface_linux_snapshot_free(uint8_t *pixels) {
-    free(pixels);
+    return error == 0;
 }
 
 void *gpui_ghostty_surface_linux_take_clipboard_read(

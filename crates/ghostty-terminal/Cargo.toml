@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 build = "build.rs"
 
+[features]
+# Headless GPUI window tests (`cargo test -p ghostty-terminal --features runtime-qa`).
+runtime-qa = ["gpui-kit/test-support"]
+
 [dependencies]
 gpui-kit = "=0.6.6"
 async-channel = "2.5"

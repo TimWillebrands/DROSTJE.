@@ -1,0 +1,23 @@
+[package]
+name = "drostje-browser"
+description = "The embedded Servo browser: one worker thread owning every web view, bounded commands and retained frames."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+content-security-policy.workspace = true
+dpi.workspace = true
+drostje-fonts.workspace = true
+euclid.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+servo.workspace = true
+stylo_static_prefs.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+image.workspace = true

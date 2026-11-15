@@ -1087,7 +1087,7 @@ pub fn bind_keys(cx: &mut App) {
             Some("CommitMessage > Input && !Command && !PopupMenu"),
         ),
     ]);
-    super::theme_editor::bind_keys(cx);
+    crate::ui::theme::editor::bind_keys(cx);
 }
 
 pub fn button(
@@ -1739,7 +1739,7 @@ impl Palette {
             |catalog| catalog.unavailable_reason(),
         );
         let commands: Vec<_> = catalog
-            .map(|catalog| super::slash_commands::matches(catalog, ""))
+            .map(|catalog| crate::ui::conversation::slash_commands::matches(catalog, ""))
             .unwrap_or_default()
             .into_iter()
             .cloned()
@@ -1753,7 +1753,7 @@ impl Palette {
                     // The native filter does not rank, so descriptions would bury the
                     // command whose name was typed.
                     .keywords(command.aliases.iter().map(|alias| format!("/{alias}")))
-                    .child(move |_, cx| super::slash_commands::row(&shown, cx)),
+                    .child(move |_, cx| crate::ui::conversation::slash_commands::row(&shown, cx)),
             );
         }
         let names: Rc<Vec<String>> =

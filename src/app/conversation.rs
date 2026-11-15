@@ -504,25 +504,8 @@ impl AppState {
         if !self.is_conversation(id) {
             return;
         }
-        if self.drafts.get(&draft.key).is_some_and(|old| {
-            old.generation == draft.generation && old.changedtick > draft.changedtick
-        }) {
-            return;
-        }
-        let key = draft.key.clone();
-        self.drafts.insert(key.clone(), draft.clone());
-        match key {
-            DraftKey::Thread(id) => {
-                if let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned()
-                {
-                    if thread.draft != draft.text {
-                        thread.draft = draft.text;
-                        thread.updated_at = platform::now();
-                        self.edit_thread(thread);
-                    }
-                }
-            }
-            DraftKey::Extension { .. } => {}
+        if let Some(edited) = apply_draft(&mut self.snapshot.threads, &mut self.drafts, draft) {
+            self.edited_threads.insert(edited);
         }
     }
 
@@ -1007,6 +990,9 @@ impl AppState {
         let mut peer_turn = None;
         let mut peer_settled = None;
         let mut pause_network = false;
+        // Saved once the session is back in `conversations`: `save_thread` syncs the network,
+        // which would otherwise see a missing runtime and pause its automatic delivery.
+        let mut save = None;
         let refresh_diff = matches!(
             &event,
             ConversationEvent::Ready { .. }
@@ -1259,34 +1245,33 @@ impl AppState {
                     session.auto_dispatch = false;
                 }
                 session.interrupt_for_queue = false;
-                if let Some(mut thread) = thread.take() {
-                    if thread
+                if let Some(mut thread) = thread.take()
+                    && thread
                         .submission
                         .as_ref()
                         .and_then(|v| v.get("request_id"))
                         .and_then(Value::as_str)
                         .is_some_and(|id| id == request_id.to_string())
-                    {
-                        if matches!(outcome, TurnOutcome::Completed | TurnOutcome::Interrupted) {
-                            thread.submission = None;
-                        } else if let Some(submission) = &mut thread.submission {
-                            submission["state"] = json!(format!("{outcome:?}").to_lowercase());
-                        }
-                        self.save_thread(thread);
+                {
+                    if matches!(outcome, TurnOutcome::Completed | TurnOutcome::Interrupted) {
+                        thread.submission = None;
+                    } else if let Some(submission) = &mut thread.submission {
+                        submission["state"] = json!(format!("{outcome:?}").to_lowercase());
                     }
+                    save = Some(thread);
                 }
             }
             ConversationEvent::ModelSelected(model) => {
                 session.model = Some(model.clone());
                 if let Some(mut thread) = thread.take() {
                     thread.model = Some(model);
-                    self.save_thread(thread);
+                    save = Some(thread);
                 }
             }
             ConversationEvent::TitleChanged(title) => {
                 if let Some(mut thread) = thread.take() {
                     thread.title = title;
-                    self.save_thread(thread);
+                    save = Some(thread);
                 }
             }
             ConversationEvent::EditorTextRequested(text) => {
@@ -1392,23 +1377,25 @@ impl AppState {
                     self.active_threads.remove(&id);
                     session.outcome = Some(TurnOutcome::Failed);
                 }
-                if let Some(mut thread) = thread.take() {
-                    if let Some(submission) = &mut thread.submission {
-                        if request_id.is_some_and(|id| {
-                            submission
-                                .get("request_id")
-                                .and_then(Value::as_str)
-                                .is_some_and(|value| value == id.to_string())
-                        }) {
-                            submission["state"] = json!("failed");
-                            submission["error"] = json!(message);
-                            self.save_thread(thread);
-                        }
-                    }
+                if let Some(mut thread) = thread.take()
+                    && let Some(submission) = &mut thread.submission
+                    && request_id.is_some_and(|id| {
+                        submission
+                            .get("request_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == id.to_string())
+                    })
+                {
+                    submission["state"] = json!("failed");
+                    submission["error"] = json!(message);
+                    save = Some(thread);
                 }
             }
         }
         self.conversations.insert(id, session);
+        if let Some(thread) = save {
+            self.save_thread(thread);
+        }
         if pause_network {
             self.pause_network_delivery(id);
         }
@@ -1441,6 +1428,35 @@ impl AppState {
         // checked after every event rather than on one of them.
         self.dispatch_queued(id, cx);
     }
+}
+
+/// Records `draft` unless the editor already reported a later changedtick of the same buffer
+/// generation, and copies a thread draft's text into its row in place. Returns the thread whose
+/// row changed, so the caller can mark it edited (an in-memory change, never a write).
+fn apply_draft(
+    threads: &mut [Thread],
+    drafts: &mut HashMap<DraftKey, DraftSnapshot>,
+    draft: DraftSnapshot,
+) -> Option<ThreadId> {
+    if drafts.get(&draft.key).is_some_and(|old| {
+        old.generation == draft.generation && old.changedtick > draft.changedtick
+    }) {
+        return None;
+    }
+    let edited = match &draft.key {
+        DraftKey::Thread(id) => threads
+            .iter_mut()
+            .find(|thread| thread.id == *id)
+            .filter(|thread| thread.draft != draft.text)
+            .map(|thread| {
+                thread.draft.clone_from(&draft.text);
+                thread.updated_at = platform::now();
+                thread.id
+            }),
+        DraftKey::Extension { .. } => None,
+    };
+    drafts.insert(draft.key.clone(), draft);
+    edited
 }
 
 /// Whether the queue may start its next turn after a turn settled this way. Only a completed
@@ -1558,9 +1574,9 @@ fn harness_lock_reason(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConversationDefaults, ConversationSession, ConversationState, ModelKey, Project,
-        ProjectDefaults, Thread, ThreadKind, TurnOutcome, conversation_defaults,
-        harness_lock_reason, queue_continues,
+        ConversationDefaults, ConversationSession, ConversationState, DraftKey, DraftSnapshot,
+        HashMap, ModelKey, Project, ProjectDefaults, Thread, ThreadKind, TurnOutcome, apply_draft,
+        conversation_defaults, harness_lock_reason, queue_continues,
     };
     use crate::harness::{ContentBlock, Message};
     use serde_json::json;
@@ -1619,6 +1635,85 @@ mod tests {
             model,
             ..ConversationDefaults::default()
         }
+    }
+
+    fn snapshot(key: DraftKey, generation: Uuid, changedtick: u64, text: &str) -> DraftSnapshot {
+        DraftSnapshot {
+            key,
+            generation,
+            changedtick,
+            text: text.into(),
+            cursor: (0, text.len()),
+        }
+    }
+
+    #[test]
+    fn drafts_update_their_thread_in_place_and_ignore_stale_ticks() {
+        let mut threads = vec![conversation(2, "omp", None, "2026-10-01T00:00:00Z")];
+        let id = threads[0].id;
+        let key = DraftKey::Thread(id);
+        let generation = Uuid::from_u128(7);
+        let mut drafts = HashMap::new();
+
+        let edited = apply_draft(
+            &mut threads,
+            &mut drafts,
+            snapshot(key.clone(), generation, 3, "hi"),
+        );
+        assert_eq!(edited, Some(id));
+        assert_eq!(threads[0].draft, "hi");
+        assert_ne!(
+            threads[0].updated_at, "2026-10-01T00:00:00Z",
+            "typing is activity"
+        );
+        assert_eq!(drafts[&key].changedtick, 3);
+
+        // An older tick of the same buffer generation changes nothing.
+        let touched = threads[0].updated_at.clone();
+        let stale = apply_draft(
+            &mut threads,
+            &mut drafts,
+            snapshot(key.clone(), generation, 2, "h"),
+        );
+        assert_eq!(stale, None);
+        assert_eq!(threads[0].draft, "hi");
+        assert_eq!(drafts[&key].changedtick, 3);
+
+        // A later tick with the same text records the revision but leaves the row alone.
+        threads[0].updated_at = touched.clone();
+        let same = apply_draft(
+            &mut threads,
+            &mut drafts,
+            snapshot(key.clone(), generation, 5, "hi"),
+        );
+        assert_eq!(same, None);
+        assert_eq!(threads[0].updated_at, touched);
+        assert_eq!(drafts[&key].changedtick, 5);
+
+        // A new buffer generation restarts its ticks.
+        let reopened = Uuid::from_u128(8);
+        let edited = apply_draft(
+            &mut threads,
+            &mut drafts,
+            snapshot(key.clone(), reopened, 1, "hello"),
+        );
+        assert_eq!(edited, Some(id));
+        assert_eq!(threads[0].draft, "hello");
+        assert_eq!(drafts[&key].revision().generation, reopened);
+
+        // Extension buffers are tracked but never written into the thread row.
+        let extension = DraftKey::Extension {
+            thread: id,
+            request: "ask".into(),
+        };
+        let edited = apply_draft(
+            &mut threads,
+            &mut drafts,
+            snapshot(extension.clone(), generation, 1, "answer"),
+        );
+        assert_eq!(edited, None);
+        assert_eq!(threads[0].draft, "hello");
+        assert_eq!(drafts[&extension].text, "answer");
     }
 
     #[test]

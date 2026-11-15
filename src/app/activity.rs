@@ -1,3 +1,5 @@
+use super::AppState;
+use crate::harness::{ConversationState, TurnOutcome};
 use crate::model::ThreadId;
 use std::collections::HashMap;
 
@@ -37,6 +39,28 @@ impl UnseenTurns {
             (false, Some(&failed)) => ThreadActivity::Unseen { failed },
             (false, None) => ThreadActivity::Idle,
         }
+    }
+}
+
+impl AppState {
+    pub fn thread_activity(&self, id: ThreadId) -> ThreadActivity {
+        self.unseen_turns
+            .activity(id, self.active_threads.contains(&id))
+    }
+
+    /// A turn that did not complete or stop on request ended badly: shown as failed.
+    pub(super) fn turn_ended(&mut self, id: ThreadId) {
+        let failed = self.conversations.get(&id).is_none_or(|session| {
+            matches!(
+                session.state,
+                ConversationState::Failed | ConversationState::Disconnected
+            ) || !matches!(
+                session.outcome,
+                Some(TurnOutcome::Completed | TurnOutcome::Interrupted)
+            )
+        });
+        self.unseen_turns
+            .turn_ended(id, self.selected_thread, failed);
     }
 }
 

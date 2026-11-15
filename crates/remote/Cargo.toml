@@ -1,0 +1,43 @@
+[package]
+name = "drostje-remote"
+description = "Authenticated relay transport, location-aware remote Conversations and the headless drostje-host service."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+# The desktop's embedded-browser tool, forwarded to drostje-browser-tools. The headless
+# drostje-host leaves it off, so it builds without Servo.
+browser = ["drostje-browser-tools/browser"]
+
+[[bin]]
+name = "drostje-host"
+path = "src/bin/drostje-host.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+base64.workspace = true
+drostje-browser-tools.workspace = true
+drostje-diff.workspace = true
+drostje-harness.workspace = true
+drostje-model.workspace = true
+drostje-network.workspace = true
+drostje-platform.workspace = true
+parking_lot.workspace = true
+rusqlite.workspace = true
+# Not named in code: selects ring as the TLS provider tungstenite's rustls client uses.
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+tungstenite.workspace = true
+url.workspace = true
+uuid.workspace = true
+# Not named in code: tungstenite TRACE logs include raw handshake headers, and the
+# workspace spec compiles them out of drostje-host too.
+log.workspace = true
+
+[dev-dependencies]
+drostje-store.workspace = true
+image.workspace = true

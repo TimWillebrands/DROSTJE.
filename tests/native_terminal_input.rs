@@ -4,7 +4,7 @@ use ghostty_terminal::{Terminal, TerminalOptions};
 use gpui_kit::{component::Root, *};
 use std::{
     cell::RefCell,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -74,8 +74,8 @@ impl Render for Surface {
     }
 }
 
-async fn remote(nvim: &PathBuf, socket: &PathBuf, expression: &str) -> anyhow::Result<String> {
-    let (nvim, socket, expression) = (nvim.clone(), socket.clone(), expression.to_owned());
+async fn remote(nvim: &Path, socket: &Path, expression: &str) -> anyhow::Result<String> {
+    let (nvim, socket, expression) = (nvim.to_owned(), socket.to_owned(), expression.to_owned());
     smol::unblock(move || {
         let mut child = std::process::Command::new(nvim)
             .args(["--clean", "-n", "-i", "NONE", "--headless", "--server"])
@@ -108,8 +108,8 @@ async fn remote(nvim: &PathBuf, socket: &PathBuf, expression: &str) -> anyhow::R
 }
 
 async fn wait_for(
-    nvim: &PathBuf,
-    socket: &PathBuf,
+    nvim: &Path,
+    socket: &Path,
     expression: &str,
     expected: &str,
 ) -> anyhow::Result<()> {
@@ -130,8 +130,8 @@ async fn wait_for(
 async fn navigate_from_native(
     window: WindowHandle<Root>,
     surface: &Entity<Surface>,
-    nvim: &PathBuf,
-    socket: &PathBuf,
+    nvim: &Path,
+    socket: &Path,
     cx: &mut AsyncApp,
 ) -> anyhow::Result<()> {
     let state = "json_encode([mode(), getline(1, '$'), getcmdline(), getcmdpos(), getpos('.')])";

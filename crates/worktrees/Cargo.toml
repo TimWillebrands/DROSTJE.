@@ -1,0 +1,13 @@
+[package]
+name = "drostje-worktrees"
+description = "Pure naming and lifecycle rules for Conversation worktrees and their codename branches."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+drostje-model.workspace = true
+drostje-platform.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

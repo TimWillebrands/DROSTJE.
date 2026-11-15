@@ -4,6 +4,7 @@
 //! Native child views never cover GPUI overlays. No libghostty-vt renderer is used.
 
 mod clipboard;
+mod frame;
 pub mod input_surface;
 mod native;
 mod terminal;

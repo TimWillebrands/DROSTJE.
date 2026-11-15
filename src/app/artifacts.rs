@@ -624,7 +624,7 @@ mod tests {
     ) {
         let f = open(cx);
         let (thread, browser) = (f.thread, Uuid::new_v4());
-        f.state.update(cx, |state, cx| {
+        f.state.update(cx, |state, _| {
             state.artifact_events(thread, browser, "Scope".into(), vec![event("e1")]);
         });
         let first = delivered(&f.native);
@@ -643,7 +643,7 @@ mod tests {
         assert!(f.receipts.borrow().is_empty(), "dispatch is not delivery");
 
         // A second event waits for the first attempt; it is never merged into it.
-        f.state.update(cx, |state, cx| {
+        f.state.update(cx, |state, _| {
             state.artifact_events(thread, browser, "Scope".into(), vec![event("e2")]);
         });
         assert!(f.native.try_recv().is_err());
@@ -724,7 +724,7 @@ mod tests {
     ) {
         let f = open(cx);
         let (thread, browser) = (f.thread, Uuid::new_v4());
-        f.state.update(cx, |state, cx| {
+        f.state.update(cx, |state, _| {
             // A pending permission request holds artifact input back.
             state
                 .conversations
@@ -753,7 +753,7 @@ mod tests {
             Some("Answer the agent's pending request first")
         );
 
-        f.state.update(cx, |state, cx| {
+        f.state.update(cx, |state, _| {
             let mut restarted = ConversationSession::new(None);
             restarted.commands = state.conversations[&thread].commands.clone();
             restarted.state = ConversationState::Ready;
@@ -768,7 +768,7 @@ mod tests {
         );
         assert_eq!(f.receipts.borrow()[1].status, ReceiptStatus::Failed);
 
-        f.state.update(cx, |state, cx| {
+        f.state.update(cx, |state, _| {
             state.conversations.remove(&thread);
             state.artifact_events(thread, browser, "Scope".into(), vec![event("late")]);
         });
