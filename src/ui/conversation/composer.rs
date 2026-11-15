@@ -1,5 +1,3 @@
-//! The Conversation owns a vertical split, independent of its sidebar split.
-//! Only explicit resizing is persisted; transient queue/attachment height is not.
 use crate::model::ThreadId;
 use crate::ui::workspace::Workspace;
 use gpui_kit::{
@@ -105,8 +103,6 @@ impl Workspace {
         sizes.update(cx, |sizes, cx| {
             sizes.resize_panel(1, height + px(delta), window, cx);
         });
-        // The kit's on_resize callback is a mouse-drag completion hook.
-        // Programmatic resizing must persist its clamped result explicitly.
         if let Some(height) = sizes.read(cx).sizes().get(1).copied() {
             self.state.update(cx, |state, _| {
                 state.set_thread_composer_height(id, f32::from(height));

@@ -2429,6 +2429,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "drostje-lint"
+version = "0.1.0"
+
+[[package]]
 name = "drostje-model"
 version = "0.1.0"
 dependencies = [

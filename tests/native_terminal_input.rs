@@ -1,5 +1,3 @@
-//! Opt-in real-window regression: no providers, user configuration, or project files.
-//! Run with DROSTJE_NATIVE_INPUT_QA=1; requires a GUI session and Neovim on PATH.
 use ghostty_terminal::{Terminal, TerminalOptions};
 use gpui_kit::{component::Root, *};
 use std::{
@@ -174,7 +172,6 @@ async fn navigate_from_native(
             let surface = surface.read(cx);
             assert_eq!(&surface.navigation[dispatched..], &[direction], "{key}");
         })?;
-        // Allow native PTY input to settle before observing the real Neovim state.
         smol::Timer::after(Duration::from_millis(50)).await;
         anyhow::ensure!(
             remote(nvim, socket, state).await? == before,
@@ -201,9 +198,6 @@ async fn scenario(
     cx.update_window(window.into(), |_, window, cx| {
         terminal.update(cx, |terminal, cx| terminal.focus(window, cx))
     })?;
-    // Reproduce the old commit API's actual clipboard-paste semantics against
-    // the same Neovim process. Its bracketed paste must insert ':' into the
-    // buffer, not enter command mode. No mock PTY/echo or source inspection.
     let clipboard = cx.update(|cx| cx.read_from_clipboard());
     cx.update_window(window.into(), |_, window, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(":".into()));
@@ -235,8 +229,6 @@ async fn scenario(
     wait_for(&nvim, &socket, "mode()", "n").await?;
     remote(&nvim, &socket, "execute('enew!')").await?;
     wait_for(&nvim, &socket, "getline(1)", "").await?;
-    // These are native text commits, the exact seam used by OS text/IME input.
-    // With the old paste API ':' enters pasted text instead of command mode.
     cx.update_window(window.into(), |_, window, cx| {
         terminal.update(cx, |terminal, cx| {
             terminal.replace_text_in_range(None, ":", window, cx);
@@ -311,7 +303,6 @@ async fn scenario(
         })?;
     }
     wait_for(&nvim, &socket, "getline(1)", ":Gé").await?;
-    // Preedit stays local until committed, then reaches Neovim exactly once.
     cx.update_window(window.into(), |_, window, cx| {
         terminal.update(cx, |terminal, cx| {
             terminal.replace_and_mark_text_in_range(None, "界", Some(1..1), window, cx);

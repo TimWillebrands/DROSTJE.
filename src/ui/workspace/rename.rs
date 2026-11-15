@@ -1,5 +1,3 @@
-//! Inline rename of a project, Space or thread.
-
 use super::*;
 
 pub(super) struct InlineRename {

@@ -28,7 +28,6 @@ pub struct TextPage {
     pub has_older: bool,
 }
 
-/// Read a bounded page without doing filesystem work on the UI executor.
 pub async fn read_text(path: PathBuf, before: Option<u64>) -> Result<TextPage> {
     smol::unblock(move || text_page(path, before)).await
 }
@@ -48,7 +47,6 @@ fn text_page(path: PathBuf, before: Option<u64>) -> Result<TextPage> {
     file.seek(SeekFrom::Start(window_start))?;
     let mut bytes = vec![0; (requested_end - window_start) as usize];
     file.read_exact(&mut bytes)?;
-    // A live writer's trailing fragment is not a complete line yet.
     let end = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -72,7 +70,6 @@ fn text_page(path: PathBuf, before: Option<u64>) -> Result<TextPage> {
         }
     }
     if start == 0 && window_start != 0 {
-        // The bounded read may begin halfway through a line (or UTF-8 codepoint).
         file.seek(SeekFrom::Start(window_start - 1))?;
         let mut previous = [0];
         file.read_exact(&mut previous)?;
@@ -291,7 +288,6 @@ impl Projection {
 
     fn fold(&mut self, event: &EventEntry) {
         let payload = &event.payload;
-        // Paths are data, never commands. Preserve relative references as emitted.
         for key in ["artifactRef", "artifactPath", "logPath"] {
             if let Some(path) = string(payload, key).filter(|path| !path.is_empty()) {
                 self.artifacts.insert(PathBuf::from(path));
@@ -432,14 +428,11 @@ impl Projection {
                     bounded_push(&mut self.diagnostics, diagnostic);
                 }
             }
-            // Includes agent-note: advisory notes cannot complete tasks or runs.
             _ => {}
         }
     }
 }
 
-/// Inode identity, length and timestamps: together they change whenever a file's
-/// contents, permissions or directory entries change.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     identity: (u64, u64),
@@ -458,8 +451,6 @@ impl Stamp {
         }
     }
 
-    /// A listing taken within the filesystem's timestamp granularity of the last
-    /// change could miss a second change that leaves the timestamps equal.
     fn settled(&self) -> bool {
         const SETTLE_SECONDS: i64 = 3;
         let now = SystemTime::now()
@@ -480,9 +471,7 @@ struct EventFile {
     projection: Projection,
     replay: bool,
     unavailable: Option<String>,
-    /// Normalized `run-started` log paths, derived whenever the projection changes.
     log_paths: Vec<PathBuf>,
-    /// Scan generation of the last change to the projection or availability.
     changed_at: u64,
 }
 
@@ -500,7 +489,6 @@ impl EventFile {
                 }
                 Ok((file, metadata))
             });
-        // Opening fails before any state changes; reading may change it partway.
         let (read, error) = match opened {
             Ok((file, metadata)) => match self.read(file, &metadata, path) {
                 Ok(read) => (read, None),
@@ -522,7 +510,6 @@ impl EventFile {
         self.unavailable = unavailable;
     }
 
-    /// The same early return as `read`, decided by `stat` without opening the file.
     fn unchanged_on_disk(&self, path: &Path) -> bool {
         fs::metadata(path).is_ok_and(|metadata| {
             let stamp = Stamp::of(&metadata);
@@ -534,7 +521,6 @@ impl EventFile {
         })
     }
 
-    /// Returns whether anything was (re)read.
     fn read(&mut self, mut file: File, metadata: &fs::Metadata, path: &Path) -> Result<bool> {
         let stamp = Stamp::of(metadata);
         let identity = stamp.identity;
@@ -600,8 +586,6 @@ impl EventFile {
     }
 }
 
-/// Lexical normalization plus existing-ancestor canonicalization handles deleted
-/// log files, `..`, and symlinked shared roots without prefix-string collisions.
 fn normalized(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
@@ -644,21 +628,17 @@ enum Listed {
     File(PathBuf),
 }
 
-/// A directory's discovered entries in `read_dir` order, valid while its stamp holds.
 struct Listing {
     stamp: Stamp,
     entries: Vec<Listed>,
 }
 
-/// One shared `data_root/events` tree as of the latest scan.
 struct Root {
     files: BTreeSet<PathBuf>,
     diagnostics: Vec<String>,
-    /// Latest generation that changed the file set, its diagnostics or any of its files.
     changed_at: u64,
 }
 
-/// What a launch's last snapshot was derived from.
 struct Evaluation {
     generation: u64,
     launch: FactoryLaunch,
@@ -669,7 +649,6 @@ struct Evaluation {
 
 const NO_FILES: &BTreeSet<PathBuf> = &BTreeSet::new();
 
-/// The launch's liveness as the actor reports it, else as last persisted.
 pub(super) fn liveness_of(
     launch: &FactoryLaunch,
     liveness: &BTreeMap<LaunchId, Liveness>,
@@ -682,7 +661,6 @@ pub(super) fn liveness_of(
     })
 }
 
-/// Correlation candidates in path order: the shared tree plus the recorded path.
 fn candidates<'a>(
     root: &'a BTreeSet<PathBuf>,
     stored: Option<&'a PathBuf>,
@@ -697,15 +675,10 @@ fn candidates<'a>(
     before.chain(extra).chain(after.into_iter().flatten())
 }
 
-/// Incremental observer of Factory event logs. Each scan is `observe` (stat files,
-/// read what changed) followed by `snapshot` per launch; `unchanged` tells whether a
-/// launch's last snapshot would be reproduced exactly from the observed files, apart
-/// from transcript availability, which only `snapshot` checks.
 pub(super) struct EventTracker {
     files: BTreeMap<PathBuf, EventFile>,
     roots: BTreeMap<PathBuf, Root>,
     listings: BTreeMap<PathBuf, Listing>,
-    /// Recorded event path to its normalized form.
     stored: BTreeMap<PathBuf, PathBuf>,
     evaluated: BTreeMap<LaunchId, Evaluation>,
     generation: u64,
@@ -724,18 +697,14 @@ impl EventTracker {
     }
 
     pub(super) fn refresh(&mut self) {
-        // Keep previous projections if their files disappeared; replay replaces
-        // rather than appends only once the source can actually be opened.
         for file in self.files.values_mut() {
             file.replay = true;
         }
-        // An explicit rescan trusts no cached listing, path or snapshot.
         self.listings.clear();
         self.stored.clear();
         self.evaluated.clear();
     }
 
-    /// Discover event files and read whatever changed since the previous scan.
     pub(super) fn observe<'a>(&mut self, launches: impl IntoIterator<Item = &'a FactoryLaunch>) {
         self.generation += 1;
         let generation = self.generation;
@@ -798,7 +767,6 @@ impl EventTracker {
                 })
                 .update(path, generation);
         }
-        // Files outside every tree and record can never be a candidate again.
         self.files.retain(|path, _| paths.contains(path));
         for root in self.roots.values_mut() {
             root.changed_at = root
@@ -821,7 +789,6 @@ impl EventTracker {
         let stamp = fs::metadata(directory)
             .ok()
             .map(|metadata| Stamp::of(&metadata));
-        // A stale listing is removed here and replaced by the fresh read below.
         if let Some(stamp) = stamp
             && let Some(listing) = self.listings.remove(directory)
             && listing.stamp == stamp
@@ -849,7 +816,6 @@ impl EventTracker {
                 return;
             }
         };
-        // A regular file's canonical path is its canonical directory plus its name.
         let mut base = None;
         let mut listed = Vec::new();
         let mut complete = true;
@@ -903,9 +869,6 @@ impl EventTracker {
         }
     }
 
-    /// Whether `snapshot` would reproduce this launch's previous snapshot, except for
-    /// transcript availability. False until the launch has been snapshotted since the
-    /// last `refresh`.
     pub(super) fn unchanged(
         &self,
         launch: &FactoryLaunch,
@@ -928,7 +891,6 @@ impl EventTracker {
             })
     }
 
-    /// Project one launch from the files read by the preceding `observe`.
     pub(super) fn snapshot(
         &mut self,
         launch: &FactoryLaunch,
@@ -1030,8 +992,6 @@ impl EventTracker {
                 "No event log matches this launch's exact log directory; launch outcome unknown"
                     .into(),
             );
-            // Compatibility and decode failures explain an otherwise opaque
-            // missing correlation; do not borrow another run's semantic state.
             for candidate in candidates(root_paths, stored) {
                 if let Some(file) = self.files.get(candidate) {
                     for diagnostic in &file.projection.diagnostics {
@@ -1061,8 +1021,6 @@ impl EventTracker {
         let file = &self.files[path];
         let projection = &file.projection;
         snapshot.launch.event_path = Some(path.clone());
-        // A replay is a replacement: removed semantic records must not leave
-        // stale attempt/story associations in the derived projection.
         snapshot.launch.work_item_id = projection.story_id;
         snapshot.launch.attempt_id = projection.attempt_id.clone();
         snapshot.reported_state = projection.state.clone();

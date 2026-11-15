@@ -20,21 +20,14 @@ use gpui_kit::{
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use uuid::Uuid;
 
-/// How a transcript message takes part in a run of consecutive tool calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RunPart {
-    /// Visible content that ends a run.
     Break,
-    /// Renders nothing (a result shown on its call's card, a hidden harness note).
     Transparent,
-    /// Visible content followed by this many tool calls, which start a run.
     Opens(usize),
-    /// Only tool calls and reasoning, which continue a run.
     Calls(usize),
 }
 
-/// Consecutive tool calls across messages: `head` renders the run's header, rows up to
-/// `end` belong to it. Only a run of two or more calls folds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ToolRun {
     pub(super) head: usize,
@@ -48,9 +41,6 @@ impl ToolRun {
     }
 }
 
-/// Where a message's trailing tool calls start, and how many there are. Reasoning and blank
-/// text between them belong to the run; a `todo` call keeps its own card, and an artifact
-/// is content, never folded away inside a run of calls.
 pub(super) fn trailing_calls(content: &[ContentBlock]) -> Option<(usize, usize)> {
     let start = content
         .iter()
@@ -97,7 +87,6 @@ pub(super) fn run_part(message: &Message, session: &ConversationSession) -> RunP
     }
 }
 
-/// The run of tool calls the message at `index` belongs to, if any.
 pub(super) fn tool_run(
     part: impl Fn(usize) -> RunPart,
     len: usize,
@@ -131,21 +120,16 @@ pub(super) fn tool_run(
     Some(ToolRun { head, end, calls })
 }
 
-/// Runs of the transcript as of one revision, found once per row instead of once per frame.
-/// Every row of a run shares its run, so finding it for one row settles all of them.
 #[derive(Clone, Default)]
 pub(super) struct RunCache(Rc<RefCell<RunCacheState>>);
 
 #[derive(Default)]
 struct RunCacheState {
-    /// The session generation and transcript revision the runs were found in.
     revision: Option<(Uuid, u64)>,
     runs: HashMap<usize, Option<ToolRun>>,
 }
 
 impl RunCache {
-    /// The run the message at `index` belongs to, as `tool_run` finds it. Every input of
-    /// `run_part` (messages, which calls were seen, hidden notes) changes the revision.
     pub(super) fn run(&self, session: &ConversationSession, index: usize) -> Option<ToolRun> {
         let revision = (session.generation, session.transcript_revision);
         let len = session.messages.len();
@@ -182,8 +166,6 @@ impl RunCache {
     }
 }
 
-/// The folded face of a run: how many calls, the latest one, and what is running, failed or
-/// unknown, so nothing that needs attention hides behind the fold.
 #[expect(
     clippy::too_many_arguments,
     reason = "the run header takes the row context message() renders with"
@@ -229,7 +211,6 @@ pub(super) fn tool_run_header(
             latest = Some((intent.unwrap_or(name), name, input));
         }
     }
-    // Only the latest call shows, and only while the run is folded.
     let latest = latest
         .filter(|_| !expanded)
         .map(|(caption, name, input)| (caption.to_owned(), tool_summary(name, input)));
@@ -428,7 +409,6 @@ mod tests {
             first + 1,
             "rows of a found run and a row without one are not looked at again"
         );
-        // A new revision finds the runs again.
         assert_eq!(
             cache.find((uuid::Uuid::nil(), 2), parts.len(), 3, part),
             run
@@ -462,7 +442,6 @@ mod tests {
             assert_eq!(run(index), first, "row {index}");
         }
         assert_eq!(run(6), None);
-        // A lone call is a run that does not fold; prose with calls starts a new run.
         let lone = run(7).unwrap();
         assert_eq!((lone.head, lone.end, lone.folds()), (7, 8, false));
         assert_eq!(
@@ -473,7 +452,6 @@ mod tests {
                 calls: 2
             })
         );
-        // Hidden rows before any call belong to no run.
         assert_eq!(tool_run(|ix| [Break, Transparent][ix], 2, 1), None);
     }
 }

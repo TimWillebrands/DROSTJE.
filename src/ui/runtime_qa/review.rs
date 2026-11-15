@@ -1,4 +1,3 @@
-//! Review sidebar: tracker failures and review threads.
 use super::*;
 
 #[gpui_kit::test]
@@ -14,8 +13,6 @@ async fn review_sidebar_shows_tracker_failures_and_review_threads(cx: &mut TestA
             state.save_worktree(Worktree {
                 id,
                 project_id: project.id,
-                // The project checkout stands in for the worktree directory: its `origin` is
-                // not on Azure DevOps, so a real read fails without contacting a tracker.
                 path: project.root.clone(),
                 codename: "quiet-forest".into(),
                 branch: "drostje/review".into(),

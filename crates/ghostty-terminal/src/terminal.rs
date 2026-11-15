@@ -18,7 +18,6 @@ use std::{
     sync::Arc,
 };
 
-/// An opaque terminal color. Native configuration receives packed RGB bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalColor {
     pub r: u8,
@@ -62,8 +61,6 @@ impl TerminalTheme {
     }
 }
 
-/// Commands are executable + argv, never shell source. With no program, Ghostty
-/// resolves the account's default shell and starts its normal interactive session.
 #[non_exhaustive]
 pub struct TerminalOptions {
     pub working_directory: PathBuf,
@@ -86,7 +83,6 @@ impl TerminalOptions {
     }
 }
 
-/// Exit means Ghostty observed the actual child exit, not a successful command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalStatus {
     Running,
@@ -96,8 +92,6 @@ pub enum TerminalStatus {
 
 type SurfaceOwner = Rc<RefCell<Option<NativeSurface>>>;
 
-/// Retained by GPUI's frame state, not by Terminal. Losing the drawn element
-/// drops this lease and occludes the backend even if tab owners retain entities.
 struct FrameLease(SurfaceOwner);
 impl Drop for FrameLease {
     fn drop(&mut self) {
@@ -108,9 +102,6 @@ impl Drop for FrameLease {
     }
 }
 
-/// Owns a real libghostty child and native GPU renderer. `close` takes the native
-/// resource out of its shared cell, so frame leases and cloned entities cannot
-/// postpone process teardown. The wakeup task holds only a WeakEntity.
 pub struct Terminal {
     surface: SurfaceOwner,
     focus: FocusHandle,
@@ -128,10 +119,6 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    /// Must run on the owning platform thread outside render. NSView/Metal and
-    /// Wayland/EGL construction require it. Ghostty's own font/default-shell
-    /// discovery is synchronous here; application config/file I/O is not added.
-    /// Unsupported window handles fail before any native process is started.
     pub fn spawn<T: 'static>(
         options: TerminalOptions,
         window: &mut Window,
@@ -189,7 +176,6 @@ impl Terminal {
                 cx.observe_window_activation(window, |terminal: &mut Self, window, _| {
                     terminal.sync_focus(window)
                 }),
-                // The composed frame lives in this window's atlas until dropped there.
                 cx.on_release_in(window, |terminal: &mut Self, window, _| {
                     terminal.frame.release(window)
                 }),
@@ -231,8 +217,6 @@ impl Terminal {
         })
         .unwrap_or(TerminalStatus::Closed)
     }
-    /// Snapshot native identities on the platform thread; inspect processes off it.
-    /// Missing process information remains conservative, without requiring shell integration.
     pub fn needs_confirm_quit(&self, cx: &App) -> Task<bool> {
         if self.status() != TerminalStatus::Running {
             return Task::ready(false);
@@ -256,7 +240,6 @@ impl Terminal {
         self.focus.focus(window, cx);
         self.sync_focus(window);
     }
-    /// Hiding pauses native drawing, not the shell. Showing is completed by paint.
     pub fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
         if !visible {
@@ -273,7 +256,6 @@ impl Terminal {
     pub fn update_theme(&mut self, theme: TerminalTheme) {
         self.with_surface(|surface| surface.update_theme(&theme.packed()));
     }
-    /// Explicit, idempotent teardown; cloned Entity and frame references are inert.
     pub fn close(&mut self) {
         self.tick_task = None;
         self.frame.clear();
@@ -281,8 +263,6 @@ impl Terminal {
         self.composition.clear();
         self.surface.borrow_mut().take();
     }
-    /// Read Ghostty's completed GPU frame without exposing native ownership.
-    /// The image is the caller's; if they paint it, they drop it from the atlas.
     pub fn snapshot(&mut self) -> Result<Arc<RenderImage>, String> {
         self.capture_frame()?
             .ok_or_else(|| "Terminal frame is not ready".into())
@@ -313,8 +293,6 @@ impl Terminal {
                         terminal.with_surface(|surface| surface.tick());
                         terminal.service_clipboard(cx);
                         terminal.frame_dirty = true;
-                        // The native GPU frame is composed by GPUI, so render wakeups
-                        // invalidate this entity. Parents can observe actual exit here.
                         cx.notify();
                     })
                     .is_err()
@@ -391,9 +369,6 @@ impl Terminal {
             ElementInputHandler::new(bounds, cx.entity()),
             cx,
         );
-        // GPUI's macOS surface import only supports YUV video, not BGRA; its
-        // Linux renderer has no EGL import. Compose cached native-renderer
-        // readbacks on both platforms so clipping and overlays remain correct.
         if self.frame_dirty {
             match self.capture_frame() {
                 Ok(Some(frame)) => {
@@ -401,7 +376,6 @@ impl Terminal {
                     self.backend_error = None;
                     self.frame_dirty = false;
                 }
-                // Metal installs its first completed frame asynchronously.
                 Ok(None) => {}
                 Err(error) => self.backend_error = Some(error),
             }
@@ -411,8 +385,6 @@ impl Terminal {
         }
     }
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        // Text/IME enters exclusively through EntityInputHandler. Special and
-        // modified keys go through Ghostty's key protocol, after GPUI actions.
         if !self.composition.is_empty() {
             return;
         }
@@ -562,8 +534,6 @@ impl Render for Terminal {
     }
 }
 
-// Terminals do not expose editable scrollback as a document. The only native
-// text range is the uncommitted IME preedit; committing sends it exactly once.
 impl EntityInputHandler for Terminal {
     fn text_for_range(
         &mut self,
@@ -819,11 +789,7 @@ fn unshifted_key(key: &str) -> (&str, bool) {
 
 #[cfg(target_os = "macos")]
 fn native_keycode(key: &str) -> Option<u32> {
-    // Native values mirror Ghostty's pinned macOS keycode table. GPUI does
-    // not expose NSEvent.keyCode, so keys it collapses (notably the keypad)
-    // cannot be distinguished here.
     Some(match key {
-        // ANSI printable keys, ordered by macOS virtual keycode.
         "a" => 0,
         "s" => 1,
         "d" => 2,
@@ -872,7 +838,6 @@ fn native_keycode(key: &str) -> Option<u32> {
         "." => 47,
         "`" => 50,
 
-        // Editing and navigation keys emitted by GPUI.
         "enter" | "return" => 36,
         "tab" => 48,
         "space" => 49,
@@ -889,7 +854,6 @@ fn native_keycode(key: &str) -> Option<u32> {
         "down" => 125,
         "up" => 126,
 
-        // Function keys available in Ghostty's macOS keycode table.
         "f1" => 122,
         "f2" => 120,
         "f3" => 99,
@@ -916,7 +880,6 @@ fn native_keycode(key: &str) -> Option<u32> {
 
 #[cfg(target_os = "linux")]
 fn native_keycode(key: &str) -> Option<u32> {
-    // XKB keycodes used by Ghostty's Linux key table (evdev codes plus 8).
     Some(match key {
         "escape" => 9,
         "1" => 10,

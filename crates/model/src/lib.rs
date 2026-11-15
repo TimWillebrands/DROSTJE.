@@ -33,7 +33,6 @@ pub struct DraftSnapshot {
     pub generation: Uuid,
     pub changedtick: u64,
     pub text: String,
-    /// Zero-based buffer row and UTF-8 byte column (not screen cells).
     pub cursor: (usize, usize),
 }
 impl DraftSnapshot {
@@ -45,9 +44,6 @@ impl DraftSnapshot {
     }
 }
 
-/// How to write `/name` into `draft`: replace the first `end` bytes of its first line with
-/// the returned text. A leading `/word` is the command being completed and is replaced
-/// together with one following blank; any other text is kept as the command's arguments.
 pub fn slash_command_insertion(draft: &str, name: &str) -> (usize, String) {
     let line = draft.split('\n').next().unwrap_or("");
     let end = line
@@ -115,8 +111,6 @@ pub struct ImageAttachment {
     pub height: u32,
     pub original: Option<PathBuf>,
 }
-/// A prompt written while a turn was in flight, waiting to start its own turn once the
-/// conversation is idle again. Attachments move out of the composer with the text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedMessage {
     pub id: Uuid,
@@ -125,7 +119,6 @@ pub struct QueuedMessage {
     pub attachments: Vec<ImageAttachment>,
 }
 impl QueuedMessage {
-    /// The first non-empty line, for one-line rows; the full text stays in the message.
     pub fn preview(&self) -> String {
         let line = self
             .text
@@ -169,25 +162,15 @@ pub struct FactoryThreadConfig {
     pub target_branch: String,
 }
 
-/// A linked Git worktree that Conversations run in. Several threads may share one; the
-/// directory keeps its codename for life while the branch is renamed once from the first
-/// generated title. A removed worktree keeps its row so archived threads still explain
-/// themselves.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worktree {
     pub id: WorktreeId,
     pub project_id: ProjectId,
-    /// Absolute directory under the data directory.
     pub path: PathBuf,
-    /// Stable two-word directory name.
     pub codename: String,
-    /// The branch DROSTJE. created; the agent may have moved on, Git is the truth.
     pub branch: String,
-    /// Local branch the worktree started from.
     pub base: String,
-    /// Whether the one-time rename from the generated title has been settled.
     pub named: bool,
-    /// The Conversation whose generated title may rename the branch.
     pub created_by: ThreadId,
     pub created_at: String,
     pub removed_at: Option<String>,
@@ -198,8 +181,6 @@ impl Worktree {
     }
 }
 
-/// What the issue tracker last reported about a pull request. An unrecognised state is kept
-/// raw, never mapped to open or closed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PullRequestState {
@@ -209,7 +190,6 @@ pub enum PullRequestState {
     Unknown(String),
 }
 impl PullRequestState {
-    /// Completed or abandoned: the Conversation's work has ended either way.
     pub fn closed(&self) -> bool {
         match self {
             Self::Completed | Self::Abandoned => true,
@@ -218,25 +198,18 @@ impl PullRequestState {
     }
 }
 
-/// A pull request pinned to a worktree Conversation once the tracker found exactly one for
-/// its branch. Pinned so its closure is still observed after the branch is deleted or the
-/// agent switches away; the fields other than `id` are the tracker's last report.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestLink {
     pub id: u64,
     pub url: String,
     pub title: String,
     pub state: PullRequestState,
-    /// Linked work item IDs, in the tracker's order.
     #[serde(default)]
     pub work_items: Vec<u64>,
-    /// DROSTJE. archived the Conversation when this pull request closed. Archiving happens
-    /// once: a Conversation the user unarchives afterwards stays.
     #[serde(default)]
     pub archived_on_close: bool,
 }
 
-/// A host project key, never a desktop or arbitrary remote filesystem path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteLocation {
     pub host: String,
@@ -253,30 +226,21 @@ pub struct Thread {
     pub harness: String,
     pub session_ref: Option<String>,
     pub model: Option<ModelKey>,
-    /// Harness effort level; `None` means the harness default.
     #[serde(default)]
     pub effort: Option<String>,
-    /// Harness permission mode (Claude Code `--permission-mode`); `None` means the harness default.
     #[serde(default)]
     pub permission_mode: Option<String>,
-    /// The Conversation's worktree; `None` means the project root. Fixed at creation because
-    /// harness sessions are pinned to the directory they started in.
     #[serde(default)]
     pub worktree_id: Option<WorktreeId>,
-    /// Execution location selected before the first turn; absent in legacy local threads.
     #[serde(default)]
     pub remote: Option<RemoteLocation>,
-    /// Once a submission is persisted, execution location can never be reassigned.
     #[serde(default)]
     pub execution_started: bool,
-    /// The pull request this Conversation's worktree branch was pinned to; see
-    /// [`PullRequestLink`]. Never set on project-root or Factory threads.
     #[serde(default)]
     pub pull_request: Option<PullRequestLink>,
     pub draft: String,
     pub attachments: Vec<ImageAttachment>,
     pub submission: Option<Value>,
-    /// Prompts waiting for the current turn to finish, in send order.
     #[serde(default)]
     pub queued: Vec<QueuedMessage>,
     pub archived: bool,

@@ -1,5 +1,3 @@
-//! Conversation title generator settings: which settings the generator reads, the model
-//! choices built from the installed models, and the "Conversation titles" group.
 use super::{
     SurfaceContent,
     fields::{Choice, field_error},
@@ -14,12 +12,9 @@ use gpui_kit::{
     *,
 };
 
-/// Title model select value that reveals the Hugging Face reference field.
 pub(super) const OTHER_LLAMA_MODEL: &str = "<other>";
-/// Settings field for a llama.cpp model that is not in the cache yet.
 pub(super) const LLAMA_MODEL_REFERENCE: &str = "llama_title_model_reference";
 
-/// Conversation title settings the selected generator reads, in display order.
 pub(super) fn title_setting_keys(provider: &str, llama_model: &str) -> Vec<&'static str> {
     let llama = provider != "ollama";
     let ollama = provider != "llama_cpp";
@@ -36,8 +31,6 @@ pub(super) fn title_setting_keys(provider: &str, llama_model: &str) -> Vec<&'sta
     keys
 }
 
-/// The default, every cached model, the saved model when the cache lacks it (llama.cpp
-/// downloads it on first use), and an entry for naming another model.
 pub(super) fn llama_model_choices(
     cached: Option<&Result<Vec<String>, String>>,
     selected: &str,
@@ -53,7 +46,6 @@ pub(super) fn llama_model_choices(
             _ => format!("Default ({default})"),
         },
     )];
-    // The default is listed separately only when it was chosen explicitly.
     choices.extend(
         cached
             .into_iter()
@@ -75,8 +67,6 @@ pub(super) fn llama_model_choices(
     choices
 }
 
-/// The first-installed default, every installed model, and the saved model when Ollama is
-/// known not to have it.
 pub(super) fn ollama_model_choices(
     installed: Option<&Result<Vec<String>, String>>,
     selected: &str,
@@ -109,7 +99,6 @@ pub(super) fn ollama_model_choices(
     choices
 }
 
-/// The llama.cpp model to save: the selected entry, or the typed reference for another model.
 pub(super) fn chosen_llama_model(selected: String, reference: String) -> anyhow::Result<String> {
     if selected != OTHER_LLAMA_MODEL {
         return Ok(selected);
@@ -127,7 +116,6 @@ pub(super) fn chosen_llama_model(selected: String, reference: String) -> anyhow:
 }
 
 impl SurfaceContent {
-    /// Rebuilds the title model choices when an inspection lands, keeping the draft selection.
     pub(super) fn refresh_title_model_choices(
         &mut self,
         window: &mut Window,
@@ -257,12 +245,10 @@ mod tests {
                 (OTHER_LLAMA_MODEL, "Other Hugging Face model…", false),
             ]
         );
-        // Unknown cache: the saved model is listed without a claim about its download.
         assert_eq!(
             shown(&llama_model_choices(None, "org/b-GGUF:Q4_0"))[1],
             ("org/b-GGUF:Q4_0", "org/b-GGUF:Q4_0", false)
         );
-        // A cached default appears once, unless it was chosen explicitly.
         let cached = Ok(vec![default.to_owned()]);
         assert_eq!(
             shown(&llama_model_choices(Some(&cached), "")),

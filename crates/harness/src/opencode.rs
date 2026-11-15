@@ -1,11 +1,3 @@
-//! OpenCode over the Agent Client Protocol (`opencode acp`): JSON-RPC 2.0, one JSON
-//! object per line on stdio. Only this module knows ACP wire fields.
-//!
-//! Lifecycle: `initialize`, then `session/load` for a saved session (OpenCode replays its
-//! history as `session/update` notifications before answering) or `session/new`, then the
-//! saved model, effort and mode are applied with `session/set_config_option`. Only then is
-//! the conversation `Ready`. A `session/prompt` answers once, when its turn ends; a prompt
-//! sent while a turn runs is folded into that turn by OpenCode.
 use super::stdio::{Commands, StdioChild, sleep_for};
 use super::*;
 use anyhow::{Context, Result, bail, ensure};
@@ -21,14 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Largest outgoing frame, newline included. Images travel inline as base64.
 const FRAME: usize = 1_048_576;
 const TRANSCRIPT: &str = "conversation.jsonl";
-/// OpenCode loads providers and plugins before answering `initialize` and `session/*`.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
-/// OpenCode lists its commands right after a session opens; silence means none will come.
 const COMMANDS_TIMEOUT: Duration = Duration::from_secs(10);
-/// Session ids are 30 characters today; the size bound assumes more.
 const SESSION_ID_BOUND: usize = 64;
 
 fn prompt_frame(session: &str, prompt: Vec<Value>, id: u64) -> Value {
@@ -36,7 +24,6 @@ fn prompt_frame(session: &str, prompt: Vec<Value>, id: u64) -> Value {
         "params":{"sessionId":session,"prompt":prompt}})
 }
 
-/// Upper bound of the `session/prompt` frame for this text and these image byte lengths.
 pub(super) fn submission_size_for_lengths(text: &str, images: &[(&str, u64)]) -> Result<u64> {
     let prompt = std::iter::once(json!({"type":"text","text":text}))
         .chain(
@@ -68,7 +55,6 @@ pub(super) fn submission_size(text: &str, images: &[ImageAttachment]) -> Result<
     submission_size_for_lengths(text, &lengths)
 }
 
-/// The session a saved reference names, after checking it belongs to this project.
 fn saved_session(reference: &str, cwd: &Path) -> Result<String> {
     let saved: Value = serde_json::from_str(reference).context(
         "Invalid saved OpenCode session reference; create a new conversation explicitly",
@@ -153,13 +139,11 @@ pub(super) async fn open(mut config: ConversationConfig) -> Result<ConversationH
     Ok(ConversationHandle { commands, events })
 }
 
-/// What an outstanding client request is for.
 #[derive(Debug)]
 enum Pending {
     Initialize,
     NewSession,
     LoadSession,
-    /// A saved model, effort or mode applied before the conversation reports `Ready`.
     Setup,
     SelectModel(ModelKey),
     Prompt(Uuid),
@@ -176,7 +160,6 @@ enum Phase {
 struct UserTurn {
     id: Uuid,
     rpc: u64,
-    /// OpenCode answered or streamed for this prompt, so it holds the text.
     accepted: bool,
 }
 
@@ -184,20 +167,16 @@ struct PeerAttempt {
     attempt: Uuid,
     rpc: u64,
     messages: Vec<PeerMessage>,
-    /// The attempt owns a turn: it was sent while idle, or outlived the user turn it joined.
     turn: bool,
     started: bool,
     accepted: bool,
 }
 
-/// One unanswered `session/request_permission`.
 struct Permission {
     rpc: Value,
-    /// `(optionId, name, kind)` as OpenCode offered them.
     options: Vec<(String, String, String)>,
 }
 
-/// A tool call assembled from `tool_call` and its `tool_call_update`s.
 #[derive(Clone, Debug, Default)]
 struct ToolState {
     name: String,
@@ -218,7 +197,6 @@ impl ToolState {
     }
 }
 
-/// Local records that recognise replayed prompt text DROSTJE. sent.
 #[derive(Default)]
 struct Records {
     users: HashMap<String, Vec<ImageAttachment>>,
@@ -247,8 +225,6 @@ impl Records {
         }
     }
 
-    /// How a stored message is shown: replayed prompts DROSTJE. sent regain their images,
-    /// and peer context is shown as the peer messages it carried.
     fn present(&self, message: &Message) -> Message {
         if message.role != "user" {
             return message.clone();
@@ -320,12 +296,10 @@ struct Actor {
     session_ref: String,
     image_input: bool,
     config_options: Value,
-    /// Config ids still to apply during setup, in order.
     setup: VecDeque<&'static str>,
     replaying: bool,
     transcript: File,
     records: Records,
-    /// Conversation messages in order; `message_ix` finds one by id.
     messages: Vec<Message>,
     message_ix: HashMap<String, usize>,
     dirty: Vec<String>,
@@ -394,8 +368,6 @@ impl Actor {
         })
     }
 
-    /// Coalesced transcript updates go out before any later event, so a settled turn is
-    /// never reported ahead of its final text.
     fn emit(&mut self, event: ConversationEvent) {
         if !matches!(
             event,
@@ -595,7 +567,6 @@ impl Actor {
                     let session = self.session_id()?;
                     self.notify("session/cancel", json!({"sessionId":session}))?;
                     self.interrupting = true;
-                    // ACP: the client answers pending permission requests as cancelled.
                     for (request_id, permission) in std::mem::take(&mut self.permissions) {
                         self.respond(permission.rpc, json!({"outcome":{"outcome":"cancelled"}}))?;
                         self.emit(ConversationEvent::UserRequestDismissed { request_id });
@@ -754,7 +725,6 @@ impl Actor {
         Ok(())
     }
 
-    /// The peer attempt now runs as its own turn in OpenCode.
     fn start_peer(&mut self) {
         let Some(peer) = self.peer.as_mut().filter(|peer| peer.turn && !peer.started) else {
             return;
@@ -802,7 +772,6 @@ impl Actor {
         });
     }
 
-    /// Ends an unconfirmed peer attempt without a turn of its own.
     fn stop_peer(&mut self, outcome: PeerDeliveryOutcome) {
         let Some(peer) = self.peer.take() else {
             return;
@@ -833,7 +802,6 @@ impl Actor {
         self.permissions.clear();
     }
 
-    /// Any update while a prompt is outstanding proves OpenCode is working on it.
     fn observe_activity(&mut self) {
         if self.replaying {
             return;
@@ -953,7 +921,6 @@ impl Actor {
         self.advance_setup()
     }
 
-    /// Applies the next saved setting that differs from OpenCode's, or reports `Ready`.
     fn advance_setup(&mut self) -> Result<()> {
         while let Some(config_id) = self.setup.pop_front() {
             let wanted = match config_id {
@@ -1193,7 +1160,6 @@ impl Actor {
                 }
             }
             self.permissions.clear();
-            // A peer prompt that joined this turn and is still unanswered runs on alone.
             if let Some(peer) = self.peer.as_mut().filter(|peer| !peer.turn) {
                 peer.turn = true;
                 self.start_peer();
@@ -1216,7 +1182,6 @@ impl Actor {
                     });
                 }
                 _ if stop == "cancelled" && !accepted => {
-                    // Cancelled before OpenCode showed any work on it.
                     self.stop_peer(PeerDeliveryOutcome::Unknown(
                         "Interrupted before OpenCode confirmed the peer context".into(),
                     ));
@@ -1320,7 +1285,6 @@ impl Actor {
                     .map(str::to_owned)
                     .unwrap_or_else(|| self.trailing_id(role));
                 let block = self.chunk_block(&update["content"], kind == "agent_thought_chunk");
-                // The frame is not read again; the chunk keeps its update as raw data.
                 let raw = frame["params"]["update"].take();
                 self.append_chunk(&id, role, block, raw);
             }
@@ -1370,8 +1334,6 @@ impl Actor {
         Ok(())
     }
 
-    /// The id of the last message when it has `role`, else a fresh one, for chunks
-    /// without a `messageId`.
     fn trailing_id(&self, role: &str) -> String {
         match self.messages.last() {
             Some(message) if message.role == role && message.tool_call_id.is_none() => {
@@ -1402,7 +1364,6 @@ impl Actor {
         }
     }
 
-    /// Appends in place; the message reaches the display once per loop pass via `mark`.
     fn append_chunk(&mut self, id: &str, role: &str, block: ContentBlock, raw: Value) {
         let ix = match self.message_ix.get(id) {
             Some(&ix) => ix,
@@ -1479,7 +1440,6 @@ impl Actor {
     }
 }
 
-/// Appends a streamed chunk, joining it to the previous block of the same kind.
 fn append_block(content: &mut Vec<ContentBlock>, block: ContentBlock) {
     match (content.last_mut(), block) {
         (Some(ContentBlock::Text(previous)), ContentBlock::Text(text)) => previous.push_str(&text),
@@ -1490,8 +1450,6 @@ fn append_block(content: &mut Vec<ContentBlock>, block: ContentBlock) {
     }
 }
 
-/// Folds one `tool_call` or `tool_call_update` into the call's state. The first title is
-/// OpenCode's tool name; a later, different title describes this call.
 fn merge_tool(tool: &mut ToolState, update: &Value) {
     if let Some(title) = update["title"].as_str().filter(|title| !title.is_empty()) {
         if tool.name.is_empty() {
@@ -1515,7 +1473,6 @@ fn merge_tool(tool: &mut ToolState, update: &Value) {
     tool.raw = update.clone();
 }
 
-/// OpenCode names files `filePath`; the conversation view reads `path`.
 fn normalize_input(input: &Value) -> Value {
     let mut input = input.clone();
     if input.get("path").is_none()
@@ -1588,8 +1545,6 @@ fn option_values(option: &Value) -> impl Iterator<Item = &str> {
         .filter_map(|choice| choice["value"].as_str())
 }
 
-/// The model catalog from the `model` config option. Effort levels are only known for the
-/// current model: OpenCode lists them once that model is selected.
 fn parse_models(options: &Value, image: bool) -> Vec<ModelChoice> {
     let Some(model) = config_option(options, "model") else {
         return Vec::new();
@@ -1690,7 +1645,6 @@ fn stop_notice(stop: &str) -> Option<&'static str> {
     }
 }
 
-/// Presents a permission request with OpenCode's own options, in its order.
 fn permission_request(
     request_id: String,
     params: &Value,
@@ -1741,7 +1695,6 @@ fn permission_request(
     (request, options)
 }
 
-/// The ACP outcome for an answer, or `None` when OpenCode offered nothing that matches.
 fn permission_outcome(options: &[(String, String, String)], answer: &UserAnswer) -> Option<Value> {
     let by_kind = |kind: &str| {
         options
@@ -1984,7 +1937,6 @@ mod tests {
         Ok(())
     }
 
-    /// A fake `opencode acp`: a shell script answering each request line with canned frames.
     const FAKE_AGENT: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$(dirname "$0")/args.txt"
 sid=ses_fake

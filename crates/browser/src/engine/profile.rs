@@ -1,12 +1,3 @@
-//! Per-run directory for Servo's on-disk state: IndexedDB, Cache Storage and
-//! anything else Servo keys off `Opts::config_dir`.
-//!
-//! Without a config directory Servo 0.7 drops its own temporary directory
-//! before use and writes IndexedDB below the process's working directory, so
-//! the engine always supplies one. Nothing in it outlives the engine: the
-//! directory is removed when the engine stops, and a later start removes the
-//! directories of runs that did not stop cleanly. A run holds a lock for its
-//! whole life, so concurrent DROSTJE processes never remove each other's state.
 use std::{
     env,
     fs::{self, File},
@@ -19,8 +10,6 @@ use std::{
 use uuid::Uuid;
 
 const LOCK: &str = "run.lock";
-/// A run creates its directory and takes its lock within microseconds; never
-/// sweep a directory young enough to be between those two steps.
 const STALE_AFTER: Duration = Duration::from_secs(60);
 
 pub(super) struct EngineProfile {
@@ -30,7 +19,6 @@ pub(super) struct EngineProfile {
 
 impl EngineProfile {
     pub(super) fn create() -> io::Result<Self> {
-        // The runtime dir is per user and private; the temp dir is per user on macOS.
         let root = env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(env::temp_dir)
@@ -64,7 +52,6 @@ impl EngineProfile {
 
 impl Drop for EngineProfile {
     fn drop(&mut self) {
-        // Storage threads may still be exiting; anything left is swept next start.
         let _ = fs::remove_dir_all(&self.path);
     }
 }
@@ -109,7 +96,6 @@ mod tests {
         let root = scratch();
         let run = EngineProfile::create_in(&root, Duration::ZERO).unwrap();
         fs::write(run.path().join("indexeddb.sqlite"), b"data").unwrap();
-        // Another engine starting meanwhile must not sweep a live run.
         let other = EngineProfile::create_in(&root, Duration::ZERO).unwrap();
         assert!(run.path().join("indexeddb.sqlite").exists());
         let path = run.path().to_path_buf();

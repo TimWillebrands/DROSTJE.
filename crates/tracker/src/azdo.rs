@@ -1,7 +1,3 @@
-//! The `azdo` CLI (Azure DevOps): argv, its `--json` command surface and its exit codes.
-//! `azdo` resolves organisation, project and repository from the working directory's
-//! `origin` remote, so every call runs in the Conversation's worktree.
-
 use super::{
     PullRequestSummary, ReviewComment, ReviewStatus, ReviewThread, ReviewThreads, TrackerError,
 };
@@ -12,10 +8,8 @@ use std::{
     process::{Command, Stdio},
 };
 
-/// Branch PR lists are short; more than this many is reported as unreadable, not trimmed.
 const PULL_REQUEST_LIMIT: &str = "100";
 const THREAD_LIMIT: &str = "500";
-/// `azdo` appends this to a comment preview cut at its bound.
 const TRUNCATION_MARK: &str = "\n\n[truncated;";
 
 pub fn pull_requests_for_branch(
@@ -118,8 +112,6 @@ fn review_status(raw: &str) -> ReviewStatus {
     }
 }
 
-/// A thread with at least one comment a person (or review bot) wrote; vote and push
-/// notices are system comments and a thread of only those is not review feedback.
 fn review_thread(thread: ThreadJson) -> Option<ReviewThread> {
     let comments: Vec<_> = thread
         .comments
@@ -153,8 +145,6 @@ fn review_thread(thread: ThreadJson) -> Option<ReviewThread> {
     })
 }
 
-/// Review bots keep machine state in `<!-- … -->` blocks; they are not part of the message.
-/// An unterminated block is cut off by preview truncation and dropped to the end.
 fn strip_html_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -169,14 +159,11 @@ fn strip_html_comments(text: &str) -> String {
     out
 }
 
-/// Presentational HTML that review bots wrap Markdown in. Only these tags are removed, so
-/// code such as `Vec<String>` in a comment survives.
 const MARKUP_TAGS: &[&str] = &[
     "a", "b", "br", "details", "div", "em", "font", "i", "img", "p", "span", "strong", "sub",
     "summary", "sup", "table", "tbody", "td", "th", "thead", "tr",
 ];
 
-/// Drops `MARKUP_TAGS` (opening, closing and self-closing), keeping their text.
 fn strip_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -191,7 +178,6 @@ fn strip_markup(text: &str) -> String {
             .to_ascii_lowercase();
         match tail.find('>') {
             Some(end) if MARKUP_TAGS.contains(&name.as_str()) => rest = &tail[end + 1..],
-            // A preview cut inside a tag.
             None if MARKUP_TAGS.contains(&name.as_str()) => return out,
             _ => {
                 out.push('<');
@@ -225,7 +211,6 @@ fn run<T: for<'de> Deserialize<'de>>(
         });
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // `azdo --json` reports a failure as one `{"error": …}` line on stderr.
     let message = stderr
         .lines()
         .find_map(|line| serde_json::from_str::<ErrorJson>(line).ok())
@@ -308,16 +293,12 @@ mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
-    /// Serializes tests that write and run a stand-in `azdo`: a child forked by one test
-    /// inherits another test's still-open script fd until it execs, and running that script
-    /// then fails with ETXTBSY ("Text file busy").
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A stand-in `azdo` that records its argv and working directory, then replays a reply.
     fn fake_azdo(dir: &Path, stdout: &str, stderr: &str, code: i32) -> PathBuf {
         let path = dir.join("azdo");
         fs::write(dir.join("stdout"), stdout).unwrap();
@@ -487,9 +468,6 @@ mod tests {
         assert_eq!(strip_markup("Table <span style=\"color:wh"), "Table ");
     }
 
-    /// Opt-in against a real Azure DevOps checkout, read-only:
-    /// `DROSTJE_AZDO_DIR=<checkout> DROSTJE_AZDO_BRANCH=<branch with a PR>
-    /// cargo test -p drostje-tracker real_azdo -- --ignored --nocapture`
     #[test]
     #[ignore = "needs azdo, az login and an Azure DevOps checkout"]
     fn real_azdo_reads_a_branch_pull_request_and_its_threads() {

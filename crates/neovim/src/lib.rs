@@ -1,4 +1,3 @@
-//! One real, isolated Neovim instance per workspace window.
 pub mod grid;
 mod rpc;
 mod session;
@@ -11,7 +10,6 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardContent {
     pub lines: Vec<String>,
-    /// Neovim characterwise `v`, linewise `V`, or blockwise `\u{16}<width>`.
     pub regtype: String,
 }
 impl ClipboardContent {
@@ -24,9 +22,6 @@ impl ClipboardContent {
     }
 }
 
-/// The kit theme as Neovim sees it: packed 24-bit RGB, already flattened onto the
-/// editor background, plus whether the theme is dark. `bridge.lua` maps every
-/// highlight group the editor can show onto these roles.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NvimTheme {
     pub dark: bool,
@@ -93,14 +88,11 @@ pub enum NvimEvent {
     CompositionCommitted,
     CompositionRejected(String),
     InputRejected(String),
-    /// The user quit the way Vim quits (`:q`, `:wq`, `ZZ`…). Neovim and the draft stay;
-    /// the editor gives up focus instead.
     Leave,
     Failed(String),
     Ready,
 }
 
-/// All mutations are serialized by the owned background actor. UI callbacks never wait.
 pub enum NvimCommand {
     Input(String),
     Paste(String),
@@ -151,9 +143,6 @@ pub enum NvimCommand {
         text: String,
         reply: Sender<Result<bool>>,
     },
-    /// Writes `/name ` over the leading command the active draft starts with (or before
-    /// its text) and leaves the cursor after it in insert mode. The edit is computed from
-    /// the buffer as it is when the command runs, after every earlier keystroke.
     InsertSlashCommand {
         key: DraftKey,
         name: String,
@@ -177,7 +166,6 @@ pub enum NvimCommand {
 #[derive(Clone)]
 pub struct NvimEditor {
     pub commands: Sender<NvimCommand>,
-    /// Exactly one consumer: normally NvimView forwards semantic events to Workspace.
     pub events: Receiver<NvimEvent>,
 }
 impl NvimEditor {
@@ -236,8 +224,6 @@ impl NvimEditor {
             .await?;
         result.recv().await?
     }
-    /// Quiesce and snapshot before persistence. This deliberately does not quit Neovim.
-    /// After the caller durably writes every result it may call shutdown; on failure resume_input.
     pub async fn persistence_barrier(&self) -> Result<Vec<DraftSnapshot>> {
         let (reply, result) = async_channel::bounded(1);
         self.commands

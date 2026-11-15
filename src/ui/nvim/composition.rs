@@ -1,5 +1,3 @@
-//! Native text input: the IME composition shadow, its recovery text, and the
-//! `EntityInputHandler` that answers the platform's synchronous text queries.
 use super::{
     NvimView, NvimViewEvent,
     offsets::{
@@ -279,8 +277,6 @@ impl EntityInputHandler for NvimView {
             }
         } else {
             self.send(NvimCommand::Input(text.replace('<', "<LT>")), cx);
-            // The flushed grid, not queued input, changes the display. Invalidating
-            // here forces GPUI to draw the old grid before dispatching the next key.
             return;
         }
         cx.notify();
@@ -410,8 +406,6 @@ impl EntityInputHandler for NvimView {
                 ),
             ));
         }
-        // Buffer rows may wrap and contain concealed text. Only Neovim can map those
-        // rows; the reported screen cursor is the authoritative IME candidate anchor.
         let (text, cursor) = self.base_text();
         let cursor = utf16_offset(&text, cursor);
         (range.start == cursor)

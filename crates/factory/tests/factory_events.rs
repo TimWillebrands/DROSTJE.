@@ -12,8 +12,6 @@ use std::{
 };
 use uuid::Uuid;
 
-// Exercise the internal tracker without exposing implementation-only operations
-// in the application's public API. This is the same module used by the manager.
 #[path = "../src/events.rs"]
 mod events;
 use events::{EventTracker, read_text};
@@ -100,7 +98,6 @@ fn append(path: &Path, bytes: &[u8]) {
         .unwrap();
 }
 
-/// One full observer pass, projecting every launch as the manager does on refresh.
 fn scan_all(
     tracker: &mut EventTracker,
     launches: &[FactoryLaunch],
@@ -290,7 +287,6 @@ fn exact_log_directory_not_story_identity_controls_correlation_and_ambiguity() {
         [duplicate, first_path.clone()]
     );
     assert!(ambiguous.tasks.is_empty());
-    // Durable linkage survives without choosing either competing projection.
     assert_eq!(ambiguous.launch.event_path, Some(first_path));
     assert_eq!(
         scan(&mut tracker, &second).launch.event_path,
@@ -461,7 +457,6 @@ fn a_finished_unchanged_launch_is_not_reprojected_until_its_inputs_change() {
     tracker.observe([&launch]);
     assert!(tracker.unchanged(&launch, &liveness));
 
-    // Linkage changes the durable record, which is an input of its own.
     let linked = completed.launch.clone();
     tracker.observe([&linked]);
     assert!(!tracker.unchanged(&linked, &liveness));
@@ -469,7 +464,6 @@ fn a_finished_unchanged_launch_is_not_reprojected_until_its_inputs_change() {
     tracker.observe([&linked]);
     assert!(tracker.unchanged(&linked, &liveness));
 
-    // A later append to the correlated file is read and re-projected.
     append(
         &path,
         &event("agent-note", json!({"text": "late note", "paths": []})),
@@ -482,7 +476,6 @@ fn a_finished_unchanged_launch_is_not_reprojected_until_its_inputs_change() {
     tracker.observe([&linked]);
     assert!(tracker.unchanged(&linked, &liveness));
 
-    // A competing file in the shared tree still makes the correlation ambiguous.
     let duplicate = log_path(&directory.0, "duplicate");
     fs::write(&duplicate, start(&launch)).unwrap();
     tracker.observe([&linked]);
@@ -494,7 +487,6 @@ fn a_finished_unchanged_launch_is_not_reprojected_until_its_inputs_change() {
     assert!(!tracker.unchanged(&linked, &liveness));
     assert_eq!(tracker.snapshot(&linked, &liveness), noted);
 
-    // Liveness reported by the actor and an explicit refresh both re-project.
     tracker.observe([&linked]);
     let owned = BTreeMap::from([(linked.id, Liveness::OwnedRunning)]);
     assert!(!tracker.unchanged(&linked, &owned));
@@ -509,8 +501,6 @@ fn a_settled_directory_listing_still_discovers_files_added_later() {
     let launch = launch(&directory.0);
     let first = log_path(&directory.0, "first");
     fs::write(&first, start(&launch)).unwrap();
-    // Listings are only reused once the directory is older than the timestamp
-    // granularity guard, so let the fixture tree settle first.
     std::thread::sleep(std::time::Duration::from_millis(3100));
     let liveness = BTreeMap::new();
     let mut tracker = EventTracker::new();

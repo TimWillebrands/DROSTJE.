@@ -1,5 +1,3 @@
-//! The Neovim prompt editor surface: the sole consumer of an editor's event channel, which
-//! paints Neovim's flushed grid and forwards native keys, mouse and IME input to it.
 mod clipboard;
 mod composition;
 mod cursor;
@@ -40,16 +38,11 @@ pub enum NvimViewEvent {
     Failed(String),
     InputRejected(String),
     CompositionChanged(bool),
-    /// Neovim's mode changed; `NvimView::mode` has the new one.
     ModeChanged,
-    /// A key the caret popup claimed instead of Neovim.
     CaretPopupKey(CaretPopupKey),
-    /// Neovim asked to stop editing (`:q`, `:wq`, `ZZ`…); the owner moves focus away.
     Leave,
 }
 
-/// What the caret popup's Actions ask of its owner. Bindings live in `commands::bind_keys`
-/// and follow Vim's insert-mode completion menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaretPopupKey {
     Next,
@@ -58,8 +51,6 @@ pub enum CaretPopupKey {
     Dismiss,
 }
 
-/// The sole consumer of an editor's event channel. The shadow only answers native
-/// synchronous input queries; Neovim's flushed grid is the display authority.
 pub struct NvimView {
     editor: NvimEditor,
     focus_handle: FocusHandle,
@@ -88,8 +79,6 @@ pub struct NvimView {
     bell: u64,
     dragging: Option<MouseButton>,
     scroll_remainder: Point<f32>,
-    /// Shown below the caret while the owner has something to offer there; while shown the
-    /// surface adds the `CaretPopup` key context, whose Actions become `CaretPopupKey`s.
     caret_popup: Option<AnyView>,
 }
 
@@ -136,8 +125,6 @@ impl NvimView {
                             let Ok(event) = receiver.try_recv() else {
                                 break;
                             };
-                            // Never coalesce semantic events across a grid, draft activation,
-                            // clipboard callback or composition acknowledgment.
                             this.receive(event, cx);
                             count += 1;
                         }
@@ -147,8 +134,6 @@ impl NvimView {
                     return;
                 }
                 if exhausted {
-                    // A ready channel never yields by itself. Return to the native
-                    // event loop before consuming more, so key input cannot starve.
                     smol::Timer::after(Duration::from_millis(1)).await;
                 }
             }
@@ -191,7 +176,6 @@ impl NvimView {
         }
     }
 
-    /// Neovim's current mode name, such as `insert` or `normal`.
     pub fn mode(&self) -> &str {
         &self.grid.mode
     }
@@ -215,8 +199,6 @@ impl NvimView {
             || !self.recovery.is_empty()
     }
 
-    /// Separately persist this on quit if the semantic draft barrier refuses an
-    /// unfinished composition. Never silently merge it into a committed draft.
     pub fn recovery_text(&self) -> String {
         let active = self
             .composition
@@ -244,8 +226,6 @@ impl NvimView {
         self.discard_composition(cx);
     }
 
-    /// Deliberate read-only states drop new native input rather than retaining it
-    /// as failed composition. Existing composition remains separately recoverable.
     pub fn set_writable(&mut self, writable: bool, cx: &mut Context<Self>) {
         if self.writable == writable {
             return;
@@ -357,7 +337,6 @@ impl NvimView {
                 let _ = reply.try_send(content);
             }
             NvimEvent::ClipboardSet(content) => {
-                // Native metadata is owned by the clipboard item, not a stale text cache.
                 let metadata = serde_json::json!({"drostje_nvim_register": content.regtype, "lines": content.lines});
                 cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
                     content.text(),
@@ -384,7 +363,6 @@ impl NvimView {
                 self.diagnostic = None;
                 self.requested_size = None;
                 if let Some(composition) = self.composition.as_mut() {
-                    // A restarted process cannot commit a previous generation's preedit.
                     composition.recoverable = true;
                 }
                 if self.has_composition() {

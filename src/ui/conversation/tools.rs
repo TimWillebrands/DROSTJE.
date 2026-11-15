@@ -32,8 +32,6 @@ use gpui_kit::{
 };
 use serde_json::Value;
 
-/// Tools whose results are plain output rather than prose, with the language
-/// the code block should highlight. `None` keeps the Markdown rendering.
 fn result_language<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
     match name.to_ascii_lowercase().as_str() {
         "bash" | "eval" | "grep" | "glob" => Some("text"),
@@ -49,7 +47,6 @@ fn result_language<'a>(name: &str, input: &'a Value) -> Option<&'a str> {
         _ => None,
     }
 }
-/// What a tool card says about its call, derived from the tool name and input only.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ToolSummary {
     pub icon: Lucide,
@@ -59,16 +56,11 @@ const SUMMARY_LIMIT: usize = 200;
 pub(super) fn text_field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
     input[key].as_str().filter(|value| !value.trim().is_empty())
 }
-/// OMP names the file `path`, Claude Code `file_path`.
 fn path_field(input: &Value) -> Option<&str> {
     text_field(input, "path").or_else(|| text_field(input, "file_path"))
 }
-/// The input as compact JSON, cut to `SUMMARY_LIMIT` characters. Serialization stops once
-/// the cut is known, so a large input costs no more than a small one.
 fn compact_json(input: &Value) -> String {
-    /// Enough bytes for `SUMMARY_LIMIT + 1` characters of any width.
     const PREFIX_BYTES: usize = (SUMMARY_LIMIT + 1) * 4;
-    /// Keeps the start of a serialization and fails the write once it has enough.
     struct Prefix(Vec<u8>);
     impl std::io::Write for Prefix {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -90,11 +82,9 @@ fn compact_json(input: &Value) -> String {
         Value::String(text) => text.as_str(),
         other => {
             let mut prefix = Prefix(Vec::with_capacity(PREFIX_BYTES));
-            // Stopping early is the point; what was written is still the serialization's start.
             let _ = serde_json::to_writer(&mut prefix, other);
             serialized = match String::from_utf8(prefix.0) {
                 Ok(text) => text,
-                // The cut can split the last character; drop its partial bytes.
                 Err(error) => {
                     let valid = error.utf8_error().valid_up_to();
                     let mut bytes = error.into_bytes();
@@ -110,7 +100,6 @@ fn compact_json(input: &Value) -> String {
         None => text.to_owned(),
     }
 }
-/// Files named in an `edit` patch header line such as `[path/to/file.rs#69AE]`.
 fn patch_paths(patch: &str) -> Vec<&str> {
     patch
         .lines()
@@ -122,7 +111,6 @@ fn patch_paths(patch: &str) -> Vec<&str> {
         .filter(|path| !path.is_empty())
         .collect()
 }
-/// Harnesses disagree on case (`read`, `Read`), so names match case-insensitively.
 pub fn tool_summary(name: &str, input: &Value) -> ToolSummary {
     let (icon, body) = match name.to_ascii_lowercase().as_str() {
         "bash" => (
@@ -193,18 +181,15 @@ pub(super) enum ToolOutcome {
     Running,
     Succeeded,
     Failed,
-    /// No result was recorded and nothing is running; DROSTJE. does not guess.
     Unknown,
 }
 
-/// The call half of a tool card, taken from the assistant message.
 #[derive(Clone, Copy)]
 pub(super) struct ToolCall<'a> {
     pub(super) name: &'a str,
     pub(super) intent: Option<&'a str>,
     pub(super) input: &'a Value,
 }
-/// The result half, taken from live activity or the historical result message.
 #[derive(Clone, Copy)]
 pub(super) struct ToolResult<'a> {
     pub(super) outcome: ToolOutcome,
@@ -220,8 +205,6 @@ impl ToolResult<'_> {
         }
     }
 }
-/// What a collapsed tool row shows of the summary: its first line, marked when
-/// more is folded away. The row itself truncates to the available width.
 pub(super) fn summary_line(body: &str) -> String {
     let mut lines = body.lines().filter(|line| !line.trim().is_empty());
     let first = lines.next().unwrap_or_default().trim();
@@ -232,9 +215,6 @@ pub(super) fn summary_line(body: &str) -> String {
     }
 }
 
-/// One row for a tool call, live or historical: icon, caption and the first line
-/// of the call, about one line high. The disclosure opens the full call and its
-/// result; a failed call opens automatically.
 pub(super) fn tool_card(
     key: String,
     call: ToolCall<'_>,
@@ -285,7 +265,6 @@ pub(super) fn tool_card(
         ),
     };
     let group: SharedString = format!("{key}:group").into();
-    // Only the row toggles, so selecting text in the opened detail never folds it.
     let mut header = h_flex()
         .id(SharedString::from(format!("{key}:header")))
         .w_full()
@@ -309,7 +288,6 @@ pub(super) fn tool_card(
                 .truncate()
                 .when(!expanded, |line| line.child(summary_line(&summary.body))),
         );
-    // The icon names the tool while folded; the opened row spells it out.
     if intent.is_some() && expanded {
         header = header.child(div().flex_shrink_0().child(name.to_owned()));
     }
@@ -403,8 +381,6 @@ pub(super) fn tool_card(
     card.into_any_element()
 }
 
-/// Opens the file a read, write or edit touched in Neovim. Shown on hover; the keyboard
-/// path is "Open file from conversation…", which lists the same files.
 fn open_file_button(id: String, reference: FileReference, thread: Option<ThreadId>) -> Button {
     Button::new(SharedString::from(id))
         .xsmall()
@@ -425,8 +401,6 @@ fn open_file_button(id: String, reference: FileReference, thread: Option<ThreadI
         })
 }
 
-/// A call's outcome from live activity, else its recorded result; `active` is whether the
-/// thread is still working on a call without either.
 pub(super) fn call_outcome(
     session: &ConversationSession,
     call_id: &str,
@@ -489,7 +463,6 @@ pub(super) fn tool_call_row(
         {
             return match placement {
                 crate::browser_tools::ArtifactPlacement::Conversation => pane.into_any_element(),
-                // One retained surface, one place: the transcript keeps a pointer to it.
                 crate::browser_tools::ArtifactPlacement::Composer => {
                     docked_artifact_stub(call_id, &pane, owner, cx)
                 }
@@ -530,8 +503,6 @@ pub(super) fn tool_call_row(
     tool_card(key, call, result, owner, markdown, cx)
 }
 
-/// Rows whose message carries an artifact call: they show the artifact's pane, or a stub
-/// while it is docked above the composer.
 pub(super) fn artifact_rows(session: &ConversationSession) -> Vec<usize> {
     let artifact = |name: &str| name.ends_with("show_artifact");
     if !session
@@ -555,8 +526,6 @@ pub(super) fn artifact_rows(session: &ConversationSession) -> Vec<usize> {
         .collect()
 }
 
-/// The transcript row of an artifact docked above the composer: its title and the
-/// commands that reach it, never a second copy of the page.
 fn docked_artifact_stub(
     call_id: &str,
     pane: &Entity<crate::ui::browser::BrowserPane>,
@@ -768,7 +737,6 @@ mod tests {
     #[test]
     fn compact_json_stops_serializing_at_the_cut() {
         use super::compact_json;
-        // What the summary showed when it serialized the whole input first.
         let whole = |input: &Value| {
             let text = match input {
                 Value::Null => String::new(),
@@ -833,7 +801,6 @@ mod tests {
                 body: "Which one?".into()
             }
         );
-        // Claude Code capitalises names and calls the file `file_path`.
         assert_eq!(
             tool_summary("Read", &json!({"file_path":"src/effects/pools.ts"})),
             ToolSummary {
@@ -848,7 +815,6 @@ mod tests {
         let unknown = tool_summary("hub", &json!({"op":"cancel","ids":["bg_7"]}));
         assert_eq!(unknown.icon, Lucide::Wrench);
         assert_eq!(unknown.body, r#"{"op":"cancel","ids":["bg_7"]}"#);
-        // Missing fields never panic and never show an empty card body silently.
         assert_eq!(tool_summary("bash", &Value::Null).body, "");
         let long = tool_summary("other", &json!({"text": "x".repeat(500)}));
         assert!(long.body.ends_with('…'));

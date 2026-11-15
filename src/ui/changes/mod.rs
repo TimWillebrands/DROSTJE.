@@ -1,15 +1,3 @@
-//! The Changes tab of a Conversation's sidebar: its working tree's uncommitted diff as
-//! coloured, virtualised rows, inline or side by side, and the entry points to commit them
-//! or open a changed line in a Neovim tab.
-//!
-//! AppState owns the diff (`ProjectDiffState`) and the layout preference; rows and their
-//! side-by-side pairing are parsed off-thread with the diff. This module owns the per-thread
-//! `RowList` (scroll, keyboard selection, focus), kept in the Workspace so they survive
-//! re-renders.
-//!
-//! Keyboard: the list takes `List` motions (`j`/`k`, `gg`/`G`, page keys); Return opens the
-//! selected line in Neovim and `s` switches layout, both through their `Command`s.
-
 pub(super) mod review;
 
 use super::{
@@ -44,10 +32,8 @@ use std::{
     sync::Arc,
 };
 
-/// Row lists by thread: two panes on one working tree scroll and select independently.
 pub(super) type ChangesLists = Rc<RefCell<HashMap<ThreadId, ChangesList>>>;
 
-/// One thread's Changes list: where keyboard focus lands, and the rows it moves through.
 pub(super) struct ChangesList {
     focus: FocusHandle,
     rows: RowList,
@@ -59,15 +45,12 @@ impl ChangesList {
     }
 }
 
-/// Rows not yet laid out count as one wrapped line until measured, so the scrollbar spans
-/// the whole diff.
 const ROW_ESTIMATE: f32 = 1.5;
 
 pub(super) struct RowList {
     list: ListState,
     rows: Arc<Patch>,
     layout: ChangesLayout,
-    /// The keyboard cursor, as a row of `layout`'s display rows.
     selected: Option<usize>,
     estimated_width: Rc<Cell<Option<Pixels>>>,
 }
@@ -79,7 +62,6 @@ fn display_count(rows: &Patch, layout: ChangesLayout) -> usize {
     }
 }
 
-/// Display row `ix` of `from` as the display row of `to` that shows the same patch row.
 fn convert(rows: &Patch, ix: usize, from: ChangesLayout, to: ChangesLayout) -> usize {
     match (from, to) {
         (ChangesLayout::Inline, ChangesLayout::SideBySide) => rows
@@ -105,9 +87,6 @@ impl RowList {
         }
     }
 
-    /// Shows `rows` in `layout`. A new patch keeps the reader and the cursor on the same row,
-    /// clamped, so a refresh while the agent works does not jump to the top; a new layout
-    /// keeps them on the line they showed.
     fn sync(&mut self, rows: &Arc<Patch>, layout: ChangesLayout) {
         let same_rows = Arc::ptr_eq(&self.rows, rows);
         if same_rows && self.layout == layout {
@@ -138,7 +117,6 @@ impl RowList {
         self.layout = layout;
     }
 
-    /// Moves the cursor and scrolls it into view. `page` is the rows one page covers.
     fn select(&mut self, motion: Motion, page: usize) {
         let count = display_count(&self.rows, self.layout);
         if count == 0 {
@@ -160,8 +138,6 @@ impl RowList {
         self.list.scroll_to_reveal_item(next);
     }
 
-    /// Where the cursor's line is in the working tree; on the new side when a side-by-side
-    /// row shows both.
     fn location(&self) -> Option<Result<Location, LocationError>> {
         let ix = self.selected?;
         let row = match self.layout {
@@ -179,7 +155,6 @@ impl RowList {
     }
 }
 
-/// The list for `id`, created on first use.
 fn row_list<'a>(
     lists: &'a mut HashMap<ThreadId, ChangesList>,
     id: ThreadId,
@@ -192,7 +167,6 @@ fn row_list<'a>(
 }
 
 impl Workspace {
-    /// The keyboard focus of `id`'s Changes list.
     pub(super) fn changes_focus(&self, id: ThreadId, cx: &App) -> FocusHandle {
         row_list(&mut self.changes_lists.borrow_mut(), id, cx)
             .focus
@@ -228,7 +202,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Why the selected Conversation's Changes cursor cannot open in Neovim.
     pub(super) fn open_change_reason(&self, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
         let Some(thread) = state.conversation_thread() else {
@@ -242,7 +215,6 @@ impl Workspace {
         }
     }
 
-    /// Opens the selected Conversation's Changes cursor in a Neovim tab at its line.
     pub(super) fn open_selected_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self
             .state
@@ -455,7 +427,6 @@ pub(super) fn render(
         .into_any_element()
 }
 
-/// The open button reads the workspace-level reason: it depends on the keyboard cursor.
 fn open_button(owner: &WeakEntity<Workspace>, cx: &App) -> AnyElement {
     let reason = owner
         .upgrade()
@@ -480,7 +451,6 @@ fn open_button(owner: &WeakEntity<Workspace>, cx: &App) -> AnyElement {
 
 #[cfg(feature = "runtime-qa")]
 impl Workspace {
-    /// `id`'s Changes cursor and whether its list has keyboard focus, for runtime QA.
     pub fn changes_cursor(&self, id: ThreadId, window: &Window, cx: &App) -> (Option<usize>, bool) {
         self.changes_lists
             .borrow()
@@ -491,7 +461,6 @@ impl Workspace {
     }
 }
 
-/// The diff rows of one thread's Changes tab, with the keyboard cursor and a scrollbar.
 #[derive(IntoElement)]
 struct ChangesRows {
     id: ThreadId,
@@ -591,7 +560,6 @@ impl RenderOnce for ChangesRows {
     }
 }
 
-/// The keyboard cursor: a left rule on the selected row, stronger while the list has focus.
 #[derive(Clone, Copy)]
 struct Cursor {
     selected: Option<usize>,
@@ -648,8 +616,6 @@ fn render_row(row: &Row, ix: usize, cx: &App) -> AnyElement {
     }
 }
 
-/// One side-by-side line: the old file's line left, the new file's right. Rows that are not
-/// lines span both sides.
 fn render_split_row(patch: &Patch, split: SplitRow, ix: usize, cx: &App) -> AnyElement {
     let (old, new) = match split {
         SplitRow::Full(row) => {
@@ -668,7 +634,6 @@ fn render_split_row(patch: &Patch, split: SplitRow, ix: usize, cx: &App) -> AnyE
             Some(RowKind::Added) => Some(colors.added),
             Some(RowKind::Removed) => Some(colors.removed),
             Some(_) => None,
-            // The other side changed; this side has no line here.
             None => Some(cx.theme().muted.opacity(0.4)),
         };
         h_flex()
@@ -710,7 +675,6 @@ fn line_text(row: &Row) -> AnyElement {
         .pl_1()
         .pr_2()
         .whitespace_normal()
-        // An empty line still takes a line's height.
         .child(if row.text.is_empty() {
             SharedString::new_static(" ")
         } else {
@@ -857,7 +821,6 @@ mod tests {
             offset_in_item: px(4.),
         });
         list.selected = Some(16);
-        // The same patch leaves the list alone.
         list.sync(&long, ChangesLayout::Inline);
         assert_eq!(list.list.logical_scroll_top().item_ix, 15);
 
@@ -885,7 +848,6 @@ mod tests {
         let mut list = RowList::new();
         list.sync(&rows, ChangesLayout::Inline);
         assert_eq!(list.list.item_count(), 8);
-        // `+new 2`, paired beside `-old 2` side by side.
         list.selected = Some(6);
         list.sync(&rows, ChangesLayout::SideBySide);
         assert_eq!(list.list.item_count(), 6);

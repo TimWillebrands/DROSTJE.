@@ -81,9 +81,6 @@ struct MarkerResponse {
     snapshot: Option<DraftSnapshot>,
 }
 
-/// Coalesce display and durable-shadow updates, never blocking the reader or
-/// command actor behind a slow window. Clipboard requests get errors, not stale
-/// clipboard data, if the native callback cannot be delivered promptly.
 struct Events {
     sender: Sender<NvimEvent>,
     grid: Option<Arc<super::grid::GridSnapshot>>,
@@ -120,7 +117,6 @@ impl Events {
             NvimEvent::DraftActivated(draft) => self.activated = Some(draft),
             NvimEvent::Ready => self.ready = true,
             NvimEvent::ClipboardGet { reply } => {
-                // A clipboard read must never overtake a pending native write.
                 self.flush();
                 if let Err(error) = self.sender.try_send(NvimEvent::ClipboardGet { reply })
                     && let NvimEvent::ClipboardGet { reply } = error.into_inner()
@@ -131,8 +127,6 @@ impl Events {
                 return;
             }
             event => {
-                // Grid/draft updates coalesce above. Ordered acknowledgements
-                // cannot be silently dropped: fail closed on sustained UI lag.
                 if self.control.len() == 128 {
                     self.overflowed = true;
                     self.ready = false;
@@ -200,7 +194,6 @@ struct Session {
     composition: bool,
     frozen: bool,
     theme: Option<NvimTheme>,
-    /// Requests sent by `detach`, by RPC ID, whose replies arrive as `Incoming::Response`.
     detached: HashMap<u64, &'static str>,
     failed: Option<String>,
 }
@@ -249,14 +242,12 @@ impl Session {
             self.failed = Some(error.clone());
             self.marker = None;
             self.events.ready = false;
-            // No raw input is retained in a recovery snapshot.
             self.events.emit(NvimEvent::Failed(error));
         }
     }
 
     async fn initialize(&mut self) -> Result<()> {
         self.rpc = Some(Rpc::spawn(&self.config)?);
-        // RPC IDs restart with each process.
         self.detached.clear();
         let info = self.call("nvim_get_api_info", vec![]).await?;
         let info = info
@@ -365,11 +356,6 @@ impl Session {
         self.detach("nvim_exec_lua", theme_args(theme)).await?;
         self.detach("nvim_command", vec!["redraw!".into()]).await
     }
-    /// Send a non-editing UI request without awaiting its reply. Neovim defers
-    /// non-fast requests while a key sequence is unfinished (Visual `g`, `"`,
-    /// `<C-w>`…); awaiting one there would hold every later key, including the
-    /// one that completes the sequence, until the RPC timeout. Requests still
-    /// run in send order; `process_incoming` reports a failed reply.
     async fn detach(&mut self, method: &'static str, args: Vec<Value>) -> Result<()> {
         let id = self.rpc()?.call(method, args).await?;
         self.detached.insert(id, method);
@@ -408,8 +394,6 @@ impl Session {
             )
             .await;
             match message {
-                // Responses and notifications share one FIFO, preserving the
-                // exact wire order of line events and authoritative reads.
                 Ok(Incoming::Response {
                     id: response_id,
                     result,
@@ -625,7 +609,7 @@ impl Session {
         ensure!(args.len() >= 6, "Malformed buffer line notification");
         if args[1].is_nil() {
             return Ok(());
-        } // inccommand preview is not a durable edit.
+        }
         let Some(key) = self.key_for(&args[0])? else {
             return Ok(());
         };
@@ -638,10 +622,6 @@ impl Session {
             .drafts
             .get_mut(&key)
             .context("Neovim draft is no longer available")?;
-        // A complete single-chunk update (every keystroke) splices the retained
-        // lines in place: the range is validated before the splice, so no
-        // partial state is observable. Only a multi-chunk update stages a copy
-        // until its final chunk.
         let lines = if more || draft.pending_lines.is_some() {
             draft
                 .pending_lines
@@ -800,8 +780,6 @@ impl Session {
             },
         );
         self.lua("local b=...; vim.bo[b].buftype='nofile'; vim.bo[b].bufhidden='hide'; vim.bo[b].swapfile=false; vim.bo[b].undofile=false; drostje.attach(b)", vec![handle.clone()]).await?;
-        // Keep the retained recovery text until the seed write succeeds. An
-        // initial empty-buffer notification would erase it on a failed restart.
         self.call(
             "nvim_buf_attach",
             vec![handle.clone(), false.into(), Value::Map(vec![])],
@@ -1015,8 +993,6 @@ impl Session {
             return Ok(false);
         }
         let handle = self.drafts[&key].handle.clone();
-        // The check and write occur in one Lua invocation as well as at the host
-        // barrier, so timer/autocmd changes cannot clear a newer draft.
         let result = self.lua("local b,tick,lines=...; if vim.api.nvim_buf_get_changedtick(b)~=tick then return false end; vim.api.nvim_buf_set_lines(b,0,-1,true,lines); return true", vec![handle, revision.changedtick.into(), Value::Array(text.split('\n').map(Value::from).collect())]).await?;
         let replaced = result
             .as_bool()
@@ -1051,9 +1027,6 @@ impl Session {
         let current = self.refresh_draft(&key).await?;
         let (end, text) = drostje_model::slash_command_insertion(&current.text, &name);
         let handle = self.drafts[&key].handle.clone();
-        // Check, write and cursor placement happen in one Lua call so no keystroke lands
-        // between them. `startinsert!` appends when the line ends with the inserted text,
-        // where a normal-mode cursor could not sit past the last byte.
         let result = self.lua("local b,tick,e,text=...; if vim.api.nvim_get_current_buf()~=b or vim.api.nvim_buf_get_changedtick(b)~=tick then return false end; local line=vim.api.nvim_buf_get_lines(b,0,1,true)[1]; vim.api.nvim_buf_set_text(b,0,0,0,e,{text}); if #line==e then vim.cmd('startinsert!') else vim.api.nvim_win_set_cursor(0,{1,#text}); vim.cmd('startinsert') end; return true", vec![handle, current.changedtick.into(), (end as u64).into(), text.into()]).await?;
         ensure!(
             result.as_bool() == Some(true),
@@ -1088,11 +1061,9 @@ impl Session {
                 )
             })
             .collect();
-        self.rpc.take(); // kills only the still-owned old generation; no key replay.
+        self.rpc.take();
         self.generation = Uuid::new_v4();
         self.grid = GridReducer::new(self.generation);
-        // Keep recovery snapshots if spawning/initialization fails, even across
-        // repeated restart attempts. Old handles are filtered by generation.
         self.sequence = 0;
         self.marker = None;
         self.failed = None;
@@ -1123,12 +1094,10 @@ impl Session {
     }
     async fn shutdown(&mut self) -> Result<()> {
         self.frozen = true;
-        if let Some(rpc) = &self.rpc {
-            // A quit commonly closes stdout before replying. It is intentionally
-            // sent without waiting; persistence is the caller's prerequisite.
-            if !rpc.is_failed() {
-                let _ = rpc.call("nvim_command", vec!["qa!".into()]).await;
-            }
+        if let Some(rpc) = &self.rpc
+            && !rpc.is_failed()
+        {
+            let _ = rpc.call("nvim_command", vec!["qa!".into()]).await;
         }
         if let Some(mut rpc) = self.rpc.take() {
             rpc.stop().await?;
@@ -1185,8 +1154,6 @@ impl Session {
                     break;
                 }
                 Wake::Command(Ok(command)) => {
-                    // Adjacent resize requests collapse, without moving resize
-                    // across an input/snapshot mutation boundary.
                     let command = if let NvimCommand::Resize { mut cols, mut rows } = command {
                         while let Ok(next) = commands.try_recv() {
                             match next {
@@ -1235,8 +1202,6 @@ impl Session {
                     return;
                 }
                 self.theme = Some(theme);
-                // Theme updates are non-editing and remain valid while input is
-                // frozen. Retain the newest colors through failed restarts.
                 if self.failed.is_none()
                     && let Err(error) = self.send_theme(theme).await
                 {
@@ -1413,7 +1378,6 @@ fn strings(value: &Value) -> Result<Vec<String>> {
         })
         .collect()
 }
-/// `strings` for an owned value: each line moves out of its msgpack string.
 fn owned_strings(value: Value) -> Result<Vec<String>> {
     let Value::Array(values) = value else {
         bail!("Neovim lines must be an array");
@@ -1427,7 +1391,6 @@ fn owned_strings(value: Value) -> Result<Vec<String>> {
         .map(|line| line.context("Neovim line is not UTF-8 text"))
         .collect()
 }
-/// Equals `lines.join("\n")`, reusing the capacity `text` already holds.
 fn join_lines_into(text: &mut String, lines: &[String]) {
     text.clear();
     text.reserve(lines.iter().map(String::len).sum::<usize>() + lines.len().saturating_sub(1));
@@ -1559,7 +1522,6 @@ mod tests {
     #[test]
     fn buffer_line_events_splice_in_place_or_stage_multi_chunk_updates() -> Result<()> {
         let (mut session, key, receiver) = session_with_draft();
-        // One complete chunk applies immediately and publishes the new revision.
         session.lines_event(lines_args(5, 4.into(), 1, 2, &["BETA", "gamma 界"], false))?;
         let draft = &session.drafts[&key];
         assert_eq!(draft.lines, ["alpha", "BETA", "gamma 界"]);
@@ -1568,7 +1530,6 @@ mod tests {
         assert_eq!(draft.snapshot.changedtick, 4);
         assert_eq!(changed(&receiver), std::slice::from_ref(&draft.snapshot));
 
-        // Earlier chunks stay staged: neither lines nor the committed revision move.
         session.lines_event(lines_args(5, 5.into(), 0, 1, &["ALPHA"], true))?;
         let draft = &session.drafts[&key];
         assert_eq!(draft.lines, ["alpha", "BETA", "gamma 界"]);
@@ -1583,13 +1544,11 @@ mod tests {
         assert_eq!(draft.snapshot.changedtick, 6);
         assert_eq!(changed(&receiver), std::slice::from_ref(&draft.snapshot));
 
-        // Previews and other buffers are not durable edits of this draft.
         session.lines_event(lines_args(5, Value::Nil, 0, -1, &["preview"], false))?;
         session.lines_event(lines_args(9, 7.into(), 0, -1, &["other"], false))?;
         assert_eq!(session.drafts[&key].snapshot.text, "ALPHA\nBETA");
         assert!(changed(&receiver).is_empty());
 
-        // Deleting every line leaves one empty line, as Neovim's buffer does.
         session.lines_event(lines_args(5, 8.into(), 0, -1, &[], false))?;
         let draft = &session.drafts[&key];
         assert_eq!(draft.lines, [""]);

@@ -1,9 +1,5 @@
-//! Thread panels: one dock panel per open thread, kept in sync with `AppState`,
-//! plus tab cycling and closing.
-
 use super::*;
 
-/// Get or build the panel for a thread; the registry and the workspace share the map.
 pub(super) fn thread_panel(
     threads: &ThreadPanels,
     id: ThreadId,
@@ -165,9 +161,6 @@ impl Workspace {
             .or_else(|| self.welcome.borrow().clone())
     }
 
-    /// One panel per open thread, beside the selected thread's group; the Welcome
-    /// panel only while nothing is open. Dock edits that close a thread come back
-    /// through `thread_panel_removed`, so this is the single owner of the map.
     pub(in crate::ui) fn sync_thread_panels(
         &mut self,
         window: &mut Window,
@@ -240,7 +233,6 @@ impl Workspace {
             let panel = thread_panel(&self.threads, id, &self.state, &owner, window, cx);
             let panel_id = PanelId::from(panel.entity_id());
             self.dock.update(cx, |dock, cx| {
-                // Wrapped so the tab bar draws the panel's own title, not its layout name.
                 dock.add_panel_view(panel_handle(panel), DockPlacement::Center, None, window, cx);
                 if let Some(node) = anchor {
                     dock.move_panel(
@@ -286,20 +278,13 @@ impl Workspace {
         self.sync_browser_tabs(window, cx);
         self.sync_sidebar_terminals(window, cx);
         self.release_closed_threads(cx);
-        if lost_focus {
-            // The closed pane held focus; keyboard control continues in the next thread.
-            if let Some(target) = self.thread_target(cx) {
-                self.focus_panel(target, window, cx);
-            }
+        if lost_focus && let Some(target) = self.thread_target(cx) {
+            self.focus_panel(target, window, cx);
         }
         cx.notify();
     }
-    /// A thread closed in every Space keeps no view state, as its panel and transcript
-    /// go with its tab; runs only when the open threads changed. Session data stays in
-    /// `AppState`.
     fn release_closed_threads(&mut self, cx: &App) {
         let state = self.state.read(cx);
-        // The active Space's open threads live on `AppState`, the others' in their sessions.
         let mut open = state.open_threads.clone();
         for space in state
             .spaces
@@ -343,10 +328,6 @@ impl Workspace {
             self.unrevealed_thread = None;
         }
     }
-    /// Display a thread's tab in its group without moving focus, so a thread
-    /// selected from Projects, the palette or a close is the one on screen; the
-    /// tab bar scrolls a newly displayed tab into view. False while the thread
-    /// has no panel in a group yet.
     pub(super) fn reveal_thread_tab(
         &mut self,
         id: ThreadId,
@@ -377,8 +358,6 @@ impl Workspace {
             return false;
         };
         if index != group.read(cx).active_ix() {
-            // `select_tab` focuses the displayed panel. Focus elsewhere (Projects,
-            // another pane) stays there; focus in the tab being hidden follows the tab.
             let previous = window.focused(cx).filter(|_| {
                 !group
                     .read(cx)
@@ -394,8 +373,6 @@ impl Workspace {
         true
     }
 
-    /// Every thread pane on screen opens its Conversation, not only the selected one, so
-    /// restored tabs beside the selection show their history without a click.
     pub(super) fn sync_visible_threads(&mut self, cx: &mut Context<Self>) {
         let dock = self.dock.read(cx);
         let visible: Vec<_> = self
@@ -413,7 +390,6 @@ impl Workspace {
         });
     }
 
-    /// A pane that gained focus (click, tab, directional shortcut) is the selected thread.
     pub(super) fn thread_focused(
         &mut self,
         id: ThreadId,
@@ -449,7 +425,6 @@ impl Workspace {
             return;
         }
         self.state.update(cx, |state, cx| {
-            // Selecting a thread leaves any previously active terminal intact.
             state.select_thread(id);
             cx.emit(PresentationChange::Selection);
         });
@@ -457,11 +432,6 @@ impl Workspace {
         self.active_terminal = None;
         cx.notify();
     }
-    /// The dock dropped a thread panel (tab close button or a closed split).
-    /// Called from inside the dock's own update, so focus moves on the next tick.
-    /// A thread panel the dock closed on its own (tab close button, dock edit).
-    /// Panels the workspace removed itself are already gone from the map, so
-    /// only a panel that is still the registered one for `id` closes the thread.
     pub(super) fn thread_panel_removed(
         &mut self,
         id: ThreadId,
@@ -490,8 +460,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Close a thread's tab. The thread stays in its project, and a running
-    /// turn keeps running.
     pub(in crate::ui) fn close_thread_tab(
         &mut self,
         id: ThreadId,
@@ -514,8 +482,6 @@ impl Workspace {
         });
         self.sync_thread_panels(window, cx);
     }
-    /// Archive `id` without selecting it: its tab closes, and a neighbouring tab takes over
-    /// only when it was the selected one.
     pub(in crate::ui) fn archive_thread(
         &mut self,
         id: ThreadId,
@@ -550,14 +516,10 @@ impl Workspace {
     }
 }
 
-/// The thread whose view owns a disclosure key: every key is `<kind>:<thread>[:…]`.
 fn disclosure_thread(key: &str) -> Option<ThreadId> {
     key.split(':').nth(1)?.parse().ok()
 }
 
-/// Keep per-thread view state only for threads open in some Space: the Changes list
-/// (patch, cursor, focus), the disclosure keys, and the Agents follow state, which a
-/// running turn keeps so it still opens the Agents tab at most once per turn.
 fn release_closed_thread_state<V>(
     open: &[ThreadId],
     running: &std::collections::HashSet<ThreadId>,

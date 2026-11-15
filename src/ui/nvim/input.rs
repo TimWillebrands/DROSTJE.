@@ -1,4 +1,3 @@
-//! Keyboard and mouse input translated into Neovim key notation and mouse events.
 use super::{
     NvimView,
     clipboard::{ClipboardChord, clipboard_chord},
@@ -37,7 +36,6 @@ impl NvimView {
             return;
         }
         if key.modifiers.platform {
-            // Workspace shortcuts (especially Cmd-Return and Cmd-Escape) bubble.
             return;
         }
         if !self.writable {
@@ -65,8 +63,6 @@ impl NvimView {
             window.prevent_default();
             cx.stop_propagation();
         }
-        // Printable keys, including Option-generated native Unicode, are delivered
-        // only by replace_text_in_range. Never guess Neovim's current mode here.
     }
 
     pub(super) fn mouse(

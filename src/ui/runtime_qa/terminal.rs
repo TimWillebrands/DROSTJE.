@@ -1,7 +1,5 @@
-//! Terminal tabs: local failure, persistence and reopen after restart.
 use super::*;
 
-/// Terminal tab leaves in a layout as `(tab id, project)`.
 fn terminal_tabs(value: &serde_json::Value) -> Vec<(String, String)> {
     let mut tabs = Vec::new();
     match value {
@@ -62,7 +60,6 @@ async fn terminal_tabs_keep_failure_local_and_save_tabs(cx: &mut TestAppContext)
             .is_none()
     }));
 
-    // Typing on a terminal pane must never start a Factory run or enter the composer.
     for key in ["j", "k", "i", "secondary-enter"] {
         press(cx, key);
     }
@@ -79,7 +76,6 @@ async fn terminal_tabs_keep_failure_local_and_save_tabs(cx: &mut TestAppContext)
     })
     .await;
 
-    // A failed native surface still owns a real tab; palette close stays enabled.
     open_palette(cx, &fixture).await;
     assert!(cx.read(|cx| {
         commands::Command::CloseThread
@@ -104,7 +100,6 @@ async fn terminal_tabs_keep_failure_local_and_save_tabs(cx: &mut TestAppContext)
     assert_eq!(snapshot.threads.len(), 1);
     assert_eq!(snapshot.threads[0].id, factory);
 
-    // Quit with the tab open; the second phase restarts on this data directory.
     quit(cx, &fixture).await;
     println!("DROSTJE_TERMINAL_QA_DATA={}", fixture.data.display());
 }
@@ -141,7 +136,6 @@ async fn terminal_tabs_reopen_after_restart(cx: &mut TestAppContext) {
     let live = cx.read(|cx| json!(fixture.workspace.read(cx).dock.read(cx).dump(cx)));
     assert_eq!(terminal_tabs(&live), saved, "the same tab reopened");
     let factory = factory[0];
-    // The restored active tab is the Thread region's target.
     press(cx, "secondary-2");
     until(
         cx,

@@ -1,4 +1,3 @@
-//! Visible keyboard focus and Vim-style pane navigation.
 use super::*;
 
 fn has_focus_outline(window: &Window, cx: &App, id: impl Into<gpui_kit::ElementId>) -> bool {
@@ -16,8 +15,6 @@ fn has_focus_outline(window: &Window, cx: &App, id: impl Into<gpui_kit::ElementI
 async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let first = new_conversation(cx, &fixture).await;
-    // Generic New conversation reuses an untouched Conversation through its picker.
-    // This fixture needs two distinct panes, so choose an explicit harness action.
     cx.dispatch_action(fixture.window.into(), commands::NewOmpConversation);
     let second = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
     assert_ne!(first, second);
@@ -123,7 +120,6 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
             })
             .unwrap();
 
-            // Native search owns its own focus cue, not the remembered list cursor.
             press(cx, "/");
             cx.run_until_parked();
             cx.update_window(fixture.window.into(), |_, window, cx| {
@@ -135,8 +131,6 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
             press(cx, "escape");
         }
     }
-    // Native Escape legitimately moves Neovim's insert cursor. App pane navigation
-    // must preserve the resulting draft and cursor, not assume an end-of-line cursor.
     let retained = retained.unwrap();
     press(cx, "secondary-2 i");
     let returned = editor.snapshot(DraftKey::Thread(second)).await.unwrap();
@@ -145,7 +139,6 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
     assert_eq!(returned.cursor, retained.cursor);
     let mut expected = retained.text;
     expected.insert(retained.cursor.1, 'd');
-    // Focus preserves the native Normal mode entered above; this i belongs to Neovim.
     press(cx, "i d");
     until(
         cx,
@@ -183,8 +176,6 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
     };
     let mut threads = Vec::new();
     for _ in 0..3 {
-        // Generic New conversation reuses an untouched thread through its picker.
-        // A split-layout fixture needs three distinct Conversation identities.
         cx.dispatch_action(fixture.window.into(), commands::NewOmpConversation);
         let id = cx.read(|cx| fixture.state.read(cx).selected_thread.unwrap());
         until(
@@ -205,8 +196,6 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         .await;
         threads.push(id);
     }
-    // This fixture measures outer dock adjacency. Sidebar surfaces have their
-    // own traversal scenarios and must not become extra neighbours here.
     fixture.state.update(cx, |state, cx| {
         for &id in &threads {
             if state.thread_sidebar_open(id) {
@@ -276,8 +265,6 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         threads.last().copied(),
         "the layout fixture must focus the rightmost thread before navigation"
     );
-    // At the right edge, neither moving right nor moving vertically may pick
-    // Projects just because its full-height pane has a different centre.
     for keys in [
         "secondary-alt-l",
         "secondary-alt-right",
@@ -376,8 +363,6 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         );
     }
 
-    // Stacked threads sit beside the full-height Projects pane. Its centre
-    // must not make it a vertical neighbour of any of those threads.
     let mut layout = update_workspace(
         cx,
         fixture.window,

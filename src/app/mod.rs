@@ -51,21 +51,16 @@ pub use worktrees::{
     RemovalFailure, WorkingTree, WorktreeRequest, WorktreeRequestKind, WorktreeRequestStatus,
 };
 
-/// The title of a Factory thread nobody named or configured yet.
 pub const DEFAULT_FACTORY_TITLE: &str = "New Factory thread";
 
-/// Content changes are separate from structural workspace invalidation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PresentationChange {
     Draft(ThreadId),
     Thread(ThreadId),
     Transcript(ThreadId),
     Diff(WorkingTree),
-    /// The review threads of a Conversation's pull request were (re)read.
     Review(ThreadId),
-    /// A worktree request changed status; the dialog that opened it reads the new state.
     WorktreeRequest(Uuid),
-    /// The commit subject request changed status; the Commit dialog reads the new state.
     CommitSubject(Uuid),
     Persistence,
     Selection,
@@ -94,18 +89,14 @@ pub struct AppState {
     artifacts: artifacts::ArtifactChannels,
     pub remote_client: crate::remote::Client,
     pub remote_file: Option<RemoteFileView>,
-    /// Models the title providers have locally; `None` until first inspected.
     pub title_models: Option<crate::titles::InstalledModels>,
-    /// The inspection in flight; results of earlier ones are dropped.
     title_models_request: Option<Uuid>,
     pub notices: VecDeque<WorkspaceNotice>,
     pub notice_sequence: u64,
     pub storage_error: Option<String>,
     pub pending_writes: usize,
-    /// Changed in memory; no persistence work is queued until a commit boundary.
     edited_threads: HashSet<ThreadId>,
     pub installing_pi: bool,
-    /// The Install Pi request whose look for an existing Pi is in flight.
     pi_check: Option<Uuid>,
     pub registering: bool,
     pub active_threads: HashSet<ThreadId>,
@@ -123,19 +114,13 @@ pub struct AppState {
     pub editor_error: Option<String>,
     pub factory: Option<crate::factory::FactoryManager>,
     pub factory_runs: BTreeMap<LaunchId, crate::factory::FactorySnapshot>,
-    /// Shared so presentation can hold the page and detect a new one by pointer.
     pub factory_text: Option<Result<Arc<crate::factory::TextPage>, String>>,
     pub factory_text_path: Option<PathBuf>,
     pub factory_text_generation: Uuid,
     pub pending_factory: HashSet<ThreadId>,
-    /// Conversations with a title request in flight; at most one each.
     titling: HashSet<ThreadId>,
-    /// The worktree creation or removal in flight, kept until the next one starts so the
-    /// dialog can show how it ended.
     pub worktree_request: Option<WorktreeRequest>,
-    /// The commit subject the local model is writing, or how that ended; one at a time.
     pub commit_subject: Option<commit::CommitSubjectRequest>,
-    /// Live HEAD per worktree as last read from Git; absent means not read yet.
     pub worktree_heads: HashMap<WorktreeId, Option<String>>,
     renaming_worktrees: HashSet<WorktreeId>,
     inspecting_worktrees: HashSet<WorktreeId>,
@@ -289,8 +274,6 @@ impl AppState {
                 {
                     break;
                 }
-                // A timer crosses the executor turn; yield_now can immediately
-                // repoll this task while native input is still waiting.
                 smol::Timer::after(std::time::Duration::from_millis(1)).await;
             }
         })
@@ -306,8 +289,6 @@ impl AppState {
                 Some(shutdown::Shutdown::new(state))
             });
             async move {
-                // Last-resort best effort for platform termination that bypasses
-                // the DROSTJE. quit action. Normal quit has already completed cleanup.
                 if let Some(shutdown) = shutdown
                     && let Err(error) = shutdown.run(true).await
                 {

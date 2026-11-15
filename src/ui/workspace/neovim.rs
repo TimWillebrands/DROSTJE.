@@ -1,6 +1,3 @@
-//! Neovim tabs: the user's own Neovim in a terminal surface, opened empty or on a file
-//! a Conversation displayed. A tab is a `Terminal` panel whose pane runs Neovim, so it
-//! shares terminal persistence, Spaces, visibility, focus and close confirmation.
 use super::super::terminal::{NeovimTarget, neovim_jump_expression, neovim_remote};
 use super::*;
 use crate::file_refs::{self, FileReference};
@@ -12,7 +9,6 @@ use gpui_kit::component::{
     spinner::Spinner,
 };
 
-/// Remote file bytes only enter this read-only control, never a desktop file or editor.
 struct RemoteFileDialog {
     state: Entity<AppState>,
     thread: ThreadId,
@@ -78,7 +74,6 @@ impl Render for RemoteFileDialog {
     }
 }
 
-/// The `nvim` executable setting; blank discovers Neovim on PATH.
 pub(super) fn neovim_setting(state: &AppState) -> Option<String> {
     state
         .snapshot
@@ -107,7 +102,6 @@ impl Workspace {
         }
     }
 
-    /// The keyboard path to every file the selected Conversation displayed.
     pub(super) fn open_conversation_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self
             .state
@@ -139,10 +133,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Open `reference` in a Neovim tab, at its line. Relative paths resolve against the
-    /// working tree of `thread` (or the selected Conversation). The file must exist and
-    /// be text; that is checked off the UI thread, and a failure is a visible notice.
-    /// A live Neovim tab already showing the file moves to the line instead.
     pub(in crate::ui) fn open_file_reference(
         &mut self,
         reference: FileReference,
@@ -192,7 +182,6 @@ impl Workspace {
                 let file = std::fs::canonicalize(&path).map_err(|error| {
                     format!("{} could not be resolved: {error}", path.display())
                 })?;
-                // A removed worktree leaves no directory to start in; use the file's own.
                 let root = if base.is_dir() {
                     base
                 } else {
@@ -288,7 +277,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The dock cannot change while these settle; the click is not silently lost.
         if self.preparing_space_change
             || self.terminal_confirmation
             || self.rebuilding
@@ -334,7 +322,6 @@ impl Workspace {
         });
     }
 
-    /// Neovim quit on its own (`:q`): nothing it owned is left, so neither is its tab.
     pub(super) fn neovim_exited(
         &mut self,
         id: TerminalId,
@@ -350,7 +337,6 @@ impl Workspace {
 
 #[cfg(feature = "runtime-qa")]
 impl Workspace {
-    /// Each Neovim tab's title and what it opened, for runtime QA.
     pub fn neovim_tabs(&self, cx: &App) -> Vec<(String, NeovimTarget)> {
         self.terminals
             .borrow()

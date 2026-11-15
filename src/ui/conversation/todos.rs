@@ -12,9 +12,6 @@ use gpui_kit::{
     *,
 };
 
-/// A `todo` call whose result parsed: what changed, OMP's tally and the
-/// checklist. A new or blocked list opens by default; other changes fold the
-/// list behind the disclosure so a run of `done` calls stays short.
 pub(super) fn todo_card(
     key: String,
     call: ToolCall<'_>,

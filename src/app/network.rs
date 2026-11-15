@@ -1,5 +1,3 @@
-//! App-owned automatic delivery: consent and current runtime identity precede every claim.
-//! Store work is serialized off-thread; native acceptance never mutates a Draft.
 use super::*;
 use crate::network::{
     Action, DeliveryBatch, DeliveryOutcome, DeliveryState, Network, NetworkSnapshot, Peer,
@@ -118,8 +116,6 @@ enum Update {
     Failed(String),
 }
 
-/// Kind, archived, project, worktree, title, remote location, harness, last activity and
-/// submission: see [`peer_context`].
 pub(super) type PeerContext<'a> = (
     &'a ThreadKind,
     bool,
@@ -132,8 +128,6 @@ pub(super) type PeerContext<'a> = (
     &'a Option<Value>,
 );
 
-/// Every field of a thread that `sync_network` reads, through `network_peers`,
-/// `network_context_eligible` and `network_can_receive`. Keep it in step with them.
 pub(super) fn peer_context(thread: &Thread) -> PeerContext<'_> {
     (
         &thread.kind,
@@ -361,7 +355,6 @@ impl AppState {
         }
     }
 
-    /// Only explicit user work may reactivate previously consented membership after a stop/restart.
     pub(super) fn authorize_network_user_turn(&mut self, thread: ThreadId) {
         if !self
             .network
@@ -455,8 +448,6 @@ impl AppState {
             .collect()
     }
 
-    /// Publishes the current peers and revokes runtimes that lost their context. A thread
-    /// contributes only its [`peer_context`], so saving a thread syncs only when that changed.
     pub(super) fn sync_network(&mut self) {
         if self.shutting_down || self.storage_error.is_some() {
             self.pause_all_network_delivery();
@@ -558,7 +549,6 @@ impl AppState {
                     && self.thread_in_space(thread, member.space)
             })
     }
-    /// A peer attempt is being claimed, dispatched or admitted for this runtime.
     pub(super) fn network_delivery_in_flight(&self, thread: ThreadId) -> bool {
         self.network.runtimes.get(&thread).is_some_and(|runtime| {
             runtime.claiming || runtime.lease.is_some() || runtime.preparing.is_some()
@@ -566,14 +556,11 @@ impl AppState {
     }
     fn network_can_receive(&self, thread: ThreadId) -> bool {
         self.network_delivery_enabled(thread)
-            // Native runtimes admit one injected attempt at a time.
             && !self.artifact_delivery_in_flight(thread)
             && self.conversations.get(&thread).is_some_and(|session| {
                 session.persisted
                     && !session.preparing
                     && session.requests.is_empty()
-                    // Remote native queues cannot revoke an accepted next-turn item on
-                    // desktop detach. Keep those messages in the durable Space mailbox.
                     && (session.state == ConversationState::Ready
                         || (session.state == ConversationState::Running
                             && !self.snapshot.threads.iter().any(|candidate| {
@@ -870,8 +857,6 @@ impl AppState {
             );
             return;
         }
-        // Persistence can finish after a permission, input or admission state change.
-        // Nothing has reached the native transport yet, so this lease can safely wait.
         if !self.network_can_receive(thread) {
             self.finish_network_delivery(batch.attempt, DeliveryOutcome::Deferred);
             return;
@@ -1013,8 +998,6 @@ impl AppState {
         }
         let outcome = match outcome {
             harness::PeerDeliveryOutcome::Accepted => {
-                // A busy native runtime may consume context without admitting a new turn.
-                // Idle receipts alone do not establish admission: retain their reservation.
                 if self
                     .conversations
                     .get(&thread)
@@ -1251,8 +1234,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
-    /// `receive_conversation` holds the session outside `conversations` while it handles an
-    /// event; a thread saved meanwhile must not look like a runtime that went away.
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
     fn harness_updates_that_save_the_thread_keep_automatic_delivery(
@@ -1421,7 +1402,6 @@ mod tests {
             assert!(syncs(&work) > 0, "a new thread is a new peer");
             let thread = state.thread().unwrap().clone();
 
-            // Nothing a peer or its eligibility depends on.
             let mut quiet = thread.clone();
             quiet.model = Some(ModelKey {
                 provider: "provider".into(),

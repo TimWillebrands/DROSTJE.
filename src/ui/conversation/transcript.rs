@@ -27,19 +27,11 @@ use gpui_kit::{
 };
 use std::{cell::Cell, rc::Rc};
 
-/// A disclosure in one Conversation's transcript or composer band opened or closed: that
-/// transcript's rows may change height, no other's.
 pub(in crate::ui) struct TranscriptDisclosure {
     pub(super) thread: ThreadId,
 }
 impl EventEmitter<TranscriptDisclosure> for Workspace {}
 
-/// Owns transcript layout independently of drafts, forms and the workspace shell.
-///
-/// A row reads its message and the session's tool activity (both in the session's change
-/// journal), its disclosures (`TranscriptDisclosure`), whether the thread is working (a call
-/// without a result runs or has none), where each artifact shows, and the theme. Only a
-/// change of one of these renders or remeasures rows; other app state does not.
 pub(in crate::ui) struct TranscriptView {
     id: ThreadId,
     state: Entity<AppState>,
@@ -49,18 +41,13 @@ pub(in crate::ui) struct TranscriptView {
     revision: u64,
     count: usize,
     invalidate_rows: bool,
-    /// Whether the thread was working when the rows were last measured.
     active: Option<bool>,
-    /// An artifact may have moved, resized, collapsed or closed: its rows remeasure.
     remeasure_artifacts: bool,
-    /// List width at which unmeasured rows last got an estimated height; `None` once rows
-    /// without one were added.
     estimated_width: Rc<Cell<Option<Pixels>>>,
     markdown: MarkdownStates,
     runs: RunCache,
     artifact_rows: Memo<(uuid::Uuid, u64), Vec<usize>>,
     pub(super) dock: DockCache,
-    /// Thumbnails of this transcript and its draft; freed with it.
     pub(super) images: Entity<RetainAllImageCache>,
     _subscriptions: Vec<Subscription>,
 }
@@ -83,7 +70,6 @@ impl TranscriptView {
                     crate::app::PresentationChange::Transcript(thread) if *thread == id => {
                         cx.notify()
                     }
-                    // Artifacts report placement and layout changes as thread changes.
                     crate::app::PresentationChange::Thread(thread) if *thread == id => {
                         if this.has_artifacts(cx) {
                             this.remeasure_artifacts = true;
@@ -95,7 +81,6 @@ impl TranscriptView {
                     _ => {}
                 },
             ),
-            // Any other app change reaches rows only through the session or the activity.
             cx.observe(&state, |this, _, cx| {
                 if this.stale(cx) {
                     cx.notify();
@@ -119,7 +104,6 @@ impl TranscriptView {
         }
         let list = ListState::new(0, ListAlignment::Bottom, px(500.));
         list.set_follow_mode(FollowMode::Tail);
-        // The jump button depends on scroll position; defer so the list's borrow is released.
         let view = cx.weak_entity();
         list.set_scroll_handler(move |_, _, cx| {
             let view = view.clone();
@@ -148,7 +132,6 @@ impl TranscriptView {
         }
     }
 
-    /// Whether the session or the thread's activity moved on since the rows last rendered.
     fn stale(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
         let session = state
@@ -172,7 +155,6 @@ impl TranscriptView {
             .is_some_and(|session| !self.artifact_rows(session).is_empty())
     }
 
-    /// Rows holding an artifact call, which show the artifact's pane or its docked stub.
     fn artifact_rows(&self, session: &ConversationSession) -> Rc<Vec<usize>> {
         self.artifact_rows
             .get((session.generation, session.transcript_revision), || {
@@ -182,7 +164,6 @@ impl TranscriptView {
 
     fn sync(&mut self, cx: &App) {
         let state = self.state.read(cx);
-        // Calls without a result read as running while the thread works, else as unknown.
         let active = state.active_threads.contains(&self.id);
         if self.active.is_some_and(|rendered| rendered != active) {
             self.invalidate_rows = true;
@@ -218,8 +199,6 @@ impl TranscriptView {
         if matches!(changes, RowChanges::Reset) {
             self.markdown.clear();
         }
-        // A changed or new message can join or split a run of tool calls, which changes the
-        // height of that run's other rows.
         let mut anchors = match &changes {
             RowChanges::Rows(rows) => rows.clone(),
             RowChanges::Reset | RowChanges::All => Vec::new(),
@@ -268,20 +247,12 @@ impl TranscriptView {
     }
 }
 
-/// What changed in a transcript since its list last rendered.
 enum RowChanges {
-    /// A new session, or a gap in the change journal: nothing known about the old rows holds.
     Reset,
-    /// Any row may have changed height: the thread started or stopped working, one of its
-    /// disclosures or the theme changed.
     All,
-    /// These rows changed in place.
     Rows(Vec<usize>),
 }
 
-/// Brings `list` from `old` rows to `count`. Changed rows are remeasured in place: a splice
-/// would move a reader inside a replaced row to its top and forget the row's height, so the
-/// reader would jump and the scrollbar would shrink to the rows in view.
 fn update_rows(
     list: &ListState,
     estimated_width: &Cell<Option<Pixels>>,
@@ -291,7 +262,6 @@ fn update_rows(
 ) {
     let kept = old.min(count);
     if count > old || matches!(changes, RowChanges::Reset) {
-        // New rows have no height until `estimate_unmeasured_rows` runs again.
         estimated_width.set(None);
     }
     match changes {
@@ -311,13 +281,8 @@ fn update_rows(
     }
 }
 
-/// Rows the list has not laid out count as a short message until they are measured.
 const ROW_ESTIMATE: f32 = 3.;
 
-/// Gives rows the list has not laid out an estimated height, so the scrollbar spans the whole
-/// transcript and a drag lands proportionally instead of skipping rows that count as zero.
-/// The list forgets every row height when its width changes; this runs after the list's
-/// prepaint and before the scrollbar's, so the thumb is right in the same frame.
 pub(in crate::ui) fn estimate_unmeasured_rows(
     list: &ListState,
     estimated_width: &Rc<Cell<Option<Pixels>>>,
@@ -329,7 +294,6 @@ pub(in crate::ui) fn estimate_unmeasured_rows(
         move |_, _, _| {
             let width = list.viewport_bounds().size.width;
             if estimated_width.replace(Some(width)) != Some(width) {
-                // Measured rows keep their height; only unknown ones take the estimate.
                 list.with_uniform_item_height(row);
             }
         },
@@ -341,7 +305,6 @@ pub(in crate::ui) fn estimate_unmeasured_rows(
 
 fn scroll_list(list: &ListState, motion: Motion, line: Pixels) {
     match motion {
-        // `scroll_to` pauses tail following; revealing an item would snap back to the end.
         Motion::First => list.scroll_to(ListOffset {
             item_ix: 0,
             offset_in_item: px(0.),
@@ -354,13 +317,11 @@ fn scroll_list(list: &ListState, motion: Motion, line: Pixels) {
     }
 }
 
-/// Returns to the latest message and resumes following new output.
 fn scroll_to_latest(list: &ListState) {
     list.set_follow_mode(FollowMode::Tail);
     list.scroll_to_end();
 }
 
-/// Unmeasured rows leave the end unknown; a list that stopped following is then away from it.
 fn scrolled_up(list: &ListState) -> bool {
     list.max_offset_for_scrollbar().y > px(0.)
         && !list.is_following_tail()
@@ -497,7 +458,6 @@ mod tests {
                 .detach();
         });
 
-        // App changes rows do not read: another thread, this thread's chrome, a bare notify.
         state.update(cx, |_, cx| {
             cx.emit(PresentationChange::Thread(other));
             cx.emit(PresentationChange::Transcript(other));
@@ -507,7 +467,6 @@ mod tests {
         draw(cx);
         assert_eq!(renders.get(), 0, "nothing the rows show changed");
 
-        // The thread starts working: calls without a result now read as running.
         state.update(cx, |state, cx| {
             state.active_threads.insert(id);
             cx.notify();
@@ -517,7 +476,6 @@ mod tests {
         draw(cx);
         assert_eq!(cx.read(|cx| view.read(cx).active), Some(true));
 
-        // The theme changes every row.
         cx.update(|cx| {
             let settings = std::collections::BTreeMap::from([(
                 "theme_mode".to_owned(),
@@ -568,13 +526,11 @@ mod tests {
         draw(cx);
         assert!(!scrolled_up(&rows));
 
-        // `gg` must stay at the top instead of being pulled back by tail following.
         scroll_list(&rows, Motion::First, px(36.));
         draw(cx);
         assert!(scrolled_up(&rows));
         assert_eq!(rows.logical_scroll_top().item_ix, 0);
 
-        // A page is most of the viewport, in whole 40px rows here.
         let page = (rows.viewport_bounds().size.height * super::PAGE_SHARE / px(40.)) as usize;
         assert!(page > 1);
         scroll_list(&rows, Motion::Page(1), px(36.));
@@ -617,7 +573,6 @@ mod tests {
                         })
                         .size_full(),
                     )
-                    // The estimate matches every row, so the scrollbar must span all of them.
                     .child(estimate_unmeasured_rows(&self.0, &self.1, ROW))
             }
         }
@@ -676,7 +631,6 @@ mod tests {
         assert!(at_reader(&rows), "new output must not move the reader");
         assert!(spans_all_rows(&rows), "new rows count toward the scrollbar");
 
-        // The list forgets every measured height when its width changes.
         cx.simulate_window_resize(window.into(), size(px(640.), px(480.)));
         draw(cx);
         assert!(at_reader(&rows), "a resize must not move the reader");
@@ -700,7 +654,6 @@ mod tests {
         use std::{cell::Cell, rc::Rc};
 
         const ROW: Pixels = px(40.);
-        // The newest row streams: its height grows while the others stay put.
         struct Rows(ListState, Rc<Cell<(usize, Pixels)>>);
         impl Render for Rows {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -744,7 +697,6 @@ mod tests {
             })
             .unwrap();
         };
-        // Output streams into the newest row, then a new row starts, as during a turn.
         let stream = |cx: &mut gpui_kit::TestAppContext, count: usize| {
             latest.set((count, latest.get().1 + ROW * 3.));
             update_rows(

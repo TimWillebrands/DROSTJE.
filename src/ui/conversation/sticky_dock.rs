@@ -17,7 +17,6 @@ use gpui_kit::{
 use std::rc::Rc;
 use uuid::Uuid;
 
-/// A completed tool result's content, live activity first, then the history message.
 fn call_result<'a>(session: &'a ConversationSession, call_id: &str) -> Option<&'a [ContentBlock]> {
     if let Some(tool) = session.tools.get(call_id)
         && tool.complete
@@ -33,7 +32,6 @@ fn first_text(blocks: &[ContentBlock]) -> Option<&str> {
         _ => None,
     })
 }
-/// The list as of the latest `todo` call that answered without an error.
 fn current_todo(session: &ConversationSession) -> Option<TodoList> {
     session
         .tool_call_order()
@@ -42,8 +40,6 @@ fn current_todo(session: &ConversationSession) -> Option<TodoList> {
         .filter(|(name, _)| name == "todo")
         .find_map(|(_, id)| TodoList::parse(first_text(call_result(session, id)?)?))
 }
-/// Jobs started by `task` or async `bash` and not yet settled by a `wait`
-/// result, historical `hub` snapshot or job notice, in start order.
 fn running_jobs(session: &ConversationSession) -> Vec<JobStart> {
     let mut jobs = Vec::new();
     let mut settled = std::collections::HashSet::new();
@@ -70,13 +66,9 @@ fn running_jobs(session: &ConversationSession) -> Vec<JobStart> {
     jobs.retain(|job| !settled.contains(&job.id));
     jobs
 }
-/// What the dock shows, derived from the transcript once per change instead of per frame.
 pub(super) struct DockContents {
-    /// The latest task list while any task is unfinished, with its tally and the task in
-    /// progress.
     todo: Option<OpenTodo>,
     jobs: Vec<JobStart>,
-    /// The running jobs' IDs, comma separated.
     job_ids: SharedString,
 }
 
@@ -123,8 +115,6 @@ impl DockContents {
     }
 }
 
-/// One Conversation's dock contents. Every input (tool call order, results, live activity of
-/// a seen call, notices) changes the transcript revision, and a new session its generation.
 pub(super) type DockCache = Memo<(Uuid, u64), DockContents>;
 
 pub(super) fn dock_contents(cache: &DockCache, session: &ConversationSession) -> Rc<DockContents> {
@@ -133,9 +123,6 @@ pub(super) fn dock_contents(cache: &DockCache, session: &ConversationSession) ->
     })
 }
 
-/// The band above the composer that keeps open tasks and running background
-/// jobs in view while the transcript scrolls. Folded by default; the
-/// `ToggleTaskList` and `ToggleBackgroundJobs` commands and the chevrons unfold.
 pub(super) fn sticky_dock(
     id: ThreadId,
     contents: &DockContents,

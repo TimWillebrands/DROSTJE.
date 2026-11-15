@@ -1,5 +1,3 @@
-//! Authenticated relay transport and location-aware remote Conversations.
-
 pub mod client;
 pub mod config;
 pub mod host;

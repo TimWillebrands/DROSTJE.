@@ -19,13 +19,10 @@ mod peer;
 
 const FRAME: usize = 1_048_576;
 const OUTPUT_FRAME: usize = 67_108_864;
-/// Claude Code (2.1.x, `--input-format stream-json`) emits its `system/init` frame only after
-/// the first `user` frame, so this deadline is armed by the first prompt, not by the spawn.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const TRANSCRIPT: &str = "conversation.jsonl";
 const INITIALIZE_REQUEST: &str = "drostje-initialize";
 const CONTEXT_USAGE_REQUEST: &str = "drostje-context-usage";
-/// `get_usage` is marked experimental by Claude Code; an unexpected answer is kept as a diagnostic.
 const USAGE_REQUEST: &str = "drostje-usage";
 
 pub(super) fn submission_size_for_lengths(
@@ -96,7 +93,6 @@ impl OwnedChild {
                 _ => break,
             }
         }
-        // This PID is the unreaped child whose setsid call succeeded before exec.
         let _ = drostje_platform::terminate_process_group(self.child.id());
         let deadline = Instant::now() + Duration::from_millis(250);
         while Instant::now() < deadline {
@@ -115,8 +111,6 @@ impl OwnedChild {
         if self.reaped {
             return Ok(());
         }
-        // This is the same unreaped owned process group. An uncertain native
-        // queue must not run during the graceful EOF wait used by ordinary close().
         drostje_platform::kill_process_group(self.child.id())
             .context("Kill owned Claude process group")?;
         self.stdin.take();
@@ -143,8 +137,6 @@ struct Session {
     id: Uuid,
     reference: String,
     transcript_path: PathBuf,
-    /// Claude Code stores a session at its first user frame, so a saved reference alone does not
-    /// prove one exists; a line in our transcript does. Resuming an unstored ID is a fatal error.
     resume: bool,
 }
 
@@ -196,8 +188,6 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session, Opti
     for key in &config.credential_env {
         command.env_remove(key);
     }
-    // `--permission-prompts host` only names who answers; without `--permission-prompt-tool
-    // stdio` the CLI never sends `can_use_tool` and auto-denies every prompt.
     command
         .args([
             "--print",
@@ -211,7 +201,6 @@ fn prepare(config: &mut ConversationConfig) -> Result<(OwnedChild, Session, Opti
             "host",
             "--permission-prompt-tool",
             "stdio",
-            // Interactive questions are HTML artifacts with a channel back to the agent.
             "--disallowedTools",
             ASK_USER_QUESTION,
         ])
@@ -310,12 +299,9 @@ struct Turn {
     interrupting: bool,
 }
 
-/// One unanswered `can_use_tool` request.
 #[derive(Debug)]
 struct Permission {
     input: Value,
-    /// Labelled `permission_suggestions` from the CLI; the chosen one goes back verbatim as
-    /// `updatedPermissions` so Claude Code stops asking.
     choices: Vec<(String, Value)>,
 }
 
@@ -333,7 +319,6 @@ struct Actor {
     output: async_channel::Sender<ConversationEvent>,
     events: VecDeque<ConversationEvent>,
     state: ConversationState,
-    /// Cleared at stderr end of file, after which a hung-up stderr would end every wait.
     stderr_open: bool,
     init_deadline: Option<Instant>,
     initialized: bool,
@@ -353,19 +338,12 @@ struct Actor {
     idle_sleep_assertion: Option<IdleSleepAssertion>,
     permissions: HashMap<String, Permission>,
     tools: HashMap<String, ToolActivity>,
-    /// Tool result images already stored under the session directory.
     images: ImageCache,
-    /// `set_model` control requests awaiting the CLI's answer.
     model_requests: HashMap<String, ModelKey>,
-    /// The `initialize` answer carried the model catalog, so `init` need not report one.
     models_reported: bool,
-    /// Usage control requests awaiting an answer, so refresh triggers never pile up.
     usage_requests: Vec<&'static str>,
-    /// The last command list, kept raw so `init` can mark terminal-only commands later.
     slash_commands: Option<Value>,
-    /// `terminal_slash_commands` from `init`: commands bound to the Claude Code terminal.
     terminal_commands: Vec<String>,
-    /// The `/mcp` DROSTJE. is answering through control requests for the current turn.
     mcp: Option<mcp::McpCommand>,
 }
 
@@ -445,7 +423,6 @@ impl Actor {
         Ok(())
     }
 
-    /// Asks for context and plan usage unless the same question is still unanswered.
     fn refresh_usage(&mut self, requests: &[&'static str]) -> Result<()> {
         for &request_id in requests {
             if self.usage_requests.contains(&request_id) {
@@ -466,7 +443,6 @@ impl Actor {
         Ok(())
     }
 
-    /// Appends one frame to the transcript and keeps it, without copying, in `history`.
     fn append_history(&mut self, value: Value) -> Result<()> {
         serde_json::to_writer(&mut self.transcript, &value)?;
         self.transcript.write_all(b"\n")?;
@@ -476,7 +452,6 @@ impl Actor {
         Ok(())
     }
 
-    /// [`Self::append_history`], then the frame's display messages.
     fn record_history(&mut self, value: Value) -> Result<Vec<Message>> {
         self.append_history(value)?;
         normalize_history(
@@ -500,7 +475,6 @@ impl Actor {
                         let completed = self.writes.pop_front().unwrap();
                         self.write_offset = 0;
                         if let Some((request_id, history)) = completed.accepted {
-                            // Show our submitted history once; native replay echoes are suppressed.
                             for message in self.record_history(history)? {
                                 self.emit(ConversationEvent::MessageUpdated(message));
                             }
@@ -520,7 +494,6 @@ impl Actor {
     }
 
     fn run(&mut self) -> Result<()> {
-        // The process accepts prompts as soon as its stdin is open; `init` follows the first one.
         let models = self
             .config
             .model
@@ -540,7 +513,6 @@ impl Actor {
         self.emit_peer_availability(None);
         self.emit_history()?;
         self.state(ConversationState::Ready);
-        // The `initialize` answer carries the model catalog before any prompt is sent.
         self.queue(
             json!({"type":"control_request","request_id":INITIALIZE_REQUEST,
                 "request":{"subtype":"initialize"}}),
@@ -638,9 +610,6 @@ impl Actor {
         }
     }
 
-    /// Sleeps until the child's pipes, a command or the next deadline check need this loop.
-    /// Peer socket writes and status connections have no descriptor here, so they keep
-    /// the short tick.
     fn wait(&mut self) -> Result<()> {
         let timeout = if self.lines.buffered() {
             Duration::ZERO
@@ -750,7 +719,6 @@ impl Actor {
             }
             ConversationCommand::Interrupt => {
                 if self.mcp.take().is_some() {
-                    // Control requests cannot be withdrawn; Claude Code may still apply them.
                     self.finish_local(
                         "Stopped waiting for Claude Code to answer `/mcp`; it may still apply the change. Run `/mcp` to see the servers.".into(),
                         TurnOutcome::Unknown,
@@ -1033,7 +1001,6 @@ impl Actor {
                 }
             }
             "assistant" => {
-                // The frame moves into history; the message carries it as raw data.
                 let [message] = <[Message; 1]>::try_from(self.record_history(frame)?)
                     .map_err(|_| anyhow::anyhow!("Claude Code assistant frame is one message"))?;
                 for block in &message.content {
@@ -1044,7 +1011,6 @@ impl Actor {
                         input,
                     } = block
                     {
-                        // The kept copy needs no raw data: the result frame replaces it.
                         let tool = ToolActivity {
                             id: id.clone(),
                             name: name.clone(),
@@ -1074,15 +1040,12 @@ impl Actor {
                     }
                     return Ok(());
                 }
-                // --replay-user-messages echoes ordinary stdin prompts. Their local history
-                // was already appended when the input pipe accepted the original frame.
                 if !frame["message"]["content"]
                     .as_array()
                     .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
                 {
                     return Ok(());
                 }
-                // Not peer context, so history normalizes it as tool results.
                 for message in self.record_history(frame)? {
                     if let Some(id) = &message.tool_call_id {
                         let mut tool = self.tools.remove(id).unwrap_or_else(|| ToolActivity {
@@ -1118,8 +1081,6 @@ impl Actor {
                         self.state(ConversationState::WaitingForInput);
                     }
                     Err(reason) => {
-                        // A question shape DROSTJE cannot present is declined with the reason,
-                        // visibly, so Claude Code can ask again in a supported form.
                         self.emit(ConversationEvent::Notice {
                             level: "warning".into(),
                             text: format!("Declined a Claude Code request: {reason}"),
@@ -1162,7 +1123,6 @@ impl Actor {
                 } else {
                     TurnOutcome::Completed
                 };
-                // A `/mcp` turn never reaches the CLI, so no result belongs to it.
                 let settles_user = self.mcp.is_none()
                     && self.turn.id.is_some_and(|id| {
                         native_ids.contains(&id)
@@ -1170,7 +1130,6 @@ impl Actor {
                     });
                 if settles_user {
                     self.settle_user(outcome.clone());
-                    // A result can consume both user input and safe-boundary peer context.
                     if self.peer_turn.is_some() {
                         self.settle_peer(outcome);
                     }
@@ -1200,7 +1159,6 @@ impl Actor {
                     raw: frame,
                 });
             }
-            // Claude Code pushes the whole list again whenever it changes.
             "system" if frame["subtype"] == "commands_changed" => {
                 self.commands(frame["commands"].clone())
             }
@@ -1324,7 +1282,6 @@ impl Actor {
         Ok(())
     }
 
-    /// Starts a turn for prompt text DROSTJE. answers itself instead of sending it to the CLI.
     fn accept_local(&mut self, request_id: Uuid, text: &str) -> Result<()> {
         let history = json!({"type":"drostje_user","id":request_id,"text":text,"images":[]});
         for message in self.record_history(history)? {
@@ -1353,7 +1310,6 @@ impl Actor {
         }
     }
 
-    /// Shows the output of a turn DROSTJE. answered itself and settles that turn.
     fn finish_local(&mut self, text: String, outcome: TurnOutcome) -> Result<()> {
         let frame = json!({
             "type":"drostje_command",
@@ -1445,8 +1401,6 @@ impl Actor {
             self.hard_stop_peer("Claude did not acknowledge queue-clearing Stop within 5 seconds")?;
             return Ok(());
         }
-        // Poll only bounded, credential-verified native receipts. Actual user replies are
-        // denied by the status transport and remain diagnostics, never model/user input.
         for frame in self.peer.status_frames() {
             if frame["type"] == "control" && frame["action"] == "peer_message_status" {
                 self.frame(frame)?;
@@ -1505,8 +1459,6 @@ impl Actor {
     }
 }
 
-/// The `initialize` control response lists models as `{value, displayName, supportedEffortLevels?}`;
-/// `value` is what `--model` and `set_model` accept.
 fn parse_models(models: &Value) -> Vec<ModelChoice> {
     models
         .as_array()
@@ -1538,9 +1490,6 @@ fn parse_models(models: &Value) -> Vec<ModelChoice> {
         .collect()
 }
 
-/// Command entries are `{name, description, argumentHint, aliases?, builtin?}`. Plugin
-/// commands are namespaced `plugin:name`; everything else is a skill or command file, which
-/// Claude Code does not tell apart.
 fn parse_commands(raw: &Value, terminal: &[String]) -> Option<Vec<SlashCommand>> {
     let commands = raw
         .as_array()?
@@ -1587,8 +1536,6 @@ fn parse_commands(raw: &Value, terminal: &[String]) -> Option<Vec<SlashCommand>>
     Some(commands)
 }
 
-/// Error results carry their reason in `result`, `error` or (for execution errors) `errors`.
-/// `get_context_usage` answer: `totalTokens` of `maxTokens`.
 fn parse_context_usage(answer: &Value) -> Option<ContextUsage> {
     let used_tokens = answer["totalTokens"].as_u64()?;
     let max_tokens = answer["maxTokens"].as_u64().filter(|max| *max > 0)?;
@@ -1598,8 +1545,6 @@ fn parse_context_usage(answer: &Value) -> Option<ContextUsage> {
     })
 }
 
-/// `get_usage` answer. `rate_limits_available: false` (API key, Bedrock, Vertex) means no windows;
-/// a window without a numeric utilisation is left out rather than shown as zero.
 fn parse_limits(answer: &Value) -> Option<Vec<UsageLimit>> {
     if answer["rate_limits_available"] == false {
         return Some(Vec::new());
@@ -1623,7 +1568,6 @@ fn parse_limits(answer: &Value) -> Option<Vec<UsageLimit>> {
     )
 }
 
-/// RFC 3339 timestamp (`2026-09-16T18:00:00.5+02:00`) to `SystemTime`; `None` for anything else.
 fn parse_timestamp(text: &str) -> Option<SystemTime> {
     let number = |range: std::ops::Range<usize>| -> Option<i64> {
         let digits = text.get(range)?;
@@ -1662,7 +1606,6 @@ fn parse_timestamp(text: &str) -> Option<SystemTime> {
         }
         _ => return None,
     };
-    // Days from civil date (Howard Hinnant's algorithm).
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
@@ -1727,16 +1670,12 @@ const DENIED: &str = "The user denied this tool request.";
 const ASK_USER_QUESTION: &str = "AskUserQuestion";
 const ASK_WITH_ARTIFACT: &str = "AskUserQuestion is not available in DROSTJE. To ask the user, write an HTML page with a <form data-drostje=\"answer\"> (or data-drostje-send buttons) and call show_artifact; the user's answers arrive as artifact events. For a simple question, ask in plain text instead.";
 
-/// Maps a `can_use_tool` request to the choices shown to the user: allow once, one entry per
-/// usable `permission_suggestions` item, deny. `Err` carries the reason a request cannot be
-/// presented here; it is declined with that reason.
 fn permission_request(
     request_id: String,
     request: &Value,
 ) -> std::result::Result<(UserRequest, Permission), String> {
     let tool_name = request["tool_name"].as_str().unwrap_or("tool");
     let input = request["input"].clone();
-    // Disallowed at launch; a resumed or reconfigured session may still ask.
     if tool_name == ASK_USER_QUESTION {
         return Err(ASK_WITH_ARTIFACT.into());
     }
@@ -1788,7 +1727,6 @@ fn permission_request(
     ))
 }
 
-/// The `control_response` payload for an answer; `None` when it is not one of the offered choices.
 fn permission_response(permission: &Permission, answer: &UserAnswer) -> Option<Value> {
     let deny = |message: &str| json!({"behavior":"deny","message":message});
     let allow = |suggestion: Option<&Value>| {
@@ -1817,7 +1755,6 @@ fn permission_response(permission: &Permission, answer: &UserAnswer) -> Option<V
     }
 }
 
-/// Removes and answers one request. Auto approval also clears every other pending permission.
 fn permission_responses(
     permissions: &mut HashMap<String, Permission>,
     request_id: &str,
@@ -1844,8 +1781,6 @@ fn permission_responses(
     Some(responses)
 }
 
-/// Label for one `permission_suggestions` item, or `None` for kinds DROSTJE will not offer
-/// (deny rules, `bypassPermissions`, `dontAsk`, unknown types).
 fn describe_suggestion(suggestion: &Value) -> Option<String> {
     let scope = match suggestion["destination"].as_str().unwrap_or("session") {
         "session" => "this session",
@@ -1964,7 +1899,6 @@ fn normalize_history(
                 exit_code: None,
             }])
         }
-        // Output of a command DROSTJE. answered itself, such as `/mcp`.
         "drostje_command" => Ok(vec![Message {
             id: frame["id"]
                 .as_str()
@@ -2014,15 +1948,11 @@ fn normalize_assistant(frame: &Value, sequence: usize) -> Result<Message> {
         }
     }
     Ok(Message {
-        // One `assistant` frame per content block, all sharing the API `message.id`; only the
-        // frame `uuid` is unique, and keying on the shared ID would replace earlier blocks.
         id: frame["uuid"]
             .as_str()
             .filter(|id| !id.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("claude-assistant-{sequence}")),
-        // A local slash command (`/context`, `/reload-skills`) answers with a synthetic
-        // assistant frame; like OMP's command output it is not a model reply.
         role: if frame.get("local_command_run").is_some() {
             "system"
         } else {
@@ -2058,7 +1988,6 @@ fn normalize_tool_results(
                 .map(
                     |part| match (part["type"].as_str(), part["text"].as_str()) {
                         (_, Some(text)) => ContentBlock::Text(text.into()),
-                        // `Read` on an image answers with the image itself.
                         (Some("image"), None) => match tool_result_image(part, directory, images) {
                             Ok(image) => ContentBlock::Image(image),
                             Err(error) => ContentBlock::ImageError(format!("{error:#}")),
@@ -2786,7 +2715,6 @@ done
         };
         while !matches!(receive()?, ConversationEvent::CommandsUpdated(_)) {}
 
-        // Runs one `/mcp` turn until it settles, returning the output text and outcome.
         let run = |text: &str, interrupt: bool| -> Result<(String, TurnOutcome)> {
             let request_id = Uuid::new_v4();
             handle.commands.send_blocking(ConversationCommand::Submit {
@@ -2842,7 +2770,6 @@ done
         assert_eq!(outcome, TurnOutcome::Completed);
         assert!(text.contains("- `docs`: connected, 0 tools"), "{text}");
 
-        // Claude Code never answers this toggle; Stop abandons the wait without claiming an outcome.
         let (text, outcome) = run("/mcp disable excalidraw", true)?;
         assert_eq!(outcome, TurnOutcome::Unknown);
         assert!(text.starts_with("Stopped waiting"), "{text}");

@@ -10,11 +10,8 @@ pub struct ConversationSession {
     pub peer_delivery_reason: Option<String>,
     pub models: Vec<ModelChoice>,
     pub model: Option<ModelKey>,
-    /// Slash commands the harness offers for prompt text.
     pub slash_commands: CommandCatalog,
     pub messages: Vec<Arc<Message>>,
-    /// The harness delivered the last page of provider history since the latest reset, so
-    /// `messages` is the whole stored transcript.
     pub history_loaded: bool,
     pub tools: BTreeMap<String, Arc<ToolActivity>>,
     pub requests: BTreeMap<String, UserRequest>,
@@ -28,26 +25,15 @@ pub struct ConversationSession {
     pub outcome: Option<TurnOutcome>,
     pub preparing: bool,
     pub transcript_revision: u64,
-    /// Bumped whenever `tools` may have changed, so presentation can cache what it derives.
     pub(super) tools_revision: u64,
     pub(super) transcript_changes: VecDeque<(u64, Option<usize>)>,
     pub(super) indices: HashMap<String, usize>,
-    /// IDs of every `ContentBlock::ToolCall` seen, so their result messages fold
-    /// into the call's card instead of rendering as separate rows.
     pub(super) tool_calls: HashMap<String, usize>,
     pub(super) tool_results: HashMap<String, usize>,
-    /// Every tool call in the order the assistant issued it, as `(tool name, call id)`,
-    /// so presentation can find the latest call of one tool without scanning messages.
     pub(super) tool_call_order: Vec<(String, String)>,
-    /// Indices of harness-injected `custom` messages (job notices and the like).
     pub(super) notice_indices: Vec<usize>,
     pub(super) submitted: HashMap<Uuid, DraftSnapshot>,
-    /// Whether the front of the thread's queue may start the next turn on its own. Set by
-    /// an explicit queue or send-now action; cleared by a failure, an interrupt the user
-    /// did not request through the queue, and a harness restart (a new session).
     pub auto_dispatch: bool,
-    /// The user asked to send a queued message now, so the interrupt that settles the
-    /// current turn must not stall the queue.
     pub(super) interrupt_for_queue: bool,
 }
 impl ConversationSession {
@@ -133,7 +119,6 @@ impl ConversationSession {
             .push_back((self.transcript_revision, index));
     }
 
-    /// A lagging presentation resets once when its bounded change journal expires.
     pub fn transcript_changes_since(
         &self,
         revision: u64,
@@ -166,8 +151,6 @@ impl ConversationSession {
         self.notice_indices.clear();
         self.record_transcript_change(None);
     }
-    /// Only the call's row shows its activity. Activity can arrive before the message that
-    /// carries the call; that message adds the row later, so nothing rendered changes yet.
     pub(super) fn mark_tool_changed(&mut self, call_id: &str) {
         self.tools_revision += 1;
         if let Some(index) = self.tool_calls.get(call_id).copied() {
@@ -175,26 +158,21 @@ impl ConversationSession {
         }
     }
 
-    /// Changes whenever a tool's live activity may have changed.
     pub fn tools_revision(&self) -> u64 {
         self.tools_revision
     }
 
-    /// True once the assistant message that issued this call has been seen.
     pub fn has_tool_call(&self, call_id: &str) -> bool {
         self.tool_calls.contains_key(call_id)
     }
-    /// The historical result message answering a tool call, if any.
     pub fn tool_result(&self, call_id: &str) -> Option<&Arc<Message>> {
         self.tool_results
             .get(call_id)
             .and_then(|index| self.messages.get(*index))
     }
-    /// Tool calls in issue order as `(tool name, call id)`.
     pub fn tool_call_order(&self) -> &[(String, String)] {
         &self.tool_call_order
     }
-    /// The `ContentBlock::ToolCall` for a call id, once its message has been seen.
     pub fn tool_call_block(&self, call_id: &str) -> Option<&ContentBlock> {
         let message = self.messages.get(*self.tool_calls.get(call_id)?)?;
         message
@@ -202,7 +180,6 @@ impl ConversationSession {
             .iter()
             .find(|block| matches!(block, ContentBlock::ToolCall { id, .. } if id == call_id))
     }
-    /// Harness-injected `custom` messages in transcript order.
     pub fn notices(&self) -> impl Iterator<Item = &Arc<Message>> {
         self.notice_indices
             .iter()
@@ -250,7 +227,6 @@ mod tests {
             session.tool_call_block("call_1"),
             Some(ContentBlock::ToolCall { name, .. }) if name == "bash"
         ));
-        // A streamed update of the same assistant message does not repeat the call.
         session.message(message(
             "assistant:1",
             "assistant",
@@ -335,8 +311,6 @@ mod tests {
         assert!(session.transcript_changes_since(current).is_none());
     }
 
-    /// Harnesses report a call's activity before the message that carries it. A full
-    /// reset there would snap a reader who scrolled back to the latest output.
     #[test]
     fn tool_activity_before_its_call_keeps_the_rendered_rows() {
         let mut session = ConversationSession::new(None);

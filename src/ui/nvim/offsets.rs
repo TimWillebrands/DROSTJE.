@@ -1,4 +1,3 @@
-//! Conversions between UTF-8 byte offsets, UTF-16 code units and buffer positions.
 use std::ops::Range;
 
 pub(super) fn byte_floor(text: &str, offset: usize) -> usize {

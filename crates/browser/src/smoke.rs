@@ -1,5 +1,3 @@
-//! Real engine regression migrated from the former helper-process smoke.
-//! cargo test -p drostje-browser smoke -- --ignored --nocapture
 use super::*;
 use std::time::Duration;
 
@@ -90,7 +88,6 @@ impl Browser {
 impl Drop for Browser {
     fn drop(&mut self) {
         self.runtime.shutdown();
-        // Let Servo tear down its GL surfaces before the test process exits.
         let deadline = Instant::now() + Duration::from_secs(10);
         while !self.runtime.0.0.memory.lock().stopped && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
@@ -153,7 +150,6 @@ fn real_content_height_grows_shrinks_reflows_and_resumes(browser: &Browser) {
         "document.getElementById('block').style.height = '140px'",
     );
     browser.until_height(id, 200.0);
-    // The document scrolling extent remains viewport-high, unlike natural content.
     assert!(
         browser
             .evaluate(id, "document.documentElement.scrollHeight")
@@ -207,8 +203,6 @@ fn real_content_height_grows_shrinks_reflows_and_resumes(browser: &Browser) {
         },
     );
     browser.until_height(id, 90.0);
-    // Exercise a page-initiated navigation while polling measurements, then an
-    // explicit navigation/resize barrier. Old document dimensions cannot win.
     let replacement = browser.directory.join("sizing-replacement.html");
     std::fs::write(
         &replacement,
@@ -254,8 +248,6 @@ fn real_content_height_grows_shrinks_reflows_and_resumes(browser: &Browser) {
     browser.runtime.close(id);
 }
 
-/// Real loopback HTTP: WebGPU and other origin-keyed APIs are unavailable to
-/// the opaque origins of `file:` URLs.
 struct HttpFixture {
     url: String,
     stopped: Arc<std::sync::atomic::AtomicBool>,
@@ -289,7 +281,7 @@ impl HttpFixture {
                 let path = request.split_whitespace().nth(1).unwrap_or("/");
                 if path == "/broken" {
                     continue;
-                } // Real dropped HTTP connection.
+                }
                 let (status, body) = if path == "/" {
                     ("200 OK", index)
                 } else {
@@ -612,7 +604,6 @@ fn real_html_pixels_javascript_click_text_resize_history_errors_and_shutdown() {
     );
 }
 
-/// The bottom-right pixel of `id`'s current frame, with its revision.
 fn corner(browser: &Browser, id: BrowserId) -> Option<(u64, [u8; 4])> {
     let frame = browser.snapshot(id).frame?;
     let offset = (frame.width as usize * frame.height as usize - 1) * 4;
@@ -626,7 +617,6 @@ fn real_hidden_pages_publish_frames_only_when_captured(browser: &Browser, id: Br
     const RED: [u8; 4] = [200, 10, 10, 255];
     const ORIGINAL: [u8; 4] = [12, 34, 56, 255];
     browser.runtime.set_visible(id, false);
-    // Let a publish that began before the engine saw the change land first.
     thread::sleep(Duration::from_millis(300));
     let (hidden_revision, pixel) = corner(browser, id).unwrap();
     assert_eq!(pixel, ORIGINAL);
@@ -685,7 +675,6 @@ fn real_webgpu_canvas_presents_its_render_pass(browser: &Browser) {
         !browser.snapshot(id).loading && browser.evaluate(id, "window.gpuResult") != "pending"
     });
     assert_eq!(browser.evaluate(id, "window.gpuResult"), "presented");
-    // Raw Vulkan maxima (524288 samplers) made PixiJS generate a 134 MB shader.
     let limits = browser.evaluate(id, "window.gpuLimits");
     let limits: Vec<u64> = limits
         .as_array()
@@ -697,7 +686,6 @@ fn real_webgpu_canvas_presents_its_render_pass(browser: &Browser) {
         limits[0] <= 16 && limits[1] <= 16 && limits[2] <= 1000 && limits[3] <= 4,
         "adapter must expose WebGPU's default binding-count limits, not driver maxima: {limits:?}"
     );
-    // sRGB-agnostic: the canvas centre is the clear colour, not the white page.
     browser.until("WebGPU canvas pixels in the Servo frame", || {
         browser.snapshot(id).frame.is_some_and(|frame| {
             let offset = (32 * frame.width as usize + 32) * 4;
@@ -711,8 +699,6 @@ fn real_webgpu_canvas_presents_its_render_pass(browser: &Browser) {
 }
 
 fn real_webgpu_canvas_survives_resizing_every_frame(browser: &Browser) {
-    // A canvas that shrinks while its previous, larger frame is still the
-    // WebRender descriptor used to panic the worker during texture upload.
     let server = HttpFixture::start(
         r#"<!doctype html><title>WebGPU resize smoke</title>
         <style>html,body{margin:0;background:#fff}canvas{display:block}</style>
@@ -743,7 +729,6 @@ fn real_webgpu_canvas_survives_resizing_every_frame(browser: &Browser) {
     );
     let id = BrowserId::new_v4();
     browser.runtime.open(id, server.url.clone());
-    // `snapshot` fails the test as soon as the worker reports a panic.
     browser.until("200 resized WebGPU frames", || {
         if browser.snapshot(id).loading {
             return false;
@@ -757,10 +742,6 @@ fn real_webgpu_canvas_survives_resizing_every_frame(browser: &Browser) {
 }
 
 fn real_webgpu_releases_devices_of_documents_that_navigate_away(browser: &Browser) {
-    // A navigated-away document's devices used to live until script collected
-    // them, which never happened. A process gets about ten devices; the next
-    // request failed and panicked the site's shared WebGPU thread, after which
-    // every document on the site waited forever for WebGPU.
     let server = HttpFixture::start(
         r#"<!doctype html><title>WebGPU navigation smoke</title><canvas width=64 height=64></canvas><script>
         window.gpuFrames = 0;
@@ -824,8 +805,6 @@ fn real_webgpu_releases_devices_of_documents_that_navigate_away(browser: &Browse
 }
 
 fn real_indexeddb_is_deleted_when_the_last_surface_on_its_origin_closes(browser: &Browser) {
-    // Keeps its connection open, as real sites do, so deletion cannot rely on
-    // the page closing it.
     let server = HttpFixture::start(
         r#"<!doctype html><title>IndexedDB smoke</title><script>
         indexedDB.databases().then(databases => {
@@ -848,7 +827,6 @@ fn real_indexeddb_is_deleted_when_the_last_surface_on_its_origin_closes(browser:
         });
         (id, browser.evaluate(id, "window.before"))
     };
-    // Servo 0.7 falls back to `./bottles` when it has no usable config directory.
     let working_directory_bottles =
         || std::fs::read_dir("bottles").map_or(0, |entries| entries.flatten().count());
     let bottles_before = working_directory_bottles();
@@ -862,7 +840,6 @@ fn real_indexeddb_is_deleted_when_the_last_surface_on_its_origin_closes(browser:
     let (second, before) = open("second surface on the same origin");
     assert_eq!(before, "drostje-smoke");
     browser.runtime.close(first);
-    // Longer than the close deadline: a closing surface never outlives it.
     thread::sleep(Duration::from_secs(6));
     let (third, before) = open("surface after a sibling closed");
     assert_eq!(
@@ -881,7 +858,6 @@ fn real_indexeddb_is_deleted_when_the_last_surface_on_its_origin_closes(browser:
 #[ignore = "requires a working native Servo renderer and desktop graphics session"]
 fn real_has_selector_lists_apply() {
     let browser = Browser::start();
-    // DaisyUI 5 declares its theme variables behind a selector list like this one.
     std::fs::write(
         browser.directory.join("has.html"),
         r#"<!doctype html><title>Has selector</title><style>
@@ -949,7 +925,6 @@ fn real_artifact_kit_styles_pages_and_round_trips_channel_events(browser: &Brows
         ),
         serde_json::json!({"api":"function","kit":true,"accent":"#123456","own":"rgb(1, 2, 3)"})
     );
-    // Servo cannot see faces GPUI registered; the engine serves them to artifacts.
     browser.until(
         "the bundled monospace face renders, not the serif fallback",
         || {
@@ -1046,13 +1021,9 @@ fn real_artifact_kit_styles_pages_and_round_trips_channel_events(browser: &Brows
     browser.runtime.close(ordinary);
 }
 
-/// Renders the kit gallery with the injected kit in both Delft modes and saves PNGs for
-/// review; fails on page script errors. Not a pixel assertion.
 fn real_artifact_gallery_renders_in_both_theme_modes(browser: &Browser) {
     let gallery =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/artifact-kit");
-    // The gallery's own <link> to kit.css is for standalone preview; drop it so this
-    // renders exactly what DROSTJE injects.
     let page = std::fs::read_to_string(gallery.join("gallery.html"))
         .unwrap()
         .replace(r#"<link rel="stylesheet" href="kit.css">"#, "")

@@ -1,4 +1,3 @@
-//! Settings › Hosts: setup, native pickers and remote failure UI.
 use super::*;
 
 #[gpui_kit::test]
@@ -54,9 +53,6 @@ async fn remote_host_settings_selection_and_failure_are_keyboard_safe(cx: &mut T
     ] {
         set_dialog(cx, fixture.window, &fixture.workspace, key, value);
     }
-    // set_dialog updates retained inputs, including fields virtualized below the
-    // viewport. Their focus handle need not be mounted; use the visible Settings
-    // footer, as the other Settings validation scenarios do.
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
         window.click("dialog-confirm", cx);
@@ -114,7 +110,6 @@ async fn remote_host_settings_selection_and_failure_are_keyboard_safe(cx: &mut T
         "workspace"
     );
 
-    // Editing a saved Host loads all fields, and changing the selected Host cannot discard edits.
     cx.dispatch_action(window, commands::Settings);
     select_hosts_page(cx, &fixture);
     cx.update_window(window, |_, window, cx| {
@@ -274,8 +269,6 @@ async fn remote_host_settings_selection_and_failure_are_keyboard_safe(cx: &mut T
     )
     .await;
 
-    // A failed remote stream leaves the Host's active turn outcome unknown. Reconnect
-    // must remain available for reconciliation, unlike restarting an active local harness.
     fixture.state.update(cx, |state, cx| {
         state.active_threads.insert(thread);
         assert!(
@@ -346,7 +339,6 @@ async fn remote_host_settings_selection_and_failure_are_keyboard_safe(cx: &mut T
         }
     }
 
-    // A file that exists locally must still fail at the Host, never launch a local editor.
     cx.dispatch_action(
         window,
         commands::OpenFileReference {
@@ -404,7 +396,6 @@ async fn remote_host_settings_selection_and_failure_are_keyboard_safe(cx: &mut T
     )
     .await;
 
-    // The same removal command is discoverable in the palette and used by Settings.
     cx.dispatch_action(window, commands::Settings);
     select_hosts_page(cx, &fixture);
     cx.update_window(window, |_, window, cx| {
@@ -497,8 +488,6 @@ async fn remote_host_settings_selection_and_failure_are_keyboard_safe(cx: &mut T
         );
     })
     .unwrap();
-    // Reopening Settings can reset its virtualized group to Appearance. Use the
-    // shared palette Action rather than assuming the Host button is still mounted.
     cx.simulate_keystrokes(window, "escape");
     open_palette(cx, &fixture).await;
     cx.simulate_keystrokes(

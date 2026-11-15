@@ -1,5 +1,3 @@
-//! Forms that place a Conversation in a working tree: a new worktree, an existing
-//! workspace, switching branch, and removing a worktree.
 use super::{
     SurfaceContent,
     fields::{Choice, Controls},
@@ -69,7 +67,6 @@ pub(super) fn worktree_controls(
     let branches: Vec<String> = repository
         .map(|repository| repository.branches.clone())
         .unwrap_or_default();
-    // Default to where the selected Conversation already works.
     let selected = state
         .conversation_thread()
         .filter(|thread| thread.project_id == *project)
@@ -117,8 +114,6 @@ pub(super) fn switch_branch_controls(
             .and_then(|repository| repository.as_ref().ok())
     });
     let own = thread.and_then(|thread| thread.worktree_id);
-    // Git allows a branch in one worktree only: hide the ones checked out
-    // elsewhere, as far as the app has seen them.
     let elsewhere: Vec<String> = thread
         .map(|thread| {
             let mut taken: Vec<String> = state
@@ -188,7 +183,6 @@ impl SurfaceContent {
                 self.error = Some(error);
                 self.error_field = None;
             }
-            // Done: the Workspace closes the dialog. Pending or gone: nothing to show yet.
             _ => {}
         }
         cx.notify();

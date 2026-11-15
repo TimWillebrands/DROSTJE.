@@ -18,10 +18,8 @@ use gpui_kit::*;
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Work that follows a successful draft replacement, run on the app state.
 pub type DraftContinuation = Box<dyn FnOnce(&mut AppState) + 'static>;
 
-/// Owns activation and presentation; Neovim owns every editing revision.
 pub(in crate::ui) struct PromptEditor {
     state: Entity<AppState>,
     view: Option<Entity<NvimView>>,
@@ -34,11 +32,8 @@ pub(in crate::ui) struct PromptEditor {
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     switch_task: Option<Task<()>>,
-    /// Slash-command completion for the active Conversation draft, created on first use.
     completion: Option<Entity<SlashCompletion>>,
-    /// The query the user closed the popup for; it stays closed until the query changes.
     dismissed_query: Option<String>,
-    /// See `command_note`; kept so the header redraws only when the note changes.
     command_note: Option<(String, bool)>,
 }
 
@@ -60,7 +55,6 @@ impl PromptEditor {
             _subscriptions: vec![cx.subscribe(
                 &state,
                 |this, _, change: &crate::app::PresentationChange, cx| {
-                    // Command lists arrive with conversation events.
                     if matches!(change, crate::app::PresentationChange::Thread(_)) {
                         this.sync_completion(cx);
                     }
@@ -73,13 +67,11 @@ impl PromptEditor {
         }
     }
 
-    /// The note beside the draft label, for native QA.
     #[cfg(all(test, feature = "runtime-qa"))]
     pub fn command_note_text(&self) -> Option<&str> {
         self.command_note.as_ref().map(|(note, _)| note.as_str())
     }
 
-    /// The command the popup would insert, for native QA.
     #[cfg(all(test, feature = "runtime-qa"))]
     pub fn completion_selection(&self, cx: &App) -> Option<String> {
         self.completion
@@ -88,9 +80,6 @@ impl PromptEditor {
             .map(|command| command.name.clone())
     }
 
-    /// What the draft's leading slash command needs, shown beside the draft label: why
-    /// DROSTJE. will refuse it, or its argument syntax until arguments are typed. The flag
-    /// says whether the note is command syntax.
     fn command_note(&self, state: &AppState) -> Option<(String, bool)> {
         let Some(DraftKey::Thread(id)) = &self.active else {
             return None;
@@ -109,8 +98,6 @@ impl PromptEditor {
         Some((format!("/{} {hint}", command.name), true))
     }
 
-    /// Shows the command popup while the active Conversation draft starts with a partly
-    /// typed `/command` in insert mode, and hides it otherwise.
     fn sync_completion(&mut self, cx: &mut Context<Self>) {
         let note = self.command_note(self.state.read(cx));
         if note != self.command_note {
@@ -193,8 +180,6 @@ impl PromptEditor {
         }
     }
 
-    /// Replaces the typed `/partial` with the chosen command. The draft change that follows
-    /// moves the cursor past the command, which closes the popup.
     fn accept_completion(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(DraftKey::Thread(id)) = self.active.clone() else {
             return;
@@ -323,7 +308,6 @@ impl PromptEditor {
                                     this.completion_key(*key, cx);
                                     return;
                                 }
-                                // Same Action as Cmd-Escape; a late request after focus moved is moot.
                                 NvimViewEvent::Leave => {
                                     if view.focus_handle(cx).is_focused(window) {
                                         window.dispatch_action(Box::new(crate::ui::commands::LeaveEditor), cx);
@@ -343,7 +327,6 @@ impl PromptEditor {
                             cx.notify();
                         }));
                         this._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
-                            // An inactive window can retain the editor's focus handle.
                             this.window_inactive = !window.is_window_active();
                             if this.window_inactive {
                                 this.commit_on_focus_loss(cx);
@@ -379,11 +362,8 @@ impl PromptEditor {
         };
         let id = *id;
         if self.switching {
-            // The switch owns the previous buffer's semantic snapshot and commit.
             return;
         }
-        // Do not take a semantic snapshot here: it exits insert mode. Late
-        // DraftChanged events commit after blur; IME recovery stays separate.
         self.state.update(cx, |state, cx| {
             if state.commit_thread_edits(id) {
                 cx.emit(crate::app::PresentationChange::Persistence);
@@ -520,8 +500,6 @@ impl Render for PromptEditor {
             .flex_col()
             .min_w_0()
             .min_h_0()
-            // Keep a steady focus cue even while Neovim's caret is blinking off.
-            // Blurring never changes the buffer, Vim mode, or composition.
             .bg(cx.theme().background)
             .overflow_hidden()
             .border_1()
@@ -707,8 +685,6 @@ impl Workspace {
             self.start_editor(window, cx);
         }
     }
-    /// Opens the picker over the composer. An inactive draft is activated first so the
-    /// chosen command can land in it; Root returns focus to the composer on dismiss.
     pub fn open_slash_command_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self
             .state
@@ -735,8 +711,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Writes `/name ` at the start of the Conversation's draft, replacing a partly typed
-    /// command, and leaves the cursor after it in insert mode. Nothing is sent.
     pub fn insert_slash_command(
         &mut self,
         id: ThreadId,
@@ -806,7 +780,6 @@ impl Workspace {
             return;
         }
         if let Some(reason) = self.state.read(cx).submit_reason(id) {
-            // A running turn turns Submit into Queue; every other reason stays a reason.
             if self.state.read(cx).queue_reason(id).is_none() {
                 self.queue_prompt(id, window, cx);
                 return;
@@ -849,7 +822,6 @@ impl Workspace {
         editor.update(cx, |editor, cx| editor.focus(window, cx));
     }
 
-    /// Moves the composer draft to the thread's queue; the editor stays focused and empty.
     pub fn queue_prompt(&mut self, id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         if self.editor_selection != Some(DraftKey::Thread(id)) || self.editor_override.is_some() {
             return;
@@ -886,8 +858,6 @@ impl Workspace {
         });
     }
 
-    /// Takes a queued message back into the composer. A non-empty draft is reviewed before
-    /// it is replaced, exactly like a restored submission.
     pub fn edit_queued(
         &mut self,
         id: ThreadId,
@@ -1007,8 +977,6 @@ impl Workspace {
         self.replace_draft_reviewed_then(id, text, attachments, recovery, None, window, cx);
     }
 
-    /// `then` runs on the app state once the editor text was replaced, before the view
-    /// regains focus; a declined or failed replacement never runs it.
     #[expect(
         clippy::too_many_arguments,
         reason = "one replacement, one continuation"
@@ -1048,7 +1016,6 @@ impl Workspace {
         cx.spawn_in(window, async move |workspace, window| {
             let result = async {
                 let reviewed = reviewed.await?;
-                // An empty composer has nothing to lose, so it is replaced without a review.
                 let blank = reviewed.text.trim().is_empty() && reviewed_attachments.is_empty();
                 if !blank {
                     let approval = workspace.update_in(window, |_, window, cx| {
@@ -1169,8 +1136,6 @@ impl Workspace {
         })
         .detach();
     }
-    /// Attaches whatever the native clipboard holds: copied image bytes or
-    /// copied image files. Text is left to the editor.
     pub fn paste_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self
             .state
@@ -1244,8 +1209,6 @@ impl Workspace {
             cx,
         );
     }
-    /// Runs `import` off the GPUI thread and appends accepted images to the
-    /// thread's draft attachments; rejections become notices.
     fn import_attachments(
         &mut self,
         id: ThreadId,
@@ -1337,7 +1300,6 @@ impl Workspace {
             return;
         };
         view.update(cx, |view, _| {
-            // Cancel queued continuations before restarting the RPC generation.
             view.switch_task = None;
             view.switching = false;
         });
@@ -1443,7 +1405,6 @@ impl Workspace {
                 && let Some(editor) = &editor { let _ = editor.resume_input().await; }
             let _ = workspace.update_in(window, |workspace, _, cx| {
                 workspace.quit_requested = false;
-                // A rejected editor barrier cancels quit without killing terminal sessions.
                 if snapshots.is_ok() || allow_data_loss {
                     workspace.close_all_terminals(cx);
                 }
@@ -1499,8 +1460,6 @@ impl Workspace {
         } else {
             false
         };
-        // Only suspend our retained surfaces. Extension and terminal-risk prompts
-        // must finish their own decision before Quit can replace their host.
         if (has_dialog || has_sheet) && !known_host {
             return;
         }
@@ -1552,8 +1511,6 @@ impl Workspace {
                 .on_ok(move |_, window, cx| {
                     let confirm = confirm.clone();
                     window.defer(cx, move |window, cx| {
-                        // Close the quit alert before dismissing the retained workspace
-                        // surface; this avoids closing the same modal layer twice.
                         window.close_dialog(cx);
                         let _ = confirm.update(cx, |workspace, cx| {
                             workspace.quit_requested = true;
@@ -1568,9 +1525,6 @@ impl Workspace {
                     let palette = palette.clone();
                     let form = form.clone();
                     let previous_focus = previous_focus.clone();
-                    // Close only the alert before rehosting the retained surface.
-                    // An automatic/deferred close could dismiss the replacement
-                    // or restore background focus after the Settings sheet opens.
                     window.defer(cx, move |window, cx| {
                         window.close_dialog(cx);
                         let _ = close.update(cx, |workspace, cx| {
@@ -1584,8 +1538,6 @@ impl Workspace {
                                 form.filter(|form| workspace.dialog.as_ref() == Some(form))
                             {
                                 crate::ui::settings::open_surface(close.clone(), window, cx);
-                                // open_surface defers host creation and initial focus.
-                                // Restore the exact field after those are scheduled.
                                 window.defer(cx, move |window, _cx| {
                                     window.on_next_frame(move |window, cx| {
                                         if form.read(cx).hosted()
@@ -1672,7 +1624,6 @@ mod quit_tests {
                     workspace.state.update(cx, |state, _| {
                         state.active_threads.insert(Uuid::new_v4());
                     });
-                    // Also exercise the palette's still-pending initial focus callback.
                     workspace.quit_review(window, cx);
                     assert!(workspace.quit_requested);
                     assert!(!palette.read(cx).hosted());

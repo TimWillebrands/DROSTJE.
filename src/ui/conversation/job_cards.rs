@@ -14,8 +14,6 @@ use gpui_kit::{
 };
 use serde_json::Value;
 
-/// Unrecognised notices remain inspectable, without exposing transport markup
-/// or pretending that a new harness format is a completed background job.
 pub(super) fn system_notice(
     key: String,
     text: &str,
@@ -70,9 +68,6 @@ pub(super) fn system_notice(
     card.into_any_element()
 }
 
-/// One finished background job from a `<system-notice>`: a task agent's report
-/// or a shell command's output. A structured report opens by default; raw
-/// output folds behind the disclosure like any tool result.
 pub(super) fn job_card(
     key: String,
     job: &JobResult,
@@ -204,9 +199,6 @@ pub(super) fn job_card(
     }
     card.into_any_element()
 }
-/// Generic reading view for a job's JSON report: keys become captions, strings
-/// render as Markdown, string lists as bullets, nested objects indent. Beyond a
-/// few levels the raw JSON is shown so nothing is hidden.
 fn structured_view(
     identity: String,
     value: &Value,
@@ -292,7 +284,6 @@ fn structured_view(
         .into_any_element(),
     }
 }
-/// `tests_added` → `Tests added`, `main_required` → `Main required`.
 fn humanise_key(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for (index, ch) in key.chars().enumerate() {

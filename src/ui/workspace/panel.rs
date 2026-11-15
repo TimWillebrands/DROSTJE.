@@ -1,6 +1,3 @@
-//! `WorkspacePanel`: one dock leaf (Projects, Welcome, a thread, terminal or
-//! browser tab), its tab title, menu and content.
-
 use super::*;
 
 pub struct WorkspacePanel {
@@ -9,7 +6,6 @@ pub struct WorkspacePanel {
     pub(super) workspace: WeakEntity<Workspace>,
     pub(super) focus: FocusHandle,
     pub(super) scroll: ScrollHandle,
-    /// The sidebar Output tab scrolls on its own, beside the thread's main scroll.
     pub(super) output_scroll: ScrollHandle,
     pub(super) group: Option<WeakEntity<TabGroup>>,
     pub(super) bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -17,7 +13,6 @@ pub struct WorkspacePanel {
     pub(super) network: Option<Entity<crate::ui::network::NetworkPanel>>,
     pub(super) terminal: Option<Entity<TerminalPane>>,
     pub(super) browser: Option<Entity<BrowserPane>>,
-    /// The Projects panel's prepared rows; empty for every other kind.
     pub(super) rows: projects::RowsCache,
     pub(super) _subscriptions: Vec<Subscription>,
 }
@@ -35,8 +30,6 @@ impl WorkspacePanel {
             cx.observe_global::<gpui_kit::component::Theme>(|_, cx| cx.notify()),
             cx.on_focus_in(&focus, window, |_, _, cx| cx.notify()),
             cx.on_focus_out(&focus, window, |_, _, _, cx| cx.notify()),
-            // Moving between the Projects list and its native search input stays
-            // inside the pane, but must still move the row's keyboard focus cue.
             cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
             cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
             cx.observe_window_activation(window, |_, _, cx| cx.notify()),
@@ -95,7 +88,6 @@ impl WorkspacePanel {
             _ => None,
         };
         if let PanelKind::Thread(id) = kind {
-            // Focus, however it arrived (click, tab, shortcut), selects a thread.
             let owner = workspace.clone();
             let entity_id = cx.entity().entity_id();
             subscriptions.push(cx.on_focus_in(&focus, window, move |_, window, cx| {
@@ -149,7 +141,6 @@ impl WorkspacePanel {
             _subscriptions: subscriptions,
         }
     }
-    /// Give a Terminal panel its pane. A Neovim pane that exits closes its tab.
     pub(super) fn attach_terminal(
         &mut self,
         id: TerminalId,
@@ -162,7 +153,6 @@ impl WorkspacePanel {
             window,
             move |panel, _, _: &NeovimExited, window, cx| {
                 let owner = panel.workspace.clone();
-                // The pane's observer runs inside its own update; close afterwards.
                 window.defer(cx, move |window, cx| {
                     let _ =
                         owner.update(cx, |workspace, cx| workspace.neovim_exited(id, window, cx));
@@ -245,7 +235,6 @@ impl BasePanel for WorkspacePanel {
         if let Some(terminal) = &self.terminal {
             terminal.update(cx, |terminal, cx| terminal.set_visible(false, cx));
             let owner = self.workspace.clone();
-            // Do not re-lease this panel: visibility reads every live dock leaf.
             window.defer(cx, move |window, cx| {
                 let _ = owner.update(cx, |workspace, cx| {
                     workspace.sync_terminal_visibility(window, cx)
@@ -267,10 +256,6 @@ impl BasePanel for WorkspacePanel {
             terminal.update(cx, |terminal, cx| terminal.set_visible(false, cx));
         }
         if let PanelKind::Thread(id) = self.kind {
-            // The dock often fires this from inside a `Workspace` update
-            // (`sync_thread_panels`, `reset_layout`), and updating an entity that
-            // is already leased panics. Report after that update has finished;
-            // a panel the dock has since re-added is not a close.
             cx.defer_in(window, move |panel, window, cx| {
                 if panel.group.is_some() {
                     return;
@@ -297,7 +282,6 @@ impl BasePanel for WorkspacePanel {
             state.info = PanelInfo::panel(json!({ "thread": id }));
         }
         if let PanelKind::Terminal(id) = self.kind {
-            // Enough to reopen the tab after a restart; see `TerminalTab`.
             let pane = self.terminal.as_ref().map(|pane| pane.read(cx));
             state.info = PanelInfo::panel(json!({
                 "terminal": id,
@@ -315,9 +299,6 @@ impl BasePanel for WorkspacePanel {
     }
 }
 impl Panel for WorkspacePanel {
-    /// A thread tab shows its activity mark, with a sweeping underline while its agent
-    /// works, and a close control on hover; a middle click closes it too. Closing only
-    /// closes the tab.
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title = self.panel_title(cx);
         if let PanelKind::Browser(id) = self.kind {
@@ -469,7 +450,6 @@ impl Panel for WorkspacePanel {
                             }),
                     ),
             )
-            // Inside the tab's clipped inner box, just below the label.
             .when(activity == ThreadActivity::Running, |tab| {
                 let selector = format!("thread-tab-sweep-{id}");
                 tab.child(
@@ -485,8 +465,6 @@ impl Panel for WorkspacePanel {
             .into_any_element()
     }
     fn tab_name(&self, cx: &App) -> Option<SharedString> {
-        // The dock's closable flag adds a menu item, not a tab close button.
-        // Content tabs supply their own title controls instead of a plain name.
         match self.kind {
             PanelKind::Thread(_) | PanelKind::Terminal(_) | PanelKind::Browser(_) => None,
             _ => Some(self.panel_title(cx).into()),
@@ -541,7 +519,6 @@ impl Panel for WorkspacePanel {
                 )
             }
             PanelKind::Thread(id) => {
-                // Rename, archive and close act on this tab's thread without selecting it.
                 let targeted =
                     |run: fn(&mut Workspace, ThreadId, &mut Window, &mut Context<Workspace>)| {
                         let owner = self.workspace.clone();
@@ -800,7 +777,6 @@ impl Render for WorkspacePanel {
                     |_, _, _, _| {},
                 )
                 .absolute()
-                // Measure the pane, not the static position after its content.
                 .inset_0()
                 .size_full(),
             )

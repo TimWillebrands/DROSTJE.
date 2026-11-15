@@ -1,32 +1,19 @@
-//! Which pages pay for frames. Reading pixels back and publishing them is the engine's
-//! largest per-page cost, so only pages a pane shows, or a capture waits on, publish.
-//! Hidden pages still composite at a low rate: Servo ticks animations and
-//! `requestAnimationFrame` only when a WebView paints, so a hidden page keeps running.
 use std::time::Duration;
 
-/// The fastest a shown page publishes frames.
 pub(super) const FRAME_INTERVAL: Duration = Duration::from_millis(33);
-/// The fastest a hidden page composites, without reading back or publishing pixels.
 pub(super) const HIDDEN_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 
-/// What one engine tick does with a page's pixels.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Paint {
     Skip,
-    /// Paint and publish a frame of the current content.
     Publish,
-    /// Paint only, so the page's animation clock advances; nothing is read back.
     Composite,
 }
 
 #[derive(Debug)]
 pub(super) struct FrameDemand {
-    /// A pane lays the page out; the UI reports it.
     visible: bool,
-    /// Capture request IDs waiting for a published frame of the current content.
     captures: Vec<String>,
-    /// Composited while hidden since the last publish, so the retained frame is older
-    /// than the page even when nothing is dirty.
     unpublished: bool,
 }
 
@@ -43,7 +30,6 @@ impl FrameDemand {
         self.visible = visible;
     }
 
-    /// Someone needs this page's pixels now: a pane shows it or a capture waits on it.
     pub(super) fn wanted(&self) -> bool {
         self.visible || !self.captures.is_empty()
     }
@@ -52,7 +38,6 @@ impl FrameDemand {
         self.captures.push(request_id);
     }
 
-    /// Forget captures whose callers stopped waiting, so they stop forcing frames.
     pub(super) fn retain_captures(&mut self, mut waiting: impl FnMut(&str) -> bool) {
         self.captures.retain(|request_id| waiting(request_id));
     }
@@ -73,7 +58,6 @@ impl FrameDemand {
         }
     }
 
-    /// Record that `paint` ran.
     pub(super) fn painted(&mut self, paint: &Paint) {
         match paint {
             Paint::Publish => self.unpublished = false,
@@ -82,9 +66,6 @@ impl FrameDemand {
         }
     }
 
-    /// The captures a published frame now answers: the page has nothing unpainted.
-    /// `current` is the engine's view: not dirty, a verified frame published and no
-    /// screenshot barrier outstanding.
     pub(super) fn settle(&mut self, current: bool) -> Vec<String> {
         if current && !self.unpublished {
             std::mem::take(&mut self.captures)
@@ -98,7 +79,6 @@ impl FrameDemand {
 mod tests {
     use super::*;
 
-    /// One page as the engine loop drives it: Servo marks it dirty, ticks paint it.
     struct Page {
         demand: FrameDemand,
         dirty: bool,

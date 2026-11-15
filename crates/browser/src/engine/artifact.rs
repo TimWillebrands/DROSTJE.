@@ -1,11 +1,6 @@
-//! The artifact kit: default styles and the `window.drostje` channel bridge, injected
-//! into artifact surfaces only and only into their `file:` documents. Page styles always
-//! win, because the kit's rules sit in a cascade layer below every unlayered page rule.
 use crate::ReceiptStatus;
 use servo::UserScript;
 
-// The kit stays in the repository's top-level `assets/artifact-kit`: its reference is
-// also served to agents by drostje-browser-tools, which must build without Servo.
 const KIT_CSS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/artifact-kit/kit.css"
@@ -15,9 +10,6 @@ const KIT_JS: &str = include_str!(concat!(
     "/../../assets/artifact-kit/kit.js"
 ));
 
-/// Install the kit's styles ahead of the page's own, then define `window.drostje`.
-/// The theme rule is unlayered so it overrides the kit's fallback tokens, and it comes
-/// before page styles, so a page can still restyle the tokens themselves.
 const PRELUDE: &str = r#"(() => {
     try {
         if (location.protocol !== 'file:') return;
@@ -35,20 +27,17 @@ const PRELUDE: &str = r#"(() => {
 })();
 "#;
 
-/// The kit script for one artifact surface with the given theme tokens.
 pub(super) fn script(theme: &str) -> UserScript {
     let kit = js_string(&format!("@layer drostje-kit {{\n{KIT_CSS}\n}}"));
     let prelude = PRELUDE
         .replace("__DROSTJE_THEME__", &js_string(theme))
         .replace("__DROSTJE_KIT__", &kit);
-    // kit.js defines the bridge only for file documents, like the prelude's styles.
     UserScript::new(
         format!("{prelude}if (location.protocol === 'file:') {{\n{KIT_JS}\n}}\n"),
         None,
     )
 }
 
-/// Replace the current document's theme tokens; reloads use the replaced user script.
 pub(super) fn theme_script(theme: &str) -> String {
     format!(
         "(() => {{ try {{ window.drostje && window.drostje.__theme({}); }} catch (_) {{}} }})()",
@@ -56,7 +45,6 @@ pub(super) fn theme_script(theme: &str) -> String {
     )
 }
 
-/// Settle one pending `drostje.send` promise in the page.
 pub(super) fn receipt_script(event: &str, status: ReceiptStatus, reason: Option<&str>) -> String {
     format!(
         "(() => {{ try {{ window.drostje && window.drostje.__receipt({}, {}, {}); }} catch (_) {{}} }})()",
@@ -66,7 +54,6 @@ pub(super) fn receipt_script(event: &str, status: ReceiptStatus, reason: Option<
     )
 }
 
-/// A JavaScript string literal that cannot close a surrounding script element.
 fn js_string(text: &str) -> String {
     serde_json::to_string(text)
         .unwrap_or_else(|_| "\"\"".to_owned())

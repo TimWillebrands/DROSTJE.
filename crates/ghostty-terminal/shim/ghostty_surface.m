@@ -29,14 +29,11 @@ extern const char *drost_ghostty_surface_expected_program(ghostty_surface_t);
 - (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object
                       change:(NSDictionary *)change context:(void *)context {
     (void)keyPath; (void)object; (void)change; (void)context;
-    // Metal completion installs IOSurface contents asynchronously on the main
-    // queue. Wake GPUI after that installation, not just before GPU submission.
     if (frame_ready != NULL) frame_ready(frame_userdata);
 }
 @end
 
 typedef void (*gpui_ghostty_wakeup_cb)(void *userdata);
-// Adapter operation values: paste=0, read=1, write=2.
 typedef bool (*gpui_ghostty_approve_clipboard_cb)(void *userdata, int operation, const char *text);
 
 typedef struct gpui_ghostty_surface {
@@ -88,8 +85,6 @@ static void runtime_confirm_read_clipboard(
         int operation = kind == GHOSTTY_CLIPBOARD_REQUEST_PASTE ? 0 : 1;
         bool approved = state->approve_clipboard != NULL &&
             state->approve_clipboard(state->wakeup_userdata, operation, text);
-        // Completing with empty text releases Ghostty's request without exposing
-        // clipboard contents or inserting an unsafe paste.
         ghostty_surface_complete_clipboard_request(state->surface, approved ? text : "", request, true);
     }
 }
@@ -254,10 +249,6 @@ int gpui_ghostty_process_activity(
     return drost_process_activity(root, foreground, login_wrapper, expected_program);
 }
 
-// Reports the completed frame's size in `width`, `height` and `length` and, only
-// when `capacity` covers `length`, copies it into the caller's `pixels`. A short
-// buffer returns true with nothing copied so the caller can grow it. A successful
-// capture with `length` zero means the first GPU frame is still pending.
 bool gpui_ghostty_surface_snapshot(
     gpui_ghostty_surface *state,
     uint8_t *pixels,
@@ -332,8 +323,6 @@ void gpui_ghostty_surface_set_frame(
 
 void gpui_ghostty_surface_set_visible(gpui_ghostty_surface *state, bool visible) {
     if (state == NULL || state->surface == NULL) return;
-    // Native child views never cover GPUI overlays; GPUI composes completed
-    // Metal frame readbacks because its surface importer does not accept BGRA.
     [state->view setHidden:YES];
     ghostty_surface_set_occlusion(state->surface, visible);
     if (visible) ghostty_surface_refresh(state->surface);
@@ -386,7 +375,6 @@ void gpui_ghostty_surface_theme(gpui_ghostty_surface *state, const uint8_t *them
     ghostty_surface_update_config(state->surface, state->config);
     ghostty_surface_refresh(state->surface);
 }
-
 
 void gpui_ghostty_surface_mouse_position(
     gpui_ghostty_surface *state,

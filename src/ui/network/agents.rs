@@ -1,8 +1,3 @@
-//! The Agents tab of a Conversation's sidebar: how its agent works with others, read
-//! from its own tool calls. Claude Code's `Agent` (formerly `Task`) starts subagents,
-//! `SendMessage` writes to them or to other sessions, and `ListAgents` reports the
-//! sessions it can reach. Nothing here is stored; it is derived from the transcript.
-
 use serde_json::Value;
 
 use crate::{
@@ -10,10 +5,8 @@ use crate::{
     harness::{ContentBlock, ToolActivity},
 };
 
-/// Tools through which an agent works with other agents.
 const COORDINATION_TOOLS: [&str; 4] = ["Agent", "Task", "SendMessage", "ListAgents"];
 
-/// How many coordination calls `session` holds; the Agents tab exists from the first.
 pub fn coordination_calls(session: &ConversationSession) -> usize {
     session
         .tool_call_order()
@@ -22,10 +15,6 @@ pub fn coordination_calls(session: &ConversationSession) -> usize {
         .count()
 }
 
-/// When to open a Conversation's Agents tab so the user can follow along: once per
-/// turn, at the first coordination call that arrives while the turn runs. Calls
-/// already in the transcript when it is first seen, or loaded from history, never open
-/// it, and what the user does with the sidebar afterwards holds for the rest of the turn.
 #[derive(Clone, Copy, Debug)]
 pub struct Follow {
     seen: usize,
@@ -40,7 +29,6 @@ impl Follow {
         }
     }
 
-    /// Record `count` coordination calls; true when the Agents tab should open now.
     pub fn observe(&mut self, count: usize, running: bool) -> bool {
         if !running {
             self.opened = false;
@@ -52,8 +40,6 @@ impl Follow {
     }
 }
 
-/// What a coordination call came to. Without a result, a call in a running turn is
-/// still pending and any other call is unknown: a missing answer is not success.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
     Pending,
@@ -64,20 +50,19 @@ pub enum Outcome {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EventKind {
-    /// A subagent started with `Agent` or `Task`.
     Spawn {
         description: Option<String>,
         agent_type: Option<String>,
         background: bool,
     },
-    /// A `SendMessage` to a subagent, teammate or session.
     Message {
         to: String,
         text: String,
         notify_when_idle: bool,
     },
-    /// A `ListAgents` call; its sessions are in [`Activity::sessions`] when it is the latest.
-    Listing { sessions: Option<usize> },
+    Listing {
+        sessions: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,16 +70,13 @@ pub struct Event {
     pub call_id: String,
     pub kind: EventKind,
     pub outcome: Outcome,
-    /// The first line of the call's result, as the harness reported it.
     pub result: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionRow {
     pub name: String,
-    /// The `[ref]` that disambiguates sessions with one name.
     pub reference: Option<String>,
-    /// Kind, state and age as listed, in order; their wording is the harness's own.
     pub details: Vec<String>,
 }
 
@@ -106,15 +88,12 @@ impl SessionRow {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionGroup {
-    /// The listing's own heading, e.g. `Peer sessions (4)`.
     pub title: String,
     pub rows: Vec<SessionRow>,
 }
 
-/// A `ListAgents` answer. Rows that do not follow the listed shape stay in `raw`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionList {
-    /// The name other sessions use to reach this Conversation's agent.
     pub own: Option<String>,
     pub groups: Vec<SessionGroup>,
     pub raw: String,
@@ -177,11 +156,9 @@ impl SessionList {
     }
 }
 
-/// Coordination in one Conversation, oldest first.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Activity {
     pub events: Vec<Event>,
-    /// The latest `ListAgents` answer that could be read.
     pub sessions: Option<SessionList>,
 }
 
@@ -200,7 +177,6 @@ impl Activity {
     pub fn from_session(session: &ConversationSession, turn_running: bool) -> Self {
         let mut activity = Self::default();
         for (name, call_id) in session.tool_call_order() {
-            // Other tools never become events; skip them before joining their results.
             if !COORDINATION_TOOLS.contains(&name.as_str()) {
                 continue;
             }
@@ -224,7 +200,6 @@ impl Activity {
     }
 }
 
-/// What [`Activity::from_session`] reads, so an unchanged session reuses its activity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivityKey {
     generation: uuid::Uuid,
@@ -244,7 +219,6 @@ impl ActivityKey {
     }
 }
 
-/// The Agents tab's activity, derived again only when the session it reads changed.
 #[derive(Default)]
 pub struct ActivityCache(Option<(ActivityKey, Activity)>);
 
@@ -263,7 +237,6 @@ impl ActivityCache {
     }
 }
 
-/// One coordination event from a tool call, or `None` for any other tool.
 fn event(
     name: &str,
     call_id: &str,
@@ -306,8 +279,6 @@ fn event(
     })
 }
 
-/// The settled outcome and joined text of a call: the live activity when complete,
-/// else the recorded result message.
 fn result(
     live: Option<&std::sync::Arc<ToolActivity>>,
     session: &ConversationSession,
@@ -396,7 +367,6 @@ mod tests {
         assert_eq!(builds, 5, "one build, then one per changed input");
     }
 
-    /// A `ListAgents` answer in the shape Claude Code returns it.
     const LISTING: &str = "This session is drost-bc [de0f01] — the name other sessions use to message it (it is not listed below; a message to it would be a message to yourself).
 
 Peer sessions (3):

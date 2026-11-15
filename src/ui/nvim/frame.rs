@@ -1,4 +1,3 @@
-//! One painted frame: the retained row shapes plus the cmdline strip below them.
 use super::{
     offsets::byte_floor,
     shaping::{PaintedText, RowShape, colors, text_run},

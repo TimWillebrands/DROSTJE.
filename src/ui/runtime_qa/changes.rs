@@ -1,4 +1,3 @@
-//! Changes sidebar: live diff, keyboard list, Commit panel and Git failures.
 use super::*;
 
 #[gpui_kit::test]
@@ -144,8 +143,6 @@ async fn changes_list_is_keyboard_driven_and_opens_neovim(cx: &mut TestAppContex
     assert!(visual.debug_bounds("toggle-changes-layout").is_some());
     assert!(visual.debug_bounds("open-change-in-neovim").is_some());
 
-    // Keyboard only: from the Conversation into its Changes list, move, switch layout and
-    // open the cursor's line in Neovim.
     update_workspace(
         cx,
         fixture.window,
@@ -196,7 +193,6 @@ async fn changes_list_is_keyboard_driven_and_opens_neovim(cx: &mut TestAppContex
             .is_some()
     );
     assert!(cursor(cx).1, "switching layout keeps focus in the list");
-    // `notes.txt` sorts first: its file row, hunk, then `-before` beside `+after`.
     cx.simulate_keystrokes(fixture.window.into(), "g g j j");
     cx.run_until_parked();
     assert_eq!(cursor(cx).0, Some(2));
@@ -214,9 +210,7 @@ async fn changes_list_is_keyboard_driven_and_opens_neovim(cx: &mut TestAppContex
         Some(fs::canonicalize(root.join("notes.txt")).unwrap().as_path())
     );
     assert_eq!(target.line, Some(1));
-    // Back in the Conversation's tab, `s` in its Changes list restores the inline layout.
     cx.simulate_keystrokes(fixture.window.into(), "ctrl-shift-tab");
-    // Pane navigation reads laid-out bounds; the thread tab must draw again first.
     for _ in 0..3 {
         cx.run_until_parked();
         cx.update_window(fixture.window.into(), |_, window, cx| {
@@ -307,7 +301,6 @@ async fn commit_panel_commits_the_working_tree(cx: &mut TestAppContext) {
 
     cx.dispatch_action(fixture.window.into(), commands::CommitChanges);
     cx.run_until_parked();
-    // The inline composer does not replace the Changes panel or open a modal.
     update_workspace(
         cx,
         fixture.window,
@@ -474,8 +467,6 @@ async fn dismissed_commit_reports_git_failure_and_retains_the_form(cx: &mut Test
         )
         .unwrap(),
     );
-    // Git refuses its real index lock before staging or committing anything.
-    // Never overwrite a lock belonging to another process.
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -520,8 +511,6 @@ async fn dismissed_commit_reports_git_failure_and_retains_the_form(cx: &mut Test
     .unwrap();
     settle_frames(cx, &fixture);
 
-    // Both native button clicks happen in one update: even an immediate Git
-    // refusal cannot be delivered back to the UI before the form is closed.
     let (request, progress) = cx
         .update_window(fixture.window.into(), |_, window, cx| {
             window.click("dialog-confirm", cx);

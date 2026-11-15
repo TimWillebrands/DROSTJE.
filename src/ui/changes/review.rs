@@ -1,10 +1,3 @@
-//! The Review tab of a worktree Conversation's sidebar: the pinned pull request's state,
-//! linked work items and review threads, open ones first.
-//!
-//! AppState owns the pull request link and the last read of its threads (`ReviewState`);
-//! this module only presents them. Refresh and Open go through `Command`s, so the palette
-//! reaches everything here.
-
 use crate::ui::{
     commands::{Command, button},
     workspace::{Workspace, projects::relative_age},
@@ -20,7 +13,6 @@ use gpui_kit::{
     *,
 };
 
-/// A long review bot comment would push every other thread out of view.
 const COMMENT_LINES: usize = 12;
 
 pub(in crate::ui) fn state_tag(state: &PullRequestState) -> Tag {

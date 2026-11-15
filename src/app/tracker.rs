@@ -1,11 +1,3 @@
-//! Pull requests of worktree Conversations, owned by the App layer. A poll every few minutes
-//! asks the project's tracker (see `crate::tracker`) about each live worktree Conversation:
-//! an unlinked one is pinned once its branch has exactly one pull request, a pinned one has
-//! its state and work items refreshed, and a Conversation whose pull request completed or was
-//! abandoned is archived once, as soon as nothing runs in it. Review threads are read only
-//! while a Review tab shows them. Tracker calls run off-thread; results carry a generation
-//! and stale ones are dropped. Nothing is retried beyond the next scheduled poll.
-
 use super::*;
 use crate::tracker::{
     PinDecision, PullRequestSummary, ReviewThreads, Tracker, TrackerError, TrackerTool,
@@ -16,28 +8,17 @@ use std::{path::Path, time::Duration};
 const FIRST_POLL: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_secs(120);
 
-/// Why a worktree Conversation shows no pinned pull request, or what stopped its upkeep.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkStatus {
-    /// The branch has no pull request opened since the worktree was created.
-    NoneYet {
-        branch: String,
-    },
-    /// Several pull requests qualify; DROSTJE. does not pick one.
-    Ambiguous {
-        branch: String,
-        count: usize,
-    },
+    NoneYet { branch: String },
+    Ambiguous { branch: String, count: usize },
     Detached,
-    /// The project's `origin` is not on a tracker DROSTJE. integrates with.
     Untracked,
-    /// The pull request closed; archiving waits until this reason clears.
     ArchivePending(String),
     Failed(TrackerError),
 }
 
 impl LinkStatus {
-    /// One sentence saying what happened and, where there is one, the next action.
     pub fn describe(&self) -> String {
         match self {
             Self::NoneYet { branch } => format!("No pull request from {branch} yet."),
@@ -56,7 +37,6 @@ impl LinkStatus {
     }
 }
 
-/// A tracker failure with the next action for the kinds the user can fix.
 pub fn tracker_error_text(error: &TrackerError) -> String {
     match error {
         TrackerError::Unavailable(message) => {
@@ -70,7 +50,6 @@ pub fn tracker_error_text(error: &TrackerError) -> String {
     }
 }
 
-/// The review threads of one Conversation's pull request as last read.
 #[derive(Default)]
 pub struct ReviewState {
     pub loading: bool,
@@ -82,22 +61,17 @@ pub struct ReviewState {
 pub struct PullRequests {
     pub status: HashMap<ThreadId, LinkStatus>,
     pub reviews: HashMap<ThreadId, ReviewState>,
-    /// Threads whose open sidebar shows the Review tab in a visible pane.
     visible_reviews: HashSet<ThreadId>,
-    /// A poll is in flight; the next tick waits for it rather than stacking another.
     polling: bool,
     poll_generation: u64,
 }
 
-/// One worktree Conversation to ask the tracker about.
 struct Job {
     thread: ThreadId,
     project: ProjectId,
     root: PathBuf,
     dir: PathBuf,
-    /// `None` when the worktree is detached.
     branch: Option<String>,
-    /// When the worktree was created; older pull requests are an earlier use of the branch.
     since: String,
     pinned: Option<u64>,
 }
@@ -108,9 +82,7 @@ enum Outcome {
 }
 
 impl AppState {
-    /// Starts the periodic poll; it ends with the AppState.
     pub(super) fn start_pull_request_polling(&self, cx: &mut Context<Self>) {
-        // GPUI's timer, not smol's, so test schedulers drive the poll deterministically.
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(FIRST_POLL).await;
             loop {
@@ -126,7 +98,6 @@ impl AppState {
         .detach();
     }
 
-    /// The tracker CLI path configured in Settings, if any.
     fn tracker_executable_setting(&self, tracker: Tracker) -> Option<String> {
         self.snapshot
             .settings
@@ -166,7 +137,6 @@ impl AppState {
             .collect()
     }
 
-    /// Asks the tracker about every live worktree Conversation in one off-thread pass.
     pub fn poll_pull_requests(&mut self, cx: &mut Context<Self>) {
         if self.shutting_down || self.pull_requests.polling {
             return;
@@ -220,7 +190,6 @@ impl AppState {
                     self.pull_requests.status.insert(id, status.clone()) != Some(status)
                 }
             };
-            // Polls repeat every few minutes; only a real change redraws.
             if updated {
                 cx.emit(PresentationChange::Thread(id));
                 changed = true;
@@ -232,10 +201,6 @@ impl AppState {
         }
     }
 
-    /// Archives each Conversation whose pinned pull request closed and that DROSTJE. has not
-    /// archived for it yet. A Conversation that cannot be archived now (a running turn,
-    /// another space) keeps its reason and is tried again after its turn or the next poll.
-    /// Returns whether anything was archived.
     pub(super) fn settle_closed_pull_requests(&mut self) -> bool {
         let mut archived = false;
         let closed: Vec<_> = self
@@ -287,7 +252,6 @@ impl AppState {
         archived
     }
 
-    /// Records which threads show their Review tab; a tab that just appeared is read now.
     pub(super) fn set_visible_reviews(&mut self, ids: &[ThreadId], cx: &mut Context<Self>) {
         let visible: HashSet<_> = ids
             .iter()
@@ -306,7 +270,6 @@ impl AppState {
         }
     }
 
-    /// Re-reads the pinned pull request and its review threads for `id`.
     pub fn refresh_reviews(&mut self, id: ThreadId, cx: &mut Context<Self>) {
         if self.shutting_down {
             return;
@@ -373,7 +336,6 @@ impl AppState {
         .detach();
     }
 
-    /// Why the selected Conversation has no pull request to review or open.
     pub fn pull_request_reason(&self) -> Option<String> {
         let Some(thread) = self.conversation_thread() else {
             return Some("Select a conversation first.".into());
@@ -391,7 +353,6 @@ impl AppState {
         )
     }
 
-    /// Why no pull request poll can start now.
     pub fn refresh_pull_requests_reason(&self) -> Option<String> {
         if self.shutting_down {
             return Some("Application is shutting down.".into());
@@ -404,8 +365,6 @@ impl AppState {
             .then(|| "No conversation runs in its own worktree.".into())
     }
 
-    /// The tracker failure the user must fix outside DROSTJE. (a missing CLI or a refused
-    /// sign-in), as last seen by any poll or review read.
     pub fn tracker_setup_issue(&self) -> Option<String> {
         let setup = |error: &TrackerError| match error {
             TrackerError::Unavailable(_) | TrackerError::Auth(_) => Some(tracker_error_text(error)),
@@ -438,8 +397,6 @@ impl AppState {
     }
 }
 
-/// The link to store after the tracker reported `link` for `thread`, or `None` when the
-/// report is stale (the thread was pinned to another pull request while the poll ran).
 fn merge_link(thread: &Thread, mut link: PullRequestLink) -> Option<PullRequestLink> {
     if let Some(old) = &thread.pull_request {
         if old.id != link.id {
@@ -447,15 +404,12 @@ fn merge_link(thread: &Thread, mut link: PullRequestLink) -> Option<PullRequestL
         }
         link.archived_on_close = old.archived_on_close;
     }
-    // A Conversation the user archived before the pull request closed has nothing left to
-    // archive; unarchiving it later must not undo that choice.
     if thread.archived && link.state.closed() {
         link.archived_on_close = true;
     }
     Some(link)
 }
 
-/// Its pinned pull request closed and DROSTJE. has not archived it for that yet.
 fn awaits_archive(thread: &Thread) -> bool {
     !thread.archived
         && thread
@@ -464,8 +418,6 @@ fn awaits_archive(thread: &Thread) -> bool {
             .is_some_and(|pr| pr.state.closed() && !pr.archived_on_close)
 }
 
-/// Which tracker CLI serves the repository at `root`; `Ok(None)` when its `origin` is on
-/// no tracker DROSTJE. integrates with, or it has no `origin`.
 fn resolve_tool(root: &Path, explicit: Option<&str>) -> Result<Option<TrackerTool>, TrackerError> {
     let Ok(remote) = platform::git(root, &["remote", "get-url", "origin"]) else {
         return Ok(None);
@@ -562,11 +514,9 @@ mod tests {
         for state in [PullRequestState::Completed, PullRequestState::Abandoned] {
             let closed = thread(false, Some(link(7, state.clone(), false)));
             assert!(awaits_archive(&closed), "{state:?}");
-            // Archived for it once; the user unarchived it afterwards.
             let settled = thread(false, Some(link(7, state, true)));
             assert!(!awaits_archive(&settled));
         }
-        // An unrecognised state is never read as closed.
         let unknown = thread(
             false,
             Some(link(7, PullRequestState::Unknown("x".into()), false)),
@@ -578,22 +528,18 @@ mod tests {
     #[test]
     fn tracker_reports_keep_the_pin_and_the_users_archive_choice() {
         let pinned = thread(false, Some(link(7, PullRequestState::Active, true)));
-        // A report for a pull request the thread is no longer pinned to is stale.
         assert_eq!(
             merge_link(&pinned, link(8, PullRequestState::Completed, false)),
             None
         );
-        // A refresh keeps whether DROSTJE. already archived for this pull request.
         let merged = merge_link(&pinned, link(7, PullRequestState::Completed, false)).unwrap();
         assert!(merged.archived_on_close);
         assert_eq!(merged.state, PullRequestState::Completed);
-        // A first pin is taken as reported.
         let unpinned = thread(false, None);
         assert_eq!(
             merge_link(&unpinned, link(9, PullRequestState::Active, false)),
             Some(link(9, PullRequestState::Active, false))
         );
-        // The user archived before the pull request closed: unarchiving later keeps it.
         let archived = thread(true, Some(link(7, PullRequestState::Active, false)));
         let merged = merge_link(&archived, link(7, PullRequestState::Abandoned, false)).unwrap();
         assert!(merged.archived_on_close);

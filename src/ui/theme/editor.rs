@@ -1,7 +1,3 @@
-//! The theme editor: appearance, accent and grain over whichever theme is in effect,
-//! previewed live and saved together. Cancel, Escape and dismissal restore the saved
-//! choices; nothing is written until Save.
-
 use std::{cell::Cell, rc::Rc};
 
 use gpui_kit::{
@@ -36,17 +32,12 @@ const FIELD: &str = "ThemeAccentField";
 const SWATCHES: &str = "ThemeSwatches";
 const GRAIN: &str = "ThemeGrain";
 
-/// Degrees per hue step; a jump is six steps.
 const HUE_STEP: f32 = 5.;
-/// Chroma per intensity step; a jump is five steps.
 const CHROMA_STEP: f32 = 0.01;
-/// Grain percent per step; a jump is ten steps.
 const GRAIN_STEP: f32 = 1.;
-/// Dots across and down the accent field.
 const FIELD_COLUMNS: usize = 24;
 const FIELD_ROWS: usize = 9;
 
-/// Accents offered beside the theme's own, in OKLCH hue and chroma.
 const PRESETS: [(&str, f32, f32); 8] = [
     ("Blue", 262., 0.14),
     ("Teal", 200., 0.1),
@@ -96,7 +87,6 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(bindings);
 }
 
-/// Which swatch shows `accent`: 0 is the theme's own, then [`PRESETS`] in order.
 fn swatch_ix(accent: Option<Accent>) -> Option<usize> {
     match accent {
         None => Some(0),
@@ -121,10 +111,8 @@ pub struct ThemeEditor {
     swatches: FocusHandle,
     grain_focus: FocusHandle,
     grain: Entity<SliderState>,
-    /// Where the accent field was last painted, for pointer positions.
     field_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     dragging: bool,
-    /// Saved, cancelled, or dismissed; later callbacks from the dialog do nothing.
     closed: bool,
     _subscriptions: Vec<Subscription>,
 }
@@ -313,7 +301,6 @@ impl ThemeEditor {
             (SwatchStep::First, _) => 0,
             (SwatchStep::Last, _) => last,
             (SwatchStep::By(delta), Some(ix)) => ix.saturating_add_signed(delta).min(last),
-            // A custom accent steps onto the row from its start or end.
             (SwatchStep::By(delta), None) => {
                 if delta < 0 {
                     last
@@ -353,7 +340,6 @@ impl ThemeEditor {
         );
     }
 
-    /// Save the draft as the user's appearance and adjustments.
     pub fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.closed {
             return;
@@ -369,7 +355,6 @@ impl ThemeEditor {
         self.release(cx);
     }
 
-    /// Close without saving: Cancel, or another surface taking over.
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.closed {
             return;
@@ -378,8 +363,6 @@ impl ThemeEditor {
         window.close_dialog(cx);
     }
 
-    /// The dialog closed itself (Escape, the close button, the overlay); restore the
-    /// saved choices unless they were just saved.
     fn cleanup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.closed {
             return;
@@ -443,7 +426,6 @@ impl ThemeEditor {
     fn render_field(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let accent = self.accent(cx);
         let handle = theme::accent_color(accent, cx);
-        // One color per dot, computed here so painting stays a plain copy.
         let dots: Vec<Hsla> = (0..FIELD_ROWS)
             .flat_map(|row| (0..FIELD_COLUMNS).map(move |column| (row, column)))
             .map(|(row, column)| {
@@ -583,7 +565,6 @@ impl ThemeEditor {
                 )
                 .selected(is_selected)
                 .accessibility_label(name)
-                // The row is one tab stop; h and l move along it.
                 .tab_stop(false)
                 .size_6()
                 .rounded_full()
@@ -738,8 +719,6 @@ impl Render for ThemeEditor {
                 section("Grain", None, cx)
                     .child(self.render_grain(window, cx))
                     .child(
-                        // A sample of the chrome surface, so grain is visible while the
-                        // dialog's overlay dims the window behind it.
                         div()
                             .relative()
                             .h(rems(2.5))

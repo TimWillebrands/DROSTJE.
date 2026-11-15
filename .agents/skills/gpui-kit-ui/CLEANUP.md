@@ -24,7 +24,8 @@ against the smell table, then fix in the order below (largest class first).
 
 Keep as-is: `on_mouse_down` on a pane root that only moves focus; `canvas()`
 `.absolute()` measurement overlays; layout-only `div().flex_1().truncate()`;
-`px(0.)` / `px(1.)` hairlines and window minima with a comment.
+`px(0.)` / `px(1.)` hairlines, `ListState` overdraw, and window minima or
+external sizes named as a `const NAME: Pixels`.
 
 ## Fix pass
 

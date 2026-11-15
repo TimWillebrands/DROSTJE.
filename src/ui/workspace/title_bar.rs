@@ -1,6 +1,3 @@
-//! The window's title bar, and the dock renderer that places it above the centre only, so
-//! the Projects dock reads as one full-height column the way Zed's sidebar does.
-
 use crate::app::{AppState, PresentationChange};
 use crate::ui::{
     commands::{
@@ -27,8 +24,6 @@ use gpui_kit::{
 };
 use std::{rc::Rc, sync::Arc};
 
-/// Save acknowledgements and the running-turn count repaint only their status, never the
-/// title bar or the shell.
 pub(in crate::ui) struct SaveStatus {
     state: Entity<AppState>,
     presentation: (usize, bool, bool),
@@ -104,7 +99,6 @@ impl Render for SaveStatus {
     }
 }
 
-/// What the title bar shows; it repaints only when one of these changes.
 #[derive(Clone, PartialEq)]
 struct TitlePresentation {
     project_name: SharedString,
@@ -132,11 +126,6 @@ impl TitlePresentation {
     }
 }
 
-/// The title bar above the centre column, with the recovery banners under it.
-///
-/// Rendered by the dock renderer rather than by `Workspace`, so it spans the centre and
-/// leaves the side docks their full height. Actions dispatched from here bubble through the
-/// dock into `Workspace`, exactly as they did when the bar sat above the dock.
 pub(in crate::ui) struct WorkspaceTitle {
     state: Entity<AppState>,
     owner: WeakEntity<Workspace>,
@@ -184,7 +173,6 @@ impl Render for WorkspaceTitle {
         let palette_owner = self.owner.clone();
         let recovery_owner = self.owner.clone();
         let dismiss_recovery = self.owner.clone();
-        // Rendered while the dock lays out, after `Workspace` and the dock finished rendering.
         let left_dock_open = self.owner.upgrade().is_some_and(|workspace| {
             workspace
                 .read(cx)
@@ -199,7 +187,6 @@ impl Render for WorkspaceTitle {
                 TitleBar::new()
                     .relative()
                     .children(crate::ui::theme::grain::layer(crate::ui::theme::grain(cx)))
-                    // The macOS traffic lights sit over an open left dock, not over this bar.
                     .when(left_dock_open, |bar| bar.pl_3())
                     .on_close_window(move |_, window, cx| {
                         let _ = close_owner
@@ -320,11 +307,6 @@ impl Render for WorkspaceTitle {
     }
 }
 
-/// `DockSkin` with the title bar placed above the centre column and the Projects header
-/// dropped: Projects carries its own search row at title-bar height instead.
-///
-/// Every hook delegates to `DockSkin`; only where the title goes and whether a tab group
-/// draws its header differ.
 pub(in crate::ui) struct WorkspaceDockSkin {
     pub(in crate::ui) inner: Rc<DockSkin>,
     pub(in crate::ui) title: Entity<WorkspaceTitle>,
@@ -345,8 +327,6 @@ impl DockAreaRenderer for WorkspaceDockSkin {
         self.inner.split_frame(node, axis, window, cx)
     }
 
-    /// The dock area appends the centre and the bottom dock to this column, so the title
-    /// comes first. A zoomed group replaces the whole area and draws the title itself.
     fn center_frame(&self, window: &mut Window, cx: &mut App) -> Stateful<Div> {
         self.inner
             .center_frame(window, cx)
@@ -415,7 +395,6 @@ impl TabGroupRenderer for WorkspaceTabGroups {
         cx: &mut App,
     ) -> AnyElement {
         if group.is_zoomed() {
-            // A zoomed group fills the window: keep the title bar and the zoom-out control.
             return v_flex()
                 .w_full()
                 .child(self.title.clone())

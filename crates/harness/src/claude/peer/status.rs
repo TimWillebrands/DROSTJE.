@@ -1,5 +1,3 @@
-//! Private, status-only return address for one owned Claude runtime. Native replies are
-//! explicitly denied, never acknowledged as delivered or silently discarded.
 use super::*;
 use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
@@ -37,7 +35,6 @@ impl StatusInbox {
             "Claude status socket requires an owner-only native socket directory"
         );
         let path = directory.join(format!("{:016x}.sock", Uuid::new_v4().as_u128() as u64));
-        // The owner-only directory protects the bind-to-chmod interval without changing umask.
         let listener = UnixListener::bind(&path)?;
         if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .and_then(|_| listener.set_nonblocking(true))
@@ -64,7 +61,6 @@ impl StatusInbox {
         &self.address
     }
 
-    /// A connection is being read or answered.
     pub fn busy(&self) -> bool {
         !self.incoming.is_empty() || !self.outgoing.is_empty()
     }
@@ -137,8 +133,6 @@ impl StatusInbox {
                     }
                 }
             }
-            // One protocol frame per connection is sufficient for receipts and replies. An
-            // optional auth line is never needed on this Unix status-only endpoint; redact it.
             if let Some(end) = connection.bytes.iter().position(|byte| *byte == b'\n') {
                 match serde_json::from_slice::<Value>(&connection.bytes[..end]) {
                     Ok(frame) if frame["type"] == "auth" => frames.push(diagnostic(
@@ -167,8 +161,6 @@ impl StatusInbox {
             if frame["type"] == "user"
                 && let Err(error) = self.deny_reply(frame)
             {
-                // Preserve the original frame AND the explicit rejection-transport failure.
-                // We never issue a successful delivery receipt for a native reply.
                 failures.push(diagnostic(format!(
                     "Could not return native reply denial: {error:#}"
                 )));
@@ -230,7 +222,6 @@ impl StatusInbox {
             self.outgoing.len() < CONNECTIONS,
             "Native reply denial queue is full"
         );
-        // Always send to the validated owned child socket, NEVER a sender-authored `from`.
         let stream = connect(&self.target)?;
         let mut bytes = serde_json::to_vec(&json!({
             "msgV":1,"msg_id":Uuid::new_v4(),"type":"control","action":"peer_message_status",
@@ -250,7 +241,6 @@ impl StatusInbox {
 
 impl Drop for StatusInbox {
     fn drop(&mut self) {
-        // Do not unlink another socket if the path was replaced after binding.
         if fs::symlink_metadata(&self.path)
             .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
         {
@@ -277,7 +267,6 @@ pub(super) fn address(path: &Path) -> String {
 }
 
 pub(super) fn peer_pid(stream: &UnixStream) -> Result<u32> {
-    // Kernel-generated credentials, never sender-authored frame fields.
     let credentials = drostje_platform::peer_credentials(stream)
         .context("Read native status peer credentials")?;
     ensure!(
@@ -359,8 +348,6 @@ mod tests {
             0,
             "Expired denial transport must close without sending bytes"
         );
-        // Queueing a nonblocking connection is not credential evidence. Validation
-        // belongs after connect completion and must reject before writing any receipt.
         inbox.pid = std::process::id() + 1;
         inbox.deny_reply(&json!({"type":"user","msg_id":Uuid::new_v4()}))?;
         assert_eq!(inbox.outgoing.len(), 1);

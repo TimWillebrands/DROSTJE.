@@ -1,24 +1,7 @@
-// DROSTJE. artifact kit v1: the page side of the artifact channel.
-//
-// DROSTJE runs this at document start in every frame of an artifact page,
-// before page scripts and right after inserting the kit styles (a low-priority
-// cascade layer, #drostje-kit) and the theme tokens (#drostje-theme). No
-// dependencies, no network, no storage. Everything is guarded so a failure here
-// never breaks the page.
-//
-// Wire contract (the host parses exactly this):
-//   page -> host  console.warn("__DROSTJE_CHANNEL__" + JSON {v:1, id, type, data}), at most 32 KiB
-//   host -> page  drostje.__receipt(id, "delivered" | "queued" | "failed" | "unknown", reason?)
-//   host -> page  drostje.__theme(cssText) replaces the unlayered #drostje-theme tokens
-// "queued" is not final: the event waits (for example behind a permission
-// prompt) and the host later sends delivered, failed or unknown for the same id.
-// send() resolves with that final status. No receipt at all within 15 s
-// resolves as "unknown": the kit never claims delivery.
 (function () {
   "use strict";
   try {
     if (window.drostje) return;
-    // Captured first: page scripts may replace console later.
     const emit = console.warn.bind(console);
 
     const PREFIX = "__DROSTJE_CHANNEL__";
@@ -30,8 +13,6 @@
     const LISTS = ".choices, [role=listbox], [data-drostje-list]";
     const FOCUSABLE = "input:not([type=hidden]), button, select, textarea, a[href], summary, [tabindex], [contenteditable]";
     const pending = new Map();
-
-    // ------------------------------------------------------------ channel
 
     function uuid() {
       try {
@@ -49,8 +30,6 @@
       return hex.slice(0, 8) + "-" + hex.slice(8, 12) + "-" + hex.slice(12, 16) + "-" + hex.slice(16, 20) + "-" + hex.slice(20);
     }
 
-    // The limit is checked in UTF-8 bytes. That is never less than the
-    // string's length, so it also holds for hosts that count characters.
     function byteLength(text) {
       try {
         return new TextEncoder().encode(text).length;
@@ -75,7 +54,6 @@
       clearTimeout(entry.timer);
       const receipt = Object.freeze({ status, reason: reason == null ? null : String(reason) });
       if (status === "queued") {
-        // Acknowledged but waiting: no timeout any more, the final status follows.
         entry.timer = 0;
         announce(id, receipt);
         if (entry.progress) {
@@ -90,8 +68,6 @@
       announce(id, receipt);
     }
 
-    // progress(receipt) hears intermediate "queued" receipts; the promise only
-    // resolves with a final status.
     function transmit(type, data, progress) {
       try {
         if (typeof type !== "string" || !TYPE.test(type)) {
@@ -100,7 +76,6 @@
         const body = JSON.stringify(data === undefined ? null : data);
         if (body === undefined) return Promise.reject(new TypeError("Event data is not JSON-serialisable"));
         const id = uuid();
-        // Same bytes as JSON.stringify({v: 1, id, type, data}).
         const encoded = '{"v":1,"id":' + JSON.stringify(id) + ',"type":' + JSON.stringify(type) + ',"data":' + body + "}";
         if (byteLength(encoded) > MAX_BYTES) return Promise.reject(new RangeError("Event exceeds 32 KiB"));
         return new Promise(resolve => {
@@ -137,7 +112,6 @@
         }
         let style = doc.getElementById("drostje-theme");
         if (!style || style.localName !== "style") {
-          // Unlayered, after the kit layer and before page styles, so the page still wins.
           style = doc.createElement("style");
           style.id = "drostje-theme";
           const kit = doc.getElementById("drostje-kit");
@@ -154,8 +128,6 @@
       configurable: false,
       enumerable: false,
     });
-
-    // ------------------------------------------------------------ helpers
 
     const guard = fn => function (event) {
       try {
@@ -207,7 +179,6 @@
       el.dispatchEvent(new Event(type, { bubbles: true }));
     }
 
-    // queued is an in-flight state; unknown counts as failed for styling.
     function outcome(receipt) {
       switch (receipt.status) {
         case "delivered":
@@ -221,7 +192,6 @@
       }
     }
 
-    // Resolves with the final receipt; onQueued hears intermediate queued receipts.
     function deliver(type, data, onQueued) {
       return transmit(type, data, onQueued).catch(error => ({ status: "failed", reason: (error && error.message) || null }));
     }
@@ -233,7 +203,6 @@
       if (!el.hasAttribute("role")) el.setAttribute("role", "status");
     }
 
-    // Disabling a focused button drops focus to <body>; give it back.
     function restoreFocus(el) {
       const active = document.activeElement;
       if (el && el.isConnected && !el.disabled && (!active || active === document.body || active === document.documentElement)) {
@@ -241,11 +210,6 @@
       }
     }
 
-    // ------------------------------------------------------------ form route
-
-    // Named, enabled controls: text-like -> string (a repeated name -> array),
-    // radio -> checked value or null, checkbox group -> checked values, a lone
-    // checkbox without a value -> boolean, select[multiple] -> array.
     function serialize(form, submitter) {
       const fields = new Map();
       for (const el of Array.from(form.elements)) {
@@ -310,8 +274,6 @@
       form.setAttribute("aria-busy", "true");
       for (const button of disabled) button.disabled = true;
       showStatus(status, "sending", "Sending\u2026");
-      // Submit buttons stay disabled while queued; the form is never reset, so
-      // the user's input stays for a retry or an edit.
       const progress = guard(receipt => {
         const result = outcome(receipt);
         form.setAttribute("data-drostje-state", result.state);
@@ -338,10 +300,6 @@
       else form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     }
 
-    // ------------------------------------------------------------ choose route
-
-    // The nearest ancestor holding a status, skipping statuses owned by another
-    // form route or another once-container.
     function findStatus(el) {
       for (let node = el.parentElement; node; node = node.parentElement) {
         for (const status of Array.from(node.querySelectorAll("[data-drostje-status]"))) {
@@ -359,7 +317,6 @@
       const once = el.closest("[data-drostje-once]");
       const group = once || el.parentElement;
       const peers = group ? Array.from(group.querySelectorAll("[data-drostje-send]")) : [el];
-      // One current choice per group: the previous one loses its marks.
       for (const peer of peers) {
         if (peer === el) continue;
         if (peer.getAttribute("aria-pressed") === "true") peer.setAttribute("aria-pressed", "false");
@@ -367,11 +324,8 @@
       }
       el.setAttribute("aria-pressed", "true");
       el.setAttribute("data-drostje-state", "sending");
-      // Inert until a final receipt, without native disabling, so focus stays put.
       const marked = el.getAttribute("aria-disabled") !== "true";
       if (marked) el.setAttribute("aria-disabled", "true");
-      // A once-container takes one answer: lock the others while this one is in
-      // flight (queued included); keep them locked once it is delivered.
       const locked = once ? peers.filter(peer => peer !== el && !isDisabled(peer)) : [];
       for (const peer of locked) setDisabled(peer, true);
       const status = findStatus(el);
@@ -398,12 +352,9 @@
       const target = elementOf(event.target);
       const el = target && target.closest("[data-drostje-send]");
       if (!el) return;
-      // A submit button of a form route belongs to that route (as its submitter).
       if (isSubmitButton(el) && el.form && el.form.hasAttribute("data-drostje")) return;
-      // Labels and their inputs keep their default so the choice input still toggles.
       const passive = el.localName === "label" || isCheckable(target);
       if (inFlight(el)) {
-        // A repeat, or the label's own follow-up click on its control.
         if (!passive) event.preventDefault();
         return;
       }
@@ -414,8 +365,6 @@
       if (!passive) event.preventDefault();
       choose(el);
     }
-
-    // ------------------------------------------------------------ choice lists
 
     let gAt = 0;
     let gList = null;
@@ -438,8 +387,6 @@
       }
     }
 
-    // The control that takes focus for an item: the item itself, or the first
-    // enabled focusable inside it (a radio group's inputs are all reachable).
     function focusTarget(item) {
       if (item.matches(FOCUSABLE + ", [role=option], [data-drostje-send]")) return item.disabled ? null : item;
       for (const el of Array.from(item.querySelectorAll(FOCUSABLE))) if (!el.disabled) return el;
@@ -455,7 +402,6 @@
 
     function selectOption(event, list, target) {
       if (isCheckable(target)) {
-        // Native Space/Return handling differs per engine; do it once, here.
         event.preventDefault();
         if (!target.disabled) target.click();
         return;
@@ -471,7 +417,6 @@
         }
         target.click();
       }
-      // Buttons, links and summaries keep their own activation.
     }
 
     function onKeyDown(event) {
@@ -522,15 +467,10 @@
           return;
         }
       } else return;
-      // Also stops native radio arrows from moving the selection with focus.
       event.preventDefault();
       if (next !== index) focusItem(items[next]);
     }
 
-    // ------------------------------------------------------------ label mirror
-
-    // Servo 0.7 does not re-evaluate :has() on state changes, so choice labels
-    // carry their input's state as attributes for kit.css.
     function choiceLabels(input) {
       const labels = [];
       try {
@@ -578,8 +518,6 @@
       }
     }
 
-    // ------------------------------------------------------------ wiring
-
     const doc = document;
     doc.addEventListener("submit", guard(onSubmit), true);
     doc.addEventListener("click", guard(onClick), true);
@@ -590,6 +528,5 @@
     if (doc.readyState === "loading") doc.addEventListener("DOMContentLoaded", guard(mirrorAll), { once: true });
     else guard(mirrorAll)();
   } catch (_) {
-    // The kit must never break the page.
   }
 })();

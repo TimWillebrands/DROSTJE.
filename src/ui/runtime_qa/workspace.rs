@@ -1,4 +1,3 @@
-//! Workspace shell: empty state, real-backend actions, Command, themes and the input workload.
 use super::*;
 
 #[gpui_kit::test]
@@ -71,7 +70,6 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
     quit(cx, &fixture).await;
 }
 
-/// Opt-in comparative workload, not a wall-clock assertion in ordinary CI.
 #[gpui_kit::test]
 #[ignore = "requires disposable DROSTJE_RUNTIME_FIXTURE; measures real input and navigation without provider turns"]
 async fn interaction_performance_workload(cx: &mut TestAppContext) {
@@ -321,7 +319,6 @@ async fn workspace_actions_with_real_backends(cx: &mut TestAppContext) {
             .clone()),
         "alpha GAMMA\n"
     );
-    // The dock's thread tabs retain both kinds; cycling never rewrites either draft.
     assert_eq!(
         cx.read(|cx| fixture.state.read(cx).open_threads.clone()),
         vec![first, factory]
@@ -636,7 +633,6 @@ async fn thread_workspace_keyboard_and_themes(cx: &mut TestAppContext) {
         })
         .unwrap();
     }
-    // Editing appearance is transactional: neither a choice nor Cancel previews it.
     cx.simulate_keystrokes(fixture.window.into(), "secondary-,");
     until(
         cx,

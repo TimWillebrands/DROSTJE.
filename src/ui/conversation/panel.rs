@@ -54,8 +54,6 @@ fn frame(
     sidebar: AnyElement,
     composer: Option<super::composer::ComposerSplit>,
 ) -> AnyElement {
-    // The composer shares the history column so both centre over the same width;
-    // the sidebar spans the full height beside them.
     let content = match composer {
         Some(mut split) => {
             split.history = history.into_any_element();
@@ -188,7 +186,6 @@ fn render_content(
                     .cached(StyleRefinement::default().absolute().size_full()),
             ),
         );
-        // A fresh Conversation offers its harness up front: the first thing to decide.
         if state.is_untouched(thread) && state.switch_harness_reason_for(id).is_none() {
             let switch = owner.clone();
             history = history.child(inset(
@@ -248,7 +245,6 @@ fn render_content(
                 ));
                 continue;
             }
-            // Widgets are OMP's live panels (plans, progress); open unless folded away.
             let folded_key = format!("widget-folded:{id}:{key}");
             let folded = is_expanded(owner, &folded_key, cx);
             history = history.child(inset(
@@ -282,7 +278,6 @@ fn render_content(
         if let Some(dock) = sticky_dock(id, &dock, owner, cx) {
             history = history.child(dock);
         }
-        // Input the agent waits for sits directly above the composer.
         if let Some(pane) = owner
             .upgrade()
             .and_then(|workspace| workspace.read(cx).docked_artifact(id))
@@ -308,9 +303,6 @@ fn render_content(
             )
         }));
     }
-    // A submission that is simply in flight is already visible through the
-    // disabled Send control and the sidebar state; only an unresolved one after
-    // a failure or restart needs attention here.
     let unresolved_submission = thread.submission.as_ref().filter(|submission| {
         let submission_state = submission
             .get("state")
@@ -374,7 +366,6 @@ fn render_content(
         ));
     }
     if thread.archived || project.archived {
-        // An archived thread in a live project can come back; an archived project cannot here.
         let unarchive = (thread.archived && !project.archived).then(|| {
             let reason = state.unarchive_thread_reason_for(id);
             let owner = owner.clone();
@@ -414,8 +405,6 @@ fn render_content(
             None,
         );
     }
-    // One region under a single divider: attachments, the editor and its
-    // toolbar stack without a box of their own.
     let mut composer = v_flex()
         .id("composer-draft-content")
         .flex_1()
@@ -430,7 +419,6 @@ fn render_content(
             cx,
         ));
     }
-    // Draft thumbnails load into the transcript's cache too, and leave with the thread's tab.
     let mut previews = h_flex()
         .image_cache(transcript.read(cx).images.clone())
         .id("draft-attachments")
@@ -469,8 +457,6 @@ fn render_content(
     if !thread.attachments.is_empty() {
         composer = composer.child(previews);
     }
-    // One Neovim instance: the selected conversation hosts it, every other visible
-    // conversation shows its saved draft and how to take the editor over.
     let hosts_editor = owner.upgrade().is_some_and(|workspace| {
         let workspace = workspace.read(cx);
         workspace.editor.is_some()
@@ -506,7 +492,6 @@ fn render_content(
             })
             .into_any_element(),
     });
-    // Zed-style toolbar: context actions left, meters, model settings and send right.
     let mut leading = h_flex().flex_1().min_w_0().items_center().gap_1();
     let mut trailing = h_flex().flex_shrink_0().items_center().gap_1();
     let attach = owner.clone();
@@ -558,7 +543,6 @@ fn render_content(
                     )
                 }),
         );
-    // The harness name doubles as its switcher; once a turn exists it only names it.
     let switch_reason = state.switch_harness_reason_for(id).or_else(|| {
         (state.selected_thread != Some(id)).then(|| "Select this conversation first.".to_owned())
     });
@@ -583,7 +567,6 @@ fn render_content(
                 });
             }),
     );
-    // The harness status line trails the context actions, muted and truncated.
     leading = leading.child(
         div()
             .flex_1()
@@ -601,7 +584,6 @@ fn render_content(
             cx,
         ));
     }
-    // The wordmark's full stop, breathing beside the composer while a turn runs.
     if active {
         trailing = trailing.children(activity::mark(
             "turn-running".into(),
@@ -684,7 +666,6 @@ fn render_content(
             );
         }
     }
-    // Claude Code reports its model only after the first prompt, so an empty list is not a failure.
     let unavailable = state
         .conversations
         .get(&id)
@@ -769,8 +750,6 @@ fn render_content(
         .py_1()
         .child(leading)
         .child(trailing);
-    // A definite bounded height propagates through the inset wrapper so the editor shrinks,
-    // rather than overflowing the actions or introducing a second transcript scroller.
     let preferred_height =
         13. + if thread.attachments.is_empty() {
             0.
@@ -802,7 +781,6 @@ fn render_content(
                 .border_color(cx.theme().border)
                 .pt_2()
                 .pb_2()
-                // Sweeps along the top border while a turn runs.
                 .when(active, |row| {
                     row.child(
                         div()
@@ -832,8 +810,6 @@ fn render_content(
     )
 }
 
-/// Directory identity stays separate from model settings; choosing another directory starts
-/// a new session rather than rebinding the current Conversation's harness.
 fn workspace_controls(
     thread: &crate::model::Thread,
     state: &AppState,

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ASK_GUIDANCE, ASK_TOOL, registerArtifactQuestions } from "./ask.mjs";
 
-// The real extension entrypoint against the extension API surface it relies on.
 function fixture(active) {
   const handlers = new Map();
   const api = {

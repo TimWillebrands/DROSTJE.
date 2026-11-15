@@ -21,8 +21,6 @@ use std::{
     rc::Rc,
 };
 
-/// Keep HTML and Markdown image references inert. Only decoded provider attachments
-/// may load image resources; ordinary assistant prose cannot name a local file to load.
 struct InertResources;
 impl MarkdownPlugin for InertResources {
     fn name(&self) -> &str {
@@ -60,9 +58,6 @@ impl MarkdownPlugin for InertResources {
         div().whitespace_normal().child(node.as_text().to_owned())
     }
 }
-/// Inline code that names a file (`src/app.rs:42`) opens it in Neovim at that line.
-/// Parsed from the Markdown tree, so code blocks and identifiers like `cx.notify` stay
-/// plain code; whether the file exists is checked only when it is opened.
 struct FileReferences {
     thread: Option<ThreadId>,
 }
@@ -124,8 +119,6 @@ impl MarkdownPlugin for FileReferences {
     }
 }
 
-/// Every file a Conversation displayed, in inline code or as a tool's file, most
-/// recent first and each once: the rows of "Open file from conversation…".
 pub(in crate::ui) fn file_references(session: &ConversationSession) -> Vec<FileReference> {
     let mut seen = std::collections::HashSet::new();
     let mut references = Vec::new();
@@ -159,9 +152,6 @@ pub(in crate::ui) fn file_references(session: &ConversationSession) -> Vec<FileR
     references
 }
 
-/// Transcript prose stays close to body size: headings step up modestly and
-/// paragraphs sit half a line apart, so a reply reads as a message, not a page.
-/// `body` is the size the text inherits, so prose type scales its headings too.
 fn transcript_text_style(body: Pixels) -> TextViewStyle {
     TextViewStyle::default()
         .paragraph_gap(rems(0.5))
@@ -174,17 +164,13 @@ fn transcript_text_style(body: Pixels) -> TextViewStyle {
             }
         })
 }
-/// Where a Markdown block keeps its parsed state.
 #[derive(Clone, Copy)]
 pub enum Markdown<'a> {
-    /// With its element, for as long as the element renders in consecutive frames.
     Element,
-    /// With the transcript, for the list row it renders in.
     Row(&'a MarkdownStates, usize),
 }
 
 impl Markdown<'_> {
-    /// The Conversation whose transcript renders this Markdown, if any.
     pub(super) fn thread(self) -> Option<ThreadId> {
         match self {
             Markdown::Row(states, _) => Some(states.thread),
@@ -193,23 +179,14 @@ impl Markdown<'_> {
     }
 }
 
-/// `TextView` parses longer documents on a background executor; shorter full replacements
-/// parse synchronously and notify their state at once.
 pub(super) const SYNC_PARSE_LIMIT: usize = 4 * 1024;
 
-/// Renders after which an entry no row asked for may go. Only entries that reparse in the
-/// same frame (short, settled, nothing selected) are dropped; a long document keeps its
-/// state so a returning row is measured at its real height.
 const EVICT_AFTER_RENDERS: u64 = 300;
-/// Renders between two eviction sweeps.
 const SWEEP_EVERY_RENDERS: u64 = 64;
 
-/// How a block's Markdown derives from the text it shows.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Derivation<'a> {
-    /// The text is Markdown.
     Prose,
-    /// The text is plain output inside a code fence of this language.
     Code(&'a str),
 }
 
@@ -222,56 +199,35 @@ impl Derivation<'_> {
     }
 }
 
-/// Parsed transcript Markdown, kept for as long as the transcript.
-///
-/// Element state lasts only while its element renders in consecutive frames, and a long
-/// document lays out empty until its background parse lands. A row that left the list's
-/// render window and came back would be measured at zero height, and scrolling across it
-/// would skip it. Here each text parses once, and a landing parse remeasures its row.
-///
-/// Entries are keyed by element ID and remember the source text they were derived from, so
-/// an unchanged block costs a comparison per frame rather than a copy, a derivation and a
-/// parse. Text that extends the previous text is appended, which reparses only the last
-/// block.
 #[derive(Clone)]
 pub struct MarkdownStates {
-    /// The Conversation whose working tree resolves file references in this text.
     pub(super) thread: ThreadId,
     list: ListState,
     view: EntityId,
     entries: Rc<RefCell<HashMap<ElementId, MarkdownEntry>>>,
     derived: Rc<RefCell<HashMap<SharedString, DerivedText>>>,
-    /// Renders of the transcript so far; entries remember the last one that used them.
     renders: Rc<Cell<u64>>,
 }
 
 struct MarkdownEntry {
     state: Entity<TextViewState>,
-    /// The text shown, before any code fence was added.
     source: SharedString,
     language: Option<SharedString>,
-    /// Bytes of Markdown the state holds: whether it would parse at once again.
     markdown_len: usize,
     row: Rc<Cell<usize>>,
-    /// Set until a background parse lands and the row can be measured at its real height.
     parsing: Rc<Cell<bool>>,
     used: u64,
-    /// Notifies the view of changes the view did not make itself.
     parsed: Subscription,
 }
 
-/// Text derived from a block's source (reasoning as shown), kept while the source holds.
 struct DerivedText {
     source: SharedString,
     derived: SharedString,
     used: u64,
 }
 
-/// What a `TranscriptMarkdown` element hands its `TextView`.
 enum Prepared {
-    /// The transcript's state, already showing this text.
     Current(Entity<TextViewState>),
-    /// The transcript's state at `id`, to be brought to this text while rendering.
     Update {
         states: MarkdownStates,
         id: ElementId,
@@ -279,7 +235,6 @@ enum Prepared {
         language: Option<SharedString>,
         row: usize,
     },
-    /// Element-scoped state for this Markdown.
     Element(ElementId, SharedString),
 }
 
@@ -295,8 +250,6 @@ impl MarkdownStates {
         }
     }
 
-    /// Starts a render of the transcript and now and then drops entries no row used for
-    /// `EVICT_AFTER_RENDERS` renders and that would reparse at once if their row returned.
     pub(super) fn begin_render(&self, cx: &App) {
         let render = self.renders.get() + 1;
         self.renders.set(render);
@@ -316,7 +269,6 @@ impl MarkdownStates {
             .retain(|_, derived| !stale(derived.used));
     }
 
-    /// Looks up the state for a block without copying its text when the text is unchanged.
     fn prepare(&self, id: ElementId, source: &str, derivation: Derivation, row: usize) -> Prepared {
         let language = match derivation {
             Derivation::Prose => None,
@@ -355,7 +307,6 @@ impl MarkdownStates {
             drop(entries);
             return self.insert(id, source, language, row, cx);
         };
-        // Streaming prose only grows: append the new tail instead of reparsing it all.
         let appends = derivation == Derivation::Prose
             && entry.language.is_none()
             && !entry.source.is_empty()
@@ -364,7 +315,6 @@ impl MarkdownStates {
         let state = entry.state.clone();
         if appends {
             let tail = &source[entry.source.len()..];
-            // An append always parses in the background.
             entry.parsing.set(true);
             entry.markdown_len += tail.len();
             state.update(cx, |state, cx| state.push_str(tail, cx));
@@ -372,10 +322,6 @@ impl MarkdownStates {
             let text = derivation.markdown(&source);
             entry.parsing.set(text.len() > SYNC_PARSE_LIMIT);
             entry.markdown_len = text.len();
-            // A short replacement parses at once and notifies while this view renders it.
-            // An observer made after that notification becomes active only once it has been
-            // delivered, so the view is not asked to render the change a second time; later
-            // changes reach it as before.
             state.update(cx, |state, cx| state.set_text(&text, cx));
             entry.parsed = self.observe(&state, &entry.row, &entry.parsing, cx);
         }
@@ -397,7 +343,6 @@ impl MarkdownStates {
             None => Derivation::Prose,
         };
         let text = derivation.markdown(&source);
-        // The observer becomes active after the state's first notification, as in `state`.
         let state = cx.new(|cx| TextViewState::markdown(&text, cx));
         let row = Rc::new(Cell::new(row));
         let parsing = Rc::new(Cell::new(text.len() > SYNC_PARSE_LIMIT));
@@ -418,8 +363,6 @@ impl MarkdownStates {
         state
     }
 
-    /// Re-renders the transcript when the state changes, and remeasures the row once a
-    /// background parse lands.
     fn observe(
         &self,
         state: &Entity<TextViewState>,
@@ -440,7 +383,6 @@ impl MarkdownStates {
         })
     }
 
-    /// `derive(source)`, recomputed only when `source` differs from last time at `key`.
     pub(super) fn derived(
         &self,
         key: &str,
@@ -473,7 +415,6 @@ impl MarkdownStates {
     }
 }
 
-/// Markdown `text` in the transcript's type; a row's state is reused while `text` holds.
 pub fn markdown_text(id: impl Into<ElementId>, text: &str, markdown: Markdown) -> impl IntoElement {
     TranscriptMarkdown::new(id.into(), text, Derivation::Prose, markdown)
 }
@@ -481,7 +422,6 @@ pub fn markdown_text(id: impl Into<ElementId>, text: &str, markdown: Markdown) -
 #[derive(IntoElement)]
 struct TranscriptMarkdown {
     prepared: Prepared,
-    /// The Conversation whose working tree resolves file references, if the text has one.
     thread: Option<ThreadId>,
 }
 
@@ -503,7 +443,6 @@ impl TranscriptMarkdown {
 impl RenderOnce for TranscriptMarkdown {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let body = window.text_style().font_size.to_pixels(window.rem_size());
-        // Element-scoped text has no Conversation of its own: the selected one resolves it.
         let thread = self.thread;
         match self.prepared {
             Prepared::Current(state) => TextView::new(&state),
@@ -541,9 +480,6 @@ impl RenderOnce for TranscriptMarkdown {
     }
 }
 
-/// Plain output (compiler messages, grep hits, file contents) rendered through
-/// the kit's Markdown code block, which brings the code font, background,
-/// highlighting for a known language and copy support.
 pub(super) fn code_block(
     identity: impl Into<ElementId>,
     text: &str,
@@ -552,8 +488,6 @@ pub(super) fn code_block(
 ) -> impl IntoElement {
     TranscriptMarkdown::new(identity.into(), text, Derivation::Code(language), markdown)
 }
-/// Wrap `text` in a fence longer than any backtick run it contains, so the
-/// block always closes where intended.
 fn code_fence(text: &str, language: &str) -> String {
     let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
@@ -575,7 +509,6 @@ mod tests {
     ) {
         use gpui_kit::{AppContext, ListAlignment, ListState, Pixels};
         cx.update(gpui_kit::init);
-        // Stands in for the transcript view: counts the renders the states ask of it.
         let view = cx.new(|_| ());
         let notified = std::rc::Rc::new(std::cell::Cell::new(0));
         cx.update(|cx| {
@@ -605,13 +538,10 @@ mod tests {
             "the view renders the text it just created"
         );
 
-        // A selection is a change the view did not make.
         cx.update(|cx| state.update(cx, |state, cx| state.select_all(cx)));
         cx.run_until_parked();
         assert_eq!(notified.get(), 1);
 
-        // Streaming appends: the selection survives, which a replacement would clear, and
-        // the background parse that lands renders the row again.
         cx.update(|cx| states.state(id.clone(), "Hello world".into(), None, 0, cx));
         cx.run_until_parked();
         assert_eq!(
@@ -620,12 +550,10 @@ mod tests {
         );
         assert_eq!(notified.get(), 2, "a landed append re-renders its row");
 
-        // A short replacement parses at once while the view renders it; no second render.
         cx.update(|cx| states.state(id.clone(), "Goodbye".into(), None, 0, cx));
         cx.run_until_parked();
         assert_eq!(cx.read(|cx| state.read(cx).selected_text()), "");
         assert_eq!(notified.get(), 2);
-        // Later changes still reach the view.
         cx.update(|cx| state.update(cx, |state, cx| state.select_all(cx)));
         cx.run_until_parked();
         assert_eq!(notified.get(), 3);
@@ -851,7 +779,6 @@ mod tests {
             })
             .unwrap();
         };
-        // The reader sits 10px into the row below, so 30px up is 20px into the long row.
         let scroll_up_into_long_row = |cx: &mut gpui_kit::TestAppContext| {
             rows.scroll_to(ListOffset {
                 item_ix: LONG + 1,
@@ -864,7 +791,6 @@ mod tests {
         };
         draw(cx);
 
-        // First seen above the viewport, so it lays out empty until its parse lands.
         rows.scroll_to(ListOffset {
             item_ix: LONG + 1,
             offset_in_item: px(10.),
@@ -877,7 +803,6 @@ mod tests {
             "a landed parse must remeasure its row"
         );
 
-        // Away long enough for element state to lapse, and every row invalidated.
         rows.scroll_to(ListOffset {
             item_ix: 150,
             offset_in_item: px(0.),

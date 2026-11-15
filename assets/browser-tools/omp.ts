@@ -2,7 +2,6 @@ import { registerArtifactQuestions } from "./ask.mjs";
 import { registerBrowserTools } from "./client.mjs";
 import { registerPeerDelivery } from "./peer.mjs";
 
-// OMP injects its omptype-backed Zod builder into every extension factory.
 export default function (api) {
   const z = api.zod;
   function schema(value) {

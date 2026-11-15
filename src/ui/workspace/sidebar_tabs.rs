@@ -1,9 +1,6 @@
-//! Showing and toggling a thread's sidebar tabs.
-
 use super::*;
 
 impl Workspace {
-    /// Show `tab` in a thread's sidebar (tab click, Focus output).
     pub(in crate::ui) fn show_sidebar_tab(
         &mut self,
         id: ThreadId,
@@ -53,8 +50,6 @@ impl Workspace {
             .get(&id)
             .and_then(|panel| panel.read(cx).network.clone())
     }
-    /// Open a Conversation's Agents tab when its running turn starts working with other
-    /// agents (see `agents::Follow`). Focus stays where it is.
     pub(super) fn sync_agent_activity(&mut self, id: ThreadId, cx: &mut Context<Self>) {
         let state = self.state.read(cx);
         let Some(session) = state.conversations.get(&id) else {
@@ -78,7 +73,6 @@ impl Workspace {
             self.sync_visible_threads(cx);
         }
     }
-    /// Show `tab` in a thread's sidebar, or hide the sidebar when `tab` is on screen.
     pub(super) fn toggle_sidebar_tab(
         &mut self,
         id: ThreadId,
@@ -102,7 +96,6 @@ impl Workspace {
             }
         }
     }
-    /// Fold or unfold one of the conversation's sticky docks (task list, background jobs).
     pub(super) fn toggle_dock(&mut self, dock: &str, cx: &mut Context<Self>) {
         let Some(id) = self
             .state

@@ -6,7 +6,6 @@ license = "MIT"
 build = "build.rs"
 
 [features]
-# Headless GPUI window tests (`cargo test -p ghostty-terminal --features runtime-qa`).
 runtime-qa = ["gpui-kit/test-support"]
 
 [dependencies]

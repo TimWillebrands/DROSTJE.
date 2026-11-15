@@ -15,7 +15,6 @@ export function registerBrowserTools(api, schema) {
       label: { browser: "DROSTJE Browser", network: "Space network", complete_artifact: "Complete Artifact" }[tool.name] ?? "Show Artifact",
       description: tool.description,
       parameters: schema(tool.inputSchema),
-      // OMP otherwise defers discovery of new names until a tool search.
       loadMode: "essential",
       async execute(_toolCallId, args, signal, _onUpdate, ctx) {
         if (tool.name === "network" && !networkToken) {

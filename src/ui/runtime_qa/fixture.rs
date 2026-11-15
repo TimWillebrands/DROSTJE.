@@ -1,4 +1,3 @@
-//! Shared fixture: opens a real Workspace window on the disposable DROSTJE_RUNTIME_FIXTURE.
 use super::*;
 
 pub(super) async fn until(
@@ -209,9 +208,6 @@ pub(super) async fn open_fixture_with_tools(
 }
 
 pub(super) async fn new_conversation(cx: &mut TestAppContext, fixture: &Fixture) -> ThreadId {
-    // New conversation from an untouched Conversation opens its harness picker
-    // instead of stacking another blank one (`Workspace::execute`). Scenarios that
-    // need several Conversations take the command's create branch directly.
     let untouched = cx.read(|cx| {
         let state = fixture.state.read(cx);
         state.conversation_thread().is_some_and(|thread| {
@@ -304,8 +300,6 @@ pub(super) async fn open_palette(cx: &mut TestAppContext, fixture: &Fixture) {
     }
 }
 
-/// Draws a few frames and lets dialog open/close animations, and the focus restoration
-/// that waits on them, finish.
 pub(super) fn settle_frames(cx: &mut TestAppContext, fixture: &Fixture) {
     for _ in 0..3 {
         cx.executor().advance_clock(Duration::from_millis(200));

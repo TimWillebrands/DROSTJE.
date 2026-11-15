@@ -1,19 +1,9 @@
-//! Naming and lifecycle rules for Conversation worktrees. Pure: no I/O and no Git here;
-//! `platform` runs the commands and `app::worktrees` orchestrates them.
-//!
-//! A worktree starts on a random codename branch so the first turn has a directory before any
-//! title exists, and is renamed once from the generated title. Names never derive from
-//! user-editable text: the directory keeps the codename for the worktree's whole life.
-
 use drostje_model::WorktreeId;
 use drostje_platform::WorktreeStatus;
 use std::path::{Path, PathBuf};
 
-/// Every branch DROSTJE. creates lives under this namespace.
 pub const BRANCH_PREFIX: &str = "drostje/";
-/// Longest title slug used in a branch name.
 const SLUG_LIMIT: usize = 40;
-/// Highest numeric suffix tried before giving up on a branch name.
 const SUFFIX_LIMIT: u32 = 99;
 
 const ADJECTIVES: [&str; 64] = [
@@ -34,8 +24,6 @@ const NOUNS: [&str; 64] = [
     "pewter", "thistle", "clover", "fern", "moss",
 ];
 
-/// A readable two-word name derived from the worktree identity, so a path never depends on a
-/// title and the same identity always names the same directory.
 pub fn codename(id: WorktreeId) -> String {
     let bits = id.as_u128();
     let adjective = ADJECTIVES[(bits & 0x3f) as usize];
@@ -43,7 +31,6 @@ pub fn codename(id: WorktreeId) -> String {
     format!("{adjective}-{noun}")
 }
 
-/// The codename, suffixed with identity hex when `taken` already claims it.
 pub fn unique_codename(id: WorktreeId, taken: impl Fn(&str) -> bool) -> String {
     let base = codename(id);
     if !taken(&base) {
@@ -57,13 +44,10 @@ pub fn unique_codename(id: WorktreeId, taken: impl Fn(&str) -> bool) -> String {
     format!("{base}-{hex}")
 }
 
-/// The branch a worktree starts on before its Conversation has a title.
 pub fn initial_branch(codename: &str) -> String {
     format!("{BRANCH_PREFIX}{codename}")
 }
 
-/// A Git-safe slug of a title: lowercase ASCII letters and digits joined by single dashes,
-/// bounded, never empty. `None` when the title has nothing usable.
 pub fn branch_slug(title: &str) -> Option<String> {
     let mut slug = String::new();
     let mut pending_dash = false;
@@ -86,13 +70,10 @@ pub fn branch_slug(title: &str) -> Option<String> {
     (!slug.is_empty()).then(|| slug.to_owned())
 }
 
-/// The namespaced branch for a generated title, or `None` when the title yields no slug.
 pub fn titled_branch(title: &str) -> Option<String> {
     branch_slug(title).map(|slug| format!("{BRANCH_PREFIX}{slug}"))
 }
 
-/// `candidate` or the first `candidate-N` (N from 2) that `exists` rejects; `None` when every
-/// suffix up to the limit is taken.
 pub fn unique_branch(candidate: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
     if !exists(candidate) {
         return Some(candidate.to_owned());
@@ -102,7 +83,6 @@ pub fn unique_branch(candidate: &str, exists: impl Fn(&str) -> bool) -> Option<S
         .find(|name| !exists(name))
 }
 
-/// Where a worktree lives: `<data_dir>/worktrees/<project directory name>/<codename>`.
 pub fn worktree_dir(data_dir: &Path, project_root: &Path, codename: &str) -> PathBuf {
     let project = project_root
         .file_name()
@@ -112,18 +92,13 @@ pub fn worktree_dir(data_dir: &Path, project_root: &Path, codename: &str) -> Pat
     data_dir.join("worktrees").join(project).join(codename)
 }
 
-/// What to do with a worktree that no live Conversation uses any more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Removal {
-    /// Clean, on its own branch and merged into the base: remove directory and branch.
     Remove,
-    /// The directory is already gone; record that and prune Git's bookkeeping.
     Forget,
-    /// Leave it alone, with the reason shown to the user.
     Keep(&'static str),
 }
 
-/// Auto-removal never guesses: every condition must be observed true.
 pub fn removal_decision(status: &WorktreeStatus, branch: &str) -> Removal {
     if !status.exists {
         return Removal::Forget;

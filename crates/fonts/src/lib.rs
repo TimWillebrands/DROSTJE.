@@ -1,12 +1,5 @@
-//! Typefaces bundled with DROSTJE., embedded so every surface renders the same type:
-//! GPUI registers them for the app, and the browser engine serves them to artifact
-//! pages. Each family's licence sits beside its files in the repository's `assets/fonts`.
-
-/// One embedded font file.
 pub struct Face {
-    /// The family name themes use, exactly as the font names itself.
     pub family: &'static str,
-    /// The file name; unique across families, so artifact pages fetch faces by it.
     pub file: &'static str,
     pub weight: u16,
     pub italic: bool,
@@ -20,8 +13,6 @@ macro_rules! face {
             file: $file,
             weight: $weight,
             italic: $italic,
-            // The faces stay in the repository's top-level `assets/fonts`, which README
-            // names as the place their licences live.
             bytes: include_bytes!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../assets/fonts/",
@@ -33,7 +24,6 @@ macro_rules! face {
     };
 }
 
-/// The faces bundled themes name.
 pub const FACES: [Face; 22] = [
     face!(
         "IBM Plex Sans",
@@ -105,7 +95,6 @@ pub const FACES: [Face; 22] = [
         700,
         false
     ),
-    // No Regular: normal text falls to Medium, which keeps the narrow Dosis from going thin.
     face!("Dosis", "dosis", "Dosis-Medium.ttf", 500, false),
     face!("Dosis", "dosis", "Dosis-SemiBold.ttf", 600, false),
     face!("Dosis", "dosis", "Dosis-Bold.ttf", 700, false),
@@ -132,12 +121,9 @@ pub const FACES: [Face; 22] = [
     ),
 ];
 
-/// Where artifact pages load bundled faces. `.invalid` never resolves, so nothing but
-/// the engine's interception can answer it.
 pub const ARTIFACT_FONT_ORIGIN: &str = "https://drostje-kit.invalid";
 const ARTIFACT_FONT_PATH: &str = "/fonts/";
 
-/// The bundled face an artifact font URL names, if any.
 pub fn artifact_face(url: &url::Url) -> Option<&'static Face> {
     if url.origin().ascii_serialization() != ARTIFACT_FONT_ORIGIN {
         return None;
@@ -146,8 +132,6 @@ pub fn artifact_face(url: &url::Url) -> Option<&'static Face> {
     FACES.iter().find(|face| face.file == file)
 }
 
-/// `@font-face` rules for every bundled face of these families, served to artifact
-/// pages; families DROSTJE does not bundle are left to the system.
 pub fn artifact_font_faces(families: &[&str]) -> String {
     let mut css = String::new();
     for face in FACES.iter().filter(|face| families.contains(&face.family)) {

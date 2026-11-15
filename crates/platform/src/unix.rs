@@ -1,5 +1,3 @@
-//! Safe wrappers for the Unix process, descriptor and socket calls the domain crates need.
-//! Every `unsafe` block they would otherwise write lives here.
 use std::{
     io::{self, Read, Write},
     mem,
@@ -12,9 +10,6 @@ use std::{
     time::Duration,
 };
 
-/// Makes the spawned child the leader of a new session, and so of its own process group,
-/// before it execs. A failed `setsid` fails the spawn rather than leaving the child in the
-/// caller's session. Pair with [`terminate_process_group`] and [`kill_process_group`].
 pub fn new_session(command: &mut Command) {
     // SAFETY: pre_exec runs after fork and before exec, where only async-signal-safe calls
     // are allowed; the closure calls only setsid and reads errno, with no Rust-managed inputs.
@@ -29,15 +24,10 @@ pub fn new_session(command: &mut Command) {
     }
 }
 
-/// Sends SIGTERM to the process group `leader` heads. Call it only for an unreaped child
-/// started through [`new_session`], so the group cannot belong to someone else. A group
-/// that no longer exists is not an error.
 pub fn terminate_process_group(leader: u32) -> io::Result<()> {
     signal_process_group(leader, libc::SIGTERM)
 }
 
-/// Sends SIGKILL to the process group `leader` heads, under the same contract as
-/// [`terminate_process_group`].
 pub fn kill_process_group(leader: u32) -> io::Result<()> {
     signal_process_group(leader, libc::SIGKILL)
 }
@@ -60,7 +50,6 @@ fn signal_process_group(leader: u32, signal: libc::c_int) -> io::Result<()> {
     }
 }
 
-/// Adds `O_NONBLOCK` to a descriptor, such as a child's stdio pipe, keeping its other flags.
 pub fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     let fd = fd.as_raw_fd();
     // SAFETY: fcntl only reads the status flags of this live borrowed descriptor.
@@ -75,14 +64,11 @@ pub fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     Ok(())
 }
 
-/// The effective user id of this process.
 pub fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments, cannot fail and has no memory-safety preconditions.
     unsafe { libc::geteuid() }
 }
 
-/// The session id of process `pid`, or the OS error (for example `ESRCH` once it is gone).
-/// Lets callers check that a child really leads its own session after [`new_session`].
 pub fn session_id(pid: u32) -> io::Result<u32> {
     let pid = libc::pid_t::try_from(pid)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id out of range"))?;
@@ -94,8 +80,6 @@ pub fn session_id(pid: u32) -> io::Result<u32> {
     Ok(sid as u32)
 }
 
-/// Starts connecting a nonblocking, close-on-exec Unix stream socket to `path` without
-/// waiting for the peer to accept. Poll [`poll_writable`] to learn when it has connected.
 pub fn connect_unix_nonblocking(path: &Path) -> io::Result<UnixStream> {
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: an all-zero sockaddr_un is a valid initial representation; family and path
@@ -146,16 +130,12 @@ pub fn connect_unix_nonblocking(path: &Path) -> io::Result<UnixStream> {
     Ok(UnixStream::from(owned))
 }
 
-/// What a zero-timeout write-readiness poll reported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriteReadiness {
-    /// The descriptor accepts writes (`POLLOUT`).
     pub writable: bool,
-    /// The peer hung up or the descriptor is invalid (`POLLHUP` or `POLLNVAL`).
     pub hung_up: bool,
 }
 
-/// Checks without waiting whether `fd` is writable. `None` means nothing is ready yet.
 pub fn poll_writable(fd: BorrowedFd<'_>) -> io::Result<Option<WriteReadiness>> {
     let mut descriptor = libc::pollfd {
         fd: fd.as_raw_fd(),
@@ -177,9 +157,6 @@ pub fn poll_writable(fd: BorrowedFd<'_>) -> io::Result<Option<WriteReadiness>> {
     }))
 }
 
-/// Blocks until a `readable` descriptor has input or hung up, a `writable` one accepts
-/// output, or `timeout` passes. A signal can end the wait early, so callers must recheck
-/// every descriptor (nonblocking) after it returns rather than trust that one is ready.
 pub fn wait_until_ready(
     readable: &[BorrowedFd<'_>],
     writable: &[BorrowedFd<'_>],
@@ -197,7 +174,6 @@ pub fn wait_until_ready(
         .collect();
     let count = libc::nfds_t::try_from(descriptors.len())
         .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-    // Rounded up: a deadline less than a millisecond away must not become a busy spin.
     let millis =
         libc::c_int::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX);
     // SAFETY: descriptors is an initialized array of `count` pollfds, each naming a
@@ -212,8 +188,6 @@ pub fn wait_until_ready(
     Ok(())
 }
 
-/// A self-pipe that any thread can signal to end a [`wait_until_ready`] that includes
-/// [`WakePipe::fd`]. Both ends are nonblocking and close on exec.
 pub struct WakePipe {
     reader: io::PipeReader,
     writer: io::PipeWriter,
@@ -227,17 +201,14 @@ impl WakePipe {
         Ok(Self { reader, writer })
     }
 
-    /// Makes [`Self::fd`] readable. Never blocks: a full pipe is already readable.
     pub fn wake(&self) {
         let _ = (&self.writer).write(&[1]);
     }
 
-    /// The end to wait on.
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.reader.as_fd()
     }
 
-    /// Consumes every wake signalled so far.
     pub fn clear(&self) {
         let mut buffer = [0; 64];
         loop {
@@ -251,15 +222,12 @@ impl WakePipe {
     }
 }
 
-/// Kernel-reported identity of the process on the other end of a connected Unix socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerCredentials {
     pub pid: u32,
     pub uid: u32,
 }
 
-/// Reads the peer's PID and effective user id from the kernel, never from anything the
-/// peer wrote. Unsupported outside macOS and Linux.
 pub fn peer_credentials(stream: &UnixStream) -> io::Result<PeerCredentials> {
     #[cfg(target_os = "macos")]
     {

@@ -1,6 +1,3 @@
-//! Codex through `codex app-server`: JSON-RPC over stdio (v2 protocol). One owned
-//! app-server process serves exactly one Codex thread, so turn and request
-//! correlation never has to consider another client.
 use super::stdio::{Commands, StdioChild, sleep_for};
 use super::*;
 use anyhow::{Context, Result, bail, ensure};
@@ -15,12 +12,9 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
-/// Prompts carry image paths, never bytes, so 1 MiB bounds text alone.
 const INPUT_LIMIT: usize = 1_048_576;
 const TRANSCRIPT: &str = "conversation.jsonl";
-/// `initialize` plus `thread/start` includes MCP server startup.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
-/// Live command output kept per tool card; the completed item carries the full output.
 const LIVE_OUTPUT: usize = 262_144;
 const COMPACT: &str = "compact";
 const ALLOW: &str = "Allow";
@@ -30,8 +24,6 @@ const DENY: &str = "Deny";
 const CONTINUE: &str = "Continue";
 const DECLINE: &str = "Decline";
 
-/// `(sandbox, approvalPolicy, approvalsReviewer)` for one of `permission_modes("codex")`.
-/// `None` sends no override, so the user's Codex configuration decides.
 fn permission_overrides(mode: Option<&str>) -> Result<Map<String, Value>> {
     let (sandbox, approval, reviewer) = match mode {
         None => return Ok(Map::new()),
@@ -48,7 +40,6 @@ fn permission_overrides(mode: Option<&str>) -> Result<Map<String, Value>> {
     Ok(overrides)
 }
 
-/// The saved reference names a Codex thread and the directory it belongs to.
 fn saved_thread(config: &ConversationConfig) -> Result<Option<String>> {
     let Some(reference) = &config.session_ref else {
         return Ok(None);
@@ -142,7 +133,6 @@ impl Origin {
     }
 }
 
-/// Requests DROSTJE sent and whose answer it still expects.
 #[derive(Debug)]
 enum Rpc {
     Initialize,
@@ -158,18 +148,14 @@ enum Rpc {
 
 struct Turn {
     origin: Origin,
-    /// Codex's turn ID, from the `turn/start` answer or the `turn/started` notification.
     native: Option<String>,
     interrupting: bool,
     interrupt_sent: bool,
-    /// The local transcript record written once Codex admits the turn.
     record: Option<Value>,
 }
 
-/// What an answer to a pending server request must produce.
 #[derive(Debug)]
 enum Answerable {
-    /// Command and file-change approvals; `extra` maps added option labels to decisions.
     Approval {
         extra: Vec<(String, Value)>,
     },
@@ -224,15 +210,12 @@ struct Actor {
     rpcs: HashMap<u64, Rpc>,
     raw_models: Vec<Value>,
     models: Vec<ModelChoice>,
-    /// The model passed to the next `turn/start` after the user picked one.
     selected_model: Option<String>,
     current_model: Option<String>,
-    /// "Yes and switch to auto" routes later approvals to Codex's auto reviewer.
     auto_review: bool,
     skills: Vec<Skill>,
     turn: Option<Turn>,
     peer_attempts: HashSet<Uuid>,
-    /// Peer records for `turn/steer` requests awaiting Codex's answer.
     pending_peer_records: HashMap<Uuid, Value>,
     requests: HashMap<String, ServerRequest>,
     messages: Vec<Message>,
@@ -242,7 +225,6 @@ struct Actor {
     dirty_tools: Vec<String>,
     images: ImageCache,
     transcript: File,
-    /// Local `drostje_user` and `drostje_peer` records by the `clientUserMessageId` they sent.
     records: HashMap<String, Value>,
     rate_limits: Option<Value>,
     idle_sleep_assertion: Option<IdleSleepAssertion>,
@@ -324,7 +306,6 @@ impl Actor {
         }
     }
 
-    /// The state that follows from the open requests and the active turn.
     fn derive_state(&mut self) {
         let state = if !self.requests.is_empty() {
             ConversationState::WaitingForInput
@@ -444,7 +425,6 @@ impl Actor {
         }
     }
 
-    /// Streaming deltas mark their message dirty; one update per loop pass reaches the UI.
     fn flush_dirty(&mut self) {
         for id in std::mem::take(&mut self.dirty_messages) {
             if let Some(message) = self
@@ -536,7 +516,6 @@ impl Actor {
                 message,
             }),
             None => {
-                // `turn/start` applies the model to that turn and every later one.
                 self.selected_model = Some(model.id.clone());
                 self.emit(ConversationEvent::ModelSelected(model));
             }
@@ -556,7 +535,6 @@ impl Actor {
         Ok(())
     }
 
-    /// Sends `turn/interrupt` once the turn has a Codex ID; until then the intent is kept.
     fn send_interrupt(&mut self) -> Result<()> {
         let Some(thread) = self.thread.clone() else {
             return Ok(());
@@ -714,7 +692,6 @@ impl Actor {
         let record = json!({"type":"drostje_peer","id":attempt,"messages":delivery.messages});
         match &self.turn {
             Some(turn) if turn.interrupting => bail!("Codex turn is being interrupted"),
-            // `turn/steer` adds input to the running turn at its next model call.
             Some(turn) => {
                 let native = turn
                     .native
@@ -871,7 +848,6 @@ impl Actor {
                         && self.config.allow_empty_session
                         && error.contains("no rollout found") =>
                 {
-                    // Codex stores a thread at its first turn; an unsent draft's thread never was.
                     self.notice(
                         "info",
                         "The saved Codex thread was never started; starting a new thread",
@@ -918,7 +894,6 @@ impl Actor {
                     self.rate_limits = Some(answer["rateLimits"].clone());
                     self.emit_limits();
                 }
-                // API-key logins have no plan windows.
                 Err(error) => self.emit(ConversationEvent::Diagnostic {
                     label: "Codex rate limits".into(),
                     raw: json!({ "error": error }),
@@ -1059,7 +1034,6 @@ impl Actor {
         });
     }
 
-    /// A history item, with DROSTJE's own submissions restored from local records.
     fn history_item(&mut self, item: &Value) -> Result<Vec<Message>> {
         if item["type"] == "userMessage"
             && let Some(record) = item["clientId"]
@@ -1151,7 +1125,6 @@ impl Actor {
             self.emit(ConversationEvent::UserRequestDismissed { request_id });
         }
         if let (Origin::Peer(attempt), Some(_)) = (turn.origin, turn.record) {
-            // Never admitted: Codex may or may not have read the context.
             self.emit(ConversationEvent::PeerDelivery {
                 attempt,
                 outcome: PeerDeliveryOutcome::Unknown(
@@ -1166,7 +1139,6 @@ impl Actor {
         self.derive_state();
     }
 
-    /// Ends tracking without native confirmation: unconfirmed peer context stays unknown.
     fn unsettle(&mut self, reason: &str) {
         let steering: Vec<Uuid> = self
             .rpcs
@@ -1207,7 +1179,6 @@ impl Actor {
         if let Some(thread) = params["threadId"].as_str()
             && self.thread.as_deref().is_some_and(|own| own != thread)
         {
-            // Sub-agent threads report through their own IDs; keep them visible but apart.
             self.emit(ConversationEvent::Diagnostic {
                 label: format!("Codex {method} for another thread"),
                 raw: frame.clone(),
@@ -1315,7 +1286,6 @@ impl Actor {
                 let update = &params["rateLimits"];
                 let snapshot = self.rate_limits.get_or_insert_with(|| json!({}));
                 if snapshot["limitId"].is_null() || snapshot["limitId"] == update["limitId"] {
-                    // Sparse update: present windows replace, absent ones keep their value.
                     for key in ["limitId", "primary", "secondary"] {
                         if !update[key].is_null() {
                             snapshot[key] = update[key].clone();
@@ -1415,7 +1385,6 @@ impl Actor {
                     Rpc::Skills,
                 )?;
             }
-            // Lifecycle chatter with no DROSTJE surface; diffs come from the working tree.
             "thread/started"
             | "thread/settings/updated"
             | "thread/readState/changed"
@@ -1476,7 +1445,6 @@ impl Actor {
         if item["type"] == "userMessage"
             && let Some(client) = item["clientId"].as_str()
         {
-            // DROSTJE already shows what it sent, including turns it is still admitting.
             let pending = self
                 .turn
                 .as_ref()
@@ -1491,7 +1459,6 @@ impl Actor {
         }
         let (messages, tool) =
             normalize_item(item, completed, &self.config.session_dir, &mut self.images);
-        // Streamed text already holds the deltas; an empty start must not erase them.
         for message in messages {
             let streamed = !completed
                 && self.message_index.contains_key(&message.id)
@@ -1612,7 +1579,6 @@ impl Actor {
     }
 }
 
-/// `/name` for a listed skill becomes Codex's structured skill input; images go by path.
 fn prompt_input(skills: &[Skill], text: &str, images: &[ImageAttachment]) -> Result<Vec<Value>> {
     let mut input = Vec::new();
     let mut body = text;
@@ -1657,7 +1623,6 @@ fn read_records(path: &Path) -> Result<HashMap<String, Value>> {
     Ok(records)
 }
 
-/// The Message a local `drostje_user` or `drostje_peer` record stands for.
 fn record_message(record: &Value) -> Result<Option<Message>> {
     let id = record["id"].as_str().unwrap_or_default().to_owned();
     let (role, content) = match record["type"].as_str() {
@@ -1731,7 +1696,6 @@ fn parse_models(models: &[Value], provider: &str) -> Vec<ModelChoice> {
         .collect()
 }
 
-/// Plan windows by duration: five hours and seven days are the windows DROSTJE shows.
 fn parse_limits(snapshot: &Value) -> Vec<UsageLimit> {
     ["primary", "secondary"]
         .into_iter()
@@ -1781,7 +1745,6 @@ fn parse_skills(answer: &Value) -> Vec<Skill> {
     skills
 }
 
-/// Codex's slash commands are TUI-only; DROSTJE offers `/compact` and the enabled skills.
 fn commands(skills: &[Skill]) -> Vec<SlashCommand> {
     std::iter::once(SlashCommand {
         name: COMPACT.into(),
@@ -1861,8 +1824,6 @@ fn mcp_content(result: &Value, directory: &Path, images: &mut ImageCache) -> Vec
         .collect()
 }
 
-/// One Codex item as Messages plus, for tool items, the live card. `complete` comes from
-/// the lifecycle (`item/completed`, history); a status field can only add completion.
 fn normalize_item(
     item: &Value,
     complete: bool,
@@ -2113,7 +2074,6 @@ fn normalize_item(
             )],
             None,
         ),
-        // Unknown items stay visible with their raw payload rather than being dropped.
         other => (
             vec![message(
                 "system",
@@ -2282,7 +2242,6 @@ fn permissions_approval(ui: &str, params: &Value) -> (UserRequest, Answerable) {
     )
 }
 
-/// One question of a `requestUserInput` batch; DROSTJE asks them in order.
 fn question_request(ui: &str, questions: &[Value], index: usize) -> UserRequest {
     let question = &questions[index];
     let options: Vec<UserOption> = question["options"]
@@ -2329,7 +2288,6 @@ fn question_request(ui: &str, questions: &[Value], index: usize) -> UserRequest 
     }
 }
 
-/// The JSON-RPC result for an answer, the next question of a batch, or `Invalid`.
 fn answer_request(pending: &mut ServerRequest, answer: &UserAnswer) -> Answer {
     match &mut pending.answerable {
         Answerable::Approval { extra } => {
@@ -2389,7 +2347,6 @@ fn answer_request(pending: &mut ServerRequest, answer: &UserAnswer) -> Answer {
                         .to_owned();
                     answers.insert(id, json!({"answers": [value]}));
                 }
-                // A dismissed batch answers what it has; Codex decides how to continue.
                 UserAnswer::Cancelled { .. } => {
                     return Answer::Reply(json!({"answers": answers.clone()}));
                 }
@@ -2810,7 +2767,6 @@ done
             .context("Timed out waiting for fake Codex event")
         }
 
-        /// Events until `stop` returns true for one, which is returned last.
         fn until(
             &self,
             mut stop: impl FnMut(&ConversationEvent) -> bool,

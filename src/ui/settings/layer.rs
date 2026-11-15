@@ -1,4 +1,3 @@
-//! Hosting a form in a dialog, alert dialog or sheet, its footer actions, and dismissal.
 use super::{DialogKind, SurfaceContent};
 use crate::ui::workspace::Workspace;
 use gpui_kit::{
@@ -109,7 +108,6 @@ pub(super) fn confirm_surface(
     });
 }
 
-/// Closing a layer hides it; the Workspace retains this entity as the draft owner.
 fn unhost_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
     let _ = owner.update(cx, |workspace, cx| {
         if let Some(dialog) = workspace
@@ -123,7 +121,6 @@ fn unhost_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
     });
 }
 
-/// The Root captures trigger focus and owns trapping, dismissal, and one focus restoration.
 pub(in crate::ui) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
     window.defer(cx, move |window, cx| {
         let Ok(Some(content)) = owner.update(cx, |workspace, cx| {
@@ -212,8 +209,6 @@ pub(in crate::ui) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Win
             };
             let dialog = dialog.read(cx);
             if matches!(dialog.kind, DialogKind::Settings(_)) {
-                // Settings retains its search and selected group. A saved field can
-                // be virtualized away; focus the first mounted control instead.
                 window.focus_next(cx);
                 return;
             }

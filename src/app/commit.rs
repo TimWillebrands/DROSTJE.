@@ -1,13 +1,5 @@
-//! Committing a Conversation's working tree, and the local model's subject for that commit.
-//!
-//! The commit is a worktree request, so it excludes branch switches and worktree changes while
-//! it runs and reuses their dialog lifecycle. The subject is written by the same local
-//! generator as Conversation titles. Git and the model run off-thread; results carry their
-//! request id and stale ones are dropped.
-
 use super::*;
 
-/// A commit subject written for one working tree; the Commit dialog that asked observes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitSubjectRequest {
     pub id: Uuid,
@@ -19,13 +11,10 @@ pub struct CommitSubjectRequest {
 pub enum CommitSubjectStatus {
     Pending,
     Written(String),
-    /// No local generator answered: no llama.cpp executable and no Ollama server.
     Unavailable,
     Failed(String),
 }
 
-/// Diff text handed to the model: a file summary first, so a truncated patch still names
-/// every change, then the patch itself.
 pub fn commit_prompt(diff: &platform::RepositoryDiff) -> String {
     use crate::diff::{FileChange, RowKind};
     let mut prompt = format!(
@@ -94,8 +83,6 @@ impl AppState {
         None
     }
 
-    /// Stages every change in `thread`'s working tree and commits it with `message`. The
-    /// dialog stays open until the request settles and shows Git's refusal, hooks included.
     pub fn commit_changes(&mut self, thread: ThreadId, message: &str) -> Result<Uuid> {
         if let Some(reason) = self.commit_reason() {
             anyhow::bail!(reason);
@@ -168,8 +155,6 @@ impl AppState {
         }
     }
 
-    /// Asks the local generator for a subject describing `thread`'s uncommitted changes, read
-    /// fresh from Git. A newer request replaces an older one, whose result is then dropped.
     pub fn write_commit_subject(
         &mut self,
         thread: ThreadId,

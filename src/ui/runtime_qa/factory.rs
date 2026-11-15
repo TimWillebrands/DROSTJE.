@@ -1,4 +1,3 @@
-//! Factory form input, layout recovery and persisted-configuration guard.
 use super::*;
 
 #[gpui_kit::test]
@@ -168,7 +167,6 @@ async fn layout_and_factory_runtime_recovery(cx: &mut TestAppContext) {
         ),
         Region::Thread
     );
-    // Focus output opens the selected thread's sidebar on its Output tab.
     assert!(cx.read(|cx| {
         let state = fixture.state.read(cx);
         state.thread_sidebar_open(selected)

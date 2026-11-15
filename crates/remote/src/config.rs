@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-/// Persist only the environment variable name, never its credential value.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteHostConfig {

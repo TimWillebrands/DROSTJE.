@@ -25,7 +25,6 @@ const ERROR_LIMIT: usize = 16 * 1024;
 type Reply<T> = Sender<Result<T>>;
 
 enum Request {
-    // Boxed: a launch spec dwarfs every other request in the bounded queue.
     Dispatch(ThreadId, Box<FactoryLaunchSpec>, Reply<LaunchId>),
     Prepared(LaunchId, Result<String>),
     Refresh(LaunchId, Reply<FactorySnapshot>),
@@ -39,7 +38,6 @@ struct Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        // Readiness workers must not keep a closed UI's actor accepting launches.
         self.commands.close();
     }
 }
@@ -51,7 +49,6 @@ pub struct FactoryManager {
 }
 
 impl FactoryManager {
-    /// Starts only the observer. Existing descriptors are never submitted again.
     pub fn open(store: Store, data_dir: PathBuf, launches: Vec<FactoryLaunch>) -> Result<Self> {
         let (commands, receiver) = async_channel::bounded(64);
         let (updates, events) = async_channel::unbounded();
@@ -144,7 +141,6 @@ struct Actor {
     wait_errors: BTreeMap<LaunchId, String>,
     power_errors: BTreeMap<LaunchId, String>,
     storage_failure: Option<String>,
-    /// The storage failure the latest scan's snapshots report.
     scanned_failure: Option<String>,
     tracker: EventTracker,
     updates: Sender<FactorySnapshot>,
@@ -257,8 +253,6 @@ impl Actor {
                 }
             }
         }
-        // Pending work has not spawned. On an abrupt process exit these descriptors
-        // instead remain unknown, which is deliberately not a replay instruction.
         let pending_ids: Vec<_> = self.pending.keys().copied().collect();
         for id in pending_ids {
             self.fail_pending(
@@ -266,8 +260,6 @@ impl Actor {
                 anyhow!("Factory observer closed before the process was spawned"),
             );
         }
-        // The closed observer's actor becomes the reaper. Release Store and
-        // observation state, but retain each child's assertion until it is reaped.
         let children = std::mem::take(&mut self.children);
         drop(self);
         for (_, child) in children {
@@ -309,8 +301,6 @@ impl Actor {
             launch_error: None,
             created_at: platform::now(),
         };
-        // A successful fully synchronous Store commit is required before even
-        // scheduling prerequisites. This pending record also closes duplicate clicks.
         smol::block_on(self.store.save_launch(launch.clone()))
             .context("Persist pending Factory launch; no process was spawned")?;
         let id = spec.id;
@@ -328,8 +318,6 @@ impl Actor {
             return Ok(());
         }
         let _ = self.scan();
-        // Doctor can involve Docker/provider probes. It never blocks event polling
-        // and is the only external process scheduled before the final spawn gate.
         let sender = commands.clone();
         let started = thread::Builder::new()
             .name("drostje-factory-readiness".into())
@@ -387,14 +375,12 @@ impl Actor {
         }
         let spec = pending.spec.clone();
         let result = (|| {
-            // Recheck the selected local inputs after a potentially long doctor.
             platform::validate_branch(&spec.target_repo, &spec.target_branch)?;
             if let FactorySource::LocalFolder(folder) = &spec.source {
                 read_prd(folder)?;
             }
             let stdout = append_log(&launch_dir(&spec).join("stdout.log"))?;
             let stderr = append_log(&launch_dir(&spec).join("stderr.log"))?;
-            // Prerequisites succeeding cannot override a subsequent Store failure.
             self.writable()?;
             let idle_sleep = match platform::IdleSleepAssertion::acquire("DROSTJE. Factory run") {
                 Ok(assertion) => Some(assertion),
@@ -464,8 +450,6 @@ impl Actor {
         if let Err(error) = &result {
             self.storage_failure = Some(format!("{error:#}"));
         }
-        // An observed exit/refusal remains true even if its durable write failed.
-        // Its snapshot explicitly warns that this observation was not persisted.
         self.launches.insert(launch.id, launch);
         result
     }
@@ -500,8 +484,6 @@ impl Actor {
         }
     }
 
-    /// Whether this launch's process can no longer change its observation: it
-    /// exited after a terminal event, or it was refused before spawning.
     fn settled(&self, launch: &FactoryLaunch) -> bool {
         let id = launch.id;
         if self.pending.contains_key(&id)
@@ -519,7 +501,6 @@ impl Actor {
 
     fn scan(&mut self) -> Result<()> {
         self.tracker.observe(self.launches.values());
-        // Every snapshot reports the storage failure, so a new one re-projects all.
         let failure = self.storage_failure.clone();
         let context_changed = failure != self.scanned_failure;
         let mut projections = Vec::new();
@@ -529,7 +510,6 @@ impl Actor {
                 && self.settled(launch)
                 && self.tracker.unchanged(launch, &self.liveness)
             {
-                // Its previous snapshot is still exact; nothing to compare or publish.
                 skipped.push(launch.id);
             } else {
                 projections.push(self.tracker.snapshot(launch, &self.liveness));
@@ -571,7 +551,6 @@ impl Actor {
         }
     }
 
-    /// Persist the projection's event linkage, then report the actor's own record.
     fn link(&mut self, snapshot: &mut FactorySnapshot) {
         let Some(current) = self.launches.get(&snapshot.launch.id) else {
             return;
@@ -591,8 +570,6 @@ impl Actor {
                 }
             }
         }
-        // The projection supplies linkage only, never overwrites the actual
-        // process outcome or errors collected by this actor.
         snapshot.launch = self.launches[&snapshot.launch.id].clone();
     }
 }
@@ -623,8 +600,6 @@ fn doctor(
         .current_dir(cwd)
         .stdin(Stdio::null());
     if let Some(spec) = spec {
-        // These are the CLI's documented environment counterparts, so the exact
-        // doctor argv remains unchanged while checking this launch's directories.
         command
             .env("FACTORY_DATA_ROOT", &spec.data_root)
             .env("FACTORY_LOG_DIR", &spec.log_dir)
@@ -639,8 +614,6 @@ fn doctor(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    // HostReadinessReport.ExitCode is nonzero exactly for core failure; Azure
-    // warnings intentionally do not prevent valid local-folder work.
     ensure!(
         output.status.success(),
         "Factory readiness refused ({}):\n{text}",
@@ -715,8 +688,6 @@ fn normalize_spec(mut spec: FactoryLaunchSpec, data_dir: &Path) -> Result<Factor
     Ok(spec)
 }
 
-/// Whether two specs name the same Factory source: one canonical local folder, or one Azure work
-/// item under one data root. Canonicalizes paths, so call it off the GPUI thread.
 pub fn same_source(left: &FactoryLaunchSpec, right: &FactoryLaunchSpec) -> bool {
     match (&left.source, &right.source) {
         (FactorySource::LocalFolder(left), FactorySource::LocalFolder(right)) => {
@@ -944,7 +915,6 @@ fn spawn_run(spec: &FactoryLaunchSpec, stdout: File, stderr: File) -> Result<Chi
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr);
-    // A failed setsid fails spawn rather than leave Factory tied to the GUI's session.
     platform::new_session(&mut command);
     command
         .spawn()

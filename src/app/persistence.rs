@@ -66,8 +66,6 @@ impl AppState {
         }
     }
 
-    /// Replaces the snapshot's copy of `thread`, or adds it when it is new. Returns whether
-    /// anything the Space network reads from it changed (always for a new thread).
     fn put_thread(&mut self, thread: Thread) -> bool {
         if let Some(old) = self.snapshot.threads.iter_mut().find(|t| t.id == thread.id) {
             let changed = network::peer_context(old) != network::peer_context(&thread);
@@ -80,7 +78,6 @@ impl AppState {
     }
 
     pub fn save_thread(&mut self, thread: Thread) {
-        // A read-only store refuses every write, so the snapshot then keeps the only copy.
         let write = if self.storage_error.is_none() {
             self.edited_threads.remove(&thread.id);
             Some(Box::new(thread.clone()))
@@ -96,7 +93,6 @@ impl AppState {
         }
     }
 
-    /// Typing changes memory only: no timer, write request, or save notification.
     pub fn edit_thread(&mut self, thread: Thread) {
         self.edited_threads.insert(thread.id);
         self.put_thread(thread);
@@ -129,8 +125,6 @@ impl AppState {
         }
     }
 
-    /// A persistence acknowledgement in the same queue as draft edits and layout changes.
-    /// Callers must await success before sending any corresponding external side effect.
     pub fn persist_thread(
         &mut self,
         thread: Thread,
@@ -151,8 +145,6 @@ impl AppState {
     }
 }
 
-/// The queue contains committed edits only. Flush acknowledges all preceding
-/// writes; typing never reaches this worker.
 pub(super) async fn run(store: Store, requests: Receiver<Write>, completed: Sender<AppEvent>) {
     while let Ok(request) = requests.recv().await {
         let result = match request {

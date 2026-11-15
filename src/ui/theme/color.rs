@@ -1,17 +1,9 @@
-//! OKLCH, the perceptual color space accent adjustments are made in. Changing hue or
-//! chroma at a fixed OKLab lightness keeps a theme's contrast between a color and the
-//! text set on it, which HSL does not: yellow and blue at one HSL lightness differ
-//! greatly in how light they look.
-
 use gpui_kit::Rgba;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Oklch {
-    /// Perceptual lightness, 0 (black) to 1 (white).
     pub l: f32,
-    /// Colorfulness; sRGB colors stay below about 0.33.
     pub c: f32,
-    /// Hue angle in degrees, 0 up to 360.
     pub h: f32,
 }
 
@@ -47,7 +39,6 @@ impl Oklch {
         }
     }
 
-    /// Linear sRGB channels, unclamped: values outside 0..=1 are out of gamut.
     fn linear(self) -> [f32; 3] {
         let (sin, cos) = self.h.to_radians().sin_cos();
         let (a, b) = (self.c * cos, self.c * sin);
@@ -68,8 +59,6 @@ impl Oklch {
             .all(|channel| (-EPSILON..=1. + EPSILON).contains(channel))
     }
 
-    /// The nearest sRGB color at this lightness and hue: chroma is reduced until the
-    /// color fits, so a vivid hue never clips into a different hue or lightness.
     pub fn to_rgba(self, alpha: f32) -> Rgba {
         let mut color = Self {
             l: self.l.clamp(0., 1.),
@@ -95,7 +84,6 @@ impl Oklch {
     }
 }
 
-/// `#rrggbb`, or `#rrggbbaa` when the color is translucent, as Kit theme files write it.
 pub fn hex(color: Rgba) -> String {
     let byte = |channel: f32| (channel.clamp(0., 1.) * 255.).round() as u8;
     let rgb = format!(
@@ -132,7 +120,6 @@ mod tests {
 
     #[test]
     fn matches_reference_values() {
-        // Reference values from Björn Ottosson's OKLab definition.
         let white = Oklch::from_rgba(rgba("#ffffff"));
         assert!((white.l - 1.).abs() < 1e-3 && white.c < 1e-3, "{white:?}");
         let red = Oklch::from_rgba(rgba("#ff0000"));

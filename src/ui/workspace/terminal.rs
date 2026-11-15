@@ -1,4 +1,3 @@
-//! Thread-owned shells outlive sidebar/tab visibility, but never their owning open Thread.
 use super::*;
 
 pub(in crate::ui) struct ThreadTerminal {
@@ -56,7 +55,6 @@ impl Workspace {
     pub(in crate::ui) fn sidebar_terminal(&self, id: ThreadId) -> Option<Entity<TerminalPane>> {
         self.thread_terminals.get(&id)?.pane.clone()
     }
-    /// Native runtime QA inspects the retained shell without starting a provider.
     #[cfg(feature = "runtime-qa")]
     pub fn terminal_sidebar_pane(&self, id: ThreadId) -> Option<Entity<TerminalPane>> {
         self.sidebar_terminal(id)
@@ -213,7 +211,6 @@ impl Workspace {
         self.sync_terminal_visibility(window, cx);
     }
 
-    /// A Thread close owns its shell too. A running shell always gets an explicit decision.
     pub(super) fn confirm_sidebar_terminal_stop(
         &mut self,
         id: ThreadId,

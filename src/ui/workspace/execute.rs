@@ -1,6 +1,3 @@
-//! `Workspace::execute`: one `Command` in, its effect out, plus the pickers and
-//! project commands it opens.
-
 use super::*;
 
 impl Workspace {
@@ -534,8 +531,6 @@ impl Workspace {
                 self.open_theme_editor(window, cx);
                 None
             }
-            // Asking again from a Conversation nobody used yet would only stack another
-            // blank one; offer its harness instead, so New conversation twice switches it.
             Command::NewConversation
                 if self
                     .state

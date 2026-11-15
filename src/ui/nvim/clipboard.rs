@@ -1,10 +1,7 @@
-//! The native clipboard: the composer's own copy, cut and paste chords, and the register
-//! metadata that round-trips Neovim's linewise and blockwise yanks.
 use super::{super::commands::PasteImage, NvimView};
 use crate::neovim::{ClipboardContent, NvimCommand};
 use gpui_kit::*;
 
-/// The native clipboard chords the composer takes before Neovim sees the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClipboardChord {
     Copy,
@@ -12,8 +9,6 @@ pub(super) enum ClipboardChord {
     Paste,
 }
 
-/// macOS uses the Cmd key, where Ctrl-C/X/V stay Vim keys. Elsewhere Ctrl is
-/// Vim's, so the terminal convention Ctrl-Shift-C/X/V is the native chord.
 pub(super) fn clipboard_chord(key: &Keystroke) -> Option<ClipboardChord> {
     let modifiers = key.modifiers;
     let native = if cfg!(target_os = "macos") {
@@ -33,8 +28,6 @@ pub(super) fn clipboard_chord(key: &Keystroke) -> Option<ClipboardChord> {
 }
 
 impl NvimView {
-    /// Text goes to Neovim; an image clipboard becomes a draft attachment through
-    /// the workspace's `PasteImage` action so composer and palette share one path.
     pub(super) fn paste_item(
         &mut self,
         item: ClipboardItem,
@@ -111,7 +104,6 @@ mod tests {
         assert_eq!(chord(&format!("{native}-alt-v")), None);
         assert_eq!(chord(&format!("{native}-enter")), None);
         assert_eq!(chord(&format!("{vim}-v")), None);
-        // Vim's own Ctrl-V (blockwise visual, literal insert) and Ctrl-C stay Neovim's.
         assert_eq!(chord("ctrl-v"), None);
         assert_eq!(chord("ctrl-c"), None);
         assert_eq!(chord("v"), None);

@@ -1,5 +1,3 @@
-//! Shaping grid rows: each cell's grapheme is shaped on its own and compatible cells are
-//! batched into one layout, so glyphs stay on Neovim's columns.
 use crate::neovim::grid::{Cell, GridSnapshot, Highlight};
 use gpui_kit::*;
 
@@ -8,8 +6,6 @@ pub(super) struct PaintedText {
     pub(super) line: ShapedLine,
 }
 
-/// Each cell is shaped independently. Only compatible, undecorated layouts are
-/// combined: glyph positions stay relative to Neovim columns, not text advances.
 pub(super) struct GridText {
     pub(super) origin: Point<Pixels>,
     pub(super) layout: LineLayout,
@@ -24,7 +20,6 @@ pub(super) enum RowText {
 #[derive(Default)]
 pub(super) struct RowShape {
     pub(super) texts: Vec<RowText>,
-    // Indexed in paint order: avoid a large common variant or a box per cell.
     pub(super) decorated: Vec<PaintedText>,
     pub(super) backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
 }
@@ -96,7 +91,6 @@ impl GridText {
                     glyphs: Vec::with_capacity(run.glyphs.len()),
                 });
             }
-            // The run was just inserted if absent.
             if let Some(destination) = self.layout.runs.last_mut() {
                 destination.glyphs.extend(run.glyphs.iter().map(|glyph| {
                     let mut glyph = glyph.clone();
@@ -127,8 +121,6 @@ impl GridText {
 impl RowShape {
     pub(super) fn push_text(&mut self, origin: Point<Pixels>, line: ShapedLine, run: TextRun) {
         if run.underline.is_some() || run.strikethrough.is_some() {
-            // Retain exact per-cell decoration extent, including overhang and
-            // fallback metrics. A concatenated underline would cross grid gaps.
             self.texts.push(RowText::Decorated(self.decorated.len()));
             self.decorated.push(PaintedText { origin, line });
             return;
@@ -186,9 +178,6 @@ pub(super) fn shape_row(
         if value.text.is_empty() || (!decorated && value.text == " ") {
             continue;
         }
-        // Shape the complete grapheme Neovim put in this cell, never a
-        // concatenated row. Wide continuation cells contribute no glyphs;
-        // combining marks, fallback fonts and emoji retain their shaped offsets.
         let run = text_run(grid, font, value.hl_id, value.text.len());
         let line = text_system.shape_line(
             value.text.as_str().into(),
@@ -261,8 +250,6 @@ mod tests {
                     ..Highlight::default()
                 },
             );
-            // Deliberately non-natural cell width, ligature candidates, spaces,
-            // wide continuations, combining marks, emoji, RTL and fallback fonts.
             let row: Vec<Cell> = [
                 ("f", 0),
                 ("i", 0),

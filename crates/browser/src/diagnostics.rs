@@ -1,4 +1,3 @@
-//! Bounded retained diagnostics; cursors remain monotonic when events are dropped.
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 

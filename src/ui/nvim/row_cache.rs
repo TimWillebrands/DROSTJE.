@@ -1,5 +1,3 @@
-//! Shaped grid rows retained across frames, keyed by the row's cells and everything else
-//! a row's shape depends on.
 use super::shaping::RowShape;
 use crate::neovim::NvimTheme;
 use crate::neovim::grid::{Cell, Highlight};
@@ -9,28 +7,23 @@ use std::{
     sync::Arc,
 };
 
-/// Everything a row's shape depends on besides its own cells.
 pub(super) struct RowCacheKey {
     pub(super) font: Font,
     pub(super) font_size: Pixels,
     pub(super) cell: Size<Pixels>,
-    /// Columns a row is shaped up to. The viewport's height never changes a row's shape.
     pub(super) visible_cols: usize,
     pub(super) scale_factor: f32,
     pub(super) cols: usize,
     pub(super) theme: NvimTheme,
     pub(super) defaults: [u32; 3],
-    /// Compared per entry: a row is reshaped only when an id it uses changed.
     pub(super) highlights: Arc<HashMap<u64, Highlight>>,
 }
 
 impl RowCacheKey {
-    /// The columns of a `viewport` a row is shaped up to, including a partly visible one.
     pub(super) fn visible_cols(viewport: Size<Pixels>, cell: Size<Pixels>) -> usize {
         (viewport.width / cell.width).ceil().max(0.) as usize
     }
 
-    /// Whether shapes made under `other` stay valid for every highlight they do not use.
     fn same_layout(&self, other: &Self) -> bool {
         self.font == other.font
             && self.font_size == other.font_size
@@ -43,8 +36,6 @@ impl RowCacheKey {
     }
 }
 
-/// The highlight ids whose definition differs between two tables, including ids only one
-/// of them defines (an undefined id draws with the default highlight).
 fn changed_highlights(
     previous: &HashMap<u64, Highlight>,
     next: &HashMap<u64, Highlight>,
@@ -59,8 +50,6 @@ fn changed_highlights(
 }
 
 pub(super) struct CachedRow {
-    // Retain the allocation so a recycled pointer cannot hit a stale shape, and so a
-    // highlight change can tell which rows use it.
     pub(super) source: Arc<Vec<Cell>>,
     pub(super) shape: Arc<RowShape>,
     pub(super) visible: bool,
@@ -81,9 +70,6 @@ impl RowCache {
     ) -> Vec<Arc<RowShape>> {
         match self.key.as_ref() {
             Some(previous) if previous.same_layout(&key) => {
-                // Neovim defines highlights as new attribute combinations appear, and
-                // each definition publishes a new table; rows using none of the changed
-                // ids keep their shapes.
                 if !Arc::ptr_eq(&previous.highlights, &key.highlights) {
                     let changed = changed_highlights(&previous.highlights, &key.highlights);
                     if !changed.is_empty() {
@@ -117,7 +103,6 @@ impl RowCache {
                 Arc::clone(&cached.shape)
             })
             .collect();
-        // Scrolled-out rows are not an unbounded history of shaped text.
         self.rows.retain(|_, cached| cached.visible);
         result
     }
@@ -180,8 +165,6 @@ mod tests {
         Arc::make_mut(&mut grid.rows[1])[0].text = "changed".into();
         cache.prepare(key(&grid), &grid.rows, shape);
         assert_eq!(calls.get(), 3);
-        // Only the visible slice is retained. Returning to an evicted row must
-        // shape it again rather than keeping a history of every visited row.
         cache.prepare(key(&grid), &grid.rows[..1], shape);
         cache.prepare(key(&grid), &[a], shape);
         assert_eq!(calls.get(), 4);
@@ -237,9 +220,8 @@ mod tests {
             rows: vec![Arc::new(vec![Cell::default()])],
             ..GridSnapshot::default()
         };
-        // Columns of an 8px wide cell in a viewport of the given size.
         let sized = |width: f32, height: f32| RowCacheKey {
-            visible_cols: RowCacheKey::visible_cols(size(px(width), px(height)), key(&grid).cell), // px: test geometry
+            visible_cols: RowCacheKey::visible_cols(size(px(width), px(height)), key(&grid).cell),
             ..key(&grid)
         };
         let mut cache = RowCache::default();
@@ -249,14 +231,11 @@ mod tests {
             RowShape::default()
         };
         let first = cache.prepare(sized(800., 400.), &grid.rows, shape);
-        // A taller or shorter editor, or a width inside the same last column, shapes
-        // every row exactly as before.
         for (width, height) in [(800., 120.), (800., 401.5), (793., 400.)] {
             let again = cache.prepare(sized(width, height), &grid.rows, shape);
             assert!(Arc::ptr_eq(&first[0], &again[0]));
         }
         assert_eq!(calls.get(), 1);
-        // One more partly visible column reaches cells the old shapes left out.
         cache.prepare(sized(801., 400.), &grid.rows, shape);
         assert_eq!(calls.get(), 2);
     }
@@ -290,21 +269,16 @@ mod tests {
         let first = cache.prepare(key(&grid), &grid.rows, shape);
         assert_eq!(shaped.take(), ["plain", "styled"]);
 
-        // The same table in a new allocation, as a flush that redefines a highlight
-        // identically publishes it, keeps every shape.
         grid.highlights = Arc::new((*grid.highlights).clone());
         let same = cache.prepare(key(&grid), &grid.rows, shape);
         assert!(shaped.take().is_empty());
         assert!(Arc::ptr_eq(&first[0], &same[0]) && Arc::ptr_eq(&first[1], &same[1]));
 
-        // Defining a new id leaves rows that do not use it alone. The cache shares the
-        // table, so this publishes a new allocation just like a Neovim flush does.
         Arc::make_mut(&mut grid.highlights).insert(2, bold.clone());
         let added = cache.prepare(key(&grid), &grid.rows, shape);
         assert!(shaped.take().is_empty());
         assert!(Arc::ptr_eq(&first[1], &added[1]));
 
-        // Redefining or dropping an id reshapes exactly the rows that use it.
         Arc::make_mut(&mut grid.highlights).insert(
             1,
             Highlight {
@@ -319,8 +293,6 @@ mod tests {
         Arc::make_mut(&mut grid.highlights).remove(&1);
         cache.prepare(key(&grid), &grid.rows, shape);
         assert_eq!(shaped.take(), ["styled"]);
-        // A row that used an id before it was defined drew it with the default
-        // highlight, so defining that id reshapes it too.
         Arc::make_mut(&mut grid.highlights).insert(1, bold);
         cache.prepare(key(&grid), &grid.rows, shape);
         assert_eq!(shaped.take(), ["styled"]);

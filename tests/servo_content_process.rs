@@ -1,9 +1,3 @@
-//! Opt-in real Servo regression: a page whose content process dies shows the
-//! crash state, DROSTJE keeps running, and Reload restores the page.
-//! cargo test --features runtime-qa --test servo_content_process
-//!
-//! Servo re-executes the current binary to host content processes, so this test
-//! owns `main` and serves them exactly as DROSTJE's binary does.
 use std::{
     process::Command,
     thread,
@@ -20,9 +14,6 @@ fn main() {
     let directory =
         std::env::temp_dir().join(format!("drostje-content-process-{}", BrowserId::new_v4()));
     std::fs::create_dir(&directory).unwrap();
-    // A live timer reproduces the original crash shape: script work pending
-    // when the process holding the page goes away. The `:has()` selector list
-    // needs the Stylo pref, which each content process must set for its layout.
     std::fs::write(
         directory.join("index.html"),
         "<!doctype html><title>Content process</title>\
@@ -117,8 +108,6 @@ fn until(label: &str, predicate: impl Fn() -> bool) {
     }
 }
 
-/// Live content processes spawned by this process. Killed ones linger as
-/// zombies until Servo reaps them, so their state is excluded.
 fn content_processes() -> Vec<u32> {
     let output = Command::new("ps")
         .args(["-A", "-o", "pid=,ppid=,stat=,command="])

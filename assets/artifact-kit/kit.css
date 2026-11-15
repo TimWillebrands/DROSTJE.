@@ -1,28 +1,3 @@
-/* DROSTJE. artifact kit v1: default styles for agent-written artifact pages.
- *
- * DROSTJE inserts this file at document start as
- * <style id="drostje-kit">@layer drostje-kit { ... }</style>, a low-priority
- * cascade layer: every unlayered page rule wins whatever its specificity, so
- * these are defaults a page may override. Keep it valid inside a layer block:
- * no @import, no @charset. Non-ASCII glyphs are written as CSS escapes.
- *
- * Colours and fonts come only from --dk-* tokens. The host sets real values on
- * :root in an unlayered <style id="drostje-theme">. The fallbacks below use
- * :where(:root), zero specificity, so that block also wins when this file is
- * linked unlayered (the standalone gallery).
- *
- * Servo 0.7 constraints that shape these rules:
- * - :focus-visible never matches (Servo does not set the focus-ring state), so
- *   focus styles key on :focus and stay neutral enough for pointer focus too.
- * - :has() matches when an element is styled but is not re-evaluated on later
- *   state changes. kit.js mirrors choice inputs onto their labels as
- *   data-drostje-checked/-choice/-focus; :has() rules only cover labels kit.js
- *   has not touched yet, and each sits in a rule of its own because an
- *   unsupported selector drops its whole rule.
- * - color-mix() variants sit in @supports at the end; a plain rule comes first.
- */
-
-/* Tokens: fallbacks for standalone use; the host's #drostje-theme overrides. */
 :where(:root) {
   color-scheme: light;
   --dk-bg: #f7f9fc;
@@ -61,8 +36,6 @@
   }
 }
 
-/* ---------------------------------------------------------------- base */
-
 *, *::before, *::after { box-sizing: border-box; }
 
 html {
@@ -82,7 +55,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Inline artifacts size to their content: no viewport heights, no shells. */
 main {
   display: block;
   max-width: 760px;
@@ -158,7 +130,6 @@ a {
 
 a:hover { text-decoration-color: currentColor; }
 
-/* Focus: neutral, always visible, distinct from the selected state. */
 :focus {
   outline: 1px solid var(--dk-muted);
   outline-offset: 2px;
@@ -203,7 +174,6 @@ kbd {
   white-space: nowrap;
 }
 
-/* Code wraps instead of scrolling: no nested scroll areas, nothing hidden. */
 pre {
   margin: 0 0 1em;
   padding: 12px 14px;
@@ -282,8 +252,6 @@ summary {
 summary:hover { color: var(--dk-strong); }
 details[open] > summary { margin-bottom: 0.45em; }
 
-/* ---------------------------------------------------------------- forms */
-
 button,
 input[type="button"],
 input[type="submit"],
@@ -316,7 +284,6 @@ input[type="reset"] {
 
 :where(button, input[type="submit"]).primary:hover { background: var(--dk-tint); }
 
-/* Chosen through the choose route: a neutral selected state, not a focus look. */
 :where(button, input[type="button"])[aria-pressed="true"] {
   border-color: var(--dk-strong);
   background: var(--dk-surface);
@@ -376,7 +343,6 @@ input[type="range"] { accent-color: var(--dk-strong); }
 
 label { color: var(--dk-fg); }
 
-/* <label>Name <input></label> stacks the field under its label. */
 label > :is(textarea, select, input:not([type="checkbox"], [type="radio"], [type="button"], [type="submit"], [type="reset"], [type="image"], [type="hidden"])) {
   display: block;
   margin: 4px 0 0.75em;
@@ -398,8 +364,6 @@ legend {
   text-transform: uppercase;
 }
 
-/* <meter> is left alone: Servo 0.7 draws its fill in a UA shadow tree that
- * page styles cannot reach. Use <progress> for a themed bar. */
 progress {
   width: 12em;
   max-width: 100%;
@@ -412,12 +376,9 @@ progress {
 
 progress { -webkit-appearance: none; appearance: none; }
 
-/* One engine-specific pseudo-element per rule: an unknown one drops its rule. */
 progress::-moz-progress-bar { border-radius: 3px; background: var(--dk-accent); }
 progress::-webkit-progress-bar { border-radius: 3px; background: var(--dk-line); }
 progress::-webkit-progress-value { border-radius: 3px; background: var(--dk-accent); }
-
-/* ---------------------------------------------------------------- components */
 
 .meta {
   display: flex;
@@ -545,7 +506,6 @@ progress::-webkit-progress-value { border-radius: 3px; background: var(--dk-acce
   font-size: 0.85rem;
 }
 
-/* Stacked bar: one child per segment, sized by an inline style="flex: 40". */
 .bar {
   display: flex;
   gap: 2px;
@@ -584,8 +544,6 @@ progress::-webkit-progress-value { border-radius: 3px; background: var(--dk-acce
   background: var(--dk-tone);
 }
 
-/* Bar segments and legend items take series colours in order unless toned.
- * --dk-info is left out: themes may set it equal to --dk-accent. */
 :where(.bar, .legend) > :nth-child(5n + 1) { --dk-tone: var(--dk-accent); }
 :where(.bar, .legend) > :nth-child(5n + 2) { --dk-tone: var(--dk-ok); }
 :where(.bar, .legend) > :nth-child(5n + 3) { --dk-tone: var(--dk-warn); }
@@ -615,8 +573,6 @@ progress::-webkit-progress-value { border-radius: 3px; background: var(--dk-acce
 
 .spacer { flex: 1 1 auto; }
 
-/* Choices: ( ) / (dot) radios and [ ] / [x] checkboxes, drawn by the label. The
- * native input stays focusable and accessible, only visually hidden. */
 .choices {
   position: relative;
   display: flex;
@@ -675,12 +631,10 @@ ul.choices label, ol.choices label { display: block; }
 .choices label[data-drostje-choice="checkbox"]::before,
 .choices input[type="checkbox"] + label::before { content: "[ ]"; }
 
-/* Checked before kit.js has mirrored the label. */
 .choices label:not([data-drostje-checked]):has(input[type="radio"]:checked)::before { content: "(\002022)"; color: var(--dk-accent); }
 .choices label:not([data-drostje-checked]):has(input[type="checkbox"]:checked)::before { content: "[x]"; color: var(--dk-accent); }
 .choices label:not([data-drostje-checked]):has(input:checked) { color: var(--dk-strong); }
 
-/* Checked as mirrored by kit.js, or the <input id> + <label for> pattern. */
 .choices label[data-drostje-checked="true"],
 .choices label[aria-pressed="true"],
 .choices input:checked + label { color: var(--dk-strong); }
@@ -692,7 +646,6 @@ ul.choices label, ol.choices label { display: block; }
 .choices label[data-drostje-checked="true"][data-drostje-choice="checkbox"]::before,
 .choices input[type="checkbox"]:checked + label::before { content: "[x]"; color: var(--dk-accent); }
 
-/* Focus on the hidden input shows on its label: neutral surface and outline. */
 .choices label[data-drostje-focus],
 .choices input:focus + label {
   outline: 1px solid var(--dk-muted);
@@ -713,8 +666,6 @@ ul.choices label, ol.choices label { display: block; }
 
 .choices label:has(input:disabled) { color: var(--dk-muted); opacity: 0.6; cursor: default; }
 
-/* ---------------------------------------------------------------- tones */
-
 .ok { --dk-tone: var(--dk-ok); }
 .warn { --dk-tone: var(--dk-warn); }
 .bad { --dk-tone: var(--dk-bad); }
@@ -722,22 +673,16 @@ ul.choices label, ol.choices label { display: block; }
 .accent { --dk-tone: var(--dk-accent); }
 .muted { --dk-tone: var(--dk-muted); }
 
-/* Tone classes set colour only, except where a component consumes the tone. */
 :is(.ok, .warn, .bad, .info, .accent, .muted) { color: var(--dk-tone); }
 
 .mono { font-family: var(--dk-mono); font-variant-numeric: tabular-nums; }
 
-/* Components that draw their tone as a rule or swatch keep body-coloured text. */
 .callout, .ask, .done, .card, .legend > * { color: var(--dk-fg); }
 .verdict { color: var(--dk-strong); }
 
 .done:is(.ok, .warn, .bad, .info, .accent) { border-color: var(--dk-tone); }
 .tag:is(.ok, .warn, .bad, .info, .accent) { border-color: currentColor; }
 :where(button):is(.ok, .warn, .bad, .info, .accent) { border-color: var(--dk-tone); }
-
-/* ---------------------------------------------------------------- send states (set by kit.js) */
-/* sending and queued are in flight (queued waits, e.g. behind a permission
- * prompt); sent and failed are final. */
 
 form[data-drostje-state="sending"] { cursor: progress; }
 form.ask[data-drostje-state="sent"] { border-left-color: var(--dk-ok); }
@@ -753,8 +698,6 @@ form.ask[data-drostje-state="failed"] { border-left-color: var(--dk-bad); }
 [data-drostje-send][data-drostje-state="sent"] { border-color: var(--dk-ok); color: var(--dk-ok); }
 [data-drostje-send][data-drostje-state="failed"] { border-color: var(--dk-bad); color: var(--dk-bad); }
 
-/* ---------------------------------------------------------------- narrow widths */
-
 @media (max-width: 560px) {
   main { padding: 14px 14px 18px; }
   h1 { font-size: 1.6rem; }
@@ -763,10 +706,6 @@ form.ask[data-drostje-state="failed"] { border-left-color: var(--dk-bad); }
   .done { padding: 12px 14px; }
 }
 
-/* ---------------------------------------------------------------- color-mix refinements */
-
-/* A var() inside color-mix() is only checked at computed time, so a plain
- * fallback declaration in the same rule would not apply; gate them instead. */
 @supports (color: color-mix(in srgb, red 50%, blue)) {
   ::selection { background: color-mix(in srgb, var(--dk-muted) 30%, transparent); }
   mark { background: color-mix(in srgb, var(--dk-warn) 22%, transparent); }

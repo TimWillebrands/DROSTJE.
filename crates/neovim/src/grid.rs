@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
-    /// An empty string is a wide glyph's continuation, not a blank cell.
     pub text: CellText,
     pub hl_id: u64,
 }
@@ -25,17 +24,11 @@ impl Default for Cell {
 
 const INLINE_CAPACITY: usize = 22;
 
-/// The grapheme Neovim put in one cell. Text up to `INLINE_CAPACITY` bytes
-/// (every single code point, most combining sequences) is stored inline, so
-/// building, cloning and copy-on-write of a row never touch the heap for it;
-/// longer clusters share one `Arc<str>`. The representation is canonical:
-/// text that fits is always inline.
 #[derive(Clone)]
 pub struct CellText(CellTextRepr);
 
 #[derive(Clone)]
 enum CellTextRepr {
-    /// `bytes[..len]` is valid UTF-8 copied from a `&str`; the rest is zero.
     Inline {
         len: u8,
         bytes: [u8; INLINE_CAPACITY],
@@ -44,7 +37,6 @@ enum CellTextRepr {
 }
 
 impl CellText {
-    /// A blank cell, as Neovim clears it.
     pub const BLANK: Self = Self::inline(b" ");
 
     const fn inline(text: &[u8]) -> Self {
@@ -70,8 +62,6 @@ impl CellText {
 
     pub fn as_str(&self) -> &str {
         match &self.0 {
-            // Inline bytes were copied whole from a `&str`, so this never
-            // falls back; the check only keeps the module free of `unsafe`.
             CellTextRepr::Inline { len, bytes } => {
                 std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default()
             }
@@ -204,7 +194,6 @@ pub struct HighlightedChunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cmdline {
     pub content: Vec<HighlightedChunk>,
-    /// UTF-8 byte offset into content, excluding firstc, prompt and indent.
     pub pos: usize,
     pub firstc: String,
     pub prompt: String,
@@ -212,8 +201,6 @@ pub struct Cmdline {
     pub special: Option<(String, bool)>,
 }
 
-/// Every collection is shared with earlier snapshots until a redraw changes
-/// it, so publishing a flush copies pointers, not grid or editor state.
 #[derive(Clone, Debug)]
 pub struct GridSnapshot {
     pub cols: usize,
@@ -263,8 +250,6 @@ impl Default for GridSnapshot {
     }
 }
 
-/// Only flush publishes staging. Published rows and highlights stay immutable
-/// through copy-on-write, including across separate redraw notifications.
 pub struct GridReducer {
     staging: GridSnapshot,
     committed: Arc<GridSnapshot>,
@@ -284,9 +269,6 @@ impl GridReducer {
         Arc::clone(&self.committed)
     }
 
-    /// Accepts the redraw argument array, not the surrounding RPC envelope.
-    /// A diagnostic is terminal for the session; staging after an error must
-    /// not be reused. Earlier flushes remain valid committed snapshots.
     pub fn apply(&mut self, events: &[Value]) -> Result<Vec<Arc<GridSnapshot>>> {
         let mut publications = Vec::new();
         for (event_index, event) in events.iter().enumerate() {
@@ -360,7 +342,6 @@ impl GridReducer {
             "grid_destroy" => {
                 let grid = unsigned(&args[0], "grid")?;
                 ensure!(grid > 0, "grid id must be positive");
-                // A defensive destroy for an untracked grid must not destroy grid 1.
                 if grid == 1 {
                     self.staging.rows.clear();
                     self.staging.cols = 0;
@@ -384,8 +365,6 @@ impl GridReducer {
                 let sp = color(&args[2], "default special")?;
                 signed(&args[3], "terminal foreground")?;
                 signed(&args[4], "terminal background")?;
-                // -1 is the protocol's unset sentinel. RGB attach normally sends
-                // concrete defaults, but retaining the last color is safe here.
                 if let Some(fg) = fg {
                     self.staging.default_fg = fg;
                 }
@@ -576,8 +555,6 @@ impl GridReducer {
                 "cell {cell_index} ends at column {end}, beyond width {}",
                 self.staging.cols
             );
-            // Repeated redraws of identical cells retain the published row's
-            // identity, so downstream shape caches do not invalidate on a no-op.
             if row[col..end]
                 .iter()
                 .any(|destination| destination.text != text || destination.hl_id != hl_id)
@@ -622,8 +599,6 @@ impl GridReducer {
         let Some((dst_col, src_col, width)) = scroll_overlap(left, right, cols) else {
             return Ok(());
         };
-        // Traverse away from source rows, so writes cannot clobber a later read.
-        // Exposed cells are left intact: Neovim fills them with grid_line events.
         for step in 0..height {
             let offset = if rows < 0 { height - 1 - step } else { step };
             let destination = dst_row + offset;
@@ -669,7 +644,6 @@ fn blank_row(cols: usize) -> Result<Arc<Vec<Cell>>> {
     Ok(Arc::new(cells))
 }
 
-/// Returns destination start, source start and overlapping length.
 fn scroll_overlap(start: usize, end: usize, displacement: i64) -> Option<(usize, usize, usize)> {
     let distance = usize::try_from(displacement.unsigned_abs()).ok()?;
     let length = end - start;
@@ -946,7 +920,6 @@ mod tests {
             unreachable!("long text is shared")
         };
         assert!(Arc::ptr_eq(original, copy), "cloning shares long clusters");
-        // A cell is no larger than the former `String` plus highlight id.
         assert!(std::mem::size_of::<Cell>() <= std::mem::size_of::<(String, u64)>());
     }
 
@@ -1089,7 +1062,6 @@ mod tests {
                 vec!["!".into()],
             ],
         );
-        // Multiple tuples of one event are independent: inheritance starts anew.
         let Value::Array(tuples) = &mut lines else {
             unreachable!()
         };
@@ -1287,8 +1259,6 @@ mod tests {
     #[test]
     fn scrolling_copies_overlapping_rectangles_in_both_axes_without_touching_outside() -> Result<()>
     {
-        // Each sign changes the safe traversal direction. Full-width cases also
-        // exercise row sharing followed by a mutation of one formerly shared row.
         for (top, bottom, left, right, dy, dx) in [
             (0, 5, 0, 6, 1_i64, 0_i64),
             (0, 5, 0, 6, -1, 0),
@@ -1669,7 +1639,6 @@ mod tests {
                 "changed committed rows for {bad:?}"
             );
         }
-        // Forward-compatible event and tuple extensions are not malformed.
         let mut reducer = GridReducer::new(Uuid::nil());
         reducer.apply(&[
             Value::Array(vec!["future_event".into(), Value::Nil]),

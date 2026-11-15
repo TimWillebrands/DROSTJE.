@@ -1,4 +1,3 @@
-//! Agent operations run off the GPUI thread. Delivered input is not application completion.
 use super::page;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use drostje_browser::{BrowserCommand, BrowserFrame, BrowserId, BrowserRuntime};
@@ -126,8 +125,6 @@ impl BrowserAutomation {
                     if let Some(error) = snapshot.error {
                         return Err(error);
                     }
-                    // Only a frame published after this call: a hidden page's retained
-                    // frame can be older than its content.
                     if capture.settled
                         && let Some(frame) = snapshot.frame
                         && frame.document_revision == snapshot.document_revision
@@ -143,7 +140,6 @@ impl BrowserAutomation {
         }
     }
 
-    /// GPUI applies the viewport policy; this waits for the actual engine frame.
     pub async fn viewport_result(
         runtime: BrowserRuntime,
         id: BrowserId,
@@ -151,7 +147,6 @@ impl BrowserAutomation {
         fixed: bool,
     ) -> Result<Value, String> {
         let deadline = Instant::now() + Duration::from_secs(20);
-        // Queue behind the UI's resize before observing the current viewport.
         evaluate(&runtime, id, "null".into(), deadline).await?;
         let mut capture = Capture::new(&runtime, id);
         loop {
@@ -185,14 +180,10 @@ impl BrowserAutomation {
     }
 }
 
-/// Keeps a page publishing frames while an operation waits on its pixels, whether or
-/// not a pane shows it: at most one capture is outstanding, and the next one is asked
-/// for after it completes. Dropping it abandons the outstanding capture.
 struct Capture<'a> {
     runtime: &'a BrowserRuntime,
     id: BrowserId,
     request: Option<String>,
-    /// The snapshot now holds a frame of the content as it was when this began.
     settled: bool,
 }
 
@@ -216,8 +207,6 @@ impl<'a> Capture<'a> {
         }
         match self.runtime.capture(self.id) {
             Ok(request) => self.request = Some(request),
-            // Not admitted (closed, shut down, failed or saturated): use the retained
-            // frame, as without captures. Closing and failures surface in the snapshot.
             Err(_) => self.settled = true,
         }
     }
@@ -300,8 +289,6 @@ fn encode_screenshot(
         std::fs::write(path, &png)
             .map_err(|error| format!("Screenshot could not be saved: {error}"))?;
     }
-    // The base64 text is moved into the result, and the PNG freed as soon as it is
-    // encoded: `json!` would deep-copy a String expression. Fields keep their order.
     let data = STANDARD.encode(&png);
     drop(png);
     let mut image = json!({"mimeType": "image/png"});
@@ -317,7 +304,6 @@ fn encode_screenshot(
 mod tests {
     use super::*;
 
-    /// `encode_screenshot`'s output for `golden_frame` before the copy reductions.
     const GOLDEN: &str = r#"{"id":"00000000-0000-0000-0000-000000001234","path":null,"width":3,"height":2,"frame_revision":7,"document_revision":3,"viewport":{"width":1.5,"height":1.0,"scale":2.0},"image":{"mimeType":"image/png","data":"iVBORw0KGgoAAAANSUhEUgAAAAMAAAACCAYAAACddGYaAAAAJUlEQVR4AQEaAOX/AAAlSm+Uud4DKE1ylwC84QYrUHWav+QJLlN7EAnl1WCnAwAAAABJRU5ErkJggg=="}}"#;
 
     fn golden_frame() -> Arc<BrowserFrame> {
@@ -337,12 +323,9 @@ mod tests {
         let value = encode_screenshot(id, golden_frame(), None).unwrap();
         let golden: Value = serde_json::from_str(GOLDEN).unwrap();
         assert_eq!(value, golden);
-        // Byte-exact where this build keeps insertion order, as the desktop does.
         if serde_json::to_string(&golden).unwrap() == GOLDEN {
             assert_eq!(value.to_string(), GOLDEN);
         }
-        // The MCP response as handle_mcp builds it, written as the old writer did:
-        // the status line and headers, then `Value::to_string`.
         let mut result = json!({"isError": false});
         result["content"] = Value::Array(crate::tool_content(value, true));
         let mut response = json!({"jsonrpc": "2.0", "id": 1});

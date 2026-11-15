@@ -1,4 +1,3 @@
-//! GPUI presentation for a retained Servo session. The runtime owns all I/O and web state.
 use super::commands::{
     BrowserAddress, BrowserBack, BrowserForward, BrowserReload, Command, LeaveEditor,
     ToggleArtifact,
@@ -27,18 +26,12 @@ pub struct OpenBrowserUrl {
     pub url: String,
 }
 
-/// Largest share of the window height a docked artifact takes above the composer.
 const DOCKED_SHARE: f32 = 0.45;
 
-/// Polling the engine while the page changes or the user works in it.
 const POLL_ACTIVE: Duration = Duration::from_millis(33);
-/// Polling a page nobody sees, or one that stopped changing.
 const POLL_IDLE: Duration = Duration::from_millis(264);
-/// Unchanged polls at the active rate before backing off.
 const POLL_GRACE: u32 = 15;
 
-/// How often to poll the engine: at the active rate while anything changes and shortly
-/// after, then backing off to the idle rate, which hidden and collapsed panes keep.
 #[derive(Debug, Default)]
 struct PollSchedule {
     unchanged: u32,
@@ -63,7 +56,6 @@ impl PollSchedule {
     }
 }
 
-/// The engine's RGBA frame as the BGRA image GPUI paints. Runs off the GPUI thread.
 fn bgra_image(frame: &BrowserFrame) -> Option<Arc<RenderImage>> {
     let mut pixels = frame.rgba.clone();
     for pixel in pixels.as_chunks_mut::<4>().0 {
@@ -79,8 +71,6 @@ pub(super) struct BrowserFocus;
 impl EventEmitter<BrowserFocus> for BrowserPane {}
 pub(super) struct BrowserLayout;
 impl EventEmitter<BrowserLayout> for BrowserPane {}
-/// Channel events an artifact page sent, in order; the workspace routes them to the
-/// artifact's Conversation.
 pub(super) struct BrowserChannel(pub Vec<ChannelEvent>);
 impl EventEmitter<BrowserChannel> for BrowserPane {}
 
@@ -91,31 +81,19 @@ pub struct BrowserPane {
     focus: FocusHandle,
     header_focus: FocusHandle,
     artifact: Option<String>,
-    /// Docked above the composer rather than in its transcript row.
     docked: bool,
-    /// The agent has what it needed; the page stays collapsed until reopened.
     answered: bool,
     collapsed: bool,
     content_height: Option<f32>,
-    /// The image painted now; a replaced one leaves the sprite atlas at once.
     frame: Option<Arc<RenderImage>>,
     frame_dimensions: Option<(u32, u32, f32)>,
     revision: u64,
-    /// The frame revision being converted off the GPUI thread.
     converting: Option<u64>,
-    /// The newest frame revision the engine reported.
     seen_revision: Option<u64>,
-    /// The surface was laid out in a window frame; false once a poll's notify drew no
-    /// surface for a whole poll interval.
     visible: bool,
-    /// The surface was laid out since the last poll.
     painted: bool,
-    /// Polling notified since the last poll.
     notified: bool,
-    /// A notify before the last poll has not drawn the surface yet.
     unpainted_notify: bool,
-    /// What the engine was last told: whether anyone sees the page. Hidden pages
-    /// publish frames only when an agent captures them.
     reported_shown: bool,
     schedule: PollSchedule,
     poll_delay: Duration,
@@ -148,8 +126,6 @@ impl BrowserPane {
         Self::open(id, url, None, runtime, window, cx)
     }
 
-    /// An inline artifact: the engine injects the artifact kit with `theme` tokens and
-    /// accepts its channel events. Artifact-ness is fixed for the session's lifetime.
     pub fn artifact(
         id: BrowserId,
         url: String,
@@ -185,7 +161,6 @@ impl BrowserPane {
                     snapshot.scale.to_bits(),
                 )
             })
-            // A concurrently closed session has no viewport; resize skips zero dimensions.
             .unwrap_or((0, 0, 1_f32.to_bits()));
         let address = cx.new(|cx| InputState::new(window, cx).placeholder("Enter a URL…"));
         address.update(cx, |input, cx| input.set_value(url.clone(), window, cx));
@@ -226,7 +201,6 @@ impl BrowserPane {
                 cx.notify();
             }),
         ];
-        // Free the painted frame's atlas tile in every window once the pane is gone.
         subscriptions.push(cx.on_release(|pane, cx| {
             if let Some(frame) = pane.frame.take() {
                 cx.drop_image(frame, None);
@@ -289,7 +263,6 @@ impl BrowserPane {
             _updates: updates,
         }
     }
-    /// Presentation belongs to the retained pane, never to a virtualized row.
     pub(super) fn set_artifact(&mut self, title: String) {
         if self.artifact.is_none() && self.fixed_viewport.is_none() {
             self.send(BrowserCommand::SetContentSizing { enabled: true });
@@ -297,8 +270,6 @@ impl BrowserPane {
         self.artifact = Some(title);
     }
 
-    /// Docked artifacts stay at most a share of the window tall, so the composer stays in
-    /// view; taller pages scroll inside the surface.
     pub(super) fn set_docked(&mut self, docked: bool, cx: &mut Context<Self>) {
         if self.docked != docked {
             self.docked = docked;
@@ -307,9 +278,6 @@ impl BrowserPane {
         }
     }
 
-    /// The agent has what it needed: collapse to the header, marked answered. The page
-    /// keeps its document and form values, and the user can reopen it. Focus is the
-    /// caller's to move; this never focuses the header.
     pub(super) fn complete(&mut self, cx: &mut Context<Self>) {
         if self.artifact.is_none() {
             return;
@@ -335,7 +303,6 @@ impl BrowserPane {
             return;
         }
         self.collapsed = !self.collapsed;
-        // Never leave IME or keyboard focus attached to a removed surface.
         self.composition.clear();
         self.header_focus.focus(window, cx);
         self.send(BrowserCommand::Focus { focused: false });
@@ -347,7 +314,6 @@ impl BrowserPane {
         cx.notify();
     }
 
-    /// Fix the CSS viewport and device scale, or restore following the pane's layout.
     pub fn set_viewport(
         &mut self,
         viewport: Option<(u32, u32, f32)>,
@@ -382,7 +348,6 @@ impl BrowserPane {
         Ok(())
     }
 
-    /// Physical dimensions most recently requested from Servo.
     pub(super) fn viewport_dimensions(&self) -> (u32, u32, f32) {
         (
             self.dimensions.0,
@@ -396,7 +361,6 @@ impl BrowserPane {
             return (f32::from(self.bounds.size.width).max(1.) * height as f32 / width as f32)
                 .clamp(120., 1600.);
         }
-        // Keep physical RGBA frames below the engine's 64 MiB limit, with headroom.
         let scale = window.scale_factor();
         let width = f32::from(self.bounds.size.width).max(1.);
         let cap = (48. * 1024. * 1024. / (4. * width * scale * scale))
@@ -422,8 +386,6 @@ impl BrowserPane {
         self.address
             .update(cx, |address, cx| address.focus(window, cx));
     }
-    /// Keyboard focus is anywhere in this pane: the page, its address bar or the artifact
-    /// header (including its menu button).
     pub(super) fn contains_focused(&self, window: &Window, cx: &App) -> bool {
         self.focus.contains_focused(window, cx)
             || self.header_focus.contains_focused(window, cx)
@@ -459,9 +421,6 @@ impl BrowserPane {
             _ => None,
         }
     }
-    /// One poll of the engine; returns the delay until the next. A notify that drew no
-    /// surface for a whole poll interval means nobody sees the pane: its frames wait
-    /// until it is laid out again.
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
         if self.unpainted_notify && !self.painted {
             self.visible = false;
@@ -475,8 +434,6 @@ impl BrowserPane {
         self.poll_delay
     }
 
-    /// Tell the engine when the page becomes shown or hidden. A shown page publishes
-    /// frames as it changes; a page shown again publishes what changed meanwhile.
     fn report_shown(&mut self) {
         let shown = self.visible && !self.collapsed;
         if self.reported_shown != shown {
@@ -485,7 +442,6 @@ impl BrowserPane {
         }
     }
 
-    /// Poll at the active rate again, now if the poller is backing off.
     fn wake_poll(&mut self) {
         self.schedule.wake();
         if self.poll_delay > POLL_ACTIVE {
@@ -494,13 +450,11 @@ impl BrowserPane {
         }
     }
 
-    /// Input and navigation make the page change soon; poll for it at the active rate.
     fn send(&mut self, command: BrowserCommand) {
         self.runtime.command(self.id, command);
         self.wake_poll();
     }
 
-    /// Reads the engine's state; true when anything in it changed.
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut activity = false;
         if let Some(request) = &self.copy_request
@@ -522,8 +476,6 @@ impl BrowserPane {
         let Some(snapshot) = self.runtime.snapshot(self.id) else {
             return activity;
         };
-        // Resize invalidates the engine measurement. Keep the previous usable height
-        // until its replacement arrives, rather than oscillating through the fallback.
         if (snapshot.content_height.is_some() || self.url != snapshot.url)
             && self.content_height != snapshot.content_height
         {
@@ -573,14 +525,11 @@ impl BrowserPane {
         activity || changed
     }
 
-    /// A notify from polling doubles as a probe of whether the surface is still shown.
     fn notify(&mut self, cx: &mut Context<Self>) {
         self.notified = true;
         cx.notify();
     }
 
-    /// Converts a new engine frame on a background thread, one at a time. Hidden and
-    /// collapsed panes skip frames; the newest is converted once the surface shows.
     fn show_frame(
         &mut self,
         frame: Arc<BrowserFrame>,
@@ -607,7 +556,6 @@ impl BrowserPane {
                     return;
                 }
                 pane.converting = None;
-                // A frame finished after collapsing is stale; expanding converts anew.
                 if let Some(image) = image.filter(|_| !pane.collapsed) {
                     pane.replace_frame(image, revision, dimensions, window, cx);
                 }
@@ -616,8 +564,6 @@ impl BrowserPane {
         .detach();
     }
 
-    /// Paint `image` from now on and free the replaced frame's atlas tile: nothing
-    /// paints it again, since this notify redraws the surface with the new image.
     fn replace_frame(
         &mut self,
         image: Arc<RenderImage>,
@@ -637,7 +583,6 @@ impl BrowserPane {
     fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.painted = true;
         if !self.visible {
-            // Shown again: convert the newest frame without waiting for the idle poll.
             self.visible = true;
             self.report_shown();
             self.wake_poll();
@@ -658,7 +603,6 @@ impl BrowserPane {
             if self.artifact.is_some()
                 && (self.dimensions.0 != width || self.dimensions.2 != scale.to_bits())
             {
-                // The physical frame cap can change even if natural document height does not.
                 cx.emit(BrowserLayout);
             }
             self.resize(dimensions);
@@ -676,7 +620,6 @@ impl BrowserPane {
         });
     }
 
-    /// Use the same fit operation as the image, including while a resize is pending.
     fn presentation(&self) -> Option<(Bounds<Pixels>, f32)> {
         let (width, height, scale) = self.frame_dimensions?;
         if self.bounds.size.width <= px(0.) || self.bounds.size.height <= px(0.) {
@@ -706,7 +649,6 @@ impl BrowserPane {
         let Some((bounds, scale)) = self.presentation() else {
             return;
         };
-        // Ignore letterboxing, but always release a press begun on the web surface.
         if pressed && !bounds.contains(&position)
             || !pressed && !self.pressed_buttons[button as usize]
         {
@@ -728,7 +670,6 @@ impl BrowserPane {
         } else {
             key.modifiers.control
         };
-        // Pane shortcuts belong to the app on both key-down and key-up.
         if shortcut
             && key.modifiers.alt
             && matches!(
@@ -776,14 +717,12 @@ impl BrowserPane {
         if !self.composition.is_empty() {
             return;
         }
-        // Native committed text is delivered separately; avoid inserting printable keys twice.
         if (key.key.chars().count() == 1 || key.key == "space")
             && !key.modifiers.control
             && !key.modifiers.platform
         {
             return;
         }
-        // Keys without a DOM equivalent stay with GPUI instead of failing the whole input.
         let Some((name, code)) = dom_key(&key.key) else {
             return;
         };
@@ -800,8 +739,6 @@ impl BrowserPane {
         cx.stop_propagation();
     }
 }
-/// Maps a GPUI key name to a DOM `KeyboardEvent.key` and `code`, or `None` when
-/// the key has no DOM equivalent Servo would accept.
 fn dom_key(key: &str) -> Option<(String, String)> {
     let named = match key {
         "space" => return Some((" ".into(), "Space".into())),
@@ -1092,8 +1029,6 @@ impl Render for BrowserPane {
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseUpEvent, _, cx| {
                     this.pointer(event.position, event.button, false);
-                    // A dock drop target around this pane handles the release in the
-                    // bubble phase too; a dragged tab must still land on it.
                     if !cx.has_active_drag() {
                         cx.stop_propagation();
                     }
@@ -1125,8 +1060,6 @@ impl Render for BrowserPane {
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                // A fitted artifact belongs to the transcript's scroll surface. Only the
-                // bounded fallback viewport scrolls internally.
                 if this.artifact.is_some()
                     && this.fixed_viewport.is_none()
                     && this
@@ -1493,8 +1426,6 @@ mod drop_tests {
         })
     }
 
-    /// Each engine frame is a new atlas image. The replaced one leaves the sprite atlas
-    /// as soon as its successor is installed, and the last one when the pane goes.
     #[gpui_kit::test]
     fn replaced_and_released_frames_leave_the_sprite_atlas(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
@@ -1563,15 +1494,12 @@ mod drop_tests {
             })
         });
         drop(pane);
-        // The last drawn frame still holds the pane's view until the next draw.
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
         cx.run_until_parked();
         assert!(!in_atlas(cx, &second), "a released pane frees its frame");
     }
 
-    /// A pane whose notifies draw no surface stops converting frames and polls at the
-    /// idle rate; laying it out again resumes both.
     #[gpui_kit::test]
     fn hidden_panes_stop_converting_frames_until_shown(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
@@ -1599,7 +1527,6 @@ mod drop_tests {
         let poll = |cx: &mut gpui_kit::TestAppContext| {
             cx.update_window(window.into(), |_, window, cx| {
                 pane.update(cx, |pane, cx| {
-                    // As if this poll's refresh found a change and notified.
                     pane.notified = true;
                     pane.poll(window, cx)
                 })
@@ -1663,8 +1590,6 @@ mod drop_tests {
         assert!(pane.read_with(cx, |pane, _| pane.frame.is_some()));
     }
 
-    /// Answering collapses an artifact, which hides its page from the engine; the
-    /// ToggleArtifact command shows it again.
     #[gpui_kit::test]
     fn collapsed_artifacts_are_hidden_from_the_engine(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
@@ -1716,8 +1641,6 @@ mod drop_tests {
         assert_eq!(runtime.is_visible(id), Some(true), "reopened");
     }
 
-    /// A dock tab dropped over a displayed browser reaches the tab group's drop
-    /// handler, which runs after the surface's own mouse-up in the bubble phase.
     #[gpui_kit::test]
     fn drags_dropped_on_the_web_surface_reach_the_drop_target(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
@@ -1725,7 +1648,6 @@ mod drop_tests {
             crate::ui::theme::initialize(None, None, cx);
         });
         let runtime = BrowserRuntime::new();
-        // No engine worker: the pane keeps its session state without Servo.
         runtime.shutdown();
         let window = cx.add_window(|window, cx| {
             let pane = cx.new(|cx| {

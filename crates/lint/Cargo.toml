@@ -1,0 +1,8 @@
+[package]
+name = "drostje-lint"
+description = "Repository checks run by `cargo test`: no comments in source, no unlisted Markdown."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]

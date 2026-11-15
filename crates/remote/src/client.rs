@@ -31,7 +31,6 @@ const CAPACITY: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 type Reply<T> = Sender<Result<T>>;
 
-/// One multiplexed, authenticated connection per configured Host. No mutation is replayed.
 #[derive(Clone, Default)]
 pub struct Client {
     hosts: Arc<Mutex<HashMap<String, Host>>>,
@@ -75,7 +74,6 @@ struct Runtime {
     project: String,
     config: RemoteConversationConfig,
     network: Network,
-    /// The desktop's tool server, which shows this runtime's artifacts locally.
     artifacts: Option<BrowserToolServer>,
     capability: Uuid,
     generation: Option<Uuid>,
@@ -98,7 +96,6 @@ struct Runtime {
     pending: HashMap<Uuid, Pending>,
     cancellations: HashMap<Uuid, Receiver<()>>,
     image_dir: PathBuf,
-    /// Images materialized for this runtime, which the host may then send without bytes.
     images: HashMap<Uuid, ImageAttachment>,
 }
 struct Pending {
@@ -201,7 +198,6 @@ impl Client {
                 && host.config.relay_url == config.relay_url
                 && host.config.token_env == config.token_env;
             if same_connection && !host.requests.is_closed() {
-                // Names and Project mappings are desktop metadata, not transport identity.
                 host.config = config;
                 return Ok(host.requests.clone());
             }
@@ -214,8 +210,6 @@ impl Client {
             hosts.contains_key(&config.id) || hosts.len() < 32,
             "Too many connected remote Hosts"
         );
-        // Resolve credentials before revoking a working attachment. An invalid edit must
-        // not strand its existing Conversations; explicit Reconnect never stops a turn.
         let token = config.token()?;
         hosts.remove(&config.id);
         let connection = transport::connect(&config.relay_url, &token, Role::Desktop)?;
@@ -613,7 +607,6 @@ fn run(
         if requests.is_closed() || connection.incoming.is_closed() {
             break;
         }
-        // Keep draining while the host streams; the transport waits only briefly for us.
         if !busy {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -681,7 +674,6 @@ fn deliver_event(
     if events.try_send(event).is_ok() {
         return true;
     }
-    // Backpressure is terminal, not permission to discard observations and keep acting.
     network_lease.close();
     events.close();
     false
@@ -1223,8 +1215,6 @@ fn process_response(
     }
 }
 
-/// Admit one host-originated desktop call for the current runtime generation, or answer
-/// it with the refusal right away. Bounded like Network calls; a call ID is never reused.
 fn admit_desktop_call<'a>(
     runtimes: &'a mut HashMap<Uuid, Runtime>,
     outgoing: &Sender<Outgoing>,
@@ -1267,7 +1257,6 @@ fn admit_desktop_call<'a>(
     Some(runtime)
 }
 
-/// Run one operation on the desktop tool server for a remote runtime's Conversation.
 async fn desktop_tool(
     server: Option<BrowserToolServer>,
     thread: Uuid,
@@ -1289,8 +1278,6 @@ async fn desktop_tool(
     .await
 }
 
-/// Write a remote artifact's HTML beside this runtime's other remote media and show
-/// the local copy through the desktop tool server, exactly as a local artifact.
 #[expect(
     clippy::too_many_arguments,
     reason = "Each artifact identity and presentation field stays explicit across the relay"
@@ -1342,7 +1329,6 @@ async fn show_remote_artifact(
     .await
 }
 
-/// Images without bytes in this event must be ones already materialized for the runtime.
 fn localize_images(
     event: &mut ConversationEvent,
     images: &[WireImage],
@@ -1530,7 +1516,6 @@ mod tests {
             };
             assert_eq!(image.path, directory.join(wire.id.to_string()));
         }
-        // A fresh runtime has nothing to reuse and refuses the byte-less image.
         assert!(localize_images(&mut event(), &[], &directory, &mut HashMap::new()).is_err());
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -1631,7 +1616,6 @@ mod tests {
             &sender,
             &mut runtimes,
         );
-        // The application can start its event pump before any replay or Recovered frame.
         let handle = opened.try_recv().unwrap().unwrap();
         assert!(!runtimes[&thread].recovered);
         while handle.events.try_recv().is_ok() {}
@@ -1752,7 +1736,6 @@ mod tests {
         let error = client.connection(updated.clone(), false).unwrap_err();
         assert!(error.to_string().contains("Reconnect"));
         assert!(!receiver.is_closed());
-        // Explicit retry reaches credential resolution, not an application-restart guard.
         let error = client.connection(updated, true).unwrap_err();
         assert!(
             error

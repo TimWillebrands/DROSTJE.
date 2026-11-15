@@ -78,8 +78,6 @@ impl Actor {
         } else if !found {
             self.peers.ready = false;
             self.peers.handshake_deadline = None;
-            // A removed private command must never fall through as an ordinary
-            // user prompt. Withdraw every still-unwritten private RPC frame.
             let mut withdrawn = std::collections::HashSet::new();
             let queued: Vec<_> = self
                 .writes
@@ -209,8 +207,6 @@ impl Actor {
                 "Invalid peer delivery message count"
             );
             let content = super::super::peer_context(&delivery.messages)?;
-            // Every dispatch reserves admission until native isIdle resolves the
-            // busy-host/native-idle race. Host activity is not native readiness.
             let envelope = json!({"v":1,"op":"deliver","attempt":attempt,"messages":delivery.messages,"content":content,"trigger_turn":true});
             let rpc_id = self.peer_control(envelope, Some(attempt))?;
             self.peers.idle = Some(attempt);
@@ -242,7 +238,6 @@ impl Actor {
             return;
         };
         let accepted = matches!(outcome, PeerDeliveryOutcome::Accepted);
-        // A real late native echo may resolve an earlier uncertain outcome.
         if pending.accepted || (pending.terminal && !accepted) {
             return;
         }
@@ -262,7 +257,6 @@ impl Actor {
         let Some(pending) = self.peers.pending.get(&attempt) else {
             return;
         };
-        // Compare the native details to the durable host snapshot, not free text.
         if pending.messages.len() != echoed.len()
             || !pending
                 .messages
@@ -340,8 +334,6 @@ impl Actor {
                         .admission_deadline = None;
                 }
             }
-            // Emitted by the registered message_start observer, not sendMessage's
-            // void return or the prompt RPC acknowledgement.
             "accepted" => self.peer_outcome(attempt, PeerDeliveryOutcome::Accepted),
             "turn_started" if !self.peers.pending[&attempt].started => {
                 self.peers.idle = None;
@@ -479,9 +471,6 @@ impl Actor {
             .peers
             .pending
             .iter()
-            // An old run can settle while a new idle custom-message admission
-            // is in native asynchronous preprocessing. Only its own lifecycle,
-            // an explicit failure, or the admission deadline can settle it.
             .filter(|(attempt, pending)| {
                 !pending.terminal && pending.dispatched && self.peers.idle != Some(**attempt)
             })

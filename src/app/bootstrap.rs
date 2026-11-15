@@ -12,7 +12,6 @@ pub struct Bootstrap {
 }
 
 impl Bootstrap {
-    /// Runs before GPUI starts; subsequent filesystem, Git and database work is asynchronous.
     pub fn load() -> Result<Self> {
         let data_dir = platform::data_dir()?;
         let store = Store::open(data_dir.clone())?;
@@ -55,13 +54,8 @@ impl Bootstrap {
     }
 }
 
-/// At most this many helper threads inspect repositories at startup.
 const INSPECTION_THREADS: usize = 8;
 
-/// Every project's repository as `platform::inspect_repository` reads it, keyed by project.
-/// Each inspection runs several Git processes and the window waits for all of them, so they
-/// run on scoped helper threads while `alongside` runs on the calling thread, which then
-/// helps with what is left.
 fn inspect_repositories<T>(
     projects: &[Project],
     alongside: impl FnOnce() -> T,
@@ -79,7 +73,6 @@ fn inspect_repositories<T>(
         found
     };
     std::thread::scope(|scope| {
-        // A helper that cannot start leaves its share to the others and this thread.
         let helpers: Vec<_> = (0..projects.len().min(INSPECTION_THREADS))
             .filter_map(|_| {
                 std::thread::Builder::new()
@@ -129,7 +122,6 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        // More projects than helpers, so the queue is shared.
         let projects: Vec<_> = (0..INSPECTION_THREADS * 2 + 3)
             .map(|n| Project {
                 id: Uuid::from_u128(n as u128 + 1),

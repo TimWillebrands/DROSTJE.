@@ -1,17 +1,10 @@
-//! The busy mark of running tool calls and background jobs: the kit's loader icon turning,
-//! repainted at most `MAX_FPS` times a second instead of on every vsync, and phase-locked
-//! across copies so every spinner in a view repaints in the same frame. Reduced motion
-//! keeps it still.
-
 use gpui_kit::{
     component::{Icon, IconName, Sizable, Size},
     *,
 };
 use std::time::Duration;
 
-/// Repaints per second; a turning loader reads as smooth well below the display rate.
 pub(in crate::ui) const MAX_FPS: f32 = 30.;
-/// One full turn, as the kit's spinner takes.
 const TURN: Duration = Duration::from_millis(800);
 
 #[derive(IntoElement)]
@@ -82,7 +75,6 @@ mod tests {
         let first = renders.get();
         assert!(first > 0);
 
-        // No per-frame callback: the next vsync does not render the view again.
         let callbacks = cx
             .update_window(window.into(), |_, window, cx| {
                 window.simulate_next_frame(cx)
@@ -92,7 +84,6 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(renders.get(), first);
 
-        // A tick later the view repaints.
         cx.executor()
             .advance_clock(Duration::from_secs_f32(1. / MAX_FPS) + Duration::from_millis(1));
         cx.run_until_parked();

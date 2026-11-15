@@ -1,4 +1,3 @@
-//! Native conversation boundary. Provider wire objects stay in their harness module.
 pub mod attachments;
 mod claude;
 mod codex;
@@ -38,9 +37,6 @@ pub fn display_name(harness: &str) -> &str {
 
 use uuid::Uuid;
 
-/// Permission modes a harness accepts at launch, as `(value, label)`. Empty when the
-/// harness has none. Claude Code takes them as `--permission-mode`; Codex maps them to a
-/// sandbox, approval policy and approval reviewer; OpenCode to its session mode (agent).
 pub fn permission_modes(harness: &str) -> &'static [(&'static str, &'static str)] {
     match harness {
         "claude-code" => &[
@@ -61,9 +57,6 @@ pub fn permission_modes(harness: &str) -> &'static [(&'static str, &'static str)
     }
 }
 
-/// The permission mode that lets the harness review its own permission requests, which
-/// "Yes and switch to auto" selects. `None` when the harness has no such mode, so its
-/// permission requests do not offer the switch.
 pub fn auto_permission_mode(harness: &str) -> Option<&'static str> {
     match harness {
         "claude-code" | "codex" => Some("auto"),
@@ -75,53 +68,36 @@ pub fn auto_permission_mode(harness: &str) -> Option<&'static str> {
 pub struct ConversationConfig {
     pub harness: String,
     pub executable: PathBuf,
-    /// Relay credential environment keys that must never reach provider subprocesses.
     pub credential_env: Vec<String>,
     pub cwd: PathBuf,
     pub session_dir: PathBuf,
     pub session_ref: Option<String>,
     pub model: Option<ModelKey>,
-    /// Effort level from the model's catalog; `None` means the harness default.
     pub effort: Option<String>,
-    /// One of `permission_modes(harness)`; `None` means the harness default.
     pub permission_mode: Option<String>,
-    /// Optional live artifact/browser tools, scoped to this application's conversation.
     pub browser_tools: Option<drostje_browser_tools::BrowserToolConfig>,
-    /// Only an unsent draft may replace an explicitly file-less provider session.
     pub allow_empty_session: bool,
 }
 #[derive(Clone)]
 pub struct ConversationHandle {
     pub commands: async_channel::Sender<ConversationCommand>,
-    /// Native adapters close this channel only after their child owner is reaped.
-    /// Keep each actor's child field before its output sender in drop order.
-    /// Remote hosts use channel termination, not a queued Close, to release ownership.
     pub events: async_channel::Receiver<ConversationEvent>,
 }
-/// Context injected outside a user prompt, never user consent or editor content.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerMessage {
     pub id: Uuid,
-    /// Sender Thread for `Peer`; the artifact's browser session for `Artifact`.
     pub sender: Uuid,
-    /// Sender Thread title for `Peer`; the artifact title for `Artifact`.
     pub sender_name: String,
     pub space: Uuid,
-    /// Peer text, or an artifact's `{v,id,type,data}` channel event as JSON.
     pub body: String,
-    /// Absent in records written before artifact events existed.
     #[serde(default, skip_serializing_if = "ContextOrigin::is_peer")]
     pub origin: ContextOrigin,
 }
 
-/// Who produced injected context. One delivery carries a single origin, which decides
-/// its framing for the agent and its presentation in the transcript.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextOrigin {
-    /// Another agent's message from the Space network.
     #[default]
     Peer,
-    /// The user's interaction with an HTML artifact this Conversation showed.
     Artifact,
 }
 
@@ -135,7 +111,6 @@ impl ContextOrigin {
 pub struct PeerDelivery {
     pub attempt: Uuid,
     pub messages: Vec<PeerMessage>,
-    /// Closing the sender revokes admission; accepted context cannot be recalled.
     pub cancelled: async_channel::Receiver<()>,
 }
 
@@ -146,7 +121,6 @@ pub enum PeerDeliveryOutcome {
     Unknown(String),
 }
 
-/// Frame peer data without allowing its text to close the surrounding envelope.
 pub(crate) fn peer_context(messages: &[PeerMessage]) -> anyhow::Result<String> {
     struct ContextWriter(Vec<u8>);
     impl std::io::Write for ContextWriter {
@@ -225,12 +199,8 @@ pub enum ConversationCommand {
 pub enum UserAnswer {
     Value(String),
     Confirmed(bool),
-    /// Approve this permission, switch the session to `auto_permission_mode`, and approve
-    /// other permission requests that are already pending.
     PermissionAuto,
-    Cancelled {
-        timed_out: bool,
-    },
+    Cancelled { timed_out: bool },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationState {
@@ -254,10 +224,8 @@ pub struct ModelChoice {
     pub key: ModelKey,
     pub name: String,
     pub input: Vec<String>,
-    /// Effort levels the harness accepts for this model; empty when effort is not configurable.
     pub efforts: Vec<String>,
 }
-/// Tokens in the model's context window, as last reported by the harness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextUsage {
     pub used_tokens: u64,
@@ -268,12 +236,9 @@ pub enum LimitWindow {
     FiveHour,
     SevenDay,
 }
-/// Plan rate-limit utilisation for one window; only reported by harnesses whose
-/// login has plan limits.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageLimit {
     pub window: LimitWindow,
-    /// Percentage of the window used, 0–100.
     pub percent_used: f32,
     pub resets_at: Option<SystemTime>,
 }
@@ -284,12 +249,9 @@ pub enum ContentBlock {
     Image(ImageAttachment),
     ImageError(String),
     PeerMessage(PeerMessage),
-    /// An assistant's request to run a tool. Its outcome arrives separately: live
-    /// through `ToolActivity`, or in history as a message whose `tool_call_id` matches.
     ToolCall {
         id: String,
         name: String,
-        /// Short provider-supplied purpose line, shown as the card caption.
         intent: Option<String>,
         input: Value,
     },
@@ -300,7 +262,6 @@ pub struct Message {
     pub role: String,
     pub content: Vec<ContentBlock>,
     pub raw: Option<Value>,
-    /// Set on tool result messages; names the `ContentBlock::ToolCall` they answer.
     pub tool_call_id: Option<String>,
     pub error: bool,
     pub exit_code: Option<i64>,
@@ -321,10 +282,7 @@ pub struct ToolActivity {
 pub enum UserRequestKind {
     Confirm,
     Select,
-    /// A permission request from a harness with an `auto_permission_mode`. Kept distinct so
-    /// only permissions expose auto approval.
     Permission,
-    /// A single-choice question which also accepts a free-form answer.
     Question,
     Input,
     Editor,
@@ -347,7 +305,6 @@ pub struct UserRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ConversationEvent {
     Ready {
-        /// Whether this runtime supports native peer-origin context injection.
         peer_delivery: bool,
         session_ref: String,
         models: Vec<ModelChoice>,
@@ -379,14 +336,11 @@ pub enum ConversationEvent {
         attempt: Uuid,
         outcome: PeerDeliveryOutcome,
     },
-    /// An idle runtime admitted a turn caused by a peer message.
     PeerTurnStarted {
         request_id: Uuid,
     },
     ModelSelected(ModelKey),
-    /// The complete command list; replaces any earlier one.
     CommandsUpdated(Vec<SlashCommand>),
-    /// The harness could not list its commands. Prompts still send typed commands.
     CommandsUnavailable(String),
     TitleChanged(String),
     EditorTextRequested(String),
@@ -399,7 +353,6 @@ pub enum ConversationEvent {
         lines: Vec<String>,
     },
     ContextUsageUpdated(ContextUsage),
-    /// The complete set of known limit windows; empty when the login has no plan limits.
     LimitsUpdated(Vec<UsageLimit>),
     Notice {
         level: String,
@@ -432,9 +385,6 @@ pub async fn install_pi(data_dir: PathBuf) -> anyhow::Result<PathBuf> {
     pi::install(data_dir).await
 }
 
-/// Largest physical JSONL request for a supported harness, without loading or
-/// base64-encoding the owned image files. Codex receives image paths, not bytes, so its
-/// requests are never the largest.
 pub fn submission_size(
     request_id: Uuid,
     text: &str,
@@ -444,7 +394,6 @@ pub fn submission_size(
         .max(claude::submission_size(request_id, text, images)?)
         .max(opencode::submission_size(text, images)?))
 }
-/// Image preparation uses this before writing reviewed copies to disk.
 pub fn submission_size_for_lengths(
     request_id: Uuid,
     text: &str,
@@ -457,16 +406,10 @@ pub fn submission_size_for_lengths(
         .max(opencode::submission_size_for_lengths(text, images)?))
 }
 
-/// A bounded cache avoids rewriting the same image on every canonical message snapshot.
-/// It keeps only the stored attachment, never the image data: entries are keyed by MIME,
-/// encoded length and a 64-bit hash of the encoded data under a key drawn at random per
-/// cache, so two different images share an entry only by a 2^-64 accident nobody can aim
-/// for. Files outlive cache eviction because messages own references.
 #[derive(Default)]
 struct ImageCache {
     hasher: std::hash::RandomState,
     entries: std::collections::VecDeque<(ImageKey, ImageAttachment)>,
-    /// Encoded length of the cached images, bounding the cache as when it held the data.
     bytes: usize,
 }
 #[derive(PartialEq, Eq)]
@@ -476,7 +419,6 @@ struct ImageKey {
     hash: u64,
 }
 impl ImageCache {
-    /// Stores a provider's base64 image under `directory/native-images`.
     fn import(
         &mut self,
         mime: &str,

@@ -5,14 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Artifact kit gallery</title>
 
-<!-- ===== Standalone preview stub: debug only, not part of the kit ===================
-     Opened as file://…/gallery.html?preview there is no DROSTJE host to answer, so
-     this stands in for it: each channel message gets drostje.__receipt(id, "delivered")
-     after 400 ms. ?preview=failed|unknown picks another final receipt; ?preview=queued
-     sends "queued" first and "delivered" 2 s later; ?preview=silent sends none (the kit
-     resolves "unknown" after 15 s). It has to run before kit.js,
-     which captures console.warn when it starts. Inside DROSTJE the real kit.js has
-     already captured console.warn, so this wrapper never sees a message. -->
 <script>
 (() => {
   const params = new URLSearchParams(location.search);
@@ -42,10 +34,7 @@
   };
 })();
 </script>
-<!-- ===== End of preview stub ======================================================= -->
 
-<!-- DROSTJE injects the kit into every artifact itself; these two lines only make the
-     gallery work when opened on its own. kit.js does nothing when already injected. -->
 <link rel="stylesheet" href="kit.css">
 <script src="kit.js"></script>
 </head>

@@ -16,31 +16,20 @@ use serde_json::Value;
 use crate::app::{AppState, NoticeLevel};
 use color::{Oklch, hex};
 
-/// Themes shipped with DROSTJE.: Delft, the default, and Ink, a reading mode. The
-/// default of each mode is the fallback, and bundled themes are listed before registry
-/// themes. Kit's registry is not told about them: `ThemeRegistry::load_themes_from_str`
-/// entries are dropped on every directory reload, so bundled themes live here instead.
 const BUNDLED_THEMES: &str = include_str!("../../../assets/themes/drostje.json");
-/// Names the bundled defaults had before Delft; a saved choice of them means the default.
 const RENAMED_THEMES: [(&str, &str); 2] = [
     ("DROSTJE. Light", "Delft Light"),
     ("DROSTJE. Dark", "Delft Dark"),
 ];
-/// The faces bundled themes name, embedded so every platform renders the same type.
 fn bundled_fonts() -> Vec<Cow<'static, [u8]>> {
     crate::fonts::FACES
         .iter()
         .map(|face| Cow::Borrowed(face.bytes))
         .collect()
 }
-/// The brand face: the wordmark and the Welcome screen, in every theme.
 pub const DISPLAY_FONT: &str = "Dosis";
-/// Base UI size when a theme sets no `font.size`. Kit uses it as the window's
-/// rem, so it scales spacing and every `text_*` step along with the prose.
 const UI_FONT_SIZE: Pixels = px(15.);
 
-/// Terminal ANSI colors share the active theme's base palette; literal ANSI black/white
-/// stay ordered by luminance even in light mode, independently of default text colors.
 pub(super) fn terminal_theme(cx: &App) -> ghostty_terminal::TerminalTheme {
     use ghostty_terminal::{TerminalColor, TerminalTheme};
     let theme = Theme::global(cx);
@@ -82,14 +71,10 @@ pub(super) fn terminal_theme(cx: &App) -> ghostty_terminal::TerminalTheme {
     )
 }
 
-/// What bundled themes set beyond Kit's format, as `prose.*`, `signature` and `grain`
-/// keys beside Kit's own. Other themes get the defaults.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Extensions {
     prose: Prose,
-    /// The wordmark's full stop and the running-turn mark; the accent when unset.
     signature: Option<Hsla>,
-    /// Grain strength over window chrome, 0 to 1; none when unset.
     grain: Option<f32>,
 }
 
@@ -115,12 +100,10 @@ impl Extensions {
     }
 }
 
-/// How a theme sets agent prose in the transcript; unset fields use the UI font.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prose {
     pub family: Option<SharedString>,
     pub size: Option<Pixels>,
-    /// Line height as a multiple of the size.
     pub line_height: Option<f32>,
 }
 
@@ -151,7 +134,6 @@ struct Bundled {
     extensions: Extensions,
 }
 
-/// Bundled themes in file order; each mode has exactly one default.
 fn parse_bundled() -> Vec<Bundled> {
     let set: ThemeSet =
         serde_json::from_str(BUNDLED_THEMES).expect("assets/themes/drostje.json is valid Kit JSON");
@@ -179,7 +161,6 @@ fn parse_bundled() -> Vec<Bundled> {
     bundled
 }
 
-/// A saved theme name under its current name.
 pub fn saved_theme_name(name: &str) -> &str {
     RENAMED_THEMES
         .iter()
@@ -187,7 +168,6 @@ pub fn saved_theme_name(name: &str) -> &str {
         .map_or(name, |(_, new)| new)
 }
 
-/// Whether the app follows the system's light or dark mode or fixes one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Appearance {
     #[default]
@@ -199,7 +179,6 @@ pub enum Appearance {
 impl Appearance {
     pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
 
-    /// The `theme_mode` setting value.
     pub fn setting(self) -> &'static str {
         match self {
             Self::System => "system",
@@ -233,14 +212,9 @@ impl Appearance {
     }
 }
 
-/// Where the user's adjustments to every theme are saved.
 pub const ADJUSTMENTS_SETTING: &str = "theme_adjustments";
-/// The most colorful accent offered; sRGB accents beyond it are mostly out of gamut.
 pub const MAX_CHROMA: f32 = 0.25;
-/// Below this chroma a theme's primary is grey and has no hue to keep.
 const NEUTRAL_CHROMA: f32 = 0.02;
-/// Colors that carry a theme's accent. Adjusting the accent re-hues each one at its own
-/// lightness, so the theme's contrast with the text on them is kept.
 const ACCENT_COLORS: [&str; 14] = [
     "primary.background",
     "primary.hover.background",
@@ -258,12 +232,9 @@ const ACCENT_COLORS: [&str; 14] = [
     "table.active.border",
 ];
 
-/// An accent in OKLCH hue and chroma; each theme supplies the lightness.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Accent {
-    /// Degrees, 0 up to 360.
     pub hue: f32,
-    /// 0 (grey) to [`MAX_CHROMA`].
     pub chroma: f32,
 }
 
@@ -276,16 +247,13 @@ impl Accent {
     }
 }
 
-/// The user's changes over every theme. Unset fields keep the theme's own value.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Adjustments {
     pub accent: Option<Accent>,
-    /// Grain strength, 0 to 1.
     pub grain: Option<f32>,
 }
 
 impl Adjustments {
-    /// Malformed fields are ignored, so a hand-edited value cannot block startup.
     pub(crate) fn from_setting(value: Option<&Value>) -> Self {
         let number = |value: &Value, key: &str| value.get(key).and_then(Value::as_f64);
         let Some(value) = value else {
@@ -314,7 +282,6 @@ impl Adjustments {
     }
 }
 
-/// Appearance and adjustments as the theme editor previews them before saving.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ThemeDraft {
     pub appearance: Appearance,
@@ -354,8 +321,6 @@ impl Preferences {
     }
 }
 
-/// `config` with its accent colors re-hued to `accent`. A theme without a primary color
-/// gets one at a lightness that suits its mode.
 fn with_accent(config: &ThemeConfig, accent: Accent) -> ThemeConfig {
     let mut value = serde_json::to_value(config).expect("Kit theme fields are JSON-compatible");
     let colors = value["colors"]
@@ -388,7 +353,6 @@ fn with_accent(config: &ThemeConfig, accent: Accent) -> ThemeConfig {
         } else if original.c > NEUTRAL_CHROMA || key.contains("primary") {
             accent.chroma
         } else {
-            // A grey ring or caret beside a grey primary stays grey.
             original.c
         };
         let tinted = Oklch {
@@ -401,7 +365,6 @@ fn with_accent(config: &ThemeConfig, accent: Accent) -> ThemeConfig {
     serde_json::from_value(value).expect("a re-hued Kit theme is still a Kit theme")
 }
 
-/// The primary color of `config` in OKLCH, or a neutral stand-in when it has none.
 fn primary_of(config: &ThemeConfig) -> Oklch {
     config
         .colors
@@ -421,22 +384,17 @@ struct AppliedTheme {
     light_config: Rc<ThemeConfig>,
     dark_config: Rc<ThemeConfig>,
     adjustments: Adjustments,
-    /// The unadjusted primary of the theme in effect, which accents take lightness from.
     reference: Oklch,
-    // Kit's ThemeConfig has no PartialEq. Compare its JSON data only when
-    // resolving a changed configuration, never on a render or routine state update.
     light: Value,
     dark: Value,
 }
 
 struct Coordinator {
     preferences: Preferences,
-    /// The theme editor's unsaved choices, shown in place of the saved ones.
     preview: Option<ThemeDraft>,
     bundled: Vec<Bundled>,
     native_appearance: Option<Appearance>,
     applied: Option<AppliedTheme>,
-    /// Extensions of the theme in effect for the current mode.
     extensions: Extensions,
     fonts_error: Option<String>,
     warnings: Vec<String>,
@@ -456,7 +414,6 @@ impl Coordinator {
         }
     }
 
-    /// The default bundled theme of `mode`.
     fn bundled(&self, mode: ThemeMode) -> &Rc<ThemeConfig> {
         &self
             .bundled
@@ -466,7 +423,6 @@ impl Coordinator {
             .config
     }
 
-    /// The saved preferences with the editor's preview, if one is open, over them.
     fn effective(&self) -> Preferences {
         let mut preferences = self.preferences.clone();
         if let Some(draft) = self.preview {
@@ -485,8 +441,6 @@ impl Coordinator {
     }
 }
 
-/// A bundled theme wins over a registry theme of the same name so a stray
-/// file cannot replace the defaults; other registry themes are found by name.
 fn find_theme<'a>(name: &str, cx: &'a App) -> Option<&'a Rc<ThemeConfig>> {
     let name = saved_theme_name(name);
     cx.global::<Coordinator>()
@@ -506,14 +460,11 @@ struct InitialLoad {
 
 impl Global for InitialLoad {}
 
-/// Initialize after Kit, before constructing a window or starting its editor.
-/// Without a bootstrap (the recovery window), use System and registry defaults.
 pub fn initialize(
     settings: Option<&BTreeMap<String, Value>>,
     data_dir: Option<&Path>,
     cx: &mut App,
 ) {
-    // Register once per app; a second initialization reuses the faces.
     let fonts_error = match cx.try_global::<Coordinator>() {
         Some(coordinator) => coordinator.fonts_error.clone(),
         None => cx
@@ -534,27 +485,22 @@ pub fn initialize(
     });
     apply(None, cx);
 
-    if let Some(data_dir) = data_dir {
-        // Kit loads top-level ThemeSet JSON files and owns duplicate-name
-        // precedence. Its callback marks the initial load attempt, NOT watcher
-        // readiness: asynchronous watcher/parse errors are logged inside Kit.
-        if let Err(error) = ThemeRegistry::watch_dir(data_dir.join("themes"), cx, |cx| {
+    if let Some(data_dir) = data_dir
+        && let Err(error) = ThemeRegistry::watch_dir(data_dir.join("themes"), cx, |cx| {
             cx.global_mut::<InitialLoad>().finished = true;
-        }) {
-            let load = cx.global_mut::<InitialLoad>();
-            load.finished = true;
-            load.error = Some(format!("Could not load the themes directory: {error:#}"));
-        }
+        })
+    {
+        let load = cx.global_mut::<InitialLoad>();
+        load.finished = true;
+        load.error = Some(format!("Could not load the themes directory: {error:#}"));
     }
 }
 
-/// Whether the initial registry load attempt finished; not watcher readiness.
 pub fn initial_load_finished(cx: &App) -> bool {
     cx.try_global::<InitialLoad>()
         .is_none_or(|load| load.finished)
 }
 
-/// Bundled themes first, then registry themes in Kit's order, without repeats.
 pub fn theme_names(mode: ThemeMode, cx: &App) -> Vec<String> {
     let bundled: Vec<_> = cx
         .global::<Coordinator>()
@@ -572,15 +518,12 @@ pub fn theme_names(mode: ThemeMode, cx: &App) -> Vec<String> {
     bundled.into_iter().chain(registry).collect()
 }
 
-/// Agent prose in the theme in effect; empty fields fall back to the UI font.
 pub fn prose(cx: &App) -> Prose {
     cx.try_global::<Coordinator>()
         .map(|coordinator| coordinator.extensions.prose.clone())
         .unwrap_or_default()
 }
 
-/// The theme in effect as artifact kit tokens: one `:root` rule that artifact pages read
-/// through `var(--dk-*)`, so inline artifacts follow the app's colours, type and mode.
 pub fn artifact_tokens(cx: &App) -> String {
     let theme = Theme::global(cx);
     let color = |color: Hsla| hex(Rgba::from(color));
@@ -593,7 +536,6 @@ pub fn artifact_tokens(cx: &App) -> String {
         }
     };
     let prose = prose(cx);
-    // Headings use the theme's prose face, else the bundled book serif.
     let serif_family = prose
         .family
         .as_ref()
@@ -624,7 +566,6 @@ pub fn artifact_tokens(cx: &App) -> String {
         ),
         ("--dk-size", format!("{}px", f32::from(theme.font_size))),
     ];
-    // Bundled faces reach artifact pages through the engine; system fonts stay system.
     let mut css = crate::fonts::artifact_font_faces(&[
         theme.font_family.as_ref(),
         theme.mono_font_family.as_ref(),
@@ -645,15 +586,12 @@ pub fn artifact_tokens(cx: &App) -> String {
     css
 }
 
-/// The full stop's color in the theme in effect.
 pub fn signature(cx: &App) -> Hsla {
     cx.try_global::<Coordinator>()
         .and_then(|coordinator| coordinator.extensions.signature)
         .unwrap_or_else(|| Theme::global(cx).primary)
 }
 
-/// Diff row colours in the theme in effect, from its success and danger roles. Washes stay
-/// faint so code keeps the foreground colour; the sign carries full strength.
 pub struct DiffColors {
     pub added: Hsla,
     pub added_sign: Hsla,
@@ -676,7 +614,6 @@ pub fn diff_colors(cx: &App) -> DiffColors {
     }
 }
 
-/// Grain strength over window chrome in the theme in effect, 0 to 1.
 pub fn grain(cx: &App) -> f32 {
     cx.try_global::<Coordinator>().map_or(0., |coordinator| {
         coordinator
@@ -688,14 +625,12 @@ pub fn grain(cx: &App) -> f32 {
     })
 }
 
-/// The grain the theme in effect sets itself, before the user's adjustment.
 pub fn theme_grain(cx: &App) -> f32 {
     cx.try_global::<Coordinator>()
         .and_then(|coordinator| coordinator.extensions.grain)
         .unwrap_or(0.)
 }
 
-/// The saved appearance and adjustments, or the editor's preview while one is open.
 pub fn draft(cx: &App) -> ThemeDraft {
     cx.try_global::<Coordinator>()
         .map(|coordinator| {
@@ -708,7 +643,6 @@ pub fn draft(cx: &App) -> ThemeDraft {
         .unwrap_or_default()
 }
 
-/// The name of the theme in effect, as its unadjusted file names it.
 pub fn active_name(cx: &App) -> SharedString {
     cx.try_global::<Coordinator>()
         .and_then(|coordinator| coordinator.applied.as_ref())
@@ -722,13 +656,11 @@ pub fn active_name(cx: &App) -> SharedString {
         .unwrap_or_else(|| Theme::global(cx).theme_name().clone())
 }
 
-/// The accent the theme in effect has before any adjustment.
 pub fn theme_accent(cx: &App) -> Accent {
     let reference = reference(cx);
     Accent::new(reference.h, reference.c)
 }
 
-/// How `accent` looks as the primary color of the theme in effect.
 pub fn accent_color(accent: Accent, cx: &App) -> Hsla {
     Oklch {
         l: reference(cx).l,
@@ -748,13 +680,11 @@ fn reference(cx: &App) -> Oklch {
         )
 }
 
-/// Show `draft` in place of the saved choices until [`end_preview`].
 pub fn preview(draft: ThemeDraft, state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     cx.global_mut::<Coordinator>().preview = Some(draft);
     update(state, window, cx);
 }
 
-/// Return to the saved choices, including any the editor saved just before.
 pub fn end_preview(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     let preferences = Preferences::from_settings(&state.read(cx).snapshot.settings);
     let coordinator = cx.global_mut::<Coordinator>();
@@ -763,8 +693,6 @@ pub fn end_preview(state: &Entity<AppState>, window: &mut Window, cx: &mut App) 
     update(state, window, cx);
 }
 
-/// Validate new choices while allowing an unavailable saved choice to survive
-/// an unrelated Settings save. Resolution keeps that name and uses a fallback.
 pub fn validate_preferences(
     mode: &str,
     light: Option<&str>,
@@ -839,8 +767,6 @@ fn resolve(
 fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
     let preferences = cx.global::<Coordinator>().effective();
     if cx.global::<Coordinator>().native_appearance != Some(preferences.appearance) {
-        // Record before calling the platform: resulting appearance notifications
-        // must not set the native override a second time.
         cx.global_mut::<Coordinator>().native_appearance = Some(preferences.appearance);
         cx.set_window_appearance(preferences.appearance.native());
     }
@@ -909,7 +835,6 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
             || previous.light != applied.light
             || previous.dark != applied.dark
     });
-    // Grain is drawn by views, not Kit's palette, so it needs its own refresh.
     let grain_changed =
         previous.is_some_and(|previous| previous.adjustments.grain != adjustments.grain);
     let extensions =
@@ -919,9 +844,6 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
     coordinator.applied = Some(applied);
     coordinator.extensions = extensions;
     if changed {
-        // Kit only replaces optional typography/radius/highlight fields when
-        // present. Reset those fields to Kit defaults so switching away from a
-        // custom theme does not leak its styling into another theme.
         let defaults = Theme::default();
         let theme = Theme::global_mut(cx);
         theme.font_family = defaults.font_family;
@@ -938,8 +860,6 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
         };
         theme.light_theme = light_theme;
         theme.dark_theme = dark_theme;
-        // change applies the effective config and syncs all direct mutations to
-        // Base; a separate sync_base would duplicate that projection.
         Theme::change(mode, window, cx);
         cx.refresh_windows();
     } else if grain_changed {
@@ -967,8 +887,6 @@ fn update(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     }
 }
 
-/// Keep these subscriptions with the workspace, not in rendering. In
-/// particular, routine AppState notifications must not reapply the palette.
 pub fn attach(state: Entity<AppState>, window: &mut Window, cx: &mut App) -> Vec<Subscription> {
     if !cx.has_global::<Coordinator>() {
         let state = state.read(cx);
@@ -1027,8 +945,6 @@ pub fn attach_recovery(window: &mut Window, cx: &mut App) -> Subscription {
 
 #[cfg(test)]
 mod tests {
-    // Not `use super::*`: the Kit facade exports a `test` macro that would
-    // shadow `#[test]`.
     use super::{
         Accent, Adjustments, DISPLAY_FONT, Prose, bundled_fonts, parse_bundled, saved_theme_name,
         with_accent,
@@ -1181,9 +1097,6 @@ mod tests {
             );
         }
         for theme in &bundled {
-            // Kit 0.6.1 drops the flattened `editor.*` / status colors of a
-            // highlight block while parsing (its own default does too), so
-            // only the syntax table is asserted here.
             let highlight = theme
                 .config
                 .highlight
@@ -1202,7 +1115,6 @@ mod tests {
         assert_eq!(saved_theme_name("Runtime dark"), "Runtime dark");
     }
 
-    /// The test platform's text system is a stub, so this asks the real one.
     #[test]
     #[ignore = "creates the macOS platform, which panics off the main thread where libtest runs tests; needs a harness = false runner"]
     fn every_family_a_bundled_theme_names_is_embedded() {
@@ -1233,7 +1145,6 @@ mod tests {
             face.style = style;
             text_system.font_id(&face).unwrap()
         };
-        // Bold and italic text uses real faces, not the regular one.
         for family in ["IBM Plex Sans", "Lilex", "Libron"] {
             let face = |weight, style| face(family, weight, style);
             let regular = face(FontWeight::NORMAL, FontStyle::Normal);
@@ -1248,7 +1159,6 @@ mod tests {
                 "{family} italic"
             );
         }
-        // Dosis has no Regular: normal text is set in Medium, and bold stays bold.
         let normal = face("Dosis", FontWeight::NORMAL, FontStyle::Normal);
         assert_eq!(normal, face("Dosis", FontWeight::MEDIUM, FontStyle::Normal));
         assert_ne!(normal, face("Dosis", FontWeight::BOLD, FontStyle::Normal));

@@ -1,4 +1,3 @@
-//! Projects rows, thread tabs, worktree Conversations, rename and archive.
 use super::*;
 
 #[gpui_kit::test]
@@ -134,7 +133,6 @@ async fn new_thread_tab_draws_its_title(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     })
     .unwrap();
-    // A panel docked without its presentation handle falls back to the layout name "Thread".
     let selector: &'static str = Box::leak(format!("thread-tab-{id}").into_boxed_str());
     let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
     assert!(
@@ -149,7 +147,6 @@ async fn new_thread_tab_draws_its_title(cx: &mut TestAppContext) {
 async fn visible_thread_opens_its_conversation_without_selection(cx: &mut TestAppContext) {
     let fixture = open_fixture(cx, None).await;
     let id = new_conversation(cx, &fixture).await;
-    // A restored tab that is on screen while a terminal or nothing holds the selection.
     fixture.state.update(cx, |state, cx| {
         let project = state.selected_project.unwrap();
         state.select_terminal_project(project);
@@ -570,7 +567,6 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
         Some(worktree.branch.as_str())
     );
 
-    // Explicit creation still shares the selected Conversation's checkout, even when blank.
     cx.dispatch_action(fixture.window.into(), commands::NewOmpConversation);
     cx.run_until_parked();
     let sibling = cx.read(|cx| {
@@ -584,7 +580,6 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
     assert_ne!(sibling.id, thread.id);
     assert_eq!(sibling.worktree_id, Some(worktree.id));
 
-    // The composer workspace menu can leave an inherited worktree without moving its session.
     cx.update_window(fixture.window.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click("composer-workspace-picker", cx);
@@ -632,7 +627,6 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
         );
         selected.id
     });
-    // The same palette command can return to an existing worktree.
     cx.dispatch_action(fixture.window.into(), commands::NewConversationInWorkspace);
     cx.run_until_parked();
     cx.update_window(fixture.window.into(), |_, window, cx| {
@@ -699,7 +693,6 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
             .is_some_and(|dialog| !dialog.read(cx).hosted())
     }));
 
-    // Switching to a new branch from HEAD settles the title rename and updates the label.
     cx.dispatch_action(fixture.window.into(), commands::SwitchBranch);
     cx.run_until_parked();
     set_dialog(
@@ -758,7 +751,6 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
         Some("feature-x")
     );
 
-    // Archiving the last live thread removes a clean, merged worktree and its branch.
     for id in [sibling.id, thread.id, shared] {
         fixture.state.update(cx, |state, cx| {
             state.select_thread(id);
@@ -785,7 +777,6 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
     quit(cx, &fixture).await;
 }
 
-/// The thread each tab group displays, read from the dock's own layout dump.
 fn displayed_threads(layout: &serde_json::Value) -> Vec<String> {
     let mut displayed = Vec::new();
     let mut stack = vec![layout];
@@ -828,7 +819,6 @@ async fn projects_selection_displays_the_threads_tab(cx: &mut TestAppContext) {
     };
     assert_eq!(displayed(cx), vec![threads[2].to_string()]);
 
-    // The first tab sits behind the other two; a click on its Projects row shows it.
     update_workspace(
         cx,
         fixture.window,
@@ -852,7 +842,6 @@ async fn projects_selection_displays_the_threads_tab(cx: &mut TestAppContext) {
         "selecting from Projects keeps keyboard focus in the list"
     );
 
-    // A selection made by other means is shown too, from Projects again.
     cx.simulate_keystrokes(fixture.window.into(), "ctrl-tab");
     cx.run_until_parked();
     assert_eq!(displayed(cx), vec![threads[1].to_string()]);

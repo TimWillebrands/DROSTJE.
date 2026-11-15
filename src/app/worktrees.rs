@@ -1,20 +1,12 @@
-//! Worktree lifecycle owned by the App layer: creation requests from the dialog, the one-time
-//! branch rename after the first generated title, and removal (automatic when clean and
-//! merged, explicit otherwise). Git runs off-thread through `platform`; results come back as
-//! `AppEvent`s tagged with the request or worktree identity and stale ones are dropped.
-
 use super::*;
 use crate::worktrees::{self as naming, Removal};
 
-/// Which checkout a Conversation's processes and Changes read: the project root or one of
-/// its linked worktrees. `Copy` so it can ride in `PresentationChange`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WorkingTree {
     Project(ProjectId),
     Worktree(WorktreeId),
 }
 
-/// The single worktree operation in flight; the dialog that started it observes the status.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeRequest {
     pub id: Uuid,
@@ -37,7 +29,6 @@ pub enum WorktreeRequestKind {
         branch: String,
         create: bool,
     },
-    /// Stage everything in the working tree and commit it.
     Commit {
         tree: WorkingTree,
     },
@@ -47,13 +38,10 @@ pub enum WorktreeRequestKind {
 pub enum WorktreeRequestStatus {
     Pending,
     Failed(String),
-    /// Removal stopped at uncommitted changes; the same request with `force` discards them.
     Refused(String),
-    /// Finished; a creation carries the Conversation it opened.
     Done(Option<ThreadId>),
 }
 
-/// Why a removal did not happen; only a dirty tree can be overridden.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RemovalFailure {
     Dirty(String),
@@ -69,8 +57,6 @@ impl AppState {
         thread.worktree_id.and_then(|id| self.worktree(id))
     }
 
-    /// The checkout a thread's processes run in. A removed worktree still resolves to its
-    /// old directory so reads fail honestly instead of silently falling back to the root.
     pub fn working_tree_of(&self, thread: &Thread) -> Option<(WorkingTree, PathBuf)> {
         if thread.remote.is_some() {
             return None;
@@ -100,7 +86,6 @@ impl AppState {
         self.sync_network();
     }
 
-    /// A live thread is one that can still start work: neither it nor its project is archived.
     pub fn worktree_has_live_threads(&self, id: WorktreeId) -> bool {
         self.snapshot.threads.iter().any(|thread| {
             thread.worktree_id == Some(id)
@@ -113,7 +98,6 @@ impl AppState {
         })
     }
 
-    /// The branch to show for a worktree: Git's live HEAD when read, else the recorded one.
     pub fn worktree_branch_label(&self, worktree: &Worktree) -> String {
         match self.worktree_heads.get(&worktree.id) {
             Some(Some(branch)) => branch.clone(),
@@ -122,7 +106,6 @@ impl AppState {
         }
     }
 
-    /// Stores a HEAD observed by a Git read so labels follow switches made anywhere.
     pub(super) fn record_head(&mut self, tree: WorkingTree, head: Option<String>) {
         match tree {
             WorkingTree::Worktree(id) => {
@@ -202,9 +185,6 @@ impl AppState {
         None
     }
 
-    /// Checks out `branch` (created from HEAD when `create`) in the selected Conversation's
-    /// working tree. Git refuses dirty trees and branches checked out elsewhere; the dialog
-    /// shows that refusal.
     pub fn switch_branch(&mut self, branch: &str, create: bool) -> Result<Uuid> {
         if let Some(reason) = self.switch_branch_reason() {
             anyhow::bail!(reason);
@@ -257,7 +237,6 @@ impl AppState {
                         if let Some(mut worktree) = worktree
                             && self.storage_error.is_none()
                         {
-                            // A chosen branch ends the one-time rename from the title.
                             worktree.branch = branch.clone();
                             worktree.named = true;
                             self.save_worktree(worktree);
@@ -327,8 +306,6 @@ impl AppState {
         }
     }
 
-    /// Starts a worktree of `project_id` from local branch `base` and, once Git has created
-    /// it, a Conversation inside it. Nothing is persisted until the directory exists.
     pub fn create_worktree_conversation(
         &mut self,
         project_id: ProjectId,
@@ -452,8 +429,6 @@ impl AppState {
                 };
                 match (blocked, project) {
                     (Some(reason), project) => {
-                        // The row was never written: take the directory back so nothing is
-                        // left that the app does not know about.
                         if let Some(project) = project {
                             let root = project.root;
                             let path = worktree.path.clone();
@@ -505,8 +480,6 @@ impl AppState {
         cx.emit(PresentationChange::Selection);
     }
 
-    /// The one rename a worktree gets: from its codename branch to the generated title, only
-    /// while the creating Conversation's title is the first automatic one.
     pub(super) fn rename_worktree_branch(&mut self, thread_id: ThreadId, title: &str) {
         let Some(worktree) = self
             .snapshot
@@ -539,7 +512,6 @@ impl AppState {
             return;
         };
         let Some(candidate) = candidate else {
-            // Nothing usable in the title: the codename branch is the name.
             self.renaming_worktrees.remove(&worktree.id);
             let mut settled = worktree;
             settled.named = true;
@@ -600,7 +572,6 @@ impl AppState {
         }
     }
 
-    /// Re-reads one project's branches and state, for after a branch rename or removal.
     pub(super) fn refresh_repository(&self, id: ProjectId) {
         let Some(root) = self
             .snapshot
@@ -622,15 +593,10 @@ impl AppState {
         .detach();
     }
 
-    /// Archives a thread; when it was the last live thread of a worktree, that worktree is
-    /// inspected for automatic removal. Archiving says the thread no longer matters: its tab
-    /// closes without the thread being selected first (a neighbouring tab takes over only when
-    /// it was the selected one), and it leaves Projects unless archived threads are shown.
     pub fn archive_thread(&mut self, id: ThreadId) -> Result<()> {
         self.archive_thread_because(id, None)
     }
 
-    /// `archive_thread`, with the `cause` the notice names when DROSTJE. archived on its own.
     pub(super) fn archive_thread_because(
         &mut self,
         id: ThreadId,
@@ -639,7 +605,6 @@ impl AppState {
         if let Some(reason) = self.archive_thread_reason_for(id) {
             anyhow::bail!(reason);
         }
-        // Closing first commits the draft the tab held.
         self.close_thread(id);
         let mut thread = self
             .snapshot
@@ -652,7 +617,6 @@ impl AppState {
         thread.updated_at = platform::now();
         let worktree = thread.worktree_id;
         let title = thread.title.clone();
-        // An untouched thread was never more than a placeholder; it leaves silently.
         let untouched = self.is_untouched(&thread);
         self.save_thread(thread);
         if !untouched && !self.show_archived {
@@ -670,8 +634,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Every live worktree without live threads is a removal candidate; at startup this
-    /// finishes what a previous session left behind.
     pub(super) fn reconcile_worktrees(&mut self) {
         let live: Vec<_> = self
             .snapshot
@@ -739,7 +701,6 @@ impl AppState {
         let Some(worktree) = self.worktree(id).filter(|w| w.is_live()).cloned() else {
             return;
         };
-        // A thread may have been created on it while Git was reading.
         if self.worktree_has_live_threads(id) || self.worktree_request_pending() {
             return;
         }
@@ -797,8 +758,6 @@ impl AppState {
         None
     }
 
-    /// Removes a worktree directory on request. Its Conversations' harness sessions are
-    /// closed first; they stay in history and can no longer resume.
     pub fn remove_worktree(&mut self, id: WorktreeId, force: bool) -> Result<Uuid> {
         if let Some(reason) = self.remove_worktree_reason_for(id) {
             anyhow::bail!(reason);
@@ -828,9 +787,6 @@ impl AppState {
         Ok(request)
     }
 
-    /// Removes the directory (or prunes a registration whose directory is already gone) and
-    /// deletes the branch only when it is merged into the base. `Ok(true)` means the branch
-    /// went too.
     fn remove_worktree_files(&mut self, request: Option<Uuid>, worktree: Worktree, force: bool) {
         let Some(root) = self
             .snapshot

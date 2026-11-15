@@ -1,5 +1,3 @@
-//! Opt-in real Store/editor/native-runtime QA. The runner must OS-deny IP egress.
-//! Native acceptance is not a successful provider response or proof of reading.
 use super::*;
 use crate::{
     harness::ConversationState,
@@ -309,7 +307,6 @@ async fn space_network_automatic_delivery_preserves_private_input(cx: &mut TestA
     )
     .await;
 
-    // Reconnect is a new runtime capability: saved membership is not runtime consent.
     let old = cx.read(|cx| fixture.state.read(cx).conversations[&second].generation);
     fixture
         .state
@@ -396,7 +393,6 @@ async fn space_network_automatic_delivery_preserves_private_input(cx: &mut TestA
     );
     quit(cx, &fixture).await;
 
-    // An actual pre-automatic saved membership must not inherit new paid-turn consent.
     let saved = fixture.store.snapshot().await.unwrap();
     let saved_thread = saved
         .threads

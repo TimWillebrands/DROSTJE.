@@ -1,11 +1,3 @@
-//! The `todo` tool's list, read back from the result text OMP prints so the
-//! transcript can show a checklist instead of a wall of monospace lines.
-//!
-//! OMP prints the list after its `Overall:` and `Active phase` lines as
-//! two-space `Phase:` headers with four-space `- [X] task (marker)` rows, where
-//! the marker is `in progress`, `dropped` or `blocked: reason`. Anything that
-//! does not fit this shape parses to `None` and stays raw text; DROSTJE. never
-//! invents a task state.
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,12 +21,10 @@ pub struct TodoPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TodoList {
     pub phases: Vec<TodoPhase>,
-    /// OMP's own tally line, such as `3/7 done, 3 open, 1 blocked`.
     pub overall: Option<String>,
     pub active_phase: Option<String>,
 }
 impl TodoPhase {
-    /// Completed tasks over tasks still counting; dropped tasks count for neither.
     pub fn progress(&self) -> (usize, usize) {
         let mut done = 0;
         let mut total = 0;
@@ -133,7 +123,6 @@ fn parse_task(checked: bool, content: &str) -> TodoTask {
     }
 }
 
-/// One line saying what a `todo` call changed, from its arguments alone.
 pub fn describe_change(input: &Value) -> Option<String> {
     let field = |key: &str| input[key].as_str().filter(|value| !value.is_empty());
     let subject = || field("task").or_else(|| field("phase"));
@@ -237,10 +226,8 @@ mod tests {
     fn anything_else_stays_raw() {
         assert_eq!(TodoList::parse("Unknown task: Ship it"), None);
         assert_eq!(TodoList::parse(""), None);
-        // Headers without rows and rows without a header never invent a phase.
         assert_eq!(TodoList::parse("  Orphans:\n"), None);
         assert_eq!(TodoList::parse("    - [ ] Homeless task\n"), None);
-        // The remaining-items lines are not phase headers.
         assert_eq!(
             TodoList::parse("Remaining items (1):\n  - Task [pending] (Phase)\n"),
             None

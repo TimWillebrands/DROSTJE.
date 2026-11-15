@@ -1,5 +1,3 @@
-//! The UI touches retained memory only. Servo and all rendering handles live on
-//! a dedicated worker thread; commands and evaluation results are bounded.
 use std::{
     collections::{HashMap, VecDeque},
     ffi::OsStr,
@@ -27,12 +25,6 @@ pub type BrowserId = uuid::Uuid;
 
 static CONTENT_PROCESSES: AtomicBool = AtomicBool::new(false);
 
-/// Must run first in `main`, before any other startup work. Servo re-executes
-/// `current_exe` as `--content-process <token>` to host a site's script and
-/// layout; such a process is served here and `true` means the caller must exit.
-/// Otherwise engines started by this process run pages in content processes, so
-/// a page that crashes its process shows Servo's crash page instead of taking
-/// DROSTJE down. Binaries that never call this (libtest) keep pages in-process.
 pub fn serve_content_process() -> bool {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() != Some(OsStr::new("--content-process")) {
@@ -46,8 +38,6 @@ pub fn serve_content_process() -> bool {
     true
 }
 
-/// Whether the engine accepts this DOM `KeyboardEvent.key` and `.code` (empty means
-/// unidentified) in a [`BrowserCommand::Key`]; the error names the rejected value.
 pub fn check_dom_key(key: &str, code: &str) -> Result<(), String> {
     engine::parse_dom_key(key, code).map(drop)
 }
@@ -60,10 +50,8 @@ pub struct BrowserSnapshot {
     pub error: Option<String>,
     pub can_go_back: bool,
     pub can_go_forward: bool,
-    /// Natural document height in CSS pixels, measured only for opted-in artifacts.
     pub content_height: Option<f32>,
     pub document_revision: u64,
-    /// Physical surface dimensions; inspect exposes CSS dimensions.
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub scale: f32,
@@ -83,18 +71,13 @@ pub struct BrowserFrame {
 struct Session {
     wire_id: BrowserId,
     content_sizing: bool,
-    /// A pane shows the page. Hidden pages publish frames only for captures.
     visible: bool,
-    /// Theme tokens for an artifact surface. Only artifacts get the kit and a channel;
-    /// fixed when the surface opens, because the engine injects it at WebView creation.
     artifact: Option<String>,
-    /// Channel events not yet taken by the presentation owner.
     channel: VecDeque<ChannelEvent>,
     snapshot: BrowserSnapshot,
     diagnostics: Diagnostics,
 }
 
-/// Unread channel events per artifact; the pane drains them every frame.
 const MAX_CHANNEL_BACKLOG: usize = 64;
 
 struct Evaluation {
@@ -156,8 +139,6 @@ impl BrowserRuntime {
         self.open_surface(id, url, None);
     }
 
-    /// Open an artifact surface: the engine injects the artifact kit with these theme
-    /// tokens and accepts `drostje.send` channel events from its file documents.
     pub fn open_artifact(&self, id: BrowserId, url: String, theme: String) {
         self.open_surface(id, url, Some(theme));
     }
@@ -234,8 +215,6 @@ impl BrowserRuntime {
                 }
                 return;
             }
-            // Completed responses remain until consumed. Reject rather than silently
-            // evict a result a caller is still waiting for.
             if memory.evaluations.len() >= MAX_PENDING {
                 if let Some(session) = memory.sessions.get_mut(&id) {
                     session.snapshot.error = Some("Too many pending JavaScript results; consume previous results before evaluating again".into());
@@ -309,8 +288,6 @@ impl BrowserRuntime {
         shared.wake();
     }
 
-    /// Enqueue one indivisible input batch. Completion acknowledges delivery to
-    /// Servo, not page-script handling, navigation completion or rendering.
     pub fn dispatch(&self, id: BrowserId, commands: Vec<BrowserCommand>) -> Result<String, String> {
         self.dispatch_batch(id, commands, None)
     }
@@ -386,7 +363,6 @@ impl BrowserRuntime {
         Ok(request_id)
     }
 
-    /// Asynchronous JavaScript evaluation with explicit admission failure.
     pub fn evaluate(&self, id: BrowserId, script: String) -> Result<String, String> {
         self.request(id, |id, request_id| Request::Command {
             id,
@@ -394,9 +370,6 @@ impl BrowserRuntime {
         })
     }
 
-    /// Whether a pane shows this page. The engine publishes frames of hidden pages only
-    /// for [`Self::capture`]; they keep compositing at a low rate so their animations
-    /// and `requestAnimationFrame` callbacks keep running. Pages open visible.
     pub fn set_visible(&self, id: BrowserId, visible: bool) {
         let shared = &self.0.0;
         let mut memory = shared.memory.lock();
@@ -408,25 +381,18 @@ impl BrowserRuntime {
         }
         session.visible = visible;
         drop(memory);
-        // Becoming visible publishes pending content without waiting for an idle tick.
         shared.wake();
     }
 
-    /// The visibility last reported through [`Self::set_visible`].
     pub fn is_visible(&self, id: BrowserId) -> Option<bool> {
         let memory = self.0.0.memory.lock();
         memory.sessions.get(&id).map(|session| session.visible)
     }
 
-    /// Ask for a frame of the page's current content, shown or not. The returned
-    /// request completes, through [`Self::evaluation`], once the snapshot holds a frame
-    /// painted after this call, or the page's latest frame if nothing changed since.
     pub fn capture(&self, id: BrowserId) -> Result<String, String> {
         self.request(id, |id, request_id| Request::Capture { id, request_id })
     }
 
-    /// Queue one request whose result arrives through [`Self::evaluation`], or say why
-    /// it cannot be admitted.
     fn request(
         &self,
         id: BrowserId,
@@ -490,7 +456,6 @@ impl BrowserRuntime {
         }))
     }
 
-    /// Channel events an artifact sent since the last call, oldest first.
     pub fn take_channel(&self, id: BrowserId) -> Vec<ChannelEvent> {
         let mut memory = self.0.0.memory.lock();
         memory
@@ -500,7 +465,6 @@ impl BrowserRuntime {
             .unwrap_or_default()
     }
 
-    /// Tell an artifact page what happened to one of its events.
     pub fn receipt(
         &self,
         id: BrowserId,
@@ -541,8 +505,6 @@ impl BrowserRuntime {
             memory
                 .queue
                 .retain(|request| request.id() != session.wire_id);
-            // The worker reconciles live identities before each bounded batch.
-            // No Close message can be dropped or grow beyond the input bound.
         }
         for evaluation in memory
             .evaluations
@@ -589,9 +551,6 @@ impl BrowserRuntime {
         shared.wake();
     }
 
-    /// Waits for the worker to finish Servo's cooperative shutdown after
-    /// `shutdown`; exiting the process during that teardown crashes in Servo's
-    /// threads. Returns `false` when the timeout elapsed first.
     pub fn wait_for_shutdown(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
@@ -701,7 +660,6 @@ fn apply_event(memory: &mut Memory, event: Event, bytes: Vec<u8>) -> io::Result<
                 snapshot.url = url;
                 snapshot.title = title;
                 snapshot.loading = loading;
-                // Local queue/input failures survive unrelated title/frame updates.
                 if error.is_some() {
                     snapshot.error = error;
                 }
@@ -1152,7 +1110,6 @@ mod tests {
     #[test]
     fn closing_cancels_queued_open_and_evaluations_without_a_lifecycle_backlog() {
         let runtime = BrowserRuntime::new();
-        // Hold startup so this test observes the queue before the worker consumes it.
         runtime.0.0.memory.lock().started = true;
         for _ in 0..MAX_PENDING * 2 {
             let id = BrowserId::new_v4();

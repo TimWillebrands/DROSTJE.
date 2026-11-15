@@ -1,6 +1,5 @@
 [workspace]
 members = ["crates/*"]
-# Plain `cargo check` / `cargo test` at the root cover every crate, not only the app.
 default-members = [".", "crates/*"]
 resolver = "3"
 
@@ -8,7 +7,6 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 
-# One version per external crate across the workspace; member crates opt in with `.workspace = true`.
 [workspace.dependencies]
 anyhow = "1"
 async-channel = "2"
@@ -27,13 +25,11 @@ thiserror = "2"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde", "v5"] }
-# Servo and the crates whose types its embedding API exposes; only drostje-browser uses them.
 servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "multiprocess", "webcrypto", "webgpu"] }
 content-security-policy = { version = "=0.9.0", default-features = false }
 dpi = "0.1"
 euclid = "0.22"
 stylo_static_prefs = "=0.22.0"
-# macOS only; members list them under `[target.'cfg(target_os = "macos")'.dependencies]`.
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
@@ -60,7 +56,6 @@ version.workspace = true
 edition.workspace = true
 default-run = "drostje"
 
-# The root package is the GPUI desktop app; the headless host is `drostje-remote`'s `drostje-host`.
 [features]
 runtime-qa = ["gpui-kit/test-support", "ghostty-terminal/runtime-qa"]
 
@@ -72,7 +67,6 @@ path = "src/main.rs"
 drostje-diff.workspace = true
 drostje-file-refs.workspace = true
 drostje-model.workspace = true
-# `desktop` sets the AppKit application icon on macOS.
 drostje-platform = { workspace = true, features = ["desktop"] }
 drostje-titles.workspace = true
 drostje-tracker.workspace = true
@@ -83,10 +77,8 @@ drostje-factory.workspace = true
 drostje-neovim.workspace = true
 drostje-fonts.workspace = true
 drostje-browser.workspace = true
-# `browser` gives harnesses the embedded-browser tool.
 drostje-browser-tools = { workspace = true, features = ["browser"] }
 drostje-harness.workspace = true
-# `browser` matches drostje-browser-tools' feature above.
 drostje-remote = { workspace = true, features = ["browser"] }
 gpui-kit = "=0.6.6"
 rusqlite.workspace = true
@@ -99,8 +91,6 @@ smol.workspace = true
 image.workspace = true
 ghostty-terminal = { version = "0.1.0", path = "crates/ghostty-terminal" }
 url.workspace = true
-# Tungstenite TRACE logs include raw handshake headers; compile them out even in debug builds.
-# This caps the log facade globally, not tracing's application spans.
 log.workspace = true
 
 [dev-dependencies]
@@ -126,7 +116,6 @@ name = "servo_workspace"
 harness = false
 required-features = ["runtime-qa"]
 
-# Owns `main` because Servo re-executes the test binary as its content processes.
 [[test]]
 name = "servo_content_process"
 harness = false
@@ -137,40 +126,16 @@ name = "native_terminal_input"
 harness = false
 required-features = ["runtime-qa"]
 
-# Keep GPUI pinned while sharing Servo's FreeType ABI. The vendored crate changes
-# only its FreeType dependency requirements; both upstream licenses are retained.
 [patch.crates-io]
 zed-font-kit = { path = "vendor/zed-font-kit" }
-# GPUI's log/serde features expose another From<_> for fmt::Error. Constrain the
-# generated CSS result type instead of relying on a unique conversion.
 stylo_derive = { path = "vendor/stylo_derive" }
-# WebGPU fixes, each marked "DROSTJE patch"; the MPL-2.0 notices are retained.
-# `web_exposed_limits` clamps raw driver binding counts (524288 samplers on
-# Vulkan, from which PixiJS sizes its batch shader) to WebGPU's defaults.
-# `WebGpuExternalImages::lock` never hands WebRender fewer bytes than a
-# descriptor it may still upload with, which panicked when a canvas shrank.
-# Destroyed canvases keep their external image id, so a frame built before the
-# image deletion locks as `Invalid` instead of panicking the painter. Messages
-# for a gone device are ignored, and per-document threads (below) start via
-# `start_webgpu_thread_for_document`.
 servo-webgpu = { path = "vendor/servo-webgpu" }
-# Upstream shares one WebGPU thread per site, so a navigated-away document's
-# GPU devices live until script collects them, which it never does; after about
-# ten, device creation fails and panics the shared thread. The vendored copy runs
-# one WebGPU thread per document and exits it with the pipeline (search
-# "DROSTJE patch"); the MPL-2.0 notice is retained. Pages run in content
-# processes: one that exits while its pages are open is reported as a crash of
-# those pages (upstream only reaps it), and on Linux children re-execute
-# /proc/self/exe so an update installed while DROSTJE runs cannot break them.
 servo-constellation = { path = "vendor/servo-constellation" }
 
-# Servo's generated DOM bindings make debug symbols disproportionately large.
 [profile.dev]
 debug = 0
 incremental = false
 
-# WebGPU compiles every page shader through naga on Servo's WebGPU thread while
-# script waits synchronously; unoptimized, a shader-heavy page stalls for minutes.
 [profile.dev.package.naga]
 opt-level = 3
 

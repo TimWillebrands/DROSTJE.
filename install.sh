@@ -1,10 +1,5 @@
 #!/bin/bash
 
-# DROSTJE. Installer
-# Builds a release binary and installs it for the current desktop:
-#   macOS  → an unsigned "DROSTJE.app" bundle in /Applications (or INSTALL_DIR)
-#   Linux  → binary, desktop entry and icons under the ~/.local prefix (or INSTALL_DIR)
-
 set -e
 
 APP_NAME="DROSTJE."
@@ -14,14 +9,11 @@ ICON_SRC="assets/drostje-app-icon.png"
 
 echo "--- Installing $APP_NAME ---"
 
-# 1. Check requirements
 if ! command -v cargo >/dev/null 2>&1; then
     echo "Error: cargo is not installed. Please install Rust and Cargo first." >&2
     exit 1
 fi
 
-# Servo's resources and engine are linked into the application. Do not silently
-# install native prerequisites when a build cannot find them.
 for tool in cmake pkg-config python3 make curl; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "Error: Servo requires $tool. Install the native build prerequisites, then rerun ./install.sh." >&2
@@ -35,7 +27,6 @@ if [ "$(uname -s)" = Darwin ]; then
     fi
 fi
 
-# 2. Get version from Cargo.toml
 VERSION=$(grep '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 if [ -z "$VERSION" ]; then
     VERSION="0.1.0"
@@ -54,7 +45,6 @@ if ! cargo build --release --locked; then
     exit 1
 fi
 
-# Run a command directly when the target is writable, otherwise through sudo.
 as_owner() {
     if [ "$NEED_SUDO" = 1 ]; then
         sudo "$@"
@@ -65,24 +55,19 @@ as_owner() {
 
 install_macos() {
     INSTALL_DIR="${INSTALL_DIR:-/Applications}"
-    # The bundle folder is "DROSTJE.app": brand plus extension, so Finder never shows "DROSTJE..app".
     BUNDLE_NAME="DROSTJE.app"
     LEGACY_BUNDLE_NAME="Drostje.app"
 
-    # 4. Create App Bundle
     echo "Step 2: Creating macOS app bundle..."
     DIST_DIR="dist"
     APP_BUNDLE="$DIST_DIR/$BUNDLE_NAME"
 
-    # Clean previous builds
     rm -rf "$DIST_DIR"
     mkdir -p "$APP_BUNDLE/Contents/MacOS"
     mkdir -p "$APP_BUNDLE/Contents/Resources"
 
-    # Copy binary
     cp "$BUILD_DIR/$BINARY_NAME" "$APP_BUNDLE/Contents/MacOS/"
 
-    # Create Info.plist
     cat <<PLIST > "$APP_BUNDLE/Contents/Info.plist"
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -112,9 +97,6 @@ install_macos() {
 </plist>
 PLIST
 
-    # Build the .icns icon set. Finder, Launchpad and Spotlight only read .icns declared
-    # via CFBundleIconFile; a bare PNG in Resources is ignored (the Dock icon comes from
-    # the binary itself at runtime, which is why it showed even without this).
     if [ -f "$ICON_SRC" ]; then
         echo "Adding app icon..."
         ICONSET="$DIST_DIR/AppIcon.iconset"
@@ -128,7 +110,6 @@ PLIST
         rm -rf "$ICONSET"
     fi
 
-    # 5. Install
     echo "Step 3: Installing to $INSTALL_DIR..."
     NEED_SUDO=0
     if [ ! -w "$INSTALL_DIR" ]; then
@@ -136,12 +117,9 @@ PLIST
         NEED_SUDO=1
     fi
 
-    # Replace any previous install (including the pre-rename "Drostje.app") instead of
-    # merging into it, so stale files and a duplicate Launchpad entry do not linger.
     as_owner rm -rf "$INSTALL_DIR/$BUNDLE_NAME" "$INSTALL_DIR/$LEGACY_BUNDLE_NAME"
     as_owner cp -R "$APP_BUNDLE" "$INSTALL_DIR/"
 
-    # Finder caches bundle icons; bump the mtime so it re-reads Info.plist and the .icns.
     as_owner touch "$INSTALL_DIR/$BUNDLE_NAME"
 
     echo "--- Installation Complete! ---"
@@ -150,8 +128,6 @@ PLIST
 }
 
 install_linux() {
-    # INSTALL_DIR is a prefix here: bin/ for the binary, share/ for the desktop entry and
-    # icons. ~/.local needs no privileges and is on the default XDG_DATA_DIRS search path.
     INSTALL_DIR="${INSTALL_DIR:-$HOME/.local}"
     BIN_DIR="$INSTALL_DIR/bin"
     SHARE_DIR="$INSTALL_DIR/share"
@@ -168,8 +144,6 @@ install_linux() {
 
     as_owner install -m 755 "$BUILD_DIR/$BINARY_NAME" "$BIN_DIR/$BINARY_NAME"
 
-    # Icons go into the hicolor theme, which every icon theme inherits from. ImageMagick
-    # renders the standard sizes; without it the launcher scales the source image itself.
     if [ -f "$ICON_SRC" ]; then
         echo "Adding app icon..."
         if command -v magick >/dev/null 2>&1; then
@@ -187,8 +161,6 @@ install_linux() {
         fi
     fi
 
-    # The desktop entry is named after the window's app id ("drostje") so the desktop
-    # pairs running windows with this entry and its icon.
     echo "Adding desktop entry..."
     cat <<DESKTOP | as_owner tee "$APPLICATIONS_DIR/$BINARY_NAME.desktop" >/dev/null
 [Desktop Entry]
@@ -204,7 +176,6 @@ StartupWMClass=$BINARY_NAME
 DESKTOP
     as_owner chmod 644 "$APPLICATIONS_DIR/$BINARY_NAME.desktop"
 
-    # Cache refreshes are best effort: launchers rescan on their own eventually.
     if command -v update-desktop-database >/dev/null 2>&1; then
         as_owner update-desktop-database -q "$APPLICATIONS_DIR" || true
     fi

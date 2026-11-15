@@ -1,5 +1,3 @@
-//! Claude Code protocol-1 inbox transport. This is deliberately separate from stdin:
-//! native inbound policy and the CLI's safe-boundary queue remain authoritative.
 use super::*;
 use std::{
     mem,
@@ -15,9 +13,7 @@ mod status;
 const REGISTRY_LIMIT: u64 = 65_536;
 const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 const RECORD_LIMIT: usize = 128;
-/// How often an unavailable inbox is looked for again.
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
-/// How often a live inbox is checked for having gone away; sending discovers it anew anyway.
 const READY_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) struct Update {
@@ -111,8 +107,6 @@ impl Inbox {
             .any(|record| record.held && !record.accepted && !record.terminal)
     }
 
-    /// A socket write is in flight or a status connection is open: neither wakes the
-    /// adapter loop, so it must keep ticking.
     pub fn busy(&self) -> bool {
         self.records.values().any(|record| {
             record
@@ -181,8 +175,6 @@ impl Inbox {
         }
         let body = super::super::peer_context(&delivery.messages)?;
         let path = self.discover()?;
-        // Bind the real, owned return address before connecting or writing any delivery.
-        // No sender-authored permission mode or own-child identity is asserted.
         let from = self.status_address(&path)?.to_owned();
         let name = match delivery.messages.first().map(|message| message.origin) {
             Some(ContextOrigin::Artifact) => "DROSTJE artifact",
@@ -200,7 +192,6 @@ impl Inbox {
         bytes.push(b'\n');
         ensure!(bytes.len() <= FRAME, "Claude peer frame exceeds 1 MiB");
         let stream = connect(&path)?;
-        // Admission can be revoked while discovery/connect runs; no bytes have been written.
         ensure!(
             !delivery.cancelled.is_closed() && delivery.cancelled.is_empty(),
             "Peer delivery was cancelled before dispatch"
@@ -302,7 +293,6 @@ impl Inbox {
         updates
     }
 
-    /// Native stdout or a credential-verified status receipt can confirm admission.
     pub fn observe(&mut self, frame: &Value) -> (Vec<Update>, Vec<(Uuid, Vec<PeerMessage>)>) {
         let mut updates = Vec::new();
         let mut messages = Vec::new();
@@ -323,7 +313,6 @@ impl Inbox {
             let Some(record) = self.records.get_mut(&id) else {
                 continue;
             };
-            // Unwritten attempts cannot have native evidence from this transport.
             if !record.written || record.terminal {
                 continue;
             }
@@ -348,8 +337,6 @@ impl Inbox {
                 record.settled = true;
             }
             if status.is_some() || accepted {
-                // Keep the sender alive until native code has parsed the frame and captured
-                // kernel credentials. Closing immediately after write loses macOS peer PID.
                 record.write = None;
             }
             if accepted && !record.accepted {
@@ -591,7 +578,6 @@ fn connect(path: &Path) -> Result<UnixStream> {
 }
 
 fn connected(stream: &UnixStream) -> Result<bool> {
-    // A zero-timeout readiness check, never a blocking wait in the conversation actor.
     let Some(readiness) = drostje_platform::poll_writable(stream.as_fd())? else {
         return Ok(false);
     };

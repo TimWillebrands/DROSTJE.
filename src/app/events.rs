@@ -1,21 +1,15 @@
 use super::*;
 
-/// Events arrive on one bounded channel; backend integrations can extend this owner
-/// without putting process work or provider state into panel render functions.
 pub enum AppEvent {
     WriteFinished(Result<(), String>),
     RepositoryChecked(ProjectId, Result<platform::RepositoryInfo, String>),
     ProjectResolved(SpaceId, Result<platform::RepositoryInfo, String>),
     Diagnostics(BTreeMap<String, String>),
     TitleModels(Uuid, crate::titles::InstalledModels),
-    /// Whether Pi is already installed, for the Install Pi request with this identity.
     PiChecked(Uuid, Option<PathBuf>),
     PiInstalled(Result<PathBuf, String>),
     StorageFailed(String),
-    InteractiveActivity {
-        thread_id: ThreadId,
-        active: bool,
-    },
+    InteractiveActivity { thread_id: ThreadId, active: bool },
     FactorySnapshot(Box<crate::factory::FactorySnapshot>),
     HarnessOpened(ThreadId, Uuid, Result<ConversationHandle, String>),
     Harness(ThreadId, Uuid, ConversationEvent),
@@ -24,12 +18,9 @@ pub enum AppEvent {
     WorktreeCreated(Uuid, Result<Box<Worktree>, String>),
     WorktreeRenamed(WorktreeId, Result<String, String>),
     WorktreeInspected(WorktreeId, Result<platform::WorktreeStatus, String>),
-    /// `Ok(true)` when the branch was deleted along with the directory.
     WorktreeRemoved(Option<Uuid>, WorktreeId, Result<bool, RemovalFailure>),
-    /// The live HEAD of a worktree; `Ok(None)` is detached.
     WorktreeHeadRead(WorktreeId, Result<Option<String>, String>),
     BranchSwitched(Uuid, WorkingTree, Result<String, String>),
-    /// A commit finished; `Ok` carries the new commit's short hash and subject.
     Committed(Uuid, WorkingTree, Result<(String, String), String>),
 }
 
@@ -167,7 +158,6 @@ impl AppState {
                     self.active_threads.insert(thread_id);
                 } else {
                     self.active_threads.remove(&thread_id);
-                    // A pull request that closed during the turn archives now.
                     if self.settle_closed_pull_requests() {
                         cx.emit(PresentationChange::Projects);
                         cx.notify();

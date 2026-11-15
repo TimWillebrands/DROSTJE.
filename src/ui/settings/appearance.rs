@@ -1,4 +1,3 @@
-//! Appearance settings: theme mode, the light and dark theme choices, and the theme folder.
 use super::{DialogKind, SurfaceContent, fields::Choice};
 use crate::app::AppState;
 use crate::ui::theme;
@@ -12,8 +11,6 @@ use gpui_kit::{
 };
 
 impl SurfaceContent {
-    /// Rereads the theme names after a registry change and rebuilds the theme choices,
-    /// keeping the draft selection.
     pub(super) fn refresh_theme_choices(&mut self, window: &mut Window, cx: &mut App) {
         if !matches!(self.kind, DialogKind::Settings(_)) {
             return;
@@ -67,8 +64,6 @@ impl SurfaceContent {
     }
 }
 
-/// The theme names each mode offers. They change only with the theme registry, so Settings
-/// reads them when it opens and on each registry change, never while rendering a field.
 #[derive(Default)]
 pub(super) struct ThemeNames {
     light: Vec<String>,
@@ -91,7 +86,6 @@ impl ThemeNames {
     }
 }
 
-/// Whether a saved theme is missing from its mode's themes; blank means the registry default.
 pub(super) fn missing_theme(names: &[String], selected: &str) -> bool {
     !selected.is_empty() && !names.iter().any(|name| name == selected)
 }
@@ -133,7 +127,6 @@ mod tests {
         assert!(missing_theme(&names, "Gone"));
         assert_eq!(theme_choices(&names, "Dune").len(), 3);
         assert!(!missing_theme(&names, "Dune"));
-        // Blank is the registry default, never a missing theme.
         assert_eq!(theme_choices(&names, "").len(), 3);
         assert!(!missing_theme(&names, ""));
         assert!(missing_theme(&[], "Dune"));

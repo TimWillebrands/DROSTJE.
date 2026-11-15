@@ -18,8 +18,6 @@ pub(crate) struct SpaceSession {
     pub layout: Option<Value>,
 }
 
-/// One settings write owns membership and every workspace projection. Provider
-/// sessions and drafts deliberately remain outside this navigation-only state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Spaces {
@@ -234,8 +232,6 @@ impl Spaces {
 
     pub fn recovery(snapshot: &WorkspaceSnapshot) -> Self {
         let mut spaces = Self::migrate(snapshot);
-        // Once metadata exists, legacy selection/layout must never replace it,
-        // even in the explicitly read-only recovery workspace.
         spaces
             .sessions
             .insert(DEFAULT_SPACE, SpaceSession::default());
@@ -512,8 +508,6 @@ impl Spaces {
             if session.selected_project == Some(project) {
                 session.selected_project = None;
             }
-            // Dock JSON belongs to the UI; rebuild the source layout after its
-            // project panels leave. An existing destination layout stays valid.
             session.layout = None;
         }
         Ok(())
@@ -637,7 +631,6 @@ impl AppState {
         self.space_state.threads.get(&id).copied()
     }
 
-    /// Borrow an inactive Space's presentation without activating its editors or layout.
     pub(crate) fn space_session(&self, space: SpaceId) -> Option<&SpaceSession> {
         self.space_state.sessions.get(&space)
     }

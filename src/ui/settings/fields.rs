@@ -1,5 +1,3 @@
-//! Shared form controls: choices, select and text fields, field errors, and the field
-//! content every dialog and Settings group renders.
 use super::{DialogKind, Field, SurfaceContent, appearance::missing_theme};
 use crate::ui::theme;
 use crate::{harness, titles};
@@ -80,7 +78,6 @@ pub(super) fn field_error(key: &'static str, message: impl Into<String>) -> anyh
     .into()
 }
 
-/// The controls a form is built from, in display order.
 #[derive(Default)]
 pub(super) struct Controls {
     pub(super) fields: Vec<Field>,

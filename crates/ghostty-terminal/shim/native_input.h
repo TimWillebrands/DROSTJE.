@@ -3,11 +3,6 @@
 
 #include <stdint.h>
 
-// EntityInputHandler delivers already composed UTF-8, not a clipboard paste.
-// An unidentified physical key prevents inventing a layout/key replay while
-// Ghostty's normal keyboard encoder delivers the committed text unchanged.
-// ghostty_surface_text is deliberately not used: it adds bracketed-paste
-// framing, which changes normal-mode commands (notably ':') into pasted text.
 static inline void gpui_ghostty_commit_text(
     ghostty_surface_t surface, const char *text, uintptr_t length
 ) {

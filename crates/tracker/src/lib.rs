@@ -1,24 +1,14 @@
-//! Issue tracker seam: the pull request a worktree branch belongs to, its state and linked
-//! work items, and its review threads. Only `azdo.rs` knows the `azdo` CLI's argv and JSON;
-//! a GitHub tracker would sit beside it behind the same functions. Every call blocks on a
-//! child process, so callers run it off the GPUI thread.
-//!
-//! Without the tracker's CLI none of this exists: the App layer reports it as a setup issue
-//! and shows no pull request state rather than a guess.
-
 pub mod azdo;
 
 use drostje_model::{PullRequestLink, PullRequestState};
 use std::path::{Path, PathBuf};
 
-/// Which tracker hosts a repository, recognised from its `origin` URL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Tracker {
     AzureDevOps,
 }
 
 impl Tracker {
-    /// The tracker behind `remote`, or `None` when DROSTJE. has no integration for its host.
     pub fn recognize(remote: &str) -> Option<Self> {
         let remote = remote.trim().to_ascii_lowercase();
         let host = remote
@@ -35,7 +25,6 @@ impl Tracker {
         .then_some(Self::AzureDevOps)
     }
 
-    /// The CLI DROSTJE. drives for this tracker; the Settings executable override uses it.
     pub fn executable(self) -> &'static str {
         match self {
             Self::AzureDevOps => "azdo",
@@ -82,39 +71,28 @@ impl Tracker {
     }
 }
 
-/// A resolved tracker CLI for one repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackerTool {
     pub tracker: Tracker,
     pub executable: PathBuf,
 }
 
-/// One pull request with a given source branch, as listed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullRequestSummary {
     pub id: u64,
     pub title: String,
     pub url: String,
     pub state: PullRequestState,
-    /// RFC 3339 UTC creation time as reported.
     pub created: String,
 }
 
-/// Whether a branch's pull requests identify exactly one to pin, and if not, why.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PinDecision {
     Pin(PullRequestSummary),
-    /// No pull request was opened from the branch since the worktree was created.
     NoneYet,
-    /// Several candidates; picking one would be a guess.
     Ambiguous(usize),
 }
 
-/// Pins the single active pull request opened from the branch since `since` (the worktree's
-/// creation). With none active, a single closed one created since then is pinned too, so a
-/// pull request completed while DROSTJE. was closed still ends its Conversation. Pull
-/// requests older than the worktree belong to an earlier use of the branch name and never
-/// count.
 pub fn pin_decision(pull_requests: &[PullRequestSummary], since: &str) -> PinDecision {
     let candidates: Vec<_> = pull_requests
         .iter()
@@ -133,17 +111,14 @@ pub fn pin_decision(pull_requests: &[PullRequestSummary], since: &str) -> PinDec
     }
 }
 
-/// Compares RFC 3339 UTC timestamps to the second; both sides use the `Z` form.
 fn not_before(time: &str, since: &str) -> bool {
     let seconds = |t: &str| t.get(..19).map(str::to_owned);
     match (seconds(time), seconds(since)) {
         (Some(time), Some(since)) => time >= since,
-        // An unreadable timestamp cannot prove the pull request is new.
         _ => false,
     }
 }
 
-/// A review thread's resolution as reported; unrecognised values are kept raw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReviewStatus {
     Active,
@@ -156,7 +131,6 @@ pub enum ReviewStatus {
 }
 
 impl ReviewStatus {
-    /// Still asks something of the author.
     pub fn open(&self) -> bool {
         match self {
             Self::Active | Self::Pending => true,
@@ -177,18 +151,14 @@ impl ReviewStatus {
     }
 }
 
-/// A pull request review thread with its human-written comments, oldest first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewThread {
     pub id: u64,
     pub status: ReviewStatus,
-    /// Repository path the thread is anchored to; `None` for general discussion.
     pub file: Option<String>,
     pub line: Option<u64>,
-    /// Later pushes moved the anchored code.
     pub outdated: bool,
     pub comments: Vec<ReviewComment>,
-    /// Comments the tracker counts, including any not returned as previews.
     pub total_comments: u64,
 }
 
@@ -197,7 +167,6 @@ pub struct ReviewComment {
     pub id: u64,
     pub author: String,
     pub body: String,
-    /// The tracker returned a preview; the full body is on the pull request page.
     pub truncated: bool,
     pub published: String,
 }
@@ -205,17 +174,13 @@ pub struct ReviewComment {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReviewThreads {
     pub threads: Vec<ReviewThread>,
-    /// More threads exist than one request returns.
     pub truncated: bool,
 }
 
-/// How a tracker call failed, in the terms the user acts on.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TrackerError {
-    /// The CLI could not be started.
     #[error("{0}")]
     Unavailable(String),
-    /// The CLI is not signed in or the token was refused.
     #[error("{0}")]
     Auth(String),
     #[error("{0}")]
@@ -273,9 +238,7 @@ mod tests {
             pin_decision(&[old.clone(), closed.clone(), active.clone()], since),
             PinDecision::Pin(active.clone())
         );
-        // A pull request from an earlier use of the branch name never counts.
         assert_eq!(pin_decision(&[old], since), PinDecision::NoneYet);
-        // One closed while DROSTJE. was not watching still pins, so it can archive.
         assert_eq!(
             pin_decision(std::slice::from_ref(&closed), since),
             PinDecision::Pin(closed.clone())

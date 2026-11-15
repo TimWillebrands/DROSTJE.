@@ -17,14 +17,11 @@ pub(super) struct BrowserRecord {
     space: SpaceId,
     thread: Option<ThreadId>,
     artifact: Option<String>,
-    /// Where the artifact shows now. Invariant: at most one `Composer` per thread.
     #[serde(default)]
     placement: ArtifactPlacement,
-    /// The agent completed the artifact; it restores collapsed.
     #[serde(default)]
     answered: bool,
 }
-/// Session lifetime is independent of virtualised transcript rows and dock attachments.
 pub(in crate::ui) struct Browsers {
     pub runtime: BrowserRuntime,
     pub panes: BTreeMap<BrowserId, Entity<BrowserPane>>,
@@ -33,7 +30,6 @@ pub(in crate::ui) struct Browsers {
     pub active: Option<BrowserId>,
     pub focused: Option<BrowserId>,
     observed: std::collections::HashSet<BrowserId>,
-    /// Theme tokens artifacts were last given; unchanged themes are not pushed again.
     artifact_theme: String,
 }
 impl Drop for Browsers {
@@ -143,8 +139,6 @@ impl Browsers {
         }
     }
 }
-/// The placement changes that show `id` at `placement` while `thread` keeps at most one
-/// docked artifact: docking `id` moves any other docked artifact into the transcript.
 fn placement_moves<'a>(
     records: impl Iterator<Item = &'a BrowserRecord>,
     thread: ThreadId,
@@ -166,7 +160,6 @@ fn placement_moves<'a>(
         .collect()
 }
 
-/// Restored layouts keep the one-dock-per-thread invariant; only Conversation artifacts dock.
 fn single_dock(records: &mut [BrowserRecord]) {
     let mut docked = std::collections::HashSet::new();
     for record in records {
@@ -186,7 +179,6 @@ pub(super) fn browser_of(state: &PanelState) -> Option<BrowserId> {
     }
 }
 impl Workspace {
-    /// Runtime QA observes the actual virtualized transcript cache, not a detached pane.
     #[cfg(feature = "runtime-qa")]
     pub fn artifact_transcript_scroll_extent(&self, thread: ThreadId, cx: &App) -> f32 {
         self.threads
@@ -215,8 +207,6 @@ impl Workspace {
                     let _ = workspace;
                 },
             ));
-            // Only artifacts a Conversation showed have a channel, and only to that
-            // Conversation. Ordinary pages never reach an agent this way.
             self._subscriptions.push(cx.subscribe(
                 pane,
                 move |workspace, _, channel: &super::super::browser::BrowserChannel, cx| {
@@ -246,7 +236,6 @@ impl Workspace {
                 pane,
                 move |_, _, _: &super::super::browser::BrowserLayout, cx| {
                     let owner = cx.entity().downgrade();
-                    // Browser refresh and canvas layout must not borrow the list during layout.
                     cx.defer(move |cx| {
                         let _ = owner.update(cx, |workspace, cx| {
                             if let Some(thread) =
@@ -323,7 +312,6 @@ impl Workspace {
             .and_then(|record| self.browsers.panes.get(&record.id))
             .cloned()
     }
-    /// The artifact a Conversation's tool call showed, with where it shows now.
     pub(in crate::ui) fn artifact_browser(
         &self,
         thread: ThreadId,
@@ -336,7 +324,6 @@ impl Workspace {
             .filter(|record| record.thread == Some(thread) && record.artifact.is_some())?;
         Some((self.browsers.panes.get(&id)?.clone(), record.placement))
     }
-    /// The artifact docked above a Conversation's composer, if any.
     pub(in crate::ui) fn docked_artifact(&self, thread: ThreadId) -> Option<Entity<BrowserPane>> {
         self.browsers
             .records
@@ -349,8 +336,6 @@ impl Workspace {
             .and_then(|record| self.browsers.panes.get(&record.id))
             .cloned()
     }
-    /// Show an artifact in its transcript row or docked above the composer. Docking moves
-    /// the previously docked artifact into the transcript; nothing is closed or reloaded.
     pub(super) fn place_artifact(
         &mut self,
         thread: ThreadId,
@@ -376,9 +361,6 @@ impl Workspace {
         self.state
             .update(cx, |_, cx| cx.emit(PresentationChange::Thread(thread)));
     }
-    /// The agent has what it needed from this artifact: it collapses to its header, marked
-    /// answered, and a docked one moves into the transcript so the prompt area is free.
-    /// Focus inside it returns to the composer, never to a hidden page.
     pub(super) fn complete_artifact(
         &mut self,
         id: BrowserId,
@@ -400,7 +382,6 @@ impl Workspace {
         };
         let focused = pane.read(cx).contains_focused(window, cx);
         pane.update(cx, |pane, cx| pane.complete(cx));
-        // The collapsed header is visible wherever the pane lands; the hidden page is not.
         if focused {
             pane.update(cx, |pane, cx| pane.focus(window, cx));
         }
@@ -660,7 +641,6 @@ impl Workspace {
         }
     }
     pub(super) fn start_browser_tools(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Receipts tell each artifact page what happened to its events.
         let receipts = self.state.read(cx).artifact_receipts();
         cx.spawn(async move |workspace, cx| {
             while let Ok(batch) = receipts.recv().await {
@@ -680,7 +660,6 @@ impl Workspace {
             }
         })
         .detach();
-        // Artifacts follow the theme in effect, including documents already shown.
         self._subscriptions
             .push(
                 cx.observe_global::<gpui_kit::component::Theme>(|workspace, cx| {
@@ -779,7 +758,6 @@ impl Workspace {
                 }
                 Err(_) => Err("Artifact path is not an absolute file path".into()),
             },
-            // The remote client writes a local copy and submits it as ShowArtifact.
             BrowserToolOperation::ShowRemoteArtifact { .. } => {
                 Err("Remote artifacts are shown through their remote host connection".into())
             }

@@ -1,4 +1,3 @@
-//! Space-local membership and delivery inspection. Rendering never delivers or acknowledges mail.
 pub(super) mod agents;
 
 use super::{
@@ -300,7 +299,6 @@ impl NetworkPanel {
         self.focus(window, cx);
         cx.notify();
     }
-    /// Follow the current turn's coordination activity without moving keyboard focus.
     pub(super) fn follow_thread_activity(&mut self, cx: &mut Context<Self>) {
         self.view = View::Thread;
         self.revision = None;

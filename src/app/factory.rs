@@ -113,8 +113,6 @@ impl AppState {
     }
 }
 
-/// Store a freshly read page; false when it equals the one shown, so an unchanged tail
-/// is neither replaced nor announced again.
 fn store_text_page(
     shown: &mut Option<Result<Arc<factory::TextPage>, String>>,
     page: Result<factory::TextPage, String>,

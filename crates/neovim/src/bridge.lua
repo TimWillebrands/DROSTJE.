@@ -36,8 +36,6 @@ vim.keymap.set('c', '<F23>', function()
   return ''
 end, { expr = true, silent = true, nowait = true })
 
--- RPC requests are deliberately uncached. The host services these on GPUI's
--- thread while its MessagePack reader remains free to handle nested requests.
 vim.g.clipboard = {
   name = 'DROSTJE. native clipboard',
   copy = {
@@ -64,9 +62,6 @@ vim.opt.undofile = false
 vim.opt.hidden = true
 vim.opt.shortmess:append('I')
 vim.opt.guicursor = 'n-v-c:block,i-ci-ve:ver25,r-cr:hor20,o:hor50,a:Cursor/lCursor-blinkwait700-blinkoff400-blinkon250'
--- Drafts are not files, and this Neovim must outlive every draft. Commands that
--- would write or unload a draft, or end Neovim, get their draft meaning instead:
--- drafts save themselves, and quitting leaves the editor.
 local quits = { quit = true, wq = true, xit = true, exit = true }
 local quit_all = { qall = true, quitall = true, wqall = true, xall = true, cquit = true }
 local writes = { write = true, update = true, wall = true }
@@ -87,14 +82,12 @@ end
 local function report(message, group)
   api.nvim_echo({ { message, group } }, group == 'ErrorMsg', {})
 end
--- Runs a claimed command outside command-line mode, where it may change windows.
 function bridge.run(cmd)
   local name, draft = cmd.cmd, vim.b.drostje_draft
   if unloads[name] then
     return report('A draft stays open until its Thread closes', 'ErrorMsg')
   end
   if writes[name] then return report('Drafts save automatically') end
-  -- The write half of `:wq` and friends is Neovim's own for any non-draft buffer.
   local write = ({ wq = 'write', xit = 'update', exit = 'update', wqall = 'wall', xall = 'wall' })[name]
   if write and not (draft and not quit_all[name]) then
     local ok, error = pcall(vim.cmd, write)
@@ -113,7 +106,6 @@ local function command_line_enter()
   if not ok or not claims(cmd) then return '<CR>' end
   bridge.claimed = cmd
   vim.fn.histadd(':', line)
-  -- <BS> on the emptied line leaves command-line mode without running anything.
   return '<C-U><BS><Cmd>lua drostje.run(drostje.claimed)<CR>'
 end
 for _, key in ipairs({ '<CR>', '<NL>', '<kEnter>' }) do
@@ -130,8 +122,6 @@ for keys, cmd in pairs({ ZZ = 'xit', ZQ = 'quit', ['<C-W>q'] = 'quit', ['<C-W><C
   end, { silent = true })
 end
 
--- Colors arrive as packed 24-bit RGB from the kit theme, with `dark` for 'background'.
--- Every highlight group the editor can show is themed; none keeps Neovim's palette.
 function bridge.theme(c)
   local mode = c.dark and 'dark' or 'light'
   if vim.o.background ~= mode then vim.o.background = mode end

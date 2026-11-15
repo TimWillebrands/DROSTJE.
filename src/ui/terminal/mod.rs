@@ -18,8 +18,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Tab identity. Saved layouts keep it so the tab reopens after a restart, always
-/// with a new shell; it never names a Thread or a persisted shell session.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -36,9 +34,6 @@ impl std::fmt::Display for TerminalId {
     }
 }
 
-/// What a Neovim tab opened: a file, at a 1-based position, or nothing. Saved with the
-/// tab so a restart reopens the same file in a new Neovim; buffers, undo history and
-/// unwritten changes belong to the process and are never restored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NeovimTarget {
     #[serde(default)]
@@ -49,25 +44,17 @@ pub struct NeovimTarget {
     pub column: Option<u32>,
 }
 
-/// The user's own Neovim, with their configuration, in a native terminal surface.
-/// Unlike the composer's isolated editor, this one reads and writes the file itself.
 struct NeovimLaunch {
     target: NeovimTarget,
-    /// The `nvim` executable setting; blank discovers it on PATH.
     setting: Option<String>,
-    /// Resolved for the running process; the remote client uses the same binary.
     executable: Option<PathBuf>,
-    /// The `--listen` address of the running process.
     socket: Option<PathBuf>,
     exit_reported: bool,
 }
 
-/// The Neovim in a tab exited on its own (`:q`), so the tab has nothing left to show.
 pub struct NeovimExited;
 impl EventEmitter<NeovimExited> for TerminalPane {}
 
-/// Argv after the executable: listen for jumps, open the file at its position.
-/// Every element is a separate argument; nothing is shell source.
 pub fn neovim_args(target: &NeovimTarget, socket: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["--listen".into(), socket.into()];
     if let Some(file) = &target.file {
@@ -84,9 +71,6 @@ pub fn neovim_args(target: &NeovimTarget, socket: &Path) -> Vec<OsString> {
     args
 }
 
-/// A Vimscript expression that shows `file` in the running Neovim (splitting rather
-/// than abandoning a modified buffer, per `:drop`) and moves the cursor. It is
-/// evaluated, not typed, so it cannot land in the buffer whatever mode Neovim is in.
 pub fn neovim_jump_expression(file: &Path, line: Option<u32>, column: Option<u32>) -> String {
     let quoted = file.display().to_string().replace('\'', "''");
     let mut commands = vec![format!("'drop ' .. fnameescape('{quoted}')")];
@@ -97,9 +81,6 @@ pub fn neovim_jump_expression(file: &Path, line: Option<u32>, column: Option<u32
     format!("execute([{}])", commands.join(", "))
 }
 
-/// Ask the Neovim listening on `socket` to evaluate `expression`. Blocking; run it on a
-/// background executor. Neovim answers only between keys, so a pending prompt there
-/// times out instead of hanging this call.
 pub fn neovim_remote(executable: &Path, socket: &Path, expression: &str) -> Result<(), String> {
     let mut child = Command::new(executable)
         .args(["-u", "NONE", "-i", "NONE", "-n", "--headless", "--server"])
@@ -131,7 +112,6 @@ pub fn neovim_remote(executable: &Path, socket: &Path, expression: &str) -> Resu
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
     }
-    // The client reports `Lua: Vim:E492: …` followed by its own stack trace.
     let stderr = stderr.lines().next().unwrap_or_default().trim();
     let stderr = stderr.strip_prefix("Lua: ").unwrap_or(stderr);
     let stderr = stderr.strip_prefix("Vim:").unwrap_or(stderr);
@@ -146,7 +126,6 @@ pub fn neovim_remote(executable: &Path, socket: &Path, expression: &str) -> Resu
 
 pub struct TerminalPane {
     pub project_id: ProjectId,
-    /// The worktree the shell started in, when it was opened from a Conversation in one.
     pub worktree: Option<WorktreeId>,
     pub space_id: SpaceId,
     pub root: PathBuf,
@@ -154,8 +133,6 @@ pub struct TerminalPane {
     native: Option<Entity<Terminal>>,
     error: Option<String>,
     starting: bool,
-    /// Bumped by every start and close, so a slow executable lookup cannot start a
-    /// process for a tab that was closed or restarted meanwhile.
     generation: u64,
     visible: bool,
     focus: FocusHandle,
@@ -173,7 +150,6 @@ impl TerminalPane {
     ) -> Self {
         Self::with_launch(project_id, worktree, space_id, root, None, window, cx)
     }
-    /// A tab running the user's Neovim in `root`, opened on `target`.
     #[expect(clippy::too_many_arguments, reason = "a tab's full launch context")]
     pub fn neovim(
         project_id: ProjectId,
@@ -235,11 +211,9 @@ impl TerminalPane {
             _subscriptions: subscriptions,
         }
     }
-    /// What this tab's Neovim opened; `None` for a shell.
     pub fn neovim_target(&self) -> Option<&NeovimTarget> {
         self.neovim.as_ref().map(|launch| &launch.target)
     }
-    /// The executable and address a remote request to this tab's running Neovim uses.
     pub fn neovim_server(&self, cx: &App) -> Option<(PathBuf, PathBuf)> {
         let launch = self.neovim.as_ref()?;
         if !self.is_alive(cx) {
@@ -259,7 +233,6 @@ impl TerminalPane {
         };
         launch.exit_reported = false;
         let setting = launch.setting.clone();
-        // PATH discovery and canonicalisation touch the file system: not on this thread.
         cx.spawn_in(window, async move |pane, cx| {
             let resolved = smol::unblock(move || {
                 crate::platform::resolve_executable("nvim", setting.as_deref())
@@ -272,7 +245,6 @@ impl TerminalPane {
                 match resolved {
                     Ok(executable) => {
                         let id = uuid::Uuid::new_v4().simple().to_string();
-                        // Unix socket paths are short (104 bytes on macOS): keep the name brief.
                         let socket =
                             std::env::temp_dir().join(format!("drostje-nvim-{}.sock", &id[..8]));
                         let Some(launch) = &mut pane.neovim else {
@@ -317,7 +289,6 @@ impl TerminalPane {
                         if (exited || terminal.backend_error().is_some())
                             && terminal.focus_handle(cx).is_focused(window)
                         {
-                            // The native input leaves the tree; retain the app's keyboard path.
                             pane.focus.focus(window, cx);
                         }
                         if exited
@@ -440,7 +411,6 @@ impl Render for TerminalPane {
         {
             native.clone().into_any_element()
         } else {
-            // A Neovim tab closes when Neovim exits; this shows only until it does.
             let message = if neovim {
                 "Neovim exited."
             } else {
@@ -538,7 +508,6 @@ mod tests {
         );
     }
 
-    /// Real Neovim: a listening instance evaluates the jump and reports failures.
     #[test]
     fn remote_jump_moves_a_listening_neovim_and_reports_errors() {
         let Ok(executable) = crate::platform::resolve_executable("nvim", None) else {
@@ -556,8 +525,6 @@ mod tests {
         let mut server = Command::new(&executable)
             .args(["--headless", "-u", "NONE", "-i", "NONE", "-n", "--listen"])
             .arg(&socket)
-            // The server writes the error text below; pin its language so the assertion
-            // holds on machines with a translated Neovim.
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

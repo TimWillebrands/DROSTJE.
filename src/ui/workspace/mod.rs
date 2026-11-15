@@ -71,7 +71,6 @@ use terminal_tabs::*;
 use thread_panels::*;
 use title_bar::{WorkspaceDockSkin, WorkspaceTitle};
 
-/// A list or scroll motion, shared by the Projects list, thread panels and the transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Motion {
     Line(isize),
@@ -80,7 +79,6 @@ pub(super) enum Motion {
     Last,
 }
 
-/// Share of the viewport one page motion covers, so a line of context survives the jump.
 pub(super) const PAGE_SHARE: f32 = 0.9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,8 +91,6 @@ impl Region {
         commands::region_action(self)
     }
 }
-/// What one dock panel shows. Threads and terminals can be tabbed,
-/// split and dragged. Welcome holds the center only while no content is open.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelKind {
     Projects,
@@ -125,7 +121,6 @@ impl PanelKind {
             }
         }
     }
-    /// Persisted layout name; never change it.
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::Projects => "Projects",
@@ -168,7 +163,6 @@ pub struct Workspace {
     pub state: Entity<AppState>,
     pub(super) dock: Entity<DockArea>,
     projects: Entity<WorkspacePanel>,
-    /// Shared with the panel registry so a restored layout rebuilds into the same map.
     threads: ThreadPanels,
     terminals: TerminalPanels,
     pub(super) thread_terminals: BTreeMap<ThreadId, ThreadTerminal>,
@@ -178,24 +172,20 @@ pub struct Workspace {
     pub(super) composer_sizes:
         BTreeMap<ThreadId, Entity<gpui_kit::component::resizable::ResizableState>>,
     pub(super) changes_lists: super::changes::ChangesLists,
-    /// Live layouts reattach retained terminals; durable layouts reopen them with a new shell.
     live_layouts: BTreeMap<SpaceId, DockAreaState>,
     active_terminal: Option<TerminalId>,
     space_terminals: BTreeMap<SpaceId, TerminalId>,
     pub(super) terminal_confirmation: bool,
     inline_rename: Option<InlineRename>,
     welcome: Rc<RefCell<Option<Entity<WorkspacePanel>>>>,
-    /// While a layout is loaded or reset, panel callbacks must not touch thread state.
     rebuilding: bool,
     focus: FocusHandle,
     pub cursor: Option<Row>,
     hovered_sidebar_row: Option<Row>,
-    /// Gesture progress and settling are presentation-only; switching still saves drafts first.
     space_swipe: projects::SpaceSwipe,
     space_slide: SpaceSlide,
     space_swipe_idle: Option<Task<()>>,
     space_direction: Option<f32>,
-    /// Filter text for the Projects list; empty shows every visible row.
     thread_search: Entity<InputState>,
     pub palette: Option<Entity<Palette>>,
     pub dialog: Option<Entity<SurfaceContent>>,
@@ -203,7 +193,6 @@ pub struct Workspace {
     background_worktree_request: Option<uuid::Uuid>,
     pub(super) commit_panel_thread: Option<ThreadId>,
     pub(super) theme_editor: Option<Entity<crate::ui::theme::editor::ThemeEditor>>,
-    /// When to open each Conversation's Agents tab.
     agent_activity: BTreeMap<ThreadId, crate::ui::network::agents::Follow>,
     pub(super) editor: Option<Entity<crate::ui::conversation::editor::PromptEditor>>,
     pub(super) editor_selection: Option<crate::model::DraftKey>,
@@ -212,7 +201,6 @@ pub struct Workspace {
     pub expanded: std::collections::HashSet<String>,
     pub extension: Option<overlays::ExtensionForm>,
     pub tool_detail: Option<(crate::model::ThreadId, String)>,
-    /// Pretty-printed JSON of the tool `tool_detail` names, built once per tool update.
     pub(super) tool_detail_text: overlays::ToolDetailText,
     pub factory_form: Option<Entity<crate::ui::factory::form::FactoryThreadForm>>,
     pub(super) model_picker: Option<conversation::ModelPicker>,
@@ -227,13 +215,8 @@ pub struct Workspace {
     reopening: Option<Region>,
     dock_measurement: Rc<Cell<Option<Bounds<Pixels>>>>,
     presented_thread: Option<ThreadId>,
-    /// A selected thread whose tab has not been displayed yet, because its
-    /// panel is added by the next `sync_thread_panels`.
     unrevealed_thread: Option<ThreadId>,
-    /// Counts the `AppState` notifications and presentation events this workspace has
-    /// observed: a change token for presentation derived from `AppState`.
     pub(super) state_revision: u64,
-    /// Threads open in any Space when closed threads' view state was last released.
     released_open_threads: Vec<ThreadId>,
     pub(super) _subscriptions: Vec<Subscription>,
 }
@@ -272,7 +255,6 @@ impl Workspace {
                 cx,
                 PanelKind::Thread(ThreadId::nil()).name(),
                 move |ctx, window, cx| {
-                    // Validation guarantees an ID; a nil one is pruned by the next sync.
                     let id = thread_of(ctx.state()).unwrap_or_else(ThreadId::nil);
                     panel_handle(thread_panel(&threads, id, &state, &owner, window, cx))
                 },
@@ -286,8 +268,6 @@ impl Workspace {
                 owner.clone(),
             );
             register_panel(cx, "Terminal", move |ctx, window, cx| {
-                // A live ID reattaches its shell; a saved tab reopens a new one.
-                // Layouts are filtered by `restorable_layout` first, so Welcome is a backstop.
                 let panel = terminal_of(ctx.state())
                     .and_then(|id| terminals.borrow().get(&id).cloned())
                     .or_else(|| {
@@ -306,7 +286,6 @@ impl Workspace {
                 .with_renderer(Rc::new(WorkspaceDockSkin { inner: skin, title }))
         });
         let inner = inner.expect("DockSkin::new ran inside the DockArea constructor");
-        // A lone thread keeps its tab, like Zed, instead of a larger title.
         inner.set_panel_style(PanelStyle::TabBar, cx);
         let saved = state.read(cx).space_layout().cloned();
         let shared_sidebar = state
@@ -402,15 +381,12 @@ impl Workspace {
             }
             let layout = workspace.restorable_layout(durable_layout(layout), cx);
             validate_layout(&layout)?;
-            // Nothing is leased during construction, so no callback can reach the
-            // workspace here; `rebuilding` matters for later resets only.
             workspace
                 .dock
                 .update(cx, |dock, cx| dock.load(layout, window, cx))
         });
         match restored {
             Some(Ok(())) => {}
-            // A layout from another version is simply rebuilt; only a corrupt one is reported.
             Some(Err(error)) if error.to_string() == OUTDATED_LAYOUT => {
                 workspace.reset_layout_with_sidebar(shared_sidebar, window, cx);
             }
@@ -595,17 +571,12 @@ impl Workspace {
     }
 }
 
-/// Native overlay layers are siblings of Workspace, so their callbacks never lease
-/// Workspace while its render is running and actions route through their own hosts.
 pub struct WorkspaceRoot {
     pub workspace: Entity<Workspace>,
 }
 
 impl Render for WorkspaceRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Catch-all for visibility changes no event reports (group collapse, zoom).
-        // Every frame that renders Workspace renders this root first, so Workspace
-        // itself does not repeat it; the check reads the dock without dumping it.
         self.workspace.update(cx, |workspace, cx| {
             workspace.sync_terminal_visibility(window, cx)
         });

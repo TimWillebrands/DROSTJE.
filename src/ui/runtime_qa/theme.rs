@@ -1,4 +1,3 @@
-//! Theme editor preview, cancel and save by keyboard.
 use super::*;
 
 #[gpui_kit::test]
@@ -28,7 +27,6 @@ async fn theme_editor_previews_cancels_and_saves_by_keyboard(cx: &mut TestAppCon
     let original = primary(cx);
     let theme_grain = cx.read(theme::theme_grain);
 
-    // The field previews live; Escape restores the saved theme and writes nothing.
     open(cx);
     cx.simulate_keystrokes(window, "shift-l");
     settle_frames(cx, &fixture);
@@ -39,7 +37,6 @@ async fn theme_editor_previews_cancels_and_saves_by_keyboard(cx: &mut TestAppCon
     assert_eq!(primary(cx), original, "Escape restores the saved accent");
     assert_eq!(saved(cx), Adjustments::default());
 
-    // Save keeps the preview: an accent from the field and grain from its row.
     open(cx);
     cx.simulate_keystrokes(window, "shift-l");
     settle_frames(cx, &fixture);
@@ -55,7 +52,6 @@ async fn theme_editor_previews_cancels_and_saves_by_keyboard(cx: &mut TestAppCon
     assert!(adjustments.accent.is_some());
     assert!((adjustments.grain.unwrap() - (theme_grain + 0.01)).abs() < 1e-4);
 
-    // The first swatch is the theme's own accent.
     open(cx);
     cx.simulate_keystrokes(window, "tab g g secondary-enter");
     settle_frames(cx, &fixture);

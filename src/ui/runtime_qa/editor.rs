@@ -1,4 +1,3 @@
-//! Embedded Neovim prompt editor: startup failure, slash commands and file references.
 use super::*;
 
 #[gpui_kit::test]
@@ -203,7 +202,6 @@ async fn slash_command_picker_writes_into_the_draft_and_refuses_blocked_commands
         },
     )
     .await;
-    // The cursor sits after the command, still in insert mode, so typing continues there.
     cx.simulate_keystrokes(fixture.window.into(), "s o f t space");
     until(
         cx,
@@ -228,7 +226,6 @@ async fn slash_command_picker_writes_into_the_draft_and_refuses_blocked_commands
         "inserting a command never sends it"
     );
 
-    // A blocked command typed by hand is refused before it reaches OMP.
     cx.simulate_keystrokes(fixture.window.into(), "escape g g d G i / m o d e l");
     until(cx, "blocked command typed", Duration::from_secs(5), |cx| {
         fixture.state.read(cx).drafts[&DraftKey::Thread(id)].text == "/model"
@@ -361,7 +358,6 @@ async fn slash_command_popup_completes_at_the_caret(cx: &mut TestAppContext) {
     )
     .await;
 
-    // Escape closes the popup without leaving insert mode; typing on reopens it.
     cx.simulate_keystrokes(fixture.window.into(), "escape g g d G i / c o");
     until(cx, "second partial command", Duration::from_secs(5), |cx| {
         draft(cx) == "/co"
@@ -378,7 +374,6 @@ async fn slash_command_popup_completes_at_the_caret(cx: &mut TestAppContext) {
     .await;
     assert!(popup_shown(cx), "a changed query reopens the popup");
 
-    // Down and Ctrl-P move the selection; Return inserts it.
     let first = cx.read(selection).unwrap();
     cx.simulate_keystrokes(fixture.window.into(), "down");
     cx.run_until_parked();
@@ -432,7 +427,6 @@ async fn conversation_file_references_open_neovim_tabs(cx: &mut TestAppContext) 
         );
     };
 
-    // A relative path resolves against the Conversation's working tree, at its line.
     open(cx, "notes.txt", Some(1));
     until(cx, "Neovim tab opened", Duration::from_secs(10), |cx| {
         fixture.workspace.read(cx).neovim_tabs(cx).len() == 1
@@ -447,7 +441,6 @@ async fn conversation_file_references_open_neovim_tabs(cx: &mut TestAppContext) 
     assert_eq!((target.line, target.column), (Some(1), None));
     assert!(cx.read(|cx| fixture.workspace.read(cx).has_active_terminal(cx)));
 
-    // A missing file is a visible notice, never an empty tab.
     let notices = cx.read(|cx| fixture.state.read(cx).notice_sequence);
     open(cx, "missing/file.rs", Some(3));
     until(cx, "missing file notice", Duration::from_secs(10), |cx| {
@@ -465,7 +458,6 @@ async fn conversation_file_references_open_neovim_tabs(cx: &mut TestAppContext) 
         1
     );
 
-    // The tab is saved with the layout, file and line included.
     update_workspace(
         cx,
         fixture.window,

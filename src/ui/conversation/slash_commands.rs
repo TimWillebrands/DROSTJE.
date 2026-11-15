@@ -1,5 +1,3 @@
-//! Composer slash-command completion: which harness commands match the draft, the caret
-//! popup that offers them, and the row every picker shows for one.
 use crate::harness::{CommandCatalog, SlashCommand};
 use crate::model::ThreadId;
 use gpui_kit::component::{
@@ -8,8 +6,6 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-/// The partial command name being typed: the draft starts with `/` and the cursor is still
-/// inside that first word. `cursor` is `(row, utf8 byte column)`.
 pub fn completion_query(draft: &str, cursor: (usize, usize)) -> Option<&str> {
     if cursor.0 != 0 {
         return None;
@@ -21,9 +17,6 @@ pub fn completion_query(draft: &str, cursor: (usize, usize)) -> Option<&str> {
     (cursor.1 <= 1 + word && !typed.contains('/')).then_some(typed)
 }
 
-/// Commands DROSTJE. may send whose name, alias or description matches `query`, best first:
-/// name prefix, then alias prefix, then any other name match, then description matches.
-/// Skills and user commands sort ahead of builtins within each rank.
 pub fn matches<'a>(catalog: &'a CommandCatalog, query: &str) -> Vec<&'a SlashCommand> {
     let query = query.to_lowercase();
     let mut ranked: Vec<_> = catalog
@@ -55,7 +48,6 @@ pub fn matches<'a>(catalog: &'a CommandCatalog, query: &str) -> Vec<&'a SlashCom
     ranked.into_iter().map(|(_, command)| command).collect()
 }
 
-/// One command: `/name` and its argument syntax in mono, the description, and its source.
 pub fn row(command: &SlashCommand, cx: &App) -> Div {
     let theme = cx.theme();
     h_flex()
@@ -88,15 +80,12 @@ pub fn row(command: &SlashCommand, cx: &App) -> Div {
         )
 }
 
-/// Rows shown at once; the window follows the selection instead of scrolling.
 const VISIBLE_ROWS: usize = 8;
 
 pub enum SlashCompletionEvent {
     Accept(String),
 }
 
-/// The caret popup's model: the commands matching what is typed after `/`, or why there
-/// are none. The prompt editor owns it and decides when it is shown.
 pub struct SlashCompletion {
     thread: ThreadId,
     query: String,
@@ -118,7 +107,6 @@ impl SlashCompletion {
         }
     }
 
-    /// Refilters for `query`, keeping the selected command while it still matches.
     pub fn set(
         &mut self,
         thread: ThreadId,
@@ -160,7 +148,6 @@ impl SlashCompletion {
         self.commands.get(self.selected_ix)
     }
 
-    /// Moves the selection by `delta`, stopping at either end like the app's other lists.
     pub fn select(&mut self, delta: isize, cx: &mut Context<Self>) {
         let last = self.commands.len().saturating_sub(1);
         let next = self.selected_ix.saturating_add_signed(delta).min(last);

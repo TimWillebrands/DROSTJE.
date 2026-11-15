@@ -1,28 +1,14 @@
-//! Unified diff text, as `platform::working_tree_diff` produces it, split into display rows.
-//!
-//! Pure and lossless for reading: every line of the patch lands in exactly one row, except the
-//! per-file Git headers (`diff --git`, `index`, `---`, `+++`, mode and rename lines), which fold
-//! into that file's [`RowKind::File`] row. Text Git did not write in a recognised shape stays a
-//! [`RowKind::Note`] so nothing is dropped.
-
-/// Row text, shared between both layouts and every frame that paints it without copying.
 pub type RowText = std::sync::Arc<str>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Patch {
     pub rows: Vec<Row>,
-    /// The same rows paired for a side-by-side view; every row index appears exactly once,
-    /// in order.
     pub split: Vec<SplitRow>,
 }
 
-/// One line of the side-by-side view, by index into [`Patch::rows`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitRow {
-    /// A file, hunk or note row spanning both sides.
     Full(usize),
-    /// The old side and the new side of one line. A context line is both sides; a removed line
-    /// pairs with the added line at the same offset of the change it belongs to.
     Pair {
         old: Option<usize>,
         new: Option<usize>,
@@ -30,20 +16,17 @@ pub enum SplitRow {
 }
 
 impl SplitRow {
-    /// The first row this line shows, which stands for it when switching layouts.
     pub fn first(self) -> usize {
         match self {
             Self::Full(ix) => ix,
             Self::Pair { old, new } => match (old, new) {
                 (Some(old), Some(new)) => old.min(new),
                 (Some(ix), None) | (None, Some(ix)) => ix,
-                // `split` never builds an empty pair.
                 (None, None) => 0,
             },
         }
     }
 
-    /// Whether this line shows row `ix`.
     pub fn contains(self, ix: usize) -> bool {
         match self {
             Self::Full(row) => row == ix,
@@ -52,16 +35,12 @@ impl SplitRow {
     }
 }
 
-/// Where a row lands in the new version of its file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
-    /// The new path, as the file row names it.
     pub path: String,
-    /// 1-based line in the new file.
     pub line: u32,
 }
 
-/// Why a row has no place in the working tree.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LocationError {
     #[error("this row belongs to no file")]
@@ -71,8 +50,6 @@ pub enum LocationError {
 }
 
 impl Patch {
-    /// The line in the working tree file that row `ix` shows or, for a removed line, where it
-    /// was removed: the next surviving line of its hunk, else the line after the last one.
     pub fn location(&self, ix: usize) -> Result<Location, LocationError> {
         if ix >= self.rows.len() {
             return Err(LocationError::NoFile);
@@ -92,7 +69,6 @@ impl Patch {
         {
             return Err(LocationError::Deleted(path));
         }
-        // This row and the rest of its file.
         let after = || {
             self.rows[ix..]
                 .iter()
@@ -129,24 +105,18 @@ impl Patch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     pub kind: RowKind,
-    /// Line content without the leading `+`, `-` or space; tabs expanded to four spaces.
     pub text: RowText,
-    /// 1-based line in the old file for removed and context lines.
     pub old_line: Option<u32>,
-    /// 1-based line in the new file for added and context lines.
     pub new_line: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowKind {
-    /// The start of one file's changes; `text` is the new path (the old one when deleted).
     File(FileHeader),
-    /// An `@@ … @@` hunk header; `text` is the whole header line.
     Hunk,
     Added,
     Removed,
     Context,
-    /// Anything else: `\ No newline at end of file`, omitted-content notices, truncation.
     Note,
 }
 
@@ -168,7 +138,6 @@ pub enum FileChange {
 
 pub fn parse(text: &str) -> Patch {
     let mut rows = Vec::new();
-    // Index of the current file row, and whether the parser is inside its hunks yet.
     let mut file: Option<usize> = None;
     let mut in_hunk = false;
     let (mut old, mut new) = (0u32, 0u32);
@@ -213,8 +182,6 @@ pub fn parse(text: &str) -> Patch {
             Some(b'+') => (RowKind::Added, &line[1..]),
             Some(b'-') => (RowKind::Removed, &line[1..]),
             Some(b' ') => (RowKind::Context, &line[1..]),
-            // Git writes an empty context line as a lone space, so a blank line ends the
-            // patch proper; what follows (the truncation notice) belongs to no file.
             None => {
                 file = None;
                 in_hunk = false;
@@ -241,7 +208,6 @@ pub fn parse(text: &str) -> Patch {
     Patch { rows, split }
 }
 
-/// Pairs each run of removed lines with the added lines that follow it, line by line.
 fn split(rows: &[Row]) -> Vec<SplitRow> {
     let mut split = Vec::with_capacity(rows.len());
     let (mut removed, mut added) = (Vec::new(), Vec::new());
@@ -258,7 +224,6 @@ fn split(rows: &[Row]) -> Vec<SplitRow> {
     for (ix, row) in rows.iter().enumerate() {
         match row.kind {
             RowKind::Removed => {
-                // A removal after additions starts a new change.
                 if !added.is_empty() {
                     flush(&mut split, &mut removed, &mut added);
                 }
@@ -297,7 +262,6 @@ fn next(counter: &mut u32) -> u32 {
     line
 }
 
-/// The new path from `a/<old> b/<new>`; Git quotes paths with unusual characters, kept as is.
 fn git_paths(paths: &str) -> String {
     match paths.rfind(" b/") {
         Some(ix) => paths[ix + 3..].to_owned(),
@@ -305,7 +269,6 @@ fn git_paths(paths: &str) -> String {
     }
 }
 
-/// Start lines from `-a,b +c,d @@ …`; a malformed header numbers from 1.
 fn hunk_starts(header: &str) -> (u32, u32) {
     let start = |sign: char| {
         header
@@ -320,7 +283,6 @@ fn hunk_starts(header: &str) -> (u32, u32) {
     (old, new)
 }
 
-/// Git's extended header lines, which say nothing a file row does not show.
 const QUIET_HEADERS: [&str; 9] = [
     "index ",
     "old mode ",
@@ -333,7 +295,6 @@ const QUIET_HEADERS: [&str; 9] = [
     "+++ ",
 ];
 
-/// Folds a Git header line into the file row; `false` when the line is not one.
 fn fold_header(file: &mut Row, line: &str) -> bool {
     let RowKind::File(header) = &mut file.kind else {
         return false;
@@ -349,7 +310,6 @@ fn fold_header(file: &mut Row, line: &str) -> bool {
     } else if let Some(path) = line.strip_prefix("+++ b/") {
         file.text = path.to_owned().into();
     } else if let Some(path) = line.strip_prefix("--- a/") {
-        // A deletion has no new path; the old one names the file.
         if header.change == FileChange::Deleted {
             file.text = path.to_owned().into();
         }
@@ -488,7 +448,6 @@ mod tests {
                 pair(Some(4), Some(7)),
                 pair(Some(5), None),
                 pair(Some(8), Some(8)),
-                // An addition before a removal is a change of its own.
                 pair(None, Some(9)),
                 pair(Some(10), None),
             ]

@@ -1,6 +1,3 @@
-//! Retained, resizable thread sidebar. Terminal is available for Conversations and
-//! Factory threads; AppState owns tab, open state and width.
-
 use crate::ui::{
     commands::{Command, button},
     factory,
@@ -124,7 +121,6 @@ impl RenderOnce for SidebarSplit {
     }
 }
 
-/// Review and Details appear only while their content exists; Agents always offers opt-in.
 fn tabs(conversation: bool, review: bool, details: bool) -> Vec<SidebarTab> {
     if !conversation {
         return vec![SidebarTab::Output, SidebarTab::Terminal];
@@ -155,7 +151,6 @@ fn label(tab: SidebarTab) -> &'static str {
     }
 }
 
-/// The command that shows or hides `tab`; the collapse control dispatches it too.
 fn toggle_command(tab: SidebarTab) -> Command {
     match tab {
         SidebarTab::Changes | SidebarTab::Details => Command::ToggleConversationDiffs,
@@ -428,7 +423,6 @@ fn caption(text: impl Into<SharedString>, cx: &App) -> Div {
         .child(text.into())
 }
 
-/// The state word of a coordination call, in the terms of what it did.
 fn outcome(event: &Event) -> Option<Tag> {
     let background = matches!(
         event.kind,
@@ -440,10 +434,8 @@ fn outcome(event: &Event) -> Option<Tag> {
     let tag = match (event.outcome, &event.kind) {
         (Outcome::Pending, EventKind::Message { .. }) => Tag::secondary().child("Sending"),
         (Outcome::Pending, _) => Tag::secondary().child("Running"),
-        // A background spawn answers once the subagent has started, not finished.
         (Outcome::Done, EventKind::Spawn { .. }) if background => Tag::secondary().child("Started"),
         (Outcome::Done, EventKind::Spawn { .. }) => Tag::secondary().child("Finished"),
-        // Delivered to the session; whether its agent read it is not reported.
         (Outcome::Done, EventKind::Message { .. }) => Tag::secondary().child("Delivered"),
         (Outcome::Done, EventKind::Listing { .. }) => return None,
         (Outcome::Failed, _) => Tag::danger().child("Failed"),
@@ -533,7 +525,6 @@ fn event_row(event: &Event, cx: &App) -> AnyElement {
                         .line_clamp(6)
                         .child(body)
                 }))
-                // A failure says why; other results repeat what the row shows.
                 .when(failed, |column| {
                     column.children(event.result.clone().map(|result| caption(result, cx)))
                 }),
@@ -552,7 +543,6 @@ fn session_rows(activity: &Activity, cx: &App) -> Vec<AnyElement> {
         );
     }
     if sessions.groups.is_empty() {
-        // Not the listing's usual shape: show it as the harness wrote it.
         rows.push(
             div()
                 .text_sm()
@@ -573,7 +563,6 @@ fn session_rows(activity: &Activity, cx: &App) -> Vec<AnyElement> {
                     .gap_2()
                     .py_0p5()
                     .child(
-                        // Busy sessions carry the same mark as this app's running turns.
                         div()
                             .size_1p5()
                             .flex_shrink_0()

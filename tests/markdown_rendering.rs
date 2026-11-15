@@ -1,4 +1,3 @@
-//! Real-font, offscreen Metal regression for inline-code fragments wrapping twice.
 fn main() {
     #[cfg(target_os = "macos")]
     macos::run();
@@ -102,7 +101,6 @@ mod macos {
                 let image = cx.capture_screenshot(window.into()).unwrap();
                 let scale = image.width() as f32 / 640.;
                 let background = *image.get_pixel(0, 0);
-                // Allow one logical pixel for antialiasing and italic overhang, not another line.
                 let right = ((bounds.right() + px(1.)).as_f32() * scale).ceil() as u32;
                 let bottom = ((bounds.bottom() + px(1.)).as_f32() * scale).ceil() as u32;
                 let spill = image
@@ -115,7 +113,6 @@ mod macos {
                 );
 
                 if text == "with the `Skill`/`Part` split" {
-                    // A clipping-only "fix" would stop the spill but still lose the final t.
                     let (left, right, foreground) = cx
                         .update_window(window.into(), |_, window, cx| {
                             let body = gpui_kit::TextStyle {
@@ -171,7 +168,6 @@ mod macos {
                     );
                 }
 
-                // Selection must still recover every byte, including wrapped Unicode/code suffixes.
                 cx.update_window(window.into(), |_, window, cx| {
                     window.drag(
                         bounds.origin + gpui_kit::point(px(0.5), px(8.)),

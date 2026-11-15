@@ -12,9 +12,6 @@ use gpui_kit::{
     *,
 };
 
-/// The images one transcript shows, loaded once and freed from every window's atlas when
-/// the transcript closes. Without a cache of their own, thumbnails load into the app-wide
-/// asset cache, which never lets them go.
 pub(super) fn thumbnail_cache(cx: &mut App) -> Entity<RetainAllImageCache> {
     RetainAllImageCache::new(cx)
 }
@@ -87,7 +84,6 @@ mod tests {
     struct Thumbnails {
         cache: Option<Entity<RetainAllImageCache>>,
         image: ImageAttachment,
-        /// The decoded thumbnail as the cache holds it, read while painting.
         loaded: Rc<RefCell<Option<Arc<RenderImage>>>>,
     }
     impl Render for Thumbnails {
@@ -176,7 +172,6 @@ mod tests {
         };
         assert!(in_atlas(cx), "a shown thumbnail is in the atlas");
 
-        // The transcript closes: its cache goes with it, and so do its images.
         drop(cache);
         cx.update(|cx| {
             view.update(cx, |view, cx| {

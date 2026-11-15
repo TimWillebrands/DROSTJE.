@@ -1,4 +1,3 @@
-//! What a form shows from `AppState` beyond its own draft, so unrelated changes skip a render.
 use super::DialogKind;
 use crate::app::AppState;
 use std::collections::BTreeMap;

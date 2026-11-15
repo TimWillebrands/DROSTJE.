@@ -22,8 +22,6 @@
 
 #include "../shim/process_activity.h"
 
-/* Standalone: cc -std=c11 -Wall -Wextra -Werror process_activity.c -o probe
- * Run probe in an empty temporary directory; no shell integration is installed. */
 static pid_t root_pid = -1;
 static bool login_wrapper = false;
 static pid_t shell_pid = -1;
@@ -44,7 +42,6 @@ static void cleanup(void) {
         kill(-root_pid, SIGKILL);
         kill(root_pid, SIGKILL);
     }
-    /* A session leader can wait for unread terminal output while exiting. */
     if (terminal >= 0) {
         close(terminal);
         terminal = -1;
@@ -119,7 +116,6 @@ static void await_marker(const char *marker, const char *scenario) {
     }
 }
 
-/* Wait on the actual process observation, never an assumed settling delay. */
 static void await_activity(int expected, int same_group, const char *scenario) {
     int64_t deadline = milliseconds() + 10000;
     int actual = -1;
@@ -134,7 +130,6 @@ static void await_activity(int expected, int same_group, const char *scenario) {
                 return;
             }
         }
-        /* Yield the CPU; no sleep or timer is used as evidence of readiness. */
         sched_yield();
     } while (milliseconds() < deadline);
     fprintf(stderr, "%s: expected %d, got %d\n", scenario, expected, actual);
@@ -199,8 +194,6 @@ int main(int argc, char **argv) {
             "TERM=dumb", "LC_ALL=C", NULL};
 #if defined(__APPLE__)
         if (login_wrapper) {
-            /* Match Exec.zig execCommand's direct-command argv, including
-             * -l (preserve cwd) and -p (preserve the isolated environment). */
             char *login_args[] = {"login", "-flp", username, "/bin/sh", "-i", NULL};
             execve("/usr/bin/login", login_args, environment);
             _exit(126);
@@ -225,8 +218,6 @@ int main(int argc, char **argv) {
         sched_yield();
     }
     await_activity(1, 0, "foreground sleep");
-    /* Foreground ownership can precede exec and signal-handler setup.
-     * SIGKILL makes fixture cleanup independent of that startup race. */
     if (kill(-job_pid, SIGKILL)) fail("terminate foreground sleep");
     await_marker(prompt, "prompt after foreground sleep");
     job_pid = -1;
@@ -260,7 +251,6 @@ int main(int argc, char **argv) {
     send_command("printf '__drost_busy__\\n'; while :; do :; done\n");
     await_marker("__drost_busy__\r\n", "built-in loop entered");
     await_activity(1, 1, "shell built-in busy loop");
-    /* SIGINT is delivered to the shell's foreground group, just like Ctrl-C. */
     if (kill(-shell_pid, SIGINT)) fail("interrupt built-in loop");
     await_marker(prompt, "prompt after interrupting built-in loop");
     await_activity(0, 1, "idle after built-in work");
@@ -276,8 +266,6 @@ int main(int argc, char **argv) {
     if (drost_process_activity((uint32_t)gone, (uint32_t)gone, false, "/bin/sh") != -1)
         fail("missing process must be unknown");
 
-    /* exec keeps the shell PID but can restore login's original process group.
-     * Wait for the actual executable transition, not a guessed delay. */
     send_command("exec /bin/sleep 600\n");
     deadline = milliseconds() + 10000;
     int image_match;

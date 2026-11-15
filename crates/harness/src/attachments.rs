@@ -86,9 +86,6 @@ pub fn import_bytes(bytes: &[u8], declared_mime: &str, data: &Path) -> Result<Im
     );
     own(bytes, &image, mime, extension, data, None)
 }
-/// Clipboard images have no source file. PNG, JPEG and WebP are stored as
-/// pasted; TIFF (what macOS offers for many copied bitmaps) is re-encoded as
-/// PNG so the stored copy stays within the formats the harness accepts.
 pub fn import_pasted(bytes: &[u8], data: &Path) -> Result<ImageAttachment> {
     ensure!(
         bytes.len() as u64 <= FILE_LIMIT,
@@ -133,7 +130,6 @@ fn flatten(image: DynamicImage) -> DynamicImage {
     }
     DynamicImage::ImageRgb8(rgb)
 }
-/// Explicit user action only. Originals remain untouched; returned files are the reviewed send copies.
 pub fn optimize(
     request_id: Uuid,
     text: &str,

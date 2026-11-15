@@ -1,4 +1,3 @@
-//! Opt-in real workspace, HTTP tools, Servo sessions and resizable sidebar. No provider turns.
 fn main() {
     #[cfg(target_os = "macos")]
     macos::run();
@@ -197,7 +196,6 @@ mod macos {
                     }),
                 );
                 cx.update_window(window.into(), |_, window, cx| {
-                    // There are no panes above, below or to the right of this browser.
                     for direction in [down, up, right] {
                         window.press(&format!("secondary-alt-{direction}"), cx);
                         assert_eq!(window.find(panel.clone()).focused(), Some(true));
@@ -250,8 +248,6 @@ mod macos {
                 );
             }
         }
-        // Raw Ctrl-W belongs to the native page, not an app prefix. Subsequent bare
-        // motion letters must still edit the input rather than move to another pane.
         tool(
             cx,
             window,
@@ -340,8 +336,6 @@ mod macos {
         })
     }
 
-    /// Input artifacts dock above the composer through the real tool, one at a time, with a
-    /// capped height; the transcript keeps a pointer, and the commands move and focus them.
     fn assert_docked_artifact(
         cx: &mut HeadlessAppContext,
         window: WindowHandle<Root>,
@@ -399,7 +393,6 @@ mod macos {
         });
         pump(cx, window);
         assert_eq!(docked_sessions(cx, state), [first_id.clone()]);
-        // A tall page stays at most 45% of the 900 px window and scrolls inside.
         tool(
             cx,
             window,
@@ -466,7 +459,6 @@ mod macos {
             );
         }
 
-        // Docking another moves the first into the transcript; it stays live.
         let second = tool(
             cx,
             window,
@@ -527,10 +519,6 @@ mod macos {
         })
     }
 
-    /// A docked form's answer travels the real path (kit, Servo, app outbox, native command)
-    /// and the page stays open for corrections. Only the agent's complete_artifact call,
-    /// through the real tool endpoint, collapses it, marks it answered, frees the dock and
-    /// hands focus back to the composer.
     fn assert_agent_completes_artifact(
         cx: &mut HeadlessAppContext,
         window: WindowHandle<Root>,
@@ -543,7 +531,6 @@ mod macos {
         use drostje::harness::{
             ConversationCommand, ConversationEvent, ConversationState, PeerDeliveryOutcome,
         };
-        // A stand-in native runtime: commands land here, outcomes go back as harness events.
         let (commands, native) = async_channel::bounded(8);
         let generation = state.update(cx, |state, _| {
             let session = state.conversations.get_mut(&thread).unwrap();
@@ -552,13 +539,11 @@ mod macos {
             session.persisted = true;
             session.peer_delivery = true;
             session.requests.clear();
-            // As a runtime that reported Ready and is idle.
             session.preparing = false;
             let generation = session.generation;
             state.active_threads.remove(&thread);
             generation
         });
-        // Accept the answer, then act out the short turn it woke: start, settle, idle.
         let accept = |cx: &mut HeadlessAppContext, attempt| {
             let events = state.read_with(cx, |state, _| state.events.clone());
             for event in [
@@ -620,7 +605,6 @@ mod macos {
             }
         };
 
-        // The user answers; the agent decides when it has what it needs.
         let page = directory.join("ask.html");
         let shown = tool(
             cx,
@@ -700,7 +684,6 @@ mod macos {
             "a delivered answer leaves the page open for corrections"
         );
 
-        // Only this Conversation's own artifacts can be completed.
         let stranger = request(
             cx,
             window,
@@ -778,8 +761,6 @@ mod macos {
     ) {
         use gpui_kit::component::{Theme, ThemeMode};
         let id = artifact["id"].as_str().unwrap();
-        // The result is from the real HTTP tool and real Servo session. Populate the
-        // component's input directly; no harness process or fabricated provider turn.
         state.update(cx, |state, cx| {
             let session = state.conversations.get_mut(&thread).unwrap();
             session.messages.push(Arc::new(Message {
@@ -810,7 +791,6 @@ mod macos {
                     raw: None,
                 }),
             );
-            // A generation change makes the production transcript consume fixture rows.
             session.generation = Uuid::new_v4();
             cx.notify();
         });
@@ -889,7 +869,6 @@ mod macos {
                 }
             );
             cx.update_window(window.into(), |_, window, cx| {
-                // Leave-editor focuses the disclosure; Tab traverses the native buttons.
                 window.click("artifact-surface", cx);
                 window.press("secondary-escape", cx);
                 for _ in 0..30 {
@@ -904,7 +883,6 @@ mod macos {
             .unwrap();
             pump(cx, window);
             cx.update_window(window.into(), |_, window, cx| {
-                // Escape dismisses a keyboard-opened native navigation menu.
                 assert!(
                     window.find("popup-menu").visible(),
                     "Navigation is reachable using native keyboard traversal"
@@ -936,7 +914,6 @@ mod macos {
             );
             artifact_height(cx, window, height);
         }
-        // Width changes must reflow the page and invalidate the actual transcript row.
         tool(
             cx,
             window,
@@ -1040,8 +1017,6 @@ mod macos {
             pump(cx, window);
         }
         cx.update_window(window.into(), |_, window, cx| {
-            // Tail following clips the center of this 1600px row above the transcript.
-            // Click its visible lower edge through native hit testing, not that center.
             let surface = window.find("artifact-surface").bounds();
             window.click_at(
                 "artifact-surface",
@@ -1089,7 +1064,6 @@ mod macos {
             short_extent, 0.,
             "Shrinking to a fitted single-row artifact must clear the cached scroll extent"
         );
-        // Evict a collapsed row from the real virtualized transcript and reattach it.
         cx.update_window(window.into(), |_, window, cx| {
             window.click("artifact-disclosure", cx)
         })
@@ -1155,10 +1129,9 @@ mod macos {
             Some(43.),
             "Row virtualization must not recreate the WebView"
         );
-        // The hidden navigation menu uses the same real reload Action as browser tabs.
         cx.update_window(window.into(), |_, window, cx| {
             window.click("artifact-navigation", cx);
-            window.press("up", cx); // Select the last menu item, Reload.
+            window.press("up", cx);
             window.press("enter", cx);
         })
         .unwrap();
@@ -1508,8 +1481,6 @@ mod macos {
             store.set_setting("factory_data_root".into(), json!(directory.join("factory"))),
         )
         .unwrap();
-        // No real harness may start here: a live runtime could take an injected artifact
-        // answer and start a provider turn. The open fails visibly instead.
         smol::block_on(store.set_setting(
             "executables".into(),
             json!({"omp": directory.join("no-harness/omp")}),
@@ -1730,8 +1701,6 @@ mod macos {
         assert_tab_closed(&mut cx, window, &state, &endpoint, thread, &browser);
         screenshot(&mut cx, window, "workspace-tab-closed.png");
 
-        // The same Close tab action must route through both nested native-input
-        // focus scopes, not just a direct call to Workspace::execute.
         for page_focused in [false, true] {
             cx.update_window(window.into(), |_, window, cx| {
                 workspace.update(cx, |workspace, cx| {

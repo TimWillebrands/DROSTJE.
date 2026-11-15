@@ -6,7 +6,6 @@ edition.workspace = true
 publish = false
 
 [features]
-# The GUI app: sets the AppKit application icon on macOS. Headless builds leave it off.
 desktop = ["dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [dependencies]

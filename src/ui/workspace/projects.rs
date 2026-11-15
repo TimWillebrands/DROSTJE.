@@ -32,8 +32,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// External geometry: the macOS traffic lights sit over the leading edge of the left dock,
-/// the same inset `TitleBar` reserves for them.
 const TRAFFIC_LIGHTS_WIDTH: Pixels = px(80.);
 
 pub(in crate::ui) fn inline_editor(
@@ -61,12 +59,9 @@ pub(in crate::ui) fn inline_editor(
         })
         .into_any_element()
 }
-/// Minimum net travel on release; crossing it while touching never commits.
 const SPACE_SWIPE_DISTANCE: f32 = 80.;
-/// Platforms without touch phases use an idle gap as release.
 pub(in crate::ui) const SPACE_SWIPE_IDLE: Duration = Duration::from_millis(150);
 
-/// One direct-manipulation gesture, followed by ignored momentum.
 #[derive(Debug, Default)]
 pub struct SpaceSwipe {
     travelled: Point<f32>,
@@ -76,7 +71,6 @@ pub struct SpaceSwipe {
 }
 
 impl SpaceSwipe {
-    /// Positive x follows fingers right, towards the previous Space.
     pub fn feed(&mut self, delta: Point<f32>, phase: TouchPhase, now: Instant) -> Option<Command> {
         let idle = self
             .last_event
@@ -101,7 +95,6 @@ impl SpaceSwipe {
         None
     }
 
-    /// Pixels, not an animation fraction: the list stays attached to the fingers.
     pub(in crate::ui) fn progress(&self) -> Option<f32> {
         if self.stepped {
             return None;
@@ -138,11 +131,6 @@ pub enum Row {
     Project(ProjectId),
     Thread(ThreadId),
 }
-/// Visible sidebar rows in display order. Each project's threads are listed most
-/// recently touched first (`updated_at`); unreadable timestamps sort last and ties
-/// keep stored (creation) order. A non-empty `query` keeps the threads whose title
-/// (or whose project's name) contains it, ignoring collapse so no match is hidden,
-/// and drops projects without a match.
 pub fn rows(state: &AppState, query: &str) -> Vec<Row> {
     visible_rows(
         state
@@ -201,7 +189,6 @@ fn visible_rows<'a>(
     rows
 }
 
-/// Seconds since the Unix epoch for a stored `YYYY-MM-DDTHH:MM:SSZ` timestamp.
 fn unix_seconds(timestamp: &str) -> Option<i64> {
     let field = |range: std::ops::Range<usize>| timestamp.get(range)?.parse::<i64>().ok();
     let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
@@ -209,7 +196,6 @@ fn unix_seconds(timestamp: &str) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    // Days from civil date (Howard Hinnant), proleptic Gregorian calendar.
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
@@ -219,9 +205,6 @@ fn unix_seconds(timestamp: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
-/// The tracker references of a thread row: its pull request as `!id` and work items as
-/// `#id`, at most two of them with the rest counted. A Factory thread names the work item it
-/// was launched from.
 fn tracker_reference(
     pull_request: Option<&PullRequestLink>,
     factory_work_item: Option<i32>,
@@ -244,8 +227,6 @@ fn tracker_reference(
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// Compact age of a stored timestamp relative to `now` (Unix seconds): `now`,
-/// `5m`, `3h`, `2d`, `3w`, `2mo`, `1y`. `None` when the timestamp is unreadable.
 pub fn relative_age(timestamp: &str, now: i64) -> Option<String> {
     const MINUTE: i64 = 60;
     const HOUR: i64 = 60 * MINUTE;
@@ -326,8 +307,6 @@ fn exceptional_state(state: &AppState, thread: &Thread) -> Option<(&'static str,
     }
 }
 
-/// A Projects menu item for one thread row: it shows `command`'s label and key, and runs
-/// `run` on that thread instead of dispatching the selection-based action.
 fn thread_item(
     command: Command,
     reason: Option<String>,
@@ -368,9 +347,6 @@ fn row_menu(
     window: &mut Window,
     cx: &mut App,
 ) -> PopupMenu {
-    // Context actions operate on the clicked row, not the keyboard cursor or previously
-    // opened thread. A project row is selected like a click; a thread row only moves the
-    // cursor, so renaming, archiving or closing it never opens its tab first.
     let _ = owner.update(cx, |workspace, cx| {
         workspace.select_row(row, matches!(row, Row::Project(_)), window, cx)
     });
@@ -478,7 +454,6 @@ fn row_menu(
                 let in_worktree = row_thread.is_some_and(|c| c.worktree_id.is_some());
                 let conversation = row_thread.is_some_and(|c| c.kind == ThreadKind::Conversation);
                 let archived = row_thread.is_some_and(|c| c.archived);
-                // Checkout commands work on the open Conversation, so they open this one.
                 let opened = |command: Command| {
                     let reason = if state.selected_thread == Some(thread) {
                         command.disabled_reason(state)
@@ -571,27 +546,20 @@ pub(in crate::ui) struct SidebarPresentation<'a> {
     pub neighbor: Option<SpaceId>,
     pub neighbor_query: &'a str,
     pub neighbor_scroll: Option<&'a ScrollHandle>,
-    /// `Workspace::state_revision`: changes whenever `AppState` may have.
     pub revision: u64,
 }
 
-/// What one Space's list shows that costs a scan of `AppState`: its rows and each
-/// thread row's facts. Rebuilt when `AppState` changed, the Space or filter differs, or
-/// the project, thread or launch count moved; hover, cursor, focus, swipe and
-/// activity-animation frames reuse it.
 struct ListRows {
     revision: u64,
     space: SpaceId,
     query: SharedString,
     counts: (usize, usize, usize),
     rows: Vec<Row>,
-    /// Index into `snapshot.projects`.
     projects: HashMap<ProjectId, usize>,
     threads: HashMap<ThreadId, ThreadFacts>,
 }
 
 struct ThreadFacts {
-    /// Index into `snapshot.threads`.
     index: usize,
     tooltip: SharedString,
     status: Option<(&'static str, bool)>,
@@ -708,8 +676,6 @@ impl ThreadFacts {
                 None => String::new(),
             }
         );
-        // Factory rows name their target branch; Conversations in a worktree name
-        // the worktree's branch the same way.
         let branch = thread
             .factory
             .as_ref()
@@ -736,8 +702,6 @@ impl ThreadFacts {
     }
 }
 
-/// Up to two retained values, for the active Space's list and the neighbour shown
-/// while swiping; the least recently built goes first.
 struct Slots<T>(Vec<T>);
 
 impl<T> Default for Slots<T> {
@@ -764,8 +728,6 @@ impl<T> Slots<T> {
     }
 }
 
-/// Retained by the Projects panel so frames that change nothing in `AppState` index
-/// prepared rows instead of filtering, sorting and searching every thread again.
 #[derive(Default)]
 pub(in crate::ui) struct RowsCache(Slots<ListRows>);
 
@@ -828,7 +790,6 @@ fn render_list(
         .flex_1()
         .min_h_0()
         .overflow_y_scroll()
-        // A sideways swipe switches Space; it must not also scroll the rows.
         .restrict_scroll_to_axis()
         .when_some(scroll, |list, scroll| list.track_scroll(scroll));
     let cached = cache.0.get(
@@ -863,8 +824,6 @@ fn render_list(
                 };
                 let collapsed = collapsed_projects.contains(&id) && query.trim().is_empty();
                 let selected = selected_project == Some(id) && selected_thread.is_none();
-                // Row actions stay quiet until the header is hovered, selected or under
-                // the keyboard cursor; each has a key or context-menu equivalent.
                 let revealed = keyboard_cursor || selected;
                 let group: SharedString = format!("project-header-{id}").into();
                 let toggle_owner = owner.clone();
@@ -1039,8 +998,6 @@ fn render_list(
                                                 };
                                                 window.dispatch_action(action, cx);
                                             });
-                                            // A collapsed project keeps its chevron so the
-                                            // hidden threads stay discoverable.
                                             if collapsed { button } else { reveal(button) }
                                         }),
                                 )
@@ -1131,7 +1088,6 @@ fn render_list(
                         .child(div().flex_shrink_0().child("Archived"));
                     first_detail = false;
                 }
-                // An untouched thread is a placeholder that leaves Projects with its tab.
                 let untouched = facts.untouched;
                 if untouched {
                     details = details
@@ -1188,10 +1144,6 @@ fn render_list(
                                                 false => label.child(thread.title.clone()),
                                             }).into_any_element()
                                         })
-                                        // Pointer shortcuts only: the context menu and palette
-                                        // carry the same commands. The lane keeps its width so
-                                        // long titles do not jump when the pointer enters; the
-                                        // activity mark holds it otherwise.
                                         .when(!thread.archived, |view| {
                                             view.child(
                                                 h_flex()
@@ -1427,7 +1379,6 @@ pub(in crate::ui) fn render(
         .bg(theme.sidebar)
         .text_color(theme.sidebar_foreground)
         .children(crate::ui::theme::grain::layer(crate::ui::theme::grain(cx)))
-        // Mouse back/forward buttons; macOS also reports three-finger swipes this way.
         .on_mouse_down(
             MouseButton::Navigate(NavigationDirection::Back),
             |_, window, cx| window.dispatch_action(Box::new(PreviousSpace), cx),
@@ -1445,8 +1396,6 @@ pub(in crate::ui) fn render(
             h_flex()
                 .id("thread-search-row")
                 .flex_shrink_0()
-                // Level with the title bar beside it, bottom border included, so the
-                // Projects column reads as one full-height pane.
                 .h(TITLE_BAR_HEIGHT)
                 .when(cfg!(target_os = "macos"), |row| {
                     row.pl(TRAFFIC_LIGHTS_WIDTH)
@@ -1461,8 +1410,6 @@ pub(in crate::ui) fn render(
                         .flex_1()
                         .min_w_0()
                         .key_context("NativeInput ProjectSearch")
-                        // Escape clears the filter and hands focus back to the list; Down
-                        // moves into the filtered rows.
                         .on_action(move |_: &Dismiss, window, cx| {
                             let _ = search_owner.update(cx, |workspace, cx| {
                                 workspace.leave_thread_search(true, window, cx)
@@ -1568,7 +1515,6 @@ pub(in crate::ui) fn render(
                             .child(preview),
                     )
                 })
-                // Neither outgoing nor preview controls may act on a moving Space.
                 .when(slide != 0., |view| {
                     view.child(div().absolute().inset_0().block_mouse_except_scroll())
                 }),
@@ -1837,7 +1783,6 @@ mod tests {
         let at = |ms| start + Duration::from_millis(ms);
         let mut swipe = SpaceSwipe::default();
 
-        // Crossing the threshold stays attached until release, including a held pause.
         assert_eq!(swipe.feed(point(50., 2.), TouchPhase::Started, at(0)), None);
         assert_eq!(swipe.feed(point(40., 1.), TouchPhase::Moved, at(16)), None);
         assert_eq!(swipe.progress(), Some(90.));
@@ -1854,7 +1799,6 @@ mod tests {
         );
         assert_eq!(swipe.release(), None);
 
-        // Without touch phases (Wayland), the owner releases after the idle gap.
         assert_eq!(
             swipe.feed(point(-90., 0.), TouchPhase::Moved, at(700)),
             None
@@ -1862,7 +1806,6 @@ mod tests {
         assert!(swipe.needs_idle_release());
         assert_eq!(swipe.release(), Some(Command::NextSpace));
 
-        // Vertical scrolling with sideways wobble never steps.
         assert_eq!(
             swipe.feed(point(90., 300.), TouchPhase::Started, at(800)),
             None
@@ -1870,7 +1813,6 @@ mod tests {
         assert_eq!(swipe.feed(point(90., 0.), TouchPhase::Moved, at(816)), None);
         assert_eq!(swipe.release(), None);
 
-        // Short travel is abandoned once the gesture goes idle.
         assert_eq!(
             swipe.feed(point(-60., 0.), TouchPhase::Moved, at(1200)),
             None
@@ -1926,12 +1868,10 @@ mod tests {
                 },
             )
         };
-        // Repeated frames of one list, then the swipe neighbour beside it.
         assert_eq!(get(&mut slots, (1, 'a')), (1, 'a'));
         assert_eq!(get(&mut slots, (1, 'a')), (1, 'a'));
         assert_eq!(get(&mut slots, (1, 'b')), (1, 'b'));
         assert_eq!(get(&mut slots, (1, 'a')), (1, 'a'));
-        // A new revision rebuilds and evicts the oldest list.
         assert_eq!(get(&mut slots, (2, 'a')), (2, 'a'));
         assert_eq!(slots.0, [(1, 'b'), (2, 'a')]);
         assert_eq!(builds, 3);

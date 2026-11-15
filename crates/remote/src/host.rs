@@ -1,4 +1,3 @@
-//! Single-owner durable execution service. Relay loss revokes admission, not subprocesses.
 use super::{
     config::RemoteHostConfig,
     transport::{self, EncodeError, Outgoing, Role, TransportEvent},
@@ -32,9 +31,7 @@ const EVENT_BUDGET: i64 = 64 * 1024 * 1024;
 const MAX_RECEIPTS: i64 = 100_000;
 const MAX_SESSIONS: usize = 256;
 const ATTACHMENT_BUDGET: u64 = 512 * 1024 * 1024;
-/// Journaled bytes loaded per replay page; a page holds at least one event.
 const REPLAY_PAGE_BYTES: usize = 4 * 1024 * 1024;
-/// Queued updates merged into one before any other input is handled.
 const COALESCE_LIMIT: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -112,8 +109,6 @@ struct Runtime {
     ready: Option<ConversationEvent>,
     peer_availability: Option<ConversationEvent>,
     controls: BTreeMap<String, ConversationEvent>,
-    /// Images whose bytes the attached desktop received since it last opened this
-    /// Conversation; cleared on every Open, Detach and desktop loss.
     sent_images: HashSet<Uuid>,
 }
 struct PendingNetwork {
@@ -135,7 +130,6 @@ enum Input {
     HarnessClosed(Uuid, Uuid),
 }
 
-/// Runs until the transport worker terminates or persistence fails. Never retries a mutation.
 pub fn run(mut config: HostConfig) -> Result<()> {
     config.validate()?;
     let token = config.relay.token()?;
@@ -147,7 +141,6 @@ pub fn run(mut config: HostConfig) -> Result<()> {
         .create(true)
         .truncate(false)
         .open(config.data_dir.join("host.lock"))?;
-    // An exclusive flock that never waits on a different host, released when `lock` drops.
     ensure!(
         lock.try_lock().is_ok(),
         "Another host owns this data directory"
@@ -162,8 +155,6 @@ pub fn run(mut config: HostConfig) -> Result<()> {
         while let Ok(event) = connection.incoming.recv_blocking() {
             if relay_input.send(Input::Transport(event)).is_err() { break; }
         }
-        // Revocation/supersession permanently ends the transport worker. Revoke
-        // admission immediately, but leave the host actor and its active turns alive.
         let _ = relay_input.send(Input::Transport(TransportEvent::Disconnected(
             "Relay transport terminated; restart the host explicitly after reviewing its token/configuration".into(),
         )));
@@ -201,9 +192,6 @@ pub fn run(mut config: HostConfig) -> Result<()> {
     }
 }
 
-/// A queued update followed by updates of the same message or tool is replaced by the
-/// latest of them; desktops replace both by ID, so the transcript ends up the same. The
-/// first other input stops the merge and is returned to be handled next, in order.
 fn coalesce(incoming: &mpsc::Receiver<Input>, input: Input) -> (Input, Option<Input>) {
     let Input::Harness(thread, generation, mut event) = input else {
         return (input, None);
@@ -258,12 +246,9 @@ struct Host {
     network: BTreeMap<Uuid, PendingNetwork>,
     epoch: Option<Uuid>,
     last_seen: Instant,
-    /// What the attached desktop declared in its latest request.
     desktop: Capabilities,
 }
 impl Host {
-    /// Handle the next input, after merging the queued updates that follow it. Returns
-    /// whether an input arrived within `wait`.
     fn step(
         &mut self,
         incoming: &mpsc::Receiver<Input>,
@@ -297,7 +282,6 @@ impl Host {
                 eprintln!("Relay disconnected: {error}");
                 self.disconnect("Relay disconnected");
             }
-            // The transport bounds every frame, and so every body, by MAX_FRAME_BYTES.
             Input::Transport(TransportEvent::Payload(request)) => {
                 let id = request.id;
                 let thread = request.thread;
@@ -325,8 +309,6 @@ impl Host {
         }
         self.deliver(Outgoing::encode(&response, None));
     }
-    /// Send a journaled event exactly as stored, minus the bytes of images the attached
-    /// desktop already received when it accepts that.
     fn send_journaled(&mut self, thread: Uuid, journaled: Journaled) {
         if self.epoch.is_none() {
             return;
@@ -359,7 +341,6 @@ impl Host {
             ))
         });
         if !sent {
-            // Events remain durable. Reattachment either replays them or reports an explicit gap.
             self.disconnect("Remote response queue unavailable; reattach to reconcile");
             let _ = self.reconnect.try_send(());
         }
@@ -534,8 +515,6 @@ impl Host {
                 [thread.to_string()],
                 |row| row.get(0),
             )?;
-            // PermissionAuto is executed on this host. The desktop deliberately does
-            // not speculate about its outcome, so a later attach may carry the old mode.
             if effects > 0 {
                 config.permission_mode = previous.config.permission_mode.clone();
             }
@@ -658,7 +637,6 @@ impl Host {
                     remote: true,
                 }),
             }))?;
-            // Persist identity before consuming provider events or admitting commands.
             self.journal
                 .start(thread, runtime_generation, &project, &root, &config)?;
             let events = handle.events.clone();
@@ -733,8 +711,6 @@ impl Host {
             .journal
             .session(thread)?
             .context("Missing durable session")?;
-        // This Open starts a new desktop view of the Conversation: it receives every
-        // image's bytes again.
         self.runtimes
             .get_mut(&thread)
             .context("Runtime disappeared")?
@@ -748,7 +724,6 @@ impl Host {
             latest_sequence: latest,
             replay_after: cursor,
         });
-        // Page through the journal so a long transcript is never held in memory at once.
         let mut after = cursor;
         loop {
             let page = self.journal.replay_page(thread, after)?;
@@ -793,7 +768,6 @@ impl Host {
             generation: runtime_generation,
             through: latest,
         });
-        // A saturated transport cannot accidentally admit turns following partial reconciliation.
         if self.epoch.is_some() {
             self.runtimes
                 .get_mut(&thread)
@@ -821,8 +795,6 @@ impl Host {
             if self.epoch != Some(pending.epoch) || self.last_seen.elapsed() > LEASE {
                 return Ok(());
             }
-            // Adapter event channels close after their child owner has reaped the process.
-            // Only now may an empty Conversation release its old durable identity.
             let transaction = self.journal.db.transaction()?;
             transaction.execute("DELETE FROM events WHERE thread=?1", [thread.to_string()])?;
             transaction.execute("DELETE FROM sessions WHERE thread=?1", [thread.to_string()])?;
@@ -968,8 +940,6 @@ impl Host {
                 ConversationCommand::Respond { request_id, answer }
             }
         };
-        // FULL synchronous SQLite commit precedes native queue admission. A crash in this
-        // window leaves Unknown forever; no code path executes an existing receipt again.
         let unknown = ReceiptStatus::Unknown(
             "Host stopped before native admission could be confirmed".into(),
         );
@@ -999,8 +969,6 @@ impl Host {
             }
         };
         if let Err(error) = self.journal.update_receipt(id, effect, &status) {
-            // Queue admission already happened; a persistence failure cannot be reported
-            // as a known rejection. The pre-dispatch Unknown receipt remains authoritative.
             self.send(Response::Receipt { id, thread, status: ReceiptStatus::Unknown(format!("Native command may have been admitted, but its receipt could not be updated: {error:#}")) });
             if let Some(runtime) = self.runtimes.get_mut(&thread) {
                 runtime.attached = false;
@@ -1178,7 +1146,6 @@ impl Host {
             }
         }
     }
-    /// Forward an artifact's HTML to the attached desktop, which shows a local copy.
     fn artifact(
         &mut self,
         thread: Uuid,
@@ -1205,7 +1172,6 @@ impl Host {
             },
         );
     }
-    /// Forward an artifact completion to the attached desktop, which owns the page.
     fn complete_artifact(
         &mut self,
         thread: Uuid,
@@ -1226,7 +1192,6 @@ impl Host {
             },
         );
     }
-    /// A desktop-side artifact operation for this runtime, answered like a Network call.
     fn desktop_call(
         &mut self,
         thread: Uuid,
@@ -1303,8 +1268,6 @@ impl Host {
     fn read_diff(&self, thread: Uuid, path: Option<&str>) -> Result<Value> {
         let root = self.root(thread)?;
         let selection = path.map(|path| confined_path(&root, path)).transpose()?;
-        // The existing diff engine bounds git/untracked output and computes exact summaries.
-        // Only the patch text crosses the relay, so display rows are never parsed here.
         let mut diff = platform::working_tree_patch(&root)?;
         if let Some(path) = selection.filter(|path| path != &root) {
             let relative = path
@@ -1349,8 +1312,6 @@ impl Host {
         )
     }
 }
-/// Strip from `journaled` the bytes of images `sent` already holds, and record the rest.
-/// Unchanged events go out as their stored JSON, without serializing them again.
 fn reuse_images(
     sent: &mut HashSet<Uuid>,
     journaled: Journaled,
@@ -1441,7 +1402,6 @@ struct Journal {
     db: Connection,
     retained: BTreeMap<Uuid, RetainedEvents>,
 }
-/// A journaled response and the exact JSON stored for it.
 struct Journaled {
     response: Response,
     payload: String,
@@ -1457,7 +1417,6 @@ impl Journal {
         let unknown = serde_json::to_string(&ReceiptStatus::Unknown("Host process restarted; prior native admission/turn outcome may be unknown. Submission will not be replayed".into()))?;
         db.execute("UPDATE receipts SET status=?1 WHERE effect IN (SELECT id FROM effects WHERE settled=0)", [&unknown])?;
         db.execute("UPDATE effects SET status=?1 WHERE settled=0", [&unknown])?;
-        // Recover exact totals once; token events must never rescan retained transcripts.
         let retained = {
             let mut statement = db.prepare("SELECT thread,COUNT(*),COALESCE(SUM(LENGTH(CAST(payload AS BLOB))),0) FROM events GROUP BY thread")?;
             let rows = statement.query_map([], |row| {
@@ -1550,8 +1509,6 @@ impl Journal {
         };
         let mut payload = serde_json::to_string(&response)?;
         if payload.len() > MAX_FRAME_BYTES - 4096 {
-            // Native terminal/control frames are bounded by their adapters. Preserve their
-            // identity and semantics even if a provider supplies an enormous reason string.
             if let Response::Event { event, images, .. } = &mut response {
                 images.clear();
                 match event {
@@ -1622,7 +1579,6 @@ impl Journal {
         transaction
             .prepare_cached("UPDATE sessions SET sequence=?2 WHERE thread=?1")?
             .execute(params![thread.to_string(), stored_sequence])?;
-        // Explicit replay-gap errors, never a silently truncated transcript.
         while retained.count > 2048 || retained.bytes > EVENT_BUDGET {
             let (oldest, bytes): (i64, i64) = transaction.prepare_cached(
                 "SELECT sequence,LENGTH(CAST(payload AS BLOB)) FROM events WHERE thread=?1 ORDER BY sequence LIMIT 1",
@@ -1641,8 +1597,6 @@ impl Journal {
         self.retained.insert(thread, retained);
         Ok(Journaled { response, payload })
     }
-    /// The journaled events after `after`, in sequence order, up to `REPLAY_PAGE_BYTES`
-    /// of them; empty once none remain.
     fn replay_page(&self, thread: Uuid, after: u64) -> Result<Vec<(u64, Journaled)>> {
         let mut statement = self.db.prepare_cached(
             "SELECT sequence,payload FROM events WHERE thread=?1 AND sequence>?2 ORDER BY sequence LIMIT 256",
@@ -2164,7 +2118,6 @@ mod tests {
         host.request(message).unwrap();
         assert_eq!(response.recv().unwrap().unwrap(), json!({"id":"shown"}));
 
-        // Completion is the agent's call, forwarded to the desktop that owns the page.
         let browser = Uuid::new_v4();
         let (reply, response) = mpsc::channel();
         host.tool(BrowserToolRequest {
@@ -2192,7 +2145,6 @@ mod tests {
         host.request(message).unwrap();
         assert_eq!(response.recv().unwrap().unwrap(), json!({"completed":true}));
 
-        // A desktop with artifacts but without completion is refused, never sent it.
         let mut partial =
             serde_json::to_value(request(&host, thread, Operation::Heartbeat)).unwrap();
         partial["capabilities"] = json!({"artifacts": true});
@@ -2213,7 +2165,6 @@ mod tests {
         );
         assert!(responses.try_recv().is_err());
 
-        // A desktop from before artifacts omits the capability: nothing is forwarded.
         let mut old = serde_json::to_value(request(&host, thread, Operation::Heartbeat)).unwrap();
         old.as_object_mut().unwrap().remove("capabilities");
         host.request(serde_json::from_value(old).unwrap()).unwrap();
@@ -2403,8 +2354,6 @@ mod tests {
         let mut bytes = base64::engine::general_purpose::STANDARD
             .decode(&image.data)
             .unwrap();
-        // PNG decoders allow trailing bytes, so this remains a valid small-dimension
-        // image while its encoded native request exceeds the 1 MiB boundary.
         bytes.resize(900 * 1024, 0);
         image.data = base64::engine::general_purpose::STANDARD.encode(bytes);
         assert!(
@@ -2589,8 +2538,6 @@ mod tests {
             "An unrelated generation cannot release this owner"
         );
         host.closed(thread, generation).unwrap();
-        // The fixture deliberately has no installed executable: replacement is attempted
-        // only after closure, then rejects instead of launching any provider.
         assert!(host.runtimes.is_empty());
         assert!(host.pending_opens.is_empty());
     }
@@ -2600,8 +2547,6 @@ mod tests {
         let temp = Temp::new();
         let (mut host, thread, commands, responses) = fixture(&temp.0);
         let generation = host.runtimes[&thread].generation;
-        // Seed the exact boundary in one commit, then exercise startup accounting and
-        // the production append/recovery path without thousands of fsyncs in the test.
         {
             let transaction = host.journal.db.transaction().unwrap();
             for sequence in 1..=2048u64 {
@@ -2768,8 +2713,6 @@ mod tests {
             raw: None,
         })
     }
-    /// What a desktop keeps of a transcript: the latest message and tool per ID, and the
-    /// order of everything else.
     fn transcript(events: &[ConversationEvent]) -> (BTreeMap<String, String>, Vec<String>) {
         let mut latest = BTreeMap::new();
         let mut others = Vec::new();
@@ -2824,7 +2767,6 @@ mod tests {
                 .send(Input::Harness(thread, generation, event))
                 .unwrap();
         }
-        // Another runtime's update is never merged into this one.
         input
             .send(Input::Harness(other, generation, text("a", "foreign")))
             .unwrap();
@@ -2849,7 +2791,6 @@ mod tests {
             .collect::<Vec<_>>()
         );
         assert_eq!(transcript(&stored), transcript(&produced));
-        // The attached desktop received exactly the journaled rows, byte for byte.
         let sent: Vec<String> = std::iter::from_fn(|| responses.try_recv().ok())
             .map(|body| body.body().to_owned())
             .collect();
@@ -2932,12 +2873,9 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(images(&responses), [1, 0]);
-        // The journal stays self-contained: every row carries its image bytes.
         assert!(host.journal.replay(thread, 0).unwrap().iter().all(
             |response| matches!(response, Response::Event { images, .. } if images.len() == 1)
         ));
-        // A reattaching desktop gets the bytes again, once: replayed rows, then the state
-        // snapshot.
         host.open(
             Uuid::new_v4(),
             thread,
@@ -2952,7 +2890,6 @@ mod tests {
         host.event(thread, generation, tool("shot", vec![block.clone()]))
             .unwrap();
         assert_eq!(images(&responses), [0]);
-        // A desktop that predates reuse always receives the bytes.
         host.desktop = Capabilities {
             image_reuse: false,
             ..Capabilities::DESKTOP

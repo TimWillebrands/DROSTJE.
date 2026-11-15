@@ -1,6 +1,3 @@
-//! Action wiring: every Workspace command reaches `Workspace::execute` (or its
-//! direct handler) through one listener on the Workspace root.
-
 use super::*;
 
 impl Workspace {

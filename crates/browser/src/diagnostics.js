@@ -1,5 +1,3 @@
-// Runs through Servo UserScript when the document's head is attached.
-// Observes real outcomes, never reads response bodies or replaces native requests.
 (() => {
     const emit = console.warn.bind(console);
     const stringify = JSON.stringify;
@@ -21,7 +19,6 @@
     if (typeof fetch === 'function') {
         const original = fetch;
         window.fetch = function(...args) {
-            // Do not coerce caller-supplied objects or inspect Request bodies.
             const url = typeof args[0] === 'string' ? args[0].slice(0, 2048) : '<Request or URL object>';
             return Reflect.apply(original, this, args).then(response => {
                 if (response.status >= 400) report('network', {type: 'http_error', api: 'fetch', url: text(response.url || url), status: response.status});

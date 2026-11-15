@@ -1,4 +1,3 @@
-//! Draft persistence on focus loss and orderly quit.
 use super::*;
 
 #[gpui_kit::test]
@@ -59,8 +58,6 @@ async fn typing_saves_on_focus_loss_and_quit_not_idle(cx: &mut TestAppContext) {
         "pausing while focused must not save the draft"
     );
 
-    // Include a final keystroke immediately before focus loss: the semantic
-    // snapshot must include it even if its normal draft event arrives later.
     cx.simulate_keystrokes(fixture.window.into(), "d secondary-escape");
     wait_for_saved_thread(cx, &fixture, id, |thread| thread.draft == "abcd").await;
     update_workspace(

@@ -17,7 +17,6 @@
 #include <fcntl.h>
 #include <string.h>
 
-/* Fixed-size paths and reads keep the background query allocation-free. */
 static char *drost_process_pid_text(char *out, uint32_t pid) {
     char digits[10];
     unsigned count = 0;
@@ -44,8 +43,6 @@ static ssize_t drost_process_read(const char *path, char *buffer, size_t capacit
 }
 #endif
 
-/* Compare the launched executable's file identity, preserving symlink aliases.
- * An exec(2) replacement must not be mistaken for a shell waiting for input. */
 static int drost_process_matches_program(uint32_t pid, const char *expected_program) {
     if (!pid || pid > INT_MAX || !expected_program || !*expected_program) return -1;
     struct stat expected, actual;
@@ -64,9 +61,6 @@ static int drost_process_matches_program(uint32_t pid, const char *expected_prog
     if (stat(path, &actual) != 0) return -1;
     if (expected.st_dev == actual.st_dev && expected.st_ino == actual.st_ino) return 1;
 #if defined(__APPLE__)
-    /* macOS /bin/sh is an executable dispatcher, not a symlink. Its system
-     * selection points to the actual shell image; compare identities so
-     * aliases of /bin/sh behave identically without guessing shell names. */
     struct stat dispatcher, selected;
     if (stat("/bin/sh", &dispatcher) == 0 &&
         expected.st_dev == dispatcher.st_dev && expected.st_ino == dispatcher.st_ino &&
@@ -82,10 +76,6 @@ static int drost_process_idle_activity(uint32_t pid, const char *expected_progra
     return same == 1 ? 0 : same == 0 ? 1 : -1;
 }
 
-/* 0 = observed idle shell, 1 = work, -1 = unknown. Call off the UI thread.
- * login_wrapper is set only when Ghostty constructed its macOS login(1)
- * invocation. Otherwise root is the shell itself; no shell-name guessing,
- * integration, heap allocation, or timed sampling is used. */
 static int drost_process_activity(
     uint32_t root, uint32_t foreground, bool login_wrapper, const char *expected_program
 ) {
@@ -93,11 +83,7 @@ static int drost_process_activity(
 
 #if defined(__APPLE__)
     if (login_wrapper) {
-        /* The setuid login wrapper denies task-info queries to its own parent.
-         * Its process group and child relationship remain inspectable. */
         if (getpgid((pid_t)root) != (pid_t)root) return -1;
-        /* login(1) waits for its shell in a separate foreground group.
-         * Resolve exactly that child, not whichever foreground job is running. */
         pid_t shells[2] = {0};
         errno = 0;
         int count = proc_listchildpids((pid_t)root, shells, sizeof(shells));
@@ -116,14 +102,10 @@ static int drost_process_activity(
     if (info.pbsd.pbi_pid != root ||
         info.pbsd.pbi_status == SZOMB || (info.pbsd.pbi_flags & PROC_FLAG_INEXIT))
         return -1;
-    /* A shell may restore login(1)'s process group before exec(2). */
     if (info.pbsd.pbi_pgid != root)
         return drost_process_matches_program(root, expected_program) == 0 ? 1 : -1;
     if (foreground != root) return 1;
 
-    /* Only existence matters, so truncating the child list is harmless.
-     * libproc maps errors to zero, retaining errno; clear it first to
-     * distinguish an empty successful result from an inspection failure. */
     pid_t children[16];
     errno = 0;
     int count = proc_listchildpids((pid_t)root, children, sizeof(children));
@@ -140,8 +122,6 @@ static int drost_process_activity(
         return -1;
     if (after.pbsd.pbi_status == SSTOP) return 1;
     if (after.pbsd.pbi_status != SRUN && after.pbsd.pbi_status != SSLEEP) return -1;
-    /* BSD SRUN alone also describes sleeping macOS tasks. The task's actual
-     * runnable-thread count distinguishes an idle read from a busy builtin. */
     if (after.ptinfo.pti_threadnum <= 0 || after.ptinfo.pti_numrunning < 0) return -1;
     return after.ptinfo.pti_numrunning > 0 ? 1 : drost_process_idle_activity(root, expected_program);
 #elif defined(__linux__)
@@ -155,18 +135,17 @@ static int drost_process_activity(
     ssize_t count = drost_process_read(path, status, sizeof(status) - 1);
     if (count <= 0 || count == (ssize_t)sizeof(status) - 1) return -1;
     status[count] = 0;
-    /* comm may contain spaces and parentheses; its final ')' delimits state. */
     const char *comm_end = strrchr(status, ')');
     if (!comm_end || strlen(comm_end) < 4 || comm_end[1] != ' ' || comm_end[3] != ' ')
         return -1;
     if (getpgid((pid_t)root) != (pid_t)root) return -1;
     switch (comm_end[2]) {
-        case 'S': break; /* interruptible sleep: ordinary idle terminal read */
-        case 'R': /* running/runnable, including shell builtins */
-        case 'D': /* blocked work */
-        case 'T': /* stopped shell */
-        case 't': return 1; /* traced shell */
-        default: return -1; /* zombie, dead, or an unrecognized state */
+        case 'S': break;
+        case 'R':
+        case 'D':
+        case 'T':
+        case 't': return 1;
+        default: return -1;
     }
     if (foreground != root) return 1;
 

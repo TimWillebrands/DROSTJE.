@@ -27,8 +27,6 @@ use gpui_kit::{
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Agent prose in the theme's prose type, as wide as the tool cards beside it; code
-/// inside keeps the mono font.
 pub(super) fn prose(content: AnyElement, cx: &App) -> AnyElement {
     let prose = theme::prose(cx);
     div()
@@ -44,9 +42,6 @@ pub(super) fn prose(content: AnyElement, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// OMP injects `<system-reminder>` nudges, `<irc>` relays and `<critical>`
-/// mode notes as `custom` messages for the model's benefit; the transcript
-/// hides them. The role check keeps the same text visible when a user pastes it.
 pub(super) fn harness_note_hidden(message: &Message) -> bool {
     const HIDDEN: [(&str, &str); 3] = [
         ("<system-reminder>", "</system-reminder>"),
@@ -81,7 +76,6 @@ pub(super) fn message(
     runs: &RunCache,
     cx: &App,
 ) -> AnyElement {
-    // A tool result answers a call rendered earlier; that card shows its content.
     if message.role == "toolResult" {
         if message
             .tool_call_id
@@ -110,7 +104,6 @@ pub(super) fn message(
     if harness_note_hidden(&message) {
         return div().into_any_element();
     }
-    // In a folding run, the head row carries the header and every row its own calls.
     let run = runs.run(session, index).filter(|run| run.folds());
     let run_key = run.map(|run| format!("toolrun:{id}:{}", session.messages[run.head].id));
     let run_expanded = run_key
@@ -128,9 +121,6 @@ pub(super) fn message(
     let raw_expanded = message.raw.is_some() && is_expanded(owner, &raw_key, cx);
     let group: SharedString = format!("message-group-{id}-{}", message.id).into();
     let copy_message = message.clone();
-    // Actions stay out of the way until the pointer is over the message; each
-    // one is an icon button with its own tooltip rather than a hidden menu. They
-    // float over the top-right corner so a hidden row never pads the transcript.
     let mut actions = h_flex()
         .absolute()
         .top_0()
@@ -185,7 +175,6 @@ pub(super) fn message(
     let mut body = v_flex().w_full().min_w_0().gap_2();
     let mut images = h_flex().flex_wrap().gap_2();
     let mut has_images = false;
-    // The run's calls sit indented under its header; folded, they are not rendered.
     let mut folded = v_flex()
         .w_full()
         .min_w_0()
@@ -292,7 +281,6 @@ pub(super) fn message(
         body = body.child(images);
     }
     if run_expanded {
-        // Rows of one run touch, so the rule runs unbroken from the header to the last call.
         body = body.child(if head { folded.pb_1() } else { folded.py_1() });
     }
     if let Some(raw) = message.raw.as_ref().filter(|_| raw_expanded) {
@@ -389,7 +377,6 @@ mod tests {
             (prose.size.width, pane)
         };
 
-        // Prose lines up with the tool cards beside it, whatever its type.
         let (ink, pane) = width(cx);
         assert_eq!(ink, pane, "Ink prose fills its column");
 
@@ -412,7 +399,6 @@ mod tests {
             "custom",
             "<critical>\nPlan mode active.\n</critical>"
         )));
-        // The same text typed by the user, or a notice the harness wants shown, stays.
         assert!(!harness_note_hidden(&custom(
             "user",
             "<system-reminder>look</system-reminder>"

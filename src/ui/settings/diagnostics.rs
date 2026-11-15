@@ -1,4 +1,3 @@
-//! The Diagnostics group: each tool's setup status, with its retry or install control.
 use super::SurfaceContent;
 use crate::app::AppState;
 use crate::ui::commands;
@@ -37,7 +36,6 @@ pub(super) fn diagnostics_group(
             .get(name)
             .cloned()
             .unwrap_or_else(|| "Not inspected".into());
-        // A resolved azdo can still be signed out; that is a setup issue too.
         let tracker_issue = (name == "azdo")
             .then(|| state.tracker_setup_issue())
             .flatten();

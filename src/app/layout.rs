@@ -1,17 +1,13 @@
 use super::*;
 
-/// A tab of a thread's sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarTab {
     Changes,
     Output,
     Terminal,
-    /// Space network membership and the Conversation's local agent activity.
     Agents,
     Browser,
-    /// Review threads of the pull request pinned to a worktree Conversation.
     Review,
-    /// Inspector for the selected thread or tool call.
     Details,
 }
 impl SidebarTab {
@@ -28,8 +24,6 @@ impl SidebarTab {
         }
     }
 
-    /// The sidebar `(open, tab)` after asking for `requested`: a hidden sidebar or
-    /// another tab switches to it; the tab already on screen hides the sidebar.
     pub fn toggle(open: bool, current: Self, requested: Self) -> (bool, Self) {
         if open && current == requested {
             (false, current)
@@ -39,13 +33,10 @@ impl SidebarTab {
     }
 }
 
-/// How the Changes tab lays out a diff; one preference for every thread.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ChangesLayout {
-    /// One column: removed lines above the added lines that replace them.
     #[default]
     Inline,
-    /// Old file left, new file right, a removal beside its replacement.
     SideBySide,
 }
 impl ChangesLayout {
@@ -74,8 +65,6 @@ impl ChangesLayout {
 }
 
 impl AppState {
-    /// Whether a thread's sidebar (Changes, Output) is shown. The settings key predates
-    /// the Output tab and is kept so existing choices survive.
     pub fn thread_sidebar_open(&self, id: ThreadId) -> bool {
         let id = id.to_string();
         self.snapshot
@@ -87,7 +76,6 @@ impl AppState {
             .unwrap_or(true)
     }
 
-    /// The sidebar tab a thread shows. Factory threads have no Changes tab.
     pub fn thread_sidebar_tab(&self, id: ThreadId) -> SidebarTab {
         SidebarTab::from_saved(
             self.is_conversation(id),
@@ -114,7 +102,6 @@ impl AppState {
         self.set_setting(ChangesLayout::KEY, Value::String(layout.saved().into()));
     }
 
-    /// Show `tab` in the thread's sidebar, or hide the sidebar when `tab` is already shown.
     pub fn toggle_thread_sidebar(&mut self, id: ThreadId, tab: SidebarTab) {
         let (open, tab) = SidebarTab::toggle(
             self.thread_sidebar_open(id),
@@ -124,7 +111,6 @@ impl AppState {
         self.set_thread_sidebar(id, open, tab);
     }
 
-    /// Open the thread's sidebar on `tab`.
     pub fn show_thread_sidebar(&mut self, id: ThreadId, tab: SidebarTab) {
         self.set_thread_sidebar(id, true, tab);
     }
@@ -192,7 +178,6 @@ impl AppState {
         widths.insert(id.to_string(), json!(width.clamp(180., 1600.)));
         self.set_setting("thread_sidebar_width", Value::Object(widths));
     }
-    /// User-resized composer height in logical pixels; absent keeps content-aware sizing.
     pub fn thread_composer_height(&self, id: ThreadId) -> Option<f32> {
         self.snapshot
             .settings

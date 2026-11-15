@@ -1,19 +1,13 @@
-//! Slash commands a harness offers for prompt text: skills, prompt templates, extension
-//! and plugin commands, and the harness's own builtins. They run when a prompt starts with
-//! `/name`, so DROSTJE. only lists them and refuses the ones that would change state it owns.
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
-/// Where a harness says a command comes from. Unknown sources are kept verbatim.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandSource {
     Builtin,
     Skill,
     Extension,
     Plugin,
-    /// A user or project command file (`.claude/commands`, OMP custom commands).
     Custom,
-    /// A prompt template expanded before the turn starts.
     Template,
     File,
     McpPrompt,
@@ -38,15 +32,11 @@ impl CommandSource {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommand {
-    /// Without the leading `/`.
     pub name: String,
     pub aliases: Vec<String>,
     pub description: String,
-    /// Harness-supplied argument syntax, such as `[focus]`; `None` when it takes none.
     pub argument_hint: Option<String>,
     pub source: CommandSource,
-    /// Why DROSTJE. refuses to send this command. Blocked commands would replace the
-    /// session, model or directory DROSTJE. tracks for the Conversation.
     pub blocked: Option<Cow<'static, str>>,
 }
 
@@ -56,7 +46,6 @@ impl SlashCommand {
     }
 }
 
-/// What the harness has told DROSTJE. about its commands.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum CommandCatalog {
     #[default]
@@ -73,8 +62,6 @@ impl CommandCatalog {
         }
     }
 
-    /// The command `text` invokes, when the harness lists it. An exact name wins over an
-    /// alias, and a builtin over another command of the same name, as the harnesses resolve it.
     pub fn invoked(&self, text: &str) -> Option<&SlashCommand> {
         let (name, _) = invocation(text)?;
         let commands = self.commands();
@@ -85,7 +72,6 @@ impl CommandCatalog {
             .or_else(|| commands.iter().find(|command| command.answers_to(name)))
     }
 
-    /// Why no command can be offered, when that is the case.
     pub fn unavailable_reason(&self) -> Option<String> {
         match self {
             Self::Loading => Some("The harness has not listed its commands yet".into()),
@@ -97,7 +83,6 @@ impl CommandCatalog {
         }
     }
 
-    /// Why `text` must not be sent, when it invokes a blocked command.
     pub fn refusal(&self, text: &str) -> Option<String> {
         let command = self.invoked(text)?;
         let reason = command.blocked.as_deref()?;
@@ -108,8 +93,6 @@ impl CommandCatalog {
     }
 }
 
-/// Splits prompt text that starts with `/name` into the name and the rest. Harnesses only
-/// treat a slash at the very start of the prompt as a command.
 pub fn invocation(text: &str) -> Option<(&str, &str)> {
     let rest = text.strip_prefix('/')?;
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());

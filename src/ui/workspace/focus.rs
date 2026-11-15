@@ -1,6 +1,3 @@
-//! Pane focus: which panel holds focus, focusing a region or panel, and spatial
-//! `Cmd-Alt-h/j/k/l` navigation between visible panes and sidebar tabs.
-
 use super::*;
 
 impl Workspace {
@@ -41,7 +38,6 @@ impl Workspace {
         }
     }
     pub fn focus_region(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
-        // A thread selected in this same update has no panel until the sync runs.
         if region == Region::Thread {
             self.sync_thread_panels(window, cx);
         }
@@ -53,7 +49,6 @@ impl Workspace {
             self.focus_panel(panel, window, cx);
         }
     }
-    /// Reveal a panel (open its dock, zoom out, select its tab) and focus it.
     pub(super) fn focus_panel(
         &mut self,
         panel: Entity<WorkspacePanel>,
@@ -112,8 +107,6 @@ impl Workspace {
                 }
             });
         }
-        // A newly activated tab has not entered the rendered focus tree yet.
-        // Commit selection here; focus callbacks cover already-visible panes.
         match kind {
             PanelKind::Thread(id) => self.thread_focused(id, panel.entity_id(), window, cx),
             PanelKind::Terminal(id) => self.terminal_focused(id, window, cx),
@@ -239,16 +232,12 @@ impl Workspace {
                     PaneDirection::Up => (origin.top() - bounds.bottom(), overlap.width, delta.x),
                     PaneDirection::Down => (bounds.top() - origin.bottom(), overlap.width, delta.x),
                 };
-                // Neighbours must lie beyond this edge, not merely have a centre
-                // somewhere in that direction. Allow one pixel of layout rounding.
                 (gap >= px(-1.) && overlap > px(1.)).then_some((
                     (panel, sidebar),
                     f32::from(gap).max(0.),
                     f32::from(cross).abs(),
                 ))
             })
-            // Edge distance takes precedence: never skip an intervening pane
-            // because a farther pane's centre happens to line up better.
             .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)))
             .map(|(panel, _, _)| panel);
         if let Some((next, sidebar)) = next {

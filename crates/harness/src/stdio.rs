@@ -1,8 +1,3 @@
-//! An owned harness child speaking newline-delimited JSON over stdio, as Codex
-//! `app-server` and OpenCode `acp` do. This module owns the process group, the
-//! nonblocking pipes and bounded framing only; each adapter keeps its own protocol.
-//! [`LineReader`] is the newline framing every stdio adapter, OMP and Claude Code included,
-//! reads its child's stdout with.
 use crate::ConversationCommand;
 use anyhow::{Context, Result, bail, ensure};
 use drostje_platform::WakePipe;
@@ -19,22 +14,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Largest stdout frame accepted from a harness; history replies can be large.
 const OUTPUT_FRAME: usize = 67_108_864;
-/// Unwritten frames allowed before the input pipe counts as stuck.
 const WRITE_QUEUE: usize = 128;
-/// A line buffer that grew past this for one large frame is released after it.
 const RETAINED_LINE: usize = 1_048_576;
 
-/// Longest an idle adapter loop sleeps, so every deadline it checks fires at most this late.
 const IDLE_WAIT: Duration = Duration::from_millis(100);
-/// The fixed tick for work no descriptor announces: a display that stopped consuming
-/// events, or a socket write in progress.
 const BUSY_WAIT: Duration = Duration::from_millis(5);
 
-/// How long an adapter loop may sleep after a pass: not at all while queued `events` can
-/// still be delivered, [`BUSY_WAIT`] while `output` is full or the caller has `busy` work,
-/// otherwise [`IDLE_WAIT`].
 pub(super) fn sleep_for<T>(
     events: &VecDeque<T>,
     output: &async_channel::Sender<T>,
@@ -49,14 +35,10 @@ pub(super) fn sleep_for<T>(
     }
 }
 
-/// An adapter's command channel, plus the wake pipe that lets its loop block until the
-/// child's pipes, a command or a timeout need it, instead of polling on a fixed tick.
 pub(super) struct Commands {
     receiver: Pin<Box<async_channel::Receiver<ConversationCommand>>>,
     signal: Arc<Signal>,
     waker: Waker,
-    /// The last [`Self::recv`] left a waker registered: a new command, or the channel
-    /// closing, signals the pipe. Otherwise commands may be left and nothing sleeps.
     armed: bool,
 }
 
@@ -85,7 +67,6 @@ impl Commands {
         })
     }
 
-    /// `try_recv` that, when the channel is empty, registers for the next command.
     pub(super) fn recv(
         &mut self,
     ) -> std::result::Result<ConversationCommand, async_channel::TryRecvError> {
@@ -95,7 +76,6 @@ impl Commands {
                 self.armed = false;
                 Ok(command)
             }
-            // A closed channel delivers nothing more, so waiting cannot miss a command.
             Poll::Ready(None) => {
                 self.armed = true;
                 Err(async_channel::TryRecvError::Closed)
@@ -107,9 +87,6 @@ impl Commands {
         }
     }
 
-    /// Sleeps until one of `readable` has input or hung up, one of `writable` accepts
-    /// output, a command arrives, or `timeout` passes. Returns at once when commands may
-    /// still be queued.
     pub(super) fn wait(
         &mut self,
         readable: &[BorrowedFd<'_>],
@@ -128,28 +105,19 @@ impl Commands {
     }
 }
 
-/// What [`LineReader::next`] found.
 pub(super) enum Line<'a> {
-    /// One complete line, newline included, valid until the next call.
     Frame(&'a [u8]),
-    /// No complete line is available without blocking.
     Pending,
-    /// The writer closed the pipe. [`LineReader::partial`] tells whether a line was cut off.
     Eof,
-    /// The line would exceed the reader's limit; the stream cannot resynchronise.
     TooLong,
 }
 
-/// Bounded newline framing over a nonblocking reader. A line that fits in one read is
-/// returned straight from the read buffer; only lines spanning reads are assembled.
 pub(super) struct LineReader {
     buffer: Box<[u8; 16_384]>,
     start: usize,
     end: usize,
     line: Vec<u8>,
-    /// `line` holds a line already returned, cleared on the next call.
     returned: bool,
-    /// Largest line accepted, newline included.
     limit: usize,
 }
 
@@ -165,18 +133,14 @@ impl LineReader {
         }
     }
 
-    /// Bytes of an unfinished line are buffered.
     pub(super) fn partial(&self) -> bool {
         !self.returned && !self.line.is_empty()
     }
 
-    /// Read bytes are waiting in the buffer, so the descriptor may never become readable
-    /// for them: the caller must not sleep.
     pub(super) fn buffered(&self) -> bool {
         self.start < self.end
     }
 
-    /// Reads until one whole line is buffered or `source` would block.
     pub(super) fn next(&mut self, source: &mut impl Read) -> std::io::Result<Line<'_>> {
         if self.returned {
             self.returned = false;
@@ -231,10 +195,8 @@ pub(super) struct StdioChild {
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
     stderr: ChildStderr,
-    /// Cleared at stderr end of file, after which a hung-up stderr would end every wait.
     stderr_open: bool,
     reaped: bool,
-    /// Product name used in errors, such as `Codex`.
     label: &'static str,
     input_limit: usize,
     lines: LineReader,
@@ -247,8 +209,6 @@ fn nonblocking(fd: BorrowedFd<'_>, label: &str) -> Result<()> {
 }
 
 impl StdioChild {
-    /// Starts `command` as the leader of a new process group with piped stdio.
-    /// `input_limit` bounds one outgoing frame, newline included.
     pub(super) fn spawn(
         mut command: Command,
         label: &'static str,
@@ -287,7 +247,6 @@ impl StdioChild {
         Ok(owned)
     }
 
-    /// Queues one frame; nothing is written until `flush`.
     pub(super) fn queue(&mut self, value: &Value) -> Result<()> {
         let mut bytes = serde_json::to_vec(value)?;
         bytes.push(b'\n');
@@ -306,7 +265,6 @@ impl StdioChild {
         Ok(())
     }
 
-    /// Writes queued frames until the pipe would block.
     pub(super) fn flush(&mut self) -> Result<()> {
         while let Some(write) = self.writes.front() {
             let Some(stdin) = self.stdin.as_mut() else {
@@ -329,8 +287,6 @@ impl StdioChild {
         Ok(())
     }
 
-    /// The next complete stdout frame, or `None` when no whole line is available yet.
-    /// End of file and malformed frames are errors: the protocol cannot resynchronise.
     pub(super) fn read_frame(&mut self) -> Result<Option<Value>> {
         loop {
             match self.lines.next(&mut self.stdout)? {
@@ -352,7 +308,6 @@ impl StdioChild {
         }
     }
 
-    /// Diagnostic text the harness wrote to stderr since the last call.
     pub(super) fn read_stderr(&mut self) -> Result<Option<String>> {
         if !self.stderr_open {
             return Ok(None);
@@ -376,8 +331,6 @@ impl StdioChild {
         }
     }
 
-    /// Sleeps on this child's pipes and `commands` for up to `timeout`; see
-    /// [`Commands::wait`].
     pub(super) fn wait(&self, commands: &mut Commands, timeout: Duration) -> Result<()> {
         let timeout = if self.lines.buffered() {
             Duration::ZERO
@@ -415,7 +368,6 @@ impl StdioChild {
         !self.reaped && matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Closes stdin, gives the harness five seconds to exit on EOF, then signals its group.
     pub(super) fn close(&mut self) {
         self.stdin.take();
         if self.reaped {
@@ -437,7 +389,6 @@ impl StdioChild {
                 _ => break,
             }
         }
-        // This PID is the unreaped child whose setsid call succeeded before exec.
         let _ = drostje_platform::terminate_process_group(self.child.id());
         let deadline = Instant::now() + Duration::from_millis(250);
         while Instant::now() < deadline {
@@ -455,12 +406,10 @@ impl StdioChild {
         }
     }
 
-    /// Kills the whole process group at once, without the graceful EOF wait.
     pub(super) fn terminate(&mut self) -> Result<()> {
         if self.reaped {
             return Ok(());
         }
-        // This is the same unreaped owned process group.
         drostje_platform::kill_process_group(self.child.id())
             .with_context(|| format!("Kill owned {} process group", self.label))?;
         self.stdin.take();
@@ -501,7 +450,6 @@ mod tests {
         }
     }
 
-    /// A reader replaying scripted reads; `None` stands for "would block".
     struct Script(VecDeque<Option<Vec<u8>>>);
     impl Read for Script {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
@@ -580,7 +528,6 @@ mod tests {
 
     #[test]
     fn frames_round_trip_through_a_real_pipe() -> Result<()> {
-        // `cat` echoes each queued frame back as one stdout line.
         let mut child = StdioChild::spawn(shell("exec cat"), "Echo", 1024)?;
         child.queue(&json!({"id":1,"method":"ping"}))?;
         child.queue(&json!({"id":2,"text":"two\nlines"}))?;
@@ -620,7 +567,6 @@ mod tests {
         let mut child =
             StdioChild::spawn(shell("read line; printf '{}\\n'; sleep 30"), "Idle", 1024)?;
 
-        // Not yet registered for commands: one may be queued, so nothing sleeps.
         let started = Instant::now();
         child.wait(&mut commands, Duration::from_secs(30))?;
         assert!(started.elapsed() < Duration::from_secs(5));

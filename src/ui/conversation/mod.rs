@@ -1,7 +1,3 @@
-//! The Conversation thread surface: transcript, composer band and the cards in between.
-//! `mod.rs` re-exports what the rest of the UI uses and holds the layout helpers every
-//! part shares.
-
 mod blocks;
 mod composer;
 mod disclosure;
@@ -41,7 +37,6 @@ use gpui_kit::{
     *,
 };
 
-// A full-width row preserves the transcript's edge scrollbar; only its content is centered.
 fn content_column() -> Div {
     div().w_full().max_w(rems(60.)).px_3()
 }

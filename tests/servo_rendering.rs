@@ -1,4 +1,3 @@
-//! Opt-in real Servo + GPUI Metal rendering/input regression, without provider turns.
 fn main() {
     #[cfg(target_os = "macos")]
     macos::run();
@@ -153,8 +152,6 @@ mod macos {
                     .frame
                     .is_some_and(|frame| frame.width == physical_width)
             });
-            // A resized framebuffer can precede the page's repaint and GPUI's
-            // asynchronous image upload. Wait for the actual displayed pixels.
             let deadline = Instant::now() + Duration::from_secs(45);
             let screenshot = loop {
                 let screenshot = cx.capture_screenshot(window.into()).unwrap();
@@ -276,7 +273,6 @@ mod macos {
                     .min(bounds.size.height.as_f32() / css_height as f32);
                 let left = (bounds.size.width.as_f32() - css_width as f32 * fit) / 2.;
                 let top = (bounds.size.height.as_f32() - css_height as f32 * fit) / 2.;
-                // The bottom-right marker proves the full, undistorted viewport is visible.
                 let deadline = Instant::now() + Duration::from_secs(45);
                 loop {
                     let screenshot = cx.capture_screenshot(window.into()).unwrap();
@@ -365,7 +361,6 @@ mod macos {
                         css_height / 2,
                         css_width / 2,
                         css_height / 2,
-                        // Servo's native wheel contract and DOM wheel deltas use device pixels.
                         30. / fit * device_scale,
                     ),
                 );

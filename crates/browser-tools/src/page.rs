@@ -1,16 +1,8 @@
-//! Bounded, DOM-derived observations; target references live for one observation only.
-//!
-//! The document owns the registry, never an element attribute or a selector. A fresh
-//! Rust UUID initializes its identity and each observation replaces at most 200 refs.
-//! Navigation/pagehide, document-element replacement, and a subsequent observation
-//! invalidate references. Resolution observes geometry only; input stays in Servo.
-
 use std::fmt::Write as _;
 
 pub(super) fn observe_script(limit: usize) -> String {
     let mut script =
         String::with_capacity(COMMON.len() + OBSERVE_HELPERS.len() + OBSERVE.len() + 160);
-    // Formatting into String cannot fail.
     let _ = write!(
         script,
         "(() => {{\nconst seed = \"{}\";\nconst limit = {};\n",

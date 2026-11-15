@@ -31,7 +31,6 @@ impl AppState {
         if (thread.archived || project.archived) && thread.session_ref.is_none() {
             return;
         }
-        // A removed worktree has no directory to run in; the composer explains why.
         if thread.remote.is_none() && self.thread_worktree(&thread).is_some_and(|w| !w.is_live()) {
             return;
         }
@@ -205,8 +204,6 @@ impl AppState {
         self.open_conversation(id, true);
     }
 
-    /// Why the selected Conversation cannot change harness, or `None` when it can. The
-    /// harness is fixed once a turn exists, because the provider session belongs to it.
     pub fn switch_harness_reason(&self) -> Option<String> {
         match self.conversation_thread() {
             Some(thread) => self.switch_harness_reason_for(thread.id),
@@ -236,9 +233,6 @@ impl AppState {
         )
     }
 
-    /// Reopens an unstarted Conversation on `harness`. The draft and attachments stay; the
-    /// model comes from the last Conversation on that harness, and harness-specific launch
-    /// flags (effort, permission mode) return to the harness defaults.
     pub fn switch_harness(&mut self, id: ThreadId, harness: &str) -> Result<()> {
         anyhow::ensure!(
             harness::CONVERSATION_HARNESSES.contains(&harness),
@@ -272,7 +266,6 @@ impl AppState {
         thread.effort = None;
         thread.permission_mode = None;
         self.save_thread(thread);
-        // Closes the old harness process and opens the new one in its place.
         self.retry_conversation(id);
         Ok(())
     }
@@ -284,8 +277,6 @@ impl AppState {
         self.turn_start_reason(id, false)
     }
 
-    /// Why a draft cannot join the thread's queue. Queueing needs a turn in flight and a
-    /// conversation that could otherwise send; the queue never covers for a broken setup.
     pub fn queue_reason(&self, id: ThreadId) -> Option<String> {
         if self.editor.is_none() || self.editor_error.is_some() {
             return Some("Connect or restart Neovim before queueing".into());
@@ -303,8 +294,6 @@ impl AppState {
         None
     }
 
-    /// Why a new turn cannot start, wherever its text comes from. With `ignore_active` a
-    /// running turn is not a reason, which is the check a queued message needs.
     fn turn_start_reason(&self, id: ThreadId, ignore_active: bool) -> Option<String> {
         if self.shutting_down {
             return Some("Application is shutting down".into());
@@ -361,8 +350,6 @@ impl AppState {
         if thread.submission.is_some() && !(ignore_active && busy) {
             return Some("Review the previous submitted draft before starting another turn".into());
         }
-        // An empty model list means the harness has not reported models yet; its Submit then
-        // owns image validation.
         if !thread.attachments.is_empty()
             && !session.models.is_empty()
             && !session.models.iter().any(|m| {
@@ -418,8 +405,6 @@ impl AppState {
         }
         self.send_command(id, ConversationCommand::SelectModel(model));
     }
-    /// Effort is a launch flag for the harness, so a change restarts its process; the
-    /// conversation resumes from the provider session.
     pub fn select_effort(&mut self, id: ThreadId, effort: Option<String>) {
         if !self.is_conversation(id) {
             return;
@@ -445,7 +430,6 @@ impl AppState {
         self.save_thread(thread);
         self.retry_conversation(id);
     }
-    /// Permission mode is a launch flag like effort: a change restarts the harness process.
     pub fn select_permission_mode(&mut self, id: ThreadId, mode: Option<String>) {
         if !self.is_conversation(id) {
             return;
@@ -471,8 +455,6 @@ impl AppState {
         self.save_thread(thread);
         self.retry_conversation(id);
     }
-    /// "Yes and switch to auto" persists the harness's auto permission mode, so the
-    /// next launch keeps it; harnesses without one keep their mode.
     pub fn respond(&mut self, id: ThreadId, request_id: String, answer: UserAnswer) {
         let switches_to_auto = matches!(&answer, UserAnswer::PermissionAuto)
             && self
@@ -509,7 +491,6 @@ impl AppState {
         }
     }
 
-    /// Why the Conversation cannot offer slash commands right now.
     pub fn slash_command_reason(&self, id: ThreadId) -> Option<String> {
         let Some(session) = self.conversations.get(&id) else {
             return Some("Open the conversation harness first".into());
@@ -517,8 +498,6 @@ impl AppState {
         session.slash_commands.unavailable_reason()
     }
 
-    /// Why `text` must not reach the harness: it invokes a slash command that would replace
-    /// state DROSTJE. owns for the Conversation.
     pub fn command_refusal(&self, id: ThreadId, text: &str) -> Option<String> {
         self.conversations.get(&id)?.slash_commands.refusal(text)
     }
@@ -550,8 +529,6 @@ impl AppState {
         self.submit_message(id, draft.text.clone(), images, Some(draft), cx);
     }
 
-    /// Starts a turn with `text` and `images`. `draft` is the editor snapshot the text came
-    /// from, cleared once the harness accepts the prompt; queued messages have none.
     fn submit_message(
         &mut self,
         id: ThreadId,
@@ -619,8 +596,6 @@ impl AppState {
         }).detach();
     }
 
-    /// Moves the composer draft and its attachments to the back of the thread's queue and
-    /// empties the editor, so the next prompt can be written while the turn runs.
     pub fn enqueue_snapshot(&mut self, id: ThreadId, draft: DraftSnapshot, cx: &mut Context<Self>) {
         let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
             return;
@@ -689,8 +664,6 @@ impl AppState {
         .detach();
     }
 
-    /// Why the front of the queue cannot start a turn right now, or `None` when a
-    /// dispatch is possible.
     pub fn queued_dispatch_reason(&self, id: ThreadId) -> Option<String> {
         let queued = self
             .snapshot
@@ -705,7 +678,6 @@ impl AppState {
         self.turn_start_reason(id, false)
     }
 
-    /// Starts the next queued turn when the queue is allowed to continue on its own.
     fn dispatch_queued(&mut self, id: ThreadId, cx: &mut Context<Self>) {
         let allowed = self
             .conversations
@@ -722,8 +694,6 @@ impl AppState {
         self.submit_message(id, message.text, message.attachments, None, cx);
     }
 
-    /// Sends one queued message ahead of the rest: immediately while idle, otherwise after
-    /// interrupting the running turn at the user's request.
     pub fn send_queued_now(&mut self, id: ThreadId, message_id: Uuid, cx: &mut Context<Self>) {
         let Some(mut thread) = self.snapshot.threads.iter().find(|t| t.id == id).cloned() else {
             return;
@@ -761,7 +731,6 @@ impl AppState {
         }
     }
 
-    /// Removes a queued message so its text can go back into the composer.
     pub fn take_queued(&mut self, id: ThreadId, message_id: Uuid) -> Option<QueuedMessage> {
         let mut thread = self.snapshot.threads.iter().find(|t| t.id == id).cloned()?;
         let position = thread.queued.iter().position(|m| m.id == message_id)?;
@@ -786,7 +755,6 @@ impl AppState {
             );
         }
     }
-    /// Whether a title is being generated for this thread.
     pub fn is_titling(&self, id: ThreadId) -> bool {
         self.titling.contains(&id)
     }
@@ -823,7 +791,6 @@ impl AppState {
         None
     }
 
-    /// Renames the selected Conversation from all of its user prompts, replacing any title.
     pub fn regenerate_title(&mut self, cx: &mut Context<Self>) {
         if let Some(reason) = self.regenerate_title_reason() {
             self.notice(NoticeLevel::Warning, reason);
@@ -859,7 +826,6 @@ impl AppState {
         self.generate_title(id, prompt, true, cx);
     }
 
-    /// The local text generator Settings configure, for titles and commit subjects.
     pub(super) fn text_generator(&self) -> titles::Generator {
         let settings = &self.snapshot.settings;
         let text = |key: &str| settings.get(key).and_then(Value::as_str);
@@ -880,8 +846,6 @@ impl AppState {
         }
     }
 
-    /// Names a Conversation with the configured local title provider. Automatic mode tries the
-    /// llama.cpp CLI before falling back to Ollama.
     fn generate_title(
         &mut self,
         id: ThreadId,
@@ -894,7 +858,6 @@ impl AppState {
         }
         let generator = self.text_generator();
         cx.emit(PresentationChange::Thread(id));
-        // The Projects list shimmers the row too, and only observes notifications.
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = smol::unblock(move || generator.title(&prompt)).await;
@@ -990,8 +953,6 @@ impl AppState {
         let mut peer_turn = None;
         let mut peer_settled = None;
         let mut pause_network = false;
-        // Saved once the session is back in `conversations`: `save_thread` syncs the network,
-        // which would otherwise see a missing runtime and pause its automatic delivery.
         let mut save = None;
         let refresh_diff = matches!(
             &event,
@@ -1399,8 +1360,6 @@ impl AppState {
         if pause_network {
             self.pause_network_delivery(id);
         }
-        // Artifact attempts share the native injection path; settle them first so the
-        // network never sees an attempt it did not make.
         if let Some((attempt, outcome)) = peer_delivery
             && let Some(outcome) = self.artifact_delivery_event(id, attempt, outcome)
         {
@@ -1424,15 +1383,10 @@ impl AppState {
             self.queue_conversation_diff(id, cx);
         }
         cx.emit(presentation);
-        // The harness reports the settled turn before it reports Ready, so the queue is
-        // checked after every event rather than on one of them.
         self.dispatch_queued(id, cx);
     }
 }
 
-/// Records `draft` unless the editor already reported a later changedtick of the same buffer
-/// generation, and copies a thread draft's text into its row in place. Returns the thread whose
-/// row changed, so the caller can mark it edited (an in-memory change, never a write).
 fn apply_draft(
     threads: &mut [Thread],
     drafts: &mut HashMap<DraftKey, DraftSnapshot>,
@@ -1459,9 +1413,6 @@ fn apply_draft(
     edited
 }
 
-/// Whether the queue may start its next turn after a turn settled this way. Only a completed
-/// turn, or an interrupt the user requested through Send now, continues; a failure or an
-/// unexplained end leaves the queue for the user to resume.
 fn queue_continues(outcome: &TurnOutcome, interrupt_for_queue: bool) -> bool {
     match outcome {
         TurnOutcome::Completed => true,
@@ -1470,7 +1421,6 @@ fn queue_continues(outcome: &TurnOutcome, interrupt_for_queue: bool) -> bool {
     }
 }
 
-/// How a new Conversation starts: harness, model and the harness launch flags.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversationDefaults {
     pub harness: String,
@@ -1479,13 +1429,6 @@ pub(crate) struct ConversationDefaults {
     pub permission_mode: Option<String>,
 }
 
-/// How a new Conversation in `project` starts. `source` is the Conversation the user is in
-/// when asking for a new one; it is copied whole (harness, model, effort, permission mode)
-/// unless an explicit `harness` names another harness. Without a source, the most recently
-/// used Conversation's harness continues; the model follows the last Conversation on that
-/// harness, else the project's default model when the harness is the project's default.
-/// Launch flags only carry over from a source on the same harness, because their values are
-/// harness-specific. With no history, the project defaults apply.
 pub(crate) fn conversation_defaults(
     threads: &[Thread],
     project: &Project,
@@ -1505,8 +1448,6 @@ pub(crate) fn conversation_defaults(
             permission_mode: source.permission_mode.clone(),
         };
     }
-    // Timestamps are fixed-width UTC, so they order as strings; `max_by` keeps the later
-    // row on a tie, which is the newer one because rows are appended.
     let latest = |harness: Option<&str>| {
         threads
             .iter()
@@ -1537,9 +1478,6 @@ pub(crate) fn conversation_defaults(
     }
 }
 
-/// A Conversation keeps its harness once anything was sent or the provider may hold
-/// history: a running turn, an unresolved submission, a queue, a transcript turn, or a
-/// provider session that is not open to prove it is empty.
 fn harness_lock_reason(
     thread: &Thread,
     session: Option<&ConversationSession>,
@@ -1562,7 +1500,6 @@ fn harness_lock_reason(
         {
             Some(STARTED.into())
         }
-        // Only fully loaded history proves an existing provider session is empty.
         Some(session) if session.history_loaded => None,
         _ if thread.session_ref.is_some() => {
             Some("The conversation history has not loaded. Reconnect it first.".into())
@@ -1668,7 +1605,6 @@ mod tests {
         );
         assert_eq!(drafts[&key].changedtick, 3);
 
-        // An older tick of the same buffer generation changes nothing.
         let touched = threads[0].updated_at.clone();
         let stale = apply_draft(
             &mut threads,
@@ -1679,7 +1615,6 @@ mod tests {
         assert_eq!(threads[0].draft, "hi");
         assert_eq!(drafts[&key].changedtick, 3);
 
-        // A later tick with the same text records the revision but leaves the row alone.
         threads[0].updated_at = touched.clone();
         let same = apply_draft(
             &mut threads,
@@ -1690,7 +1625,6 @@ mod tests {
         assert_eq!(threads[0].updated_at, touched);
         assert_eq!(drafts[&key].changedtick, 5);
 
-        // A new buffer generation restarts its ticks.
         let reopened = Uuid::from_u128(8);
         let edited = apply_draft(
             &mut threads,
@@ -1701,7 +1635,6 @@ mod tests {
         assert_eq!(threads[0].draft, "hello");
         assert_eq!(drafts[&key].revision().generation, reopened);
 
-        // Extension buffers are tracked but never written into the thread row.
         let extension = DraftKey::Extension {
             thread: id,
             request: "ask".into(),
@@ -1728,7 +1661,6 @@ mod tests {
         factory.kind = ThreadKind::Factory;
         let threads = [
             conversation(10, "omp", model("omp-used"), "2026-10-02T00:00:00Z"),
-            // Another project's Conversation still counts as the last one used.
             conversation(11, "claude-code", model("opus"), "2026-10-05T00:00:00Z"),
             conversation(12, "pi", model("pi-used"), "2026-10-03T00:00:00Z"),
             factory,
@@ -1747,7 +1679,6 @@ mod tests {
             defaults("claude-code", None),
             "Another harness never inherits the project's model"
         );
-        // Created in the same second: the later row is the newer one.
         let tied = [
             conversation(10, "omp", None, "2026-10-05T00:00:00Z"),
             conversation(12, "pi", None, "2026-10-05T00:00:00Z"),
@@ -1811,7 +1742,6 @@ mod tests {
         );
         assert!(harness_lock_reason(&thread, Some(&session), true).is_some());
 
-        // A provider session is switchable only once its whole history proved empty.
         thread.session_ref = Some("session".into());
         assert!(harness_lock_reason(&thread, None, false).is_some());
         assert!(harness_lock_reason(&thread, Some(&session), false).is_some());

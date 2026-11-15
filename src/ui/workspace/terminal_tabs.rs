@@ -1,10 +1,5 @@
-//! Terminal and Neovim tabs in the center dock: creation, visibility, focus and
-//! confirmed stop or restart.
-
 use super::*;
 
-/// Reopen a saved terminal tab with a new shell in its project, or in its worktree
-/// while that is still live. None when the tab's project left the active Space.
 pub(super) fn reopen_terminal(
     saved: &PanelState,
     terminals: &TerminalPanels,
@@ -131,8 +126,6 @@ impl Workspace {
         }
     }
     pub(super) fn sync_terminal_visibility(&self, _: &mut Window, cx: &mut App) {
-        // Ghostty frames are GPUI scene content: overlays cover them normally.
-        // Only inactive tabs/Spaces are occluded; focus independently gates input.
         let dock = self.dock.read(cx);
         let mut panes: Vec<_> = self
             .terminals
@@ -203,8 +196,6 @@ impl Workspace {
             self.add_terminal(project, worktree, root, None, window, cx);
         }
     }
-    /// Where a new terminal or Neovim tab starts: the selected project, or the worktree
-    /// of the selected Conversation when it works in one.
     pub(super) fn terminal_location(
         &self,
         cx: &App,
@@ -217,7 +208,6 @@ impl Workspace {
                 .iter()
                 .find(|project| project.id == id)
         })?;
-        // A terminal opened from a Conversation starts where that Conversation works.
         let (root, worktree) = state
             .conversation_thread()
             .filter(|thread| thread.project_id == project.id)
@@ -227,8 +217,6 @@ impl Workspace {
             .unwrap_or((project.root.clone(), None));
         Some((project.id, worktree, root))
     }
-    /// Add a terminal tab beside the current thread tab and focus it. With `neovim`,
-    /// the tab runs the user's Neovim on that target instead of a shell.
     pub(super) fn add_terminal(
         &mut self,
         project: ProjectId,
@@ -352,7 +340,6 @@ impl Workspace {
             let _ = workspace.update_in(window, |workspace, window, cx| {
                 workspace.terminal_confirmation = false;
                 cx.notify();
-                // Never apply a delayed process result to a replaced terminal.
                 let current = workspace.terminals.borrow().get(&id).cloned();
                 if current.as_ref() != Some(&panel)
                     || panel.read(cx).terminal.as_ref() != Some(&pane)
@@ -429,7 +416,6 @@ impl Workspace {
                 )
                 .on_ok(move |_, window, cx| {
                     let confirm = confirm.clone();
-                    // Own close ordering: restore modal focus before replacing its terminal.
                     window.defer(cx, move |window, cx| {
                         window.close_dialog(cx);
                         let _ = confirm.update(cx, |workspace, cx| {

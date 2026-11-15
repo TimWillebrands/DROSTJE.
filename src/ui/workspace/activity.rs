@@ -1,9 +1,3 @@
-//! How a thread shows its agent's activity: a dot that breathes while a turn runs and
-//! stays lit after one ends out of sight, and a hairline sweeping along the running
-//! thread's edges. Every copy shares one clock, so tab, row and composer move together;
-//! reduced motion keeps them still. Both use the theme's signature color, the wordmark's
-//! full stop; a failed turn uses danger.
-
 use crate::app::ThreadActivity;
 use crate::ui::theme;
 use gpui_kit::{
@@ -12,13 +6,9 @@ use gpui_kit::{
 };
 use std::time::Duration;
 
-/// Repaints per second for the ambient animations; smooth enough, and cheap.
 const MAX_FPS: f32 = 30.;
-/// The sweeping segment's share of the line.
 const SEGMENT: f32 = 0.3;
 
-/// The status dot for `activity`, or nothing while the thread is idle. `id` names the
-/// element and its debug selector, so it must be unique in the window.
 pub fn mark(id: SharedString, activity: ThreadActivity, cx: &App) -> Option<AnyElement> {
     let (color, tooltip) = match activity {
         ThreadActivity::Idle => return None,
@@ -51,8 +41,6 @@ pub fn mark(id: SharedString, activity: ThreadActivity, cx: &App) -> Option<AnyE
     )
 }
 
-/// A full-width hairline whose bright segment sweeps back and forth while a turn runs;
-/// the caller places it on an edge. Reduced motion shows the whole line, still.
 pub fn sweep(cx: &App) -> AnyElement {
     let color = theme::signature(cx);
     let track = div()

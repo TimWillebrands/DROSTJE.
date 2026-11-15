@@ -1,5 +1,3 @@
-//! Per-frame preparation and painting: cell metrics, the theme sent to Neovim, the
-//! retained row shapes, the cmdline strip, and the IME composition overlay.
 use super::{
     NvimView,
     frame::make_frame,
@@ -82,7 +80,6 @@ impl NvimView {
                 ],
                 highlights: Arc::clone(&self.grid.highlights),
             };
-            // Include a partly visible bottom row, but never shape offscreen rows.
             let row_count = self
                 .grid
                 .rows
@@ -137,7 +134,6 @@ impl NvimView {
                 rgb(self.grid.default_bg).into()
             };
             window.paint_quad(fill(bounds, background));
-            // Backgrounds precede all glyphs, including overhangs from other rows.
             for (row_index, row) in frame.rows.iter().enumerate() {
                 let origin = bounds.origin + point(px(0.), self.cell.height * row_index as f32);
                 for (rect, color) in &row.backgrounds {
@@ -256,8 +252,6 @@ impl NvimView {
     }
 }
 
-/// Every role Neovim's highlight groups draw from, flattened onto the editor background
-/// so translucent kit colors read the same inside Neovim as around it.
 pub(super) fn nvim_theme(theme: &Theme) -> NvimTheme {
     let background = theme.background.to_rgb();
     let packed = |color: Hsla| u32::from(background.blend(color.to_rgb())) >> 8;

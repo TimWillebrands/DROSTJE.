@@ -1,4 +1,3 @@
-//! The caret: its position, blink schedule, and painting in every cursor shape.
 use super::{
     NvimView,
     shaping::{colors, text_run},

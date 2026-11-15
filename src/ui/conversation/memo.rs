@@ -1,8 +1,5 @@
-//! A value derived from a transcript once per change token instead of once per frame.
-
 use std::{cell::RefCell, rc::Rc};
 
-/// The value derived for the latest key, rebuilt only when the key changes.
 pub(super) struct Memo<K, V>(RefCell<Option<(K, Rc<V>)>>);
 
 impl<K, V> Default for Memo<K, V> {
@@ -40,7 +37,6 @@ mod tests {
         let again = memo.get((1, 7), || derive("b"));
         assert!(std::rc::Rc::ptr_eq(&first, &again), "same key, same value");
         assert_eq!((derived.get(), again.as_str()), (1, "a"));
-        // A new revision or a new session derives again.
         assert_eq!(memo.get((1, 8), || derive("c")).as_str(), "c");
         assert_eq!(memo.get((2, 8), || derive("d")).as_str(), "d");
         assert_eq!(derived.get(), 3);

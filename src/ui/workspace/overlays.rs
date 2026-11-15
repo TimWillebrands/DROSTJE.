@@ -32,9 +32,6 @@ pub(in crate::ui) enum SurfaceKey {
     Extension(ThreadId, String),
 }
 
-/// What the Details inspector shows for its tool that would otherwise be serialized on
-/// every frame. Each tool update replaces the tool's `Arc` and this cache holds a clone,
-/// so pointer equality is an exact change token.
 #[derive(Default)]
 pub(in crate::ui) struct ToolDetailText(RefCell<Option<ToolText>>);
 
@@ -43,13 +40,10 @@ struct ToolText {
     tool: Arc<ToolActivity>,
     input: SharedString,
     result_keys: Vec<String>,
-    /// Built the first time the raw disclosure is open.
     raw: Option<SharedString>,
 }
 
 impl ToolDetailText {
-    /// The tool's pretty-printed input, its result blocks' disclosure keys and, when
-    /// `with_raw`, its raw data.
     fn get(
         &self,
         thread: ThreadId,
@@ -165,7 +159,6 @@ impl Workspace {
             inline_answer,
             return_focus: window.focused(cx),
         });
-        // Open before focusing the input/editor so Root remembers the actual trigger.
         if !inline_answer {
             self.sync_detail_surface(window, cx);
         }
@@ -348,7 +341,6 @@ impl Workspace {
         .detach();
     }
 
-    /// Closes only our current native host. Callers own clearing application data.
     pub(in crate::ui) fn close_detail_surface(
         &mut self,
         window: &mut Window,
@@ -422,7 +414,6 @@ impl Workspace {
         let Some(key) = key else {
             return;
         };
-        // Other application hosts must close before this one captures trigger focus.
         if let Some(palette) = self.palette.take() {
             palette.update(cx, |palette, cx| palette.dismiss(window, cx));
         }
@@ -543,7 +534,6 @@ impl Workspace {
         });
     }
 
-    // Native user dismissal already pops/restores focus: do application cleanup only.
     fn detail_closed(&mut self, key: &SurfaceKey, window: &mut Window, cx: &mut Context<Self>) {
         if self.detail_surface.as_ref() != Some(key) {
             return;
@@ -924,7 +914,6 @@ mod tests {
     fn detail_text_is_built_once_per_tool_update() {
         let cache = ToolDetailText::default();
         let thread = ThreadId::new_v4();
-        // Longer than an inline `SharedString`, so a shared copy shares its pointer.
         let first = tool(json!({"path": "src/ui/workspace/overlays.rs"}));
         let (input, _, raw) = cache.get(thread, &first, false);
         assert_eq!(input, serde_json::to_string_pretty(&first.input).unwrap());

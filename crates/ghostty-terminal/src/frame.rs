@@ -1,25 +1,10 @@
-//! Lifetime of the composed terminal readback in GPUI's sprite atlas.
-
 use gpui_kit::{Bounds, Pixels, RenderImage, Window};
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
-/// The frame GPUI composes for a terminal, plus the frames it replaced.
-///
-/// `Window::paint_image` uploads every new image into the window's sprite atlas,
-/// and only `Window::drop_image` frees that texture. A replaced frame can still be
-/// referenced by the scene being built (when it was painted earlier in the same
-/// frame) and by the presented scene, which GPUI re-presents without drawing. So
-/// a replaced frame leaves the atlas only during a paint in a later frame, when
-/// neither scene can contain it, or through [`FrameSlot::release`], which also
-/// forces the next frame to be redrawn instead of re-presented.
 pub(crate) struct FrameSlot<I = RenderImage> {
     current: Option<Arc<I>>,
-    /// Replaced frames, each tagged with the epoch it was replaced in.
     retired: Vec<(u64, Arc<I>)>,
-    /// Advanced by a next-frame callback, so a paint that observes a newer value
-    /// than a frame's tag runs in a later frame than its replacement.
     epoch: Rc<Cell<u64>>,
-    /// The epoch for which an advance is already scheduled.
     advance_scheduled: Option<u64>,
 }
 
@@ -53,8 +38,6 @@ impl<I> FrameSlot<I> {
         }
     }
 
-    /// Stops composing a frame. Needs no window: release happens on a later paint
-    /// or through [`FrameSlot::release`].
     pub(crate) fn clear(&mut self) {
         if let Some(previous) = self.current.take() {
             self.retire(previous);
@@ -65,7 +48,6 @@ impl<I> FrameSlot<I> {
         self.retired.push((self.epoch.get(), frame));
     }
 
-    /// Hands every frame replaced in an earlier epoch to `release`.
     fn release_stale(&mut self, mut release: impl FnMut(Arc<I>)) {
         let epoch = self.epoch.get();
         for (_, frame) in self.retired.extract_if(.., |(retired, _)| *retired < epoch) {
@@ -73,8 +55,6 @@ impl<I> FrameSlot<I> {
         }
     }
 
-    /// Returns the callback that ends the current epoch, once per epoch, while
-    /// replaced frames wait for it. Run it when the next frame starts.
     fn schedule_advance(&mut self) -> Option<impl FnOnce() + 'static> {
         let epoch = self.epoch.get();
         if self.retired.is_empty() || self.advance_scheduled == Some(epoch) {
@@ -85,7 +65,6 @@ impl<I> FrameSlot<I> {
         Some(move || shared.set(epoch + 1))
     }
 
-    /// Empties the slot, yielding the current frame and every replaced frame.
     fn take_all(&mut self) -> impl Iterator<Item = Arc<I>> {
         self.current
             .take()
@@ -95,8 +74,6 @@ impl<I> FrameSlot<I> {
 }
 
 impl FrameSlot {
-    /// Call from paint only. Releases frames no scene can reference any more,
-    /// then composes the current frame.
     pub(crate) fn paint(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -111,8 +88,6 @@ impl FrameSlot {
             .map_err(|error| error.to_string())
     }
 
-    /// Call from paint only, including paints that compose nothing, so a hidden
-    /// terminal does not keep replaced frames in the atlas.
     pub(crate) fn release_unreferenced(&mut self, window: &mut Window) {
         self.release_stale(|frame| {
             let _ = window.drop_image(frame);
@@ -122,8 +97,6 @@ impl FrameSlot {
         }
     }
 
-    /// Final teardown outside paint: frees every frame from `window`'s atlas and
-    /// redraws it, so GPUI never re-presents a scene that refers to them.
     pub(crate) fn release(&mut self, window: &mut Window) {
         for frame in self.take_all() {
             let _ = window.drop_image(frame);
@@ -198,7 +171,6 @@ mod tests {
     }
 }
 
-/// Proves atlas residency against GPUI's real sprite atlas in a headless window.
 #[cfg(all(test, feature = "runtime-qa"))]
 mod atlas_tests {
     use super::FrameSlot;
@@ -208,8 +180,6 @@ mod atlas_tests {
     };
     use std::sync::Arc;
 
-    /// Paints its slot like `Terminal::paint`; `repaint_with` replaces the frame
-    /// after the first paint and paints again within the same frame.
     #[derive(Default)]
     struct FrameView {
         slot: FrameSlot,
@@ -266,7 +236,6 @@ mod atlas_tests {
         next_frame(cx);
         assert!(in_atlas(cx, &first));
 
-        // One frame paints `first`, then replaces it and paints `second`.
         view.update(cx, |view, _| view.repaint_with = Some(Arc::clone(&second)));
         next_frame(cx);
         assert!(in_atlas(cx, &first), "this frame's scene still paints it");
@@ -279,7 +248,6 @@ mod atlas_tests {
         );
         assert!(in_atlas(cx, &second));
 
-        // Replacing between frames frees the old frame one frame later.
         view.update(cx, |view, _| view.slot.replace(Arc::clone(&third)));
         next_frame(cx);
         next_frame(cx);

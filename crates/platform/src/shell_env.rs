@@ -1,11 +1,3 @@
-//! Import the user's login-shell environment at startup.
-//!
-//! An app launched from Finder, the Dock or a desktop launcher inherits the session manager's
-//! minimal environment (on macOS `PATH=/usr/bin:/bin:/usr/sbin:/sbin`), so agents and Factory
-//! runs could not find tools the user reaches from a terminal (Homebrew's `zig`, `cargo`, …).
-//! [`import_login_shell_environment`] asks the user's shell once, before any thread starts,
-//! and merges the result into this process so every child inherits it.
-
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::HashMap,
@@ -22,15 +14,8 @@ use std::{
 
 const MARKER: &str = "__DROSTJE_SHELL_ENV__";
 const TIMEOUT: Duration = Duration::from_secs(5);
-/// Shell bookkeeping that describes the probe shell, not the user's environment.
 const IGNORED: &[&str] = &["_", "PWD", "OLDPWD", "SHLVL"];
 
-/// Merge the login shell's environment into this process.
-///
-/// Variables already set win, so explicit overrides (`DROSTJE_DATA_DIR=… cargo run`) survive.
-/// `PATH` takes the shell's order, followed by inherited entries the shell lacks.
-///
-/// Must run before any other thread exists: it mutates the process environment.
 pub fn import_login_shell_environment() -> Result<()> {
     let shell = login_shell()?;
     let captured = probe(&shell, TIMEOUT)?;
@@ -62,14 +47,7 @@ fn login_shell() -> Result<PathBuf> {
     Ok(shell.into())
 }
 
-/// Run `shell` as an interactive login shell and return the environment it exports.
-///
-/// Interactive, because many users extend `PATH` in `.zshrc`/`.bashrc` rather than the profile.
-/// The markers skip anything the rc files print. A shell that does not finish within `timeout`
-/// (a prompt, an `exec tmux`) is killed with its process group.
 fn probe(shell: &Path, timeout: Duration) -> Result<Vec<(OsString, OsString)>> {
-    // The script is a constant: the one place DROSTJE. hands a string to a shell, because
-    // reading the shell's own environment is the point.
     let script = format!("printf '%s' {MARKER}; command env -0; printf '%s' {MARKER}");
     let mut child = Command::new(shell)
         .args(["-l", "-i", "-c", &script])
@@ -139,7 +117,6 @@ fn parse(output: &[u8]) -> Result<Vec<(OsString, OsString)>> {
         .collect())
 }
 
-/// The variables to set so the process environment matches the login shell's.
 fn merge(
     current: &HashMap<OsString, OsString>,
     captured: Vec<(OsString, OsString)>,

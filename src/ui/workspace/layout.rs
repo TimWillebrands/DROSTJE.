@@ -1,9 +1,5 @@
-//! Dock layout: persisted panel identities, layout filtering and validation,
-//! dock sizing, visibility and saving.
-
 use super::*;
 
-/// The thread a persisted `Thread` leaf names.
 pub(super) fn thread_of(state: &PanelState) -> Option<ThreadId> {
     match &state.info {
         PanelInfo::Panel(value) => serde_json::from_value(value.get("thread")?.clone()).ok(),
@@ -16,15 +12,12 @@ pub(super) fn terminal_of(state: &PanelState) -> Option<TerminalId> {
         _ => None,
     }
 }
-/// What a saved `Terminal` leaf reopens with: a new shell where the tab worked.
-/// Neither the old process nor its scrollback is ever restored.
 #[derive(serde::Deserialize)]
 pub(super) struct TerminalTab {
     pub(super) terminal: TerminalId,
     pub(super) project: ProjectId,
     #[serde(default)]
     pub(super) worktree: Option<WorktreeId>,
-    /// Set for a Neovim tab: it reopens Neovim on the same file.
     #[serde(default)]
     pub(super) neovim: Option<NeovimTarget>,
 }
@@ -36,11 +29,9 @@ pub(super) fn terminal_tab(state: &PanelState) -> Option<TerminalTab> {
         _ => None,
     }
 }
-/// Version 4 dropped the bottom Output dock; Output is a thread sidebar tab.
 pub(super) const LAYOUT_VERSION: usize = 4;
 pub(super) const OUTDATED_LAYOUT: &str = "Layout was saved by another version";
 
-/// Projects is one retained sidebar. Space layouts own threads, not its geometry.
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub(super) struct ProjectsSidebar {
     pub(super) size: Pixels,
@@ -75,10 +66,6 @@ impl ProjectsSidebar {
         }
     }
 }
-/// Whether `entity` is drawn: no closed dock edge holds it, its group is neither
-/// collapsed nor hidden behind another zoomed group, and it is the group's active tab.
-/// Reads the live dock; `DockArea::dump` would serialize every panel, and this runs
-/// on every frame and every `AppState` change.
 pub(super) fn panel_visible(entity: &Entity<WorkspacePanel>, dock: &DockArea, cx: &App) -> bool {
     let panel_id = PanelId::from(entity.entity_id());
     if [
@@ -107,9 +94,6 @@ pub(super) fn panel_visible(entity: &Entity<WorkspacePanel>, dock: &DockArea, cx
             .is_some_and(|active| active.panel_id(cx) == panel_id)
 }
 
-/// Preserve the kept leaves and repair their containers after removing the
-/// others (terminals of another Space, unrestorable tabs). Active tabs follow the nearest surviving tab; split sizes keep the
-/// same association with their surviving children.
 pub(super) fn filter_layout(
     mut layout: DockAreaState,
     keep: &impl Fn(&PanelState) -> bool,
@@ -164,8 +148,6 @@ pub(super) fn filter_layout(
     }
     layout
 }
-/// Terminal tabs persist with their project so they reopen after a restart; a leaf
-/// that cannot name its project (an older layout) is dropped.
 pub(super) fn durable_layout(layout: DockAreaState) -> DockAreaState {
     filter_layout(layout, &|panel| {
         panel.panel_name != "Terminal" || terminal_tab(panel).is_some()
@@ -270,8 +252,6 @@ pub(super) fn validate_layout(layout: &DockAreaState) -> anyhow::Result<()> {
 }
 
 impl Workspace {
-    /// Drop Terminal leaves the Terminal registry could not resolve for the active Space:
-    /// neither a live terminal nor a saved tab whose project is still in this Space.
     pub(super) fn restorable_layout(&self, layout: DockAreaState, cx: &App) -> DockAreaState {
         let state = self.state.read(cx);
         filter_layout(layout, &|panel| {
@@ -319,7 +299,6 @@ impl Workspace {
             center = center.panel_view(panel_handle(terminal), cx);
         }
         let left = DockLayout::tabs().panel_view(panel_handle(self.projects.clone()), cx);
-        // Dock APIs consume pixels; application geometry is resolved from rem here.
         let rem = window.rem_size();
         self.rebuilding = true;
         self.dock.update(cx, |dock, cx| {
@@ -385,7 +364,6 @@ impl Workspace {
                 return;
             }
         }
-        // A panel moved into the center is a native tab, not an auxiliary dock.
         self.focus_region(region, window, cx);
     }
 
@@ -403,7 +381,6 @@ impl Workspace {
         let rem = window.rem_size();
         let mut area = dock.bounds();
         if area.size.width <= px(0.) || area.size.height <= px(0.) {
-            // First layout has no dock measurement; the dock fills the window.
             area = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
         }
         let edges = [
@@ -420,7 +397,6 @@ impl Workspace {
                 open[i] = edge.open();
             }
         }
-        // The title bar heads the centre column, above the bottom dock.
         let available = [
             area.size.width - rem * 28.,
             area.size.height - TITLE_BAR_HEIGHT - rem * 16.,
@@ -431,7 +407,6 @@ impl Workspace {
                 && (!open[2] || sizes[2] <= available[1])
         };
         if !fits(&open, &sizes) {
-            // Shrink allocations before collapsing either auxiliary pane.
             for i in 0..3 {
                 if open[i] {
                     sizes[i] = minima[i];
@@ -548,7 +523,6 @@ mod terminal_layout_tests {
                 "panel_name": "Thread", "children": [], "info": {"panel": {"thread": id}}
             })
         };
-        // A leaf from before terminal tabs were saved names no project.
         let terminal = json!({
             "panel_name": "Terminal", "children": [], "info": {"panel": {"terminal": "ephemeral"}}
         });

@@ -1,4 +1,3 @@
-//! The Commit form: its message draft, the generated subject, and the inline commit panel.
 use super::{DialogKind, SurfaceContent};
 use crate::app::{AppState, CommitSubjectStatus};
 use gpui_kit::{
@@ -17,20 +16,14 @@ use gpui_kit::{
 };
 use uuid::Uuid;
 
-/// The Commit dialog's message and the generated subject it asked for.
 pub(super) struct CommitDraft {
     pub(super) message: Entity<TextareaState>,
-    /// The subject request this dialog started; results of other requests are ignored.
     pub(super) subject_request: Option<Uuid>,
-    /// The message when the request started: a subject replaces it only if the user has not
-    /// edited it since, so typed text is never overwritten.
     pub(super) baseline: SharedString,
-    /// Why the last request produced no subject, shown next to the control that retries.
     pub(super) note: Option<String>,
 }
 
 impl SurfaceContent {
-    /// The Commit dialog's message, for native tests that type into it.
     #[cfg(all(test, feature = "runtime-qa"))]
     pub(crate) fn commit_message(&self) -> Option<Entity<TextareaState>> {
         self.commit.as_ref().map(|commit| commit.message.clone())
@@ -41,7 +34,6 @@ impl SurfaceContent {
         }
     }
 
-    /// Asks the local model for a subject for the Commit dialog's changes.
     pub fn write_commit_subject(&mut self, cx: &mut Context<Self>) {
         let DialogKind::Commit(thread) = self.kind else {
             return;
@@ -223,7 +215,6 @@ impl SurfaceContent {
     }
 }
 
-/// Renders a retained Commit surface inline, including its existing message body and actions.
 pub(in crate::ui) fn render_commit_panel(content: Entity<SurfaceContent>, cx: &App) -> AnyElement {
     v_flex()
         .id("commit-changes-panel")

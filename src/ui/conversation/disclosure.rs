@@ -9,9 +9,6 @@ use gpui_kit::{
     *,
 };
 
-/// Flip a disclosure key in the workspace's `expanded` set. `thread` is the Conversation
-/// whose transcript or composer band shows the disclosure; only that transcript remeasures.
-/// A disclosure outside any Conversation (a detail sheet) re-renders the workspace.
 pub(super) fn toggle(
     owner: &WeakEntity<Workspace>,
     thread: Option<ThreadId>,
@@ -36,7 +33,6 @@ pub(super) fn is_expanded(owner: &WeakEntity<Workspace>, key: &str, cx: &App) ->
         .upgrade()
         .is_some_and(|workspace| workspace.read(cx).expanded.contains(key))
 }
-/// The one chevron control every disclosure in the transcript uses.
 pub(super) fn disclosure(
     id: String,
     expanded: bool,

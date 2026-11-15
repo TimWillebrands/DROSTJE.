@@ -6,8 +6,6 @@ edition.workspace = true
 publish = false
 
 [features]
-# The desktop's embedded-browser tool, forwarded to drostje-browser-tools. The headless
-# drostje-host leaves it off, so it builds without Servo.
 browser = ["drostje-browser-tools/browser"]
 
 [[bin]]
@@ -26,7 +24,6 @@ drostje-network.workspace = true
 drostje-platform.workspace = true
 parking_lot.workspace = true
 rusqlite.workspace = true
-# Not named in code: selects ring as the TLS provider tungstenite's rustls client uses.
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -34,8 +31,6 @@ smol.workspace = true
 tungstenite.workspace = true
 url.workspace = true
 uuid.workspace = true
-# Not named in code: tungstenite TRACE logs include raw handshake headers, and the
-# workspace spec compiles them out of drostje-host too.
 log.workspace = true
 
 [dev-dependencies]

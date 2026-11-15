@@ -22,8 +22,6 @@ use gpui_kit::{
     *,
 };
 
-/// Match OMP's prose-first reasoning display: empty stream sentinels disappear and
-/// fenced implementation detail becomes an ellipsis instead of dominating the timeline.
 fn thinking_for_display(text: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut fence: Option<(char, usize)> = None;
@@ -74,8 +72,6 @@ fn thinking_for_display(text: &str) -> String {
     }
 }
 
-/// The `**Title**` lines a model heads its reasoning steps with, including
-/// those `thinking_for_display` closed with an ellipsis.
 fn thinking_titles(text: &str) -> Vec<&str> {
     text.lines()
         .filter_map(|line| {
@@ -86,8 +82,6 @@ fn thinking_titles(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Reasoning folds to a muted label and its step titles; the disclosure opens
-/// the full text behind the same left rule.
 fn thinking_block(
     identity: String,
     display: SharedString,
@@ -98,7 +92,6 @@ fn thinking_block(
     let key = format!("{identity}:thinking");
     let expanded = is_expanded(owner, &key, cx);
     let group: SharedString = format!("{key}:group").into();
-    // Only the label row toggles, so selecting the reasoning text never folds it.
     let header = h_flex()
         .id(SharedString::from(format!("{key}:header")))
         .w_full()
@@ -143,7 +136,6 @@ fn thinking_block(
     } else {
         let titles = thinking_titles(&display);
         if titles.is_empty() {
-            // Untitled reasoning still shows where it starts rather than a bare label.
             display
                 .lines()
                 .find(|line| !line.trim().is_empty())
@@ -258,7 +250,6 @@ pub(in crate::ui) fn block(
         )
         .small()
         .into_any_element(),
-        // Outside a conversation there is no result to attach; show the call alone.
         ContentBlock::ToolCall {
             name,
             intent,
@@ -283,8 +274,6 @@ pub(in crate::ui) fn block(
     }
 }
 
-/// The user's input from an artifact, as the agent received it: the event type, then
-/// each answered field. Values are page data, shown as plain text.
 fn artifact_event(identity: &str, peer: &PeerMessage, cx: &App) -> AnyElement {
     let (kind, fields) = artifact_event_fields(&peer.body);
     let mono = cx.theme().mono_font_family.clone();
@@ -329,8 +318,6 @@ fn artifact_event(identity: &str, peer: &PeerMessage, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// `(type, [(field, value)])` from an artifact event body. A body that is not the
-/// kit's `{v,id,type,data}` object is shown whole rather than dropped.
 fn artifact_event_fields(body: &str) -> (String, Vec<(String, String)>) {
     const LIMIT: usize = 400;
     fn text(value: &serde_json::Value) -> String {
@@ -365,8 +352,6 @@ fn artifact_event_fields(body: &str) -> (String, Vec<(String, String)>) {
     (kind, fields)
 }
 
-/// Text that may be huge: past 16 KiB it folds behind a button so a stray
-/// megabyte of output cannot stall a frame.
 pub(super) fn guarded_text(
     identity: String,
     text: &str,

@@ -1,4 +1,3 @@
-//! Versioned, path-free Conversation protocol inside the authenticated relay envelope.
 use anyhow::{Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use drostje_harness::{ConversationEvent, PeerMessage, UserAnswer};
@@ -10,25 +9,17 @@ use uuid::Uuid;
 
 pub const VERSION: u32 = 1;
 
-/// What the sending desktop supports beyond protocol version 1. Older desktops omit
-/// it, so every capability defaults to unsupported; older hosts ignore it. Additions
-/// stay optional so desktops and hosts of different versions keep working together.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
-    /// Shows `Response::ArtifactRequest` and returns artifact-origin context.
     #[serde(default)]
     pub artifacts: bool,
-    /// Handles `Response::ArtifactComplete`.
     #[serde(default)]
     pub artifact_completion: bool,
-    /// Accepts `Response::Event`s that omit the bytes of images the host already sent
-    /// since this desktop's latest Open of that Conversation, and reuses its own copies.
     #[serde(default)]
     pub image_reuse: bool,
 }
 
 impl Capabilities {
-    /// Everything this desktop build supports.
     pub const DESKTOP: Self = Self {
         artifacts: true,
         artifact_completion: true,
@@ -158,9 +149,6 @@ pub enum Response {
         call: Uuid,
         action: Value,
     },
-    /// Show a remote runtime's self-contained HTML file as an artifact on the desktop.
-    /// Answered like a Network call, with `Operation::NetworkResponse`. Sent only to
-    /// desktops whose requests declare `Capabilities::artifacts`.
     ArtifactRequest {
         thread: Uuid,
         generation: Uuid,
@@ -168,12 +156,9 @@ pub enum Response {
         name: String,
         title: Option<String>,
         html: String,
-        /// Absent from hosts that predate placement: the transcript.
         #[serde(default)]
         placement: drostje_browser_tools::ArtifactPlacement,
     },
-    /// A remote runtime completed an artifact it showed. Answered like a Network call.
-    /// Sent only to desktops that declare `Capabilities::artifact_completion`.
     ArtifactComplete {
         thread: Uuid,
         generation: Uuid,
@@ -218,7 +203,6 @@ impl WireImage {
         })
     }
 }
-/// Newly created image files remain rollback-owned until native queue admission.
 pub(crate) struct StagedImages {
     images: Vec<ImageAttachment>,
     created: Vec<std::path::PathBuf>,
@@ -246,13 +230,8 @@ impl Drop for StagedImages {
 struct DecodedImage<'a> {
     wire: &'a WireImage,
     bytes: Vec<u8>,
-    /// Whether the bytes were decoded as pixels here; known images defer that until
-    /// they would be written.
     checked: bool,
 }
-/// Images in `known` were checked and stored in `directory` by this receiver before. Their
-/// bytes are compared with that file instead of being decoded again; new or changed
-/// bytes are still fully decoded before they are written.
 fn decode_images<'a>(
     images: &'a [WireImage],
     directory: &Path,
@@ -339,7 +318,6 @@ fn stage_decoded(
                     .write(true)
                     .create_new(true)
                     .open(&path)?;
-                // Track ownership before any fallible write so partial files roll back too.
                 staged.created.push(path.clone());
                 file.write_all(&bytes)?;
                 file.sync_all()?;
@@ -377,8 +355,6 @@ pub(crate) fn stage_submission_images(
     );
     stage_decoded(decoded, directory, budget)
 }
-/// Materialize received observation bytes under an owned directory, never a sender path.
-/// `known` holds images this receiver materialized in `directory` before.
 pub fn materialize_images(
     images: &[WireImage],
     directory: &Path,
@@ -392,7 +368,6 @@ pub fn materialize_images(
     staged.commit();
     Ok(staged.take_images())
 }
-/// Move image bytes across the boundary and remove every host-local pathname.
 pub fn event_images(event: &mut ConversationEvent) -> Result<Vec<WireImage>> {
     use drostje_harness::ContentBlock;
     let mut images: Vec<WireImage> = Vec::new();
@@ -447,7 +422,6 @@ mod tests {
 
     #[test]
     fn desktops_and_hosts_of_either_version_still_understand_each_other() {
-        // A request from a desktop that predates capabilities.
         let old = serde_json::json!({"id":Uuid::new_v4(),"version":1,"thread":Uuid::new_v4(),
             "epoch":Uuid::new_v4(),"operation":"Heartbeat"});
         let request: Request = serde_json::from_value(old).unwrap();
@@ -455,11 +429,9 @@ mod tests {
         assert!(!request.capabilities.artifacts);
         assert!(!request.capabilities.artifact_completion);
         assert!(!request.capabilities.image_reuse);
-        // Capabilities this build does not know yet are ignored, not refused.
         let future: Capabilities =
             serde_json::from_value(serde_json::json!({"artifacts":true,"later":true})).unwrap();
         assert!(future.artifacts && !future.image_reuse);
-        // A new desktop stays on version 1, so older hosts keep accepting it.
         let new = serde_json::to_value(Request {
             id: Uuid::new_v4(),
             version: VERSION,
@@ -473,7 +445,6 @@ mod tests {
         assert_eq!(new["capabilities"]["artifacts"], true);
         assert_eq!(new["capabilities"]["artifact_completion"], true);
         assert_eq!(new["capabilities"]["image_reuse"], true);
-        // Peer context from an older desktop has no origin and stays peer context.
         let command: WireCommand = serde_json::from_value(serde_json::json!({"DeliverPeer":{
             "attempt":Uuid::new_v4(),"messages":[{"id":Uuid::new_v4(),"sender":Uuid::new_v4(),
             "sender_name":"Peer","space":Uuid::new_v4(),"body":"hello"}]}}))
@@ -562,22 +533,17 @@ mod tests {
             .remove(0);
         assert_eq!(stored.path, directory.join(image.id.to_string()));
         let known = HashMap::from([(image.id, stored.clone())]);
-        // Replace the stored file with bytes no decoder accepts: a second decode would fail,
-        // so success proves the known image was only compared with its file.
         let opaque = b"not pixels".to_vec();
         std::fs::write(&stored.path, &opaque).unwrap();
         let mut resent = image.clone();
         resent.data = STANDARD.encode(&opaque);
         let reused = materialize_images(std::slice::from_ref(&resent), &directory, &known).unwrap();
         assert_eq!(reused[0].path, stored.path);
-        // Unknown to the receiver, the same bytes are decoded and refused.
         assert!(
             materialize_images(std::slice::from_ref(&resent), &directory, &HashMap::new()).is_err()
         );
-        // Changed bytes under a known ID are still refused.
         resent.data = STANDARD.encode(b"other bytes");
         assert!(materialize_images(std::slice::from_ref(&resent), &directory, &known).is_err());
-        // A known image whose file disappeared is decoded before it is written again.
         std::fs::remove_file(&stored.path).unwrap();
         resent.data = STANDARD.encode(&opaque);
         assert!(materialize_images(std::slice::from_ref(&resent), &directory, &known).is_err());

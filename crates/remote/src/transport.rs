@@ -1,4 +1,3 @@
-//! SEINTJE framing is isolated here. Queued mutations never survive a lost attachment.
 use std::{
     io::ErrorKind,
     net::{TcpStream, ToSocketAddrs},
@@ -18,18 +17,14 @@ use super::{config::validate_relay_url, wire::MAX_FRAME_BYTES};
 
 const QUEUE: usize = 32;
 const IO_TICK: Duration = Duration::from_millis(100);
-/// Read timeout while traffic flows, so queued commands never wait behind an idle read.
 const ACTIVE_TICK: Duration = Duration::from_millis(1);
-/// Bytes written per pass before liveness and incoming traffic are checked again.
 const PASS_BYTES: usize = 1024 * 1024;
-/// How long a full receive queue may stall the attachment before it is closed.
 const RECEIVE_WAIT: Duration = Duration::from_secs(1);
 const HEARTBEAT: Duration = Duration::from_secs(5);
 const LEASE: Duration = Duration::from_secs(15);
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(60);
 const PROTOCOL: &str = "seintje-relay/1";
-/// Room left in every frame for the relay envelope around a body.
 pub const BODY_BUDGET: usize = MAX_FRAME_BYTES - 4096;
 
 #[derive(Debug)]
@@ -55,16 +50,13 @@ impl Role {
     }
 }
 
-/// One message body, serialized once by its producer and framed verbatim.
 #[derive(Debug)]
 pub struct Outgoing {
     body: String,
-    /// The controller attachment a desktop request was built for; never read for hosts.
     epoch: Option<Uuid>,
 }
 #[derive(Debug)]
 pub enum EncodeError {
-    /// The body does not fit `BODY_BUDGET`; serialization stopped at the limit.
     Oversized,
     Serialize(String),
 }
@@ -95,7 +87,6 @@ impl Outgoing {
             String::from_utf8(writer.bytes).map_err(|e| EncodeError::Serialize(e.to_string()))?;
         Ok(Self { body, epoch })
     }
-    /// A body this crate already serialized, such as a journaled event.
     pub(crate) fn serialized(body: String, epoch: Option<Uuid>) -> Result<Self, EncodeError> {
         if body.len() > BODY_BUDGET {
             return Err(EncodeError::Oversized);
@@ -106,7 +97,6 @@ impl Outgoing {
         &self.body
     }
 }
-/// Collects serialized bytes and stops the serializer as soon as the budget is spent.
 struct Bounded {
     bytes: Vec<u8>,
     remaining: usize,
@@ -134,19 +124,13 @@ pub struct Connection<T> {
 }
 #[derive(Debug)]
 pub enum TransportEvent<T> {
-    /// Controller attachment identity, authenticated by the relay on both endpoints.
-    PeerConnected {
-        epoch: Uuid,
-    },
+    PeerConnected { epoch: Uuid },
     PeerDisconnected,
     Payload(T),
-    /// An authenticated message whose body is valid JSON but not a `T`.
     InvalidPayload(String),
     Disconnected(String),
 }
 
-/// Consecutive failed attempts wait twice as long each time, up to `MAX_RETRY`; an
-/// authenticated attachment starts the sequence over.
 struct Backoff {
     delay: Duration,
 }
@@ -166,7 +150,6 @@ impl Backoff {
     }
 }
 
-/// Authentication is captured once; neither token nor HTTP errors containing it are logged.
 pub fn connect<T: DeserializeOwned + Send + 'static>(
     relay_url: &str,
     token: &str,
@@ -201,7 +184,6 @@ pub fn connect<T: DeserializeOwned + Send + 'static>(
                 if commands.is_closed() || events.is_closed() {
                     break;
                 }
-                // Drain before every new attachment, including attempts made while disconnected.
                 while commands.try_recv().is_ok() {}
                 while resets.try_recv().is_ok() {}
                 let mut authenticated = false;
@@ -308,7 +290,6 @@ fn socket(url: &url::Url, authorization: &tungstenite::http::HeaderValue) -> Res
         .max_message_size(Some(MAX_FRAME_BYTES))
         .write_buffer_size(0)
         .max_write_buffer_size(MAX_FRAME_BYTES + 1024);
-    // Explicit TLS handshake has no redirect path; Bearer credentials never follow redirects.
     let (socket, _) = tungstenite::client_tls_with_config(request, stream, Some(config), None)
         .map_err(|_| anyhow!("Relay WebSocket authentication or TLS handshake failed"))?;
     let tcp = tcp(&socket)?;
@@ -412,10 +393,6 @@ impl<B> Envelope<B> {
     }
 }
 
-/// Every field any relay envelope carries; `type` decides which must and may appear.
-/// Parsed flat instead of as an internally tagged enum, so a message body deserializes
-/// straight into its typed form without first being buffered as a generic tree. Each
-/// field is `None` only when absent, so `null` is never mistaken for a missing field.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, bound(deserialize = "B: Deserialize<'de>"))]
 struct RawEnvelope<B> {
@@ -435,7 +412,6 @@ struct RawEnvelope<B> {
     peer: Option<Peer>,
     #[serde(default, deserialize_with = "present")]
     limits: Option<Limits>,
-    /// `Some(None)` is an explicit `null`, which only `rejected` accepts.
     #[serde(default, deserialize_with = "present")]
     peer_epoch: Option<Option<u64>>,
     #[serde(default, deserialize_with = "present")]
@@ -455,7 +431,6 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     T::deserialize(deserializer).map(Some)
 }
 impl<B> RawEnvelope<B> {
-    /// The envelope this `type` describes, or `None` when a field is missing or foreign to it.
     fn into_envelope(self) -> Option<Envelope<B>> {
         let Self {
             kind,
@@ -519,15 +494,11 @@ impl<B> RawEnvelope<B> {
         })
     }
 }
-/// A message body that is valid JSON but not a `T` stays a per-message error for the
-/// consumer to judge; anything else malformed is an invalid relay envelope.
 fn parse_envelope<T: DeserializeOwned>(
     text: &str,
 ) -> Result<Envelope<std::result::Result<T, String>>> {
     let envelope = match serde_json::from_str::<RawEnvelope<T>>(text) {
         Ok(raw) => raw.into_envelope().map(|envelope| envelope.map_body(Ok)),
-        // Only the body differs between the two parses, so a valid untyped message
-        // means the body alone was wrong.
         Err(error) => serde_json::from_str::<RawEnvelope<IgnoredAny>>(text)
             .ok()
             .and_then(RawEnvelope::into_envelope)
@@ -673,7 +644,6 @@ impl Attachment {
         })
     }
 
-    /// The `send` envelope around an already serialized body, without parsing it again.
     fn frame(&self, payload: &Outgoing) -> Result<String> {
         let peer = self
             .peer
@@ -683,7 +653,6 @@ impl Attachment {
             Uuid::new_v4(),
             payload.body
         );
-        // Forwarded message envelopes add from_epoch and a longer type discriminator.
         ensure!(
             frame.len() <= self.frame_limit.saturating_sub(128),
             "Relay frame exceeds its advertised size limit"
@@ -692,8 +661,6 @@ impl Attachment {
     }
 }
 
-/// Wait briefly for a busy consumer instead of failing on the first full queue; a
-/// consumer that stays stuck still closes the attachment rather than losing events.
 fn deliver<T>(events: &Sender<TransportEvent<T>>, event: TransportEvent<T>) -> Result<()> {
     let event = match events.try_send(event) {
         Ok(()) => return Ok(()),
@@ -714,7 +681,6 @@ fn deliver<T>(events: &Sender<TransportEvent<T>>, event: TransportEvent<T>) -> R
     Ok(())
 }
 
-/// Write every queued payload, up to `PASS_BYTES`, and return how many frames went out.
 fn drain(
     socket: &mut Socket,
     role: Role,
@@ -727,8 +693,6 @@ fn drain(
             break;
         };
         if role == Role::Desktop && payload.epoch != attachment.controller_epoch(role).ok() {
-            // A producer can race the disconnect notification. Old requests must not
-            // acquire the destination identity of a new attachment.
             continue;
         }
         let frame = attachment.frame(&payload)?;
@@ -741,7 +705,6 @@ fn drain(
     Ok(sent)
 }
 
-/// Short reads while commands wait or traffic just flowed; back to `IO_TICK` when idle.
 fn read_timeout(queued: bool, idle_passes: u32) -> Duration {
     if queued {
         return ACTIVE_TICK;
@@ -1112,7 +1075,6 @@ mod tests {
                 ..
             }
         ));
-        // A well-formed message with the wrong body is the consumer's protocol error.
         assert!(matches!(
             parse_envelope::<Body>(&message(json!({"n":"seven"}))).unwrap(),
             Envelope::Message { body: Err(_), .. }
@@ -1190,8 +1152,6 @@ mod tests {
         ))
     }
 
-    /// A loopback relay that authenticates one host and one desktop, then forwards
-    /// every host `send` to the desktop as a `message`.
     #[expect(
         clippy::result_large_err,
         reason = "tungstenite's handshake callback returns its own HTTP error response"
@@ -1287,7 +1247,6 @@ mod tests {
             }
         }
         producer.join().unwrap();
-        // Eight frames per 100 ms read tick needed 25 s for this burst.
         let elapsed = started.elapsed();
         assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     }

@@ -1,6 +1,3 @@
-//! Opt-in, disposable real-process checks. No init, plugins, provider calls or
-//! personal ShaDa are used. Run with `NVIM=<path>` (default: `nvim` on PATH) cargo test
-//! --test neovim_runtime -- --ignored --nocapture.
 use drostje_model::DraftKey;
 use drostje_neovim::{
     ClipboardContent, NvimCommand, NvimConfig, NvimEditor, NvimEvent, NvimTheme, grid::GridSnapshot,
@@ -9,7 +6,6 @@ use parking_lot::Mutex;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
-/// Every role distinct, so a group drawn from the wrong role is visible.
 const LIGHT: NvimTheme = NvimTheme {
     dark: false,
     foreground: 0x172135,
@@ -101,7 +97,6 @@ impl Runtime {
             .await
             .unwrap();
     }
-    /// Waits until the latest grid satisfies `check`.
     async fn grid_until(&self, what: &str, check: impl Fn(&GridSnapshot) -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while !self.grid.lock().as_deref().is_some_and(&check) {
@@ -182,10 +177,6 @@ fn queued_typing_burst_reaches_grid_without_snapshot_or_redraw() {
             }
         }
         let queued = std::time::Instant::now();
-        // Observe only published flushes. A snapshot sends modal input markers,
-        // which could hide a redraw that stalls until another command arrives.
-        // The generous bound tolerates loaded CI while catching human-visible
-        // stalls; this is not a microbenchmark of each RPC round trip.
         let deadline = queued + Duration::from_millis(750);
         let expected_lines: Vec<_> = expected.lines().collect();
         loop {
@@ -382,8 +373,6 @@ fn exit_before_snapshot_callback_never_produces_submission_and_restart_drops_key
         let key = runtime.draft("retained draft").await;
         let durable = runtime.editor.snapshot(key.clone()).await.unwrap();
         runtime.keys(":lua os.exit(23)<CR>").await;
-        // The process exits while earlier input is executing: the marker can
-        // never acknowledge, so a caller cannot obtain a submission snapshot.
         assert!(runtime.editor.snapshot(key.clone()).await.is_err());
         runtime.keys("iDO NOT REPLAY<Esc>").await;
         runtime.editor.restart().await.unwrap();
@@ -446,8 +435,6 @@ fn focus_resize_and_theme_wait_out_an_unfinished_key_sequence() {
     smol::block_on(async {
         let runtime = Runtime::start().await;
         let key = runtime.draft("first\nsecond").await;
-        // Visual `g` waits for its second key; Neovim defers non-fast requests
-        // until it arrives, which only the user can send.
         runtime.keys("<Esc>vg").await;
         let started = std::time::Instant::now();
         for command in [
@@ -525,7 +512,6 @@ fn persistence_barrier_freezes_every_draft_until_explicit_resume() {
     });
 }
 
-/// Foreground of the first cell showing `text`, through its highlight.
 fn foreground_of(grid: &GridSnapshot, text: &str) -> Option<u32> {
     grid.rows
         .iter()
@@ -560,12 +546,10 @@ fn vim_write_and_quit_commands_keep_neovim_and_the_draft() {
         .enumerate()
         {
             runtime.keys(keys).await;
-            // The snapshot round trip orders every earlier key and notification.
             let snapshot = runtime.editor.snapshot(key.clone()).await.unwrap();
             assert_eq!(snapshot.text, "keep me", "{keys} changed the draft");
             assert_eq!(*runtime.leaves.lock(), ix + 1, "{keys} did not leave");
         }
-        // A split closes like Vim's would; only the last window leaves the editor.
         runtime.keys(":split<CR>:wq<CR>").await;
         runtime.editor.snapshot(key.clone()).await.unwrap();
         assert_eq!(*runtime.leaves.lock(), 7);
@@ -582,7 +566,6 @@ fn vim_write_and_quit_commands_keep_neovim_and_the_draft() {
             "keep me"
         );
         assert_eq!(*runtime.leaves.lock(), 7);
-        // Other commands still run.
         runtime.keys(":s/keep/kept/<CR>").await;
         assert_eq!(runtime.editor.snapshot(key).await.unwrap().text, "kept me");
         assert!(runtime.diagnostics.lock().is_empty());
@@ -607,7 +590,6 @@ fn theme_colors_every_visible_group() {
                 grid.default_bg == LIGHT.background && foreground_of(grid, "~") == Some(LIGHT.muted)
             })
             .await;
-        // Typed only after the theme's redraw, which would clear the message.
         runtime.keys(":bd<CR>").await;
         runtime.editor.snapshot(key).await.unwrap();
         runtime

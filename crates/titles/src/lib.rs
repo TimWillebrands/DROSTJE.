@@ -1,11 +1,3 @@
-//! Conversation titles and commit subjects from the local llama.cpp CLI or an optional Ollama
-//! server.
-//!
-//! A missing llama executable, unreachable Ollama server, or empty Ollama model list means "no
-//! text", not an error. Calls block; run them off the GPUI thread.
-//!
-//! [`installed_models`] lists what each provider can use without a download, for Settings.
-
 use anyhow::{Context as _, Result};
 use drostje_model::{Thread, ThreadKind};
 use drostje_platform as platform;
@@ -18,49 +10,36 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Placeholder title of a Conversation that has not been named yet.
 pub const DEFAULT_CONVERSATION_TITLE: &str = "New conversation";
-/// Settings key holding the Ollama model name; blank or absent means the first installed model.
 pub const MODEL_SETTING: &str = "title_model";
-/// Settings key holding the llama.cpp Hugging Face model reference.
 pub const LLAMA_MODEL_SETTING: &str = "llama_title_model";
-/// Installed model used when no llama.cpp title model is configured.
 pub const DEFAULT_LLAMA_MODEL: &str = "ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_0";
 
-/// Settings key holding the selected title generator.
 pub const PROVIDER_SETTING: &str = "title_provider";
 
-/// The default attempts llama.cpp before falling back to Ollama.
 pub const DEFAULT_PROVIDER: TitleProvider = TitleProvider::Automatic;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TitleProvider {
-    /// Try the llama.cpp CLI first, then Ollama when the executable is unavailable.
     Automatic,
     LlamaCpp,
     Ollama,
 }
 
-/// Models each title provider has locally; each source fails on its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstalledModels {
-    /// Hugging Face references in the llama.cpp cache, as `-hf` accepts them.
     pub llama: Result<Vec<String>, String>,
-    /// Model names the Ollama server lists.
     pub ollama: Result<Vec<String>, String>,
 }
 
 const DEFAULT_OLLAMA_HOST: &str = "127.0.0.1:11434";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Generation includes a cold model load.
 const GENERATE_TIMEOUT: Duration = Duration::from_secs(120);
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 
-/// One kind of short text the local model writes.
 struct Task {
     system: &'static str,
-    /// Leads the prompt for the llama.cpp CLI, which has no separate user turn label.
     lead: &'static str,
     prompt_limit: usize,
     output_limit: usize,
@@ -83,7 +62,6 @@ trailing period, no explanation.",
     output_limit: 72,
 };
 
-/// The configured local text generator, read from Settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Generator {
     pub provider: TitleProvider,
@@ -93,12 +71,10 @@ pub struct Generator {
 }
 
 impl Generator {
-    /// Names a Conversation from its user prompts.
     pub fn title(&self, prompt: &str) -> Result<Option<String>> {
         self.generate(&TITLE, &ollama_host(), prompt)
     }
 
-    /// Writes a commit subject for `changes`, a diff summary and patch.
     pub fn commit_subject(&self, changes: &str) -> Result<Option<String>> {
         self.generate(&COMMIT, &ollama_host(), changes)
     }
@@ -121,18 +97,14 @@ impl Generator {
     }
 }
 
-/// Whether an explicitly requested title may replace this thread's title, whatever it is.
 pub fn accepts_regenerated_title(thread: &Thread) -> bool {
     thread.kind == ThreadKind::Conversation && !thread.archived
 }
 
-/// Whether an automatic title may replace this thread's title: only the placeholder, so a
-/// harness or user rename always wins.
 pub fn accepts_generated_title(thread: &Thread) -> bool {
     accepts_regenerated_title(thread) && thread.title == DEFAULT_CONVERSATION_TITLE
 }
 
-/// Joins a Conversation's user prompts, oldest first, into one generation prompt.
 pub fn conversation_prompt<'a>(prompts: impl IntoIterator<Item = &'a str>) -> String {
     prompts
         .into_iter()
@@ -142,7 +114,6 @@ pub fn conversation_prompt<'a>(prompts: impl IntoIterator<Item = &'a str>) -> St
         .join("\n\n")
 }
 
-/// Server address from `OLLAMA_HOST` (as the Ollama CLI reads it), else the default port.
 pub fn ollama_host() -> String {
     std::env::var("OLLAMA_HOST")
         .ok()
@@ -172,14 +143,12 @@ fn normalize_host(raw: &str, default_port: u16) -> String {
     } else {
         format!("{host}:{default_port}")
     };
-    // A server bound to every interface is reached through loopback.
     match host.strip_prefix("0.0.0.0:") {
         Some(port) => format!("127.0.0.1:{port}"),
         None => host,
     }
 }
 
-/// Lists the downloaded llama.cpp models and installed Ollama models.
 pub fn installed_models(llama_executable: Option<&str>) -> InstalledModels {
     InstalledModels {
         llama: llama_cached_models(llama_executable).map_err(|error| format!("{error:#}")),
@@ -258,7 +227,6 @@ fn request(
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let body = body.map(Value::to_string).unwrap_or_default();
-    // HTTP/1.0 keeps the response unchunked and closes the connection after it.
     let head = format!(
         "{method} {path} HTTP/1.0\r\nHost: {host}\r\nAccept: application/json\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -320,8 +288,6 @@ fn truncate(text: &str, limit: usize) -> &str {
     }
 }
 
-/// Reduces model output to one line of at most `limit` characters, or `None` when nothing
-/// usable remains.
 fn clean_line(output: &str, limit: usize) -> Option<String> {
     let output = match output.rfind("</think>") {
         Some(ix) => &output[ix + "</think>".len()..],
@@ -422,7 +388,6 @@ fn llama_cached_models(executable: Option<&str>) -> Result<Vec<String>> {
     )?))
 }
 
-/// Model references from `llama cli --cache-list`, which numbers one per line.
 fn parse_cache_list(output: &str) -> Vec<String> {
     output
         .lines()
@@ -435,7 +400,6 @@ fn parse_cache_list(output: &str) -> Vec<String> {
         .collect()
 }
 
-/// Waits for a llama.cpp child that writes little output and returns its stdout.
 fn finish(mut child: std::process::Child, timeout: Duration, task: &str) -> Result<String> {
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -487,7 +451,6 @@ mod tests {
         }
     }
 
-    /// Serves `responses` in order, one per connection, and returns the received requests.
     fn serve(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let host = listener.local_addr().unwrap().to_string();
@@ -737,7 +700,6 @@ mod tests {
         );
     }
 
-    /// Opt-in: needs a running local Ollama with at least one model.
     #[test]
     #[ignore]
     fn local_ollama_names_a_prompt() {

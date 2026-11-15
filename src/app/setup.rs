@@ -20,7 +20,6 @@ impl AppState {
             .and_then(Value::as_str)
             .filter(|path| !path.trim().is_empty())
             .map(str::to_owned);
-        // Resolving stats and canonicalizes PATH entries, so it runs off the GPUI thread.
         let request = Uuid::new_v4();
         self.pi_check = Some(request);
         let sender = self.events.clone();
@@ -33,8 +32,6 @@ impl AppState {
         .detach();
     }
 
-    /// Finishes the Install Pi request `request`: reports a Pi that is already there, or
-    /// starts the managed install. Results of any other request are dropped.
     pub(super) fn pi_checked(&mut self, request: Uuid, found: Option<PathBuf>) {
         if self.pi_check != Some(request) {
             return;
@@ -47,7 +44,6 @@ impl AppState {
             );
             return;
         }
-        // Storage can fail while the check runs; the managed path could not be saved then.
         if self.storage_error.is_some() {
             self.notice(
                 NoticeLevel::Warning,
@@ -68,12 +64,10 @@ impl AppState {
         .detach();
     }
 
-    /// Whether an inspection of installed title models is in flight.
     pub fn title_models_loading(&self) -> bool {
         self.title_models_request.is_some()
     }
 
-    /// Lists installed title models in the background; earlier results stay visible meanwhile.
     pub fn refresh_title_models(&mut self) {
         let request = Uuid::new_v4();
         self.title_models_request = Some(request);
@@ -171,14 +165,12 @@ mod tests {
     fn install_pi_looks_for_pi_off_the_gpui_thread_and_drops_stale_answers(
         cx: &mut TestAppContext,
     ) {
-        // The look for Pi runs on a real blocking pool, as in production.
         cx.dispatcher.allow_parking();
         let dir =
             TempDirectory(std::env::temp_dir().join(format!("drostje-pi-{}", Uuid::new_v4())));
         fs::create_dir(&dir.0).unwrap();
         let store = Store::open(dir.0.join("data")).unwrap();
         let mut snapshot = smol::block_on(store.snapshot()).unwrap();
-        // A real executable, so even the background answer never starts a managed install.
         let pi = dir.0.join("pi");
         fs::write(&pi, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&pi, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
@@ -210,7 +202,6 @@ mod tests {
             assert_eq!(available(state), 0, "nothing was resolved on this thread");
             assert!(!state.installing_pi);
 
-            // A second request while the first is in flight changes nothing.
             state.install_pi();
             assert_eq!(state.pi_check, Some(request));
 
@@ -223,12 +214,10 @@ mod tests {
             assert_eq!(available(state), 1);
             assert!(!state.installing_pi, "an existing Pi is not reinstalled");
 
-            // The same answer arriving again is stale.
             state.receive(AppEvent::PiChecked(request, None), cx);
             assert!(!state.installing_pi);
             assert_eq!(available(state), 1);
 
-            // Storage that failed during the look stops the managed install.
             state.install_pi();
             let request = state.pi_check.unwrap();
             state.storage_error = Some("read-only test store".into());

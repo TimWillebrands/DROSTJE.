@@ -1,5 +1,3 @@
-//! Safe, narrow Rust ownership wrappers for Ghostty's native render surfaces.
-
 use std::{
     ffi::{CStr, c_void},
     ptr::NonNull,
@@ -54,7 +52,6 @@ impl ProcessInfo {
         })
     }
 
-    /// Performs OS process enumeration; call only on a background executor.
     pub fn needs_confirm_quit(self) -> bool {
         // SAFETY: Process identities cross by value; the program is a valid
         // NUL-terminated string alive through the call. The shim retains no
@@ -102,7 +99,6 @@ impl NativeWakeup {
         let _ = self.callbacks.sender.try_send(());
     }
 
-    // Installed once during Terminal::spawn, before servicing native events.
     pub fn init_clipboard_approval(&self, callback: Option<ClipboardApprovalCallback>) {
         if let Some(callback) = callback {
             let _ = self.callbacks.approval.set(callback);
@@ -122,7 +118,6 @@ unsafe extern "C" fn native_wakeup(userdata: *mut c_void) {
     let _ = unsafe { sender.as_ref() }.sender.try_send(());
 }
 
-// The shim uses the same lifetime-stable userdata as the wakeup callback.
 unsafe extern "C" fn native_clipboard_approval(
     userdata: *mut c_void,
     operation: i32,
@@ -199,18 +194,9 @@ pub(crate) struct NativeSnapshot {
     pub(crate) bgra: Vec<u8>,
 }
 
-/// Bounds retries when the native frame grows between a size report and a read.
 const SNAPSHOT_ATTEMPTS: usize = 3;
 
 impl NativeSnapshot {
-    /// Reads a native frame straight into the allocation GPUI will own, so a
-    /// captured frame costs one allocation (which `RenderImage` requires, as it
-    /// owns its pixels) and no copy. `capacity` carries the last frame's size
-    /// between calls: in steady state `read` runs once into an exact-fit buffer.
-    ///
-    /// `read(pixels, capacity, width, height, length)` reports the frame size and
-    /// returns false on failure; `length` zero means no frame is ready yet.
-    ///
     /// # Safety
     ///
     /// `read` writes at most `capacity` bytes to `pixels`, and when it returns
@@ -256,7 +242,6 @@ impl NativeSnapshot {
     }
 }
 
-/// Validates a reported BGRA frame and returns its row length in bytes.
 fn snapshot_row_length(width: u32, height: u32, length: usize) -> Result<usize, String> {
     let row_length = usize::try_from(width)
         .ok()
@@ -410,10 +395,6 @@ mod platform {
     }
 
     impl NativeSurface {
-        /// Creates a Ghostty-rendered child view attached to an AppKit `NSView`.
-        ///
-        /// The caller must invoke this on the AppKit main thread and keep the parent
-        /// view alive until this value is dropped.
         pub fn new(
             _display: Option<NonNull<c_void>>,
             parent_view: NonNull<c_void>,
@@ -635,8 +616,6 @@ mod platform {
         }
 
         pub fn mouse_scroll(&mut self, x: f64, y: f64, precision: bool) {
-            // Bit zero is Ghostty's high-precision scroll flag. Momentum is left
-            // unset because GPUI does not expose AppKit's momentum phase directly.
             let scroll_flags = i32::from(precision);
             // SAFETY: Values cross the adapter ABI by value.
             unsafe { gpui_ghostty_surface_mouse_scroll(self.raw.as_ptr(), x, y, scroll_flags) }
@@ -781,8 +760,6 @@ mod tests {
         assert!(state.visible);
     }
 
-    /// Reads a 2x2 bottom-up BGRA frame like the shims: size first, pixels only
-    /// into a buffer that fits.
     fn capture_2x2(
         capacity: &mut usize,
         reads: &mut usize,
@@ -837,7 +814,6 @@ mod tests {
         assert!(capture(1, 4, false).is_err(), "native failure");
         assert!(capture(2, 4, true).is_err(), "length disagrees with size");
 
-        // A frame that grows on every read never settles into the buffer.
         let mut capacity = 0;
         let growing = |_: *mut u8, room: usize, w: &mut u32, h: &mut u32, l: &mut usize| {
             *w = u32::try_from(room / 4 + 1).unwrap();

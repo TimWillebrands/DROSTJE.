@@ -27,10 +27,8 @@ use std::{
     sync::Arc,
 };
 
-/// Builds a disclosure's content, only while it is open.
 type DisclosureContent = Box<dyn FnOnce(&mut Window, &mut App) -> AnyElement>;
 
-// Disclosure state belongs to the native element identity, not the selected thread.
 #[derive(IntoElement)]
 struct Disclosure {
     id: SharedString,
@@ -82,7 +80,6 @@ fn lazy_disclosure(
     }
 }
 
-/// A timeline note's raw line, read from the run when its disclosure opens.
 fn raw_event(owner: &WeakEntity<Workspace>, launch: LaunchId, offset: u64, cx: &App) -> AnyElement {
     let raw = owner.upgrade().and_then(|workspace| {
         let state = workspace.read(cx).state.read(cx);
@@ -118,8 +115,6 @@ fn plain_text(text: impl Into<SharedString>, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-// Only new log content can request following. Opening a disclosure or repainting
-// must not pull a reader back down, and an offset above the bottom stays put.
 #[derive(IntoElement)]
 struct FollowingScroll {
     id: SharedString,
@@ -206,7 +201,6 @@ fn read_button(
     })
 }
 
-/// The launch recorded for a Factory thread, if it was ever started.
 pub fn launch_for(state: &AppState, thread_id: ThreadId) -> Option<&FactoryLaunch> {
     state
         .snapshot
@@ -496,8 +490,6 @@ pub fn render(
         .into_any_element()
 }
 
-/// The Output tab of a thread's sidebar: the thread's Factory launch files, the
-/// file last read, and workspace diagnostics.
 pub fn output(
     state: &AppState,
     thread_id: ThreadId,
@@ -530,7 +522,6 @@ pub fn output(
     .into_any_element()
 }
 
-/// Everything the Output tab shows above the text of the file last read.
 fn output_header(
     state: &AppState,
     thread_id: ThreadId,
@@ -637,7 +628,6 @@ fn output_header(
     body
 }
 
-/// Workspace diagnostics below the file text, or the empty state.
 fn output_footer(state: &AppState, thread_id: ThreadId, cx: &App) -> Vec<AnyElement> {
     let mut body = Vec::new();
     if !state.notices.is_empty() {
@@ -690,8 +680,6 @@ fn output_footer(state: &AppState, thread_id: ThreadId, cx: &App) -> Vec<AnyElem
     body
 }
 
-/// Byte ranges of `text`'s lines, split at each newline; a trailing newline ends in an
-/// empty line, as the unsplit text showed it.
 fn line_ranges(text: &str) -> Vec<Range<usize>> {
     let mut start = 0;
     let mut lines = Vec::new();
@@ -703,8 +691,6 @@ fn line_ranges(text: &str) -> Vec<Range<usize>> {
     lines
 }
 
-/// How many leading lines of `old` are gone when `new` is the same file's later tail;
-/// `None` when `new` does not continue `old`.
 fn continued_tail(old: &TextPage, new: &TextPage) -> Option<usize> {
     if old.path != new.path || new.start_offset < old.start_offset {
         return None;
@@ -723,8 +709,6 @@ fn continued_tail(old: &TextPage, new: &TextPage) -> Option<usize> {
     })
 }
 
-/// The Output tab with a file loaded: its header, one row per line and its footer in
-/// one virtualised scroll region that follows new text only while at the end.
 #[derive(IntoElement)]
 struct OutputPage {
     page: Arc<TextPage>,
@@ -732,7 +716,6 @@ struct OutputPage {
     owner: WeakEntity<Workspace>,
 }
 
-/// The list rows of the page last shown; a new page is told apart by pointer.
 struct PageRows {
     page: Option<Arc<TextPage>>,
     lines: Arc<[Range<usize>]>,
@@ -742,7 +725,7 @@ struct PageRows {
 
 impl PageRows {
     fn new() -> Self {
-        let list = ListState::new(0, ListAlignment::Top, px(400.)); // px: list overdraw
+        let list = ListState::new(0, ListAlignment::Top, px(400.));
         list.set_follow_mode(FollowMode::Tail);
         Self {
             page: None,
@@ -752,8 +735,6 @@ impl PageRows {
         }
     }
 
-    /// Rows are the header, the lines, then the footer. A later tail of the same file
-    /// splices in place, so a reader who scrolled up stays on the same line.
     fn show(&mut self, page: &Arc<TextPage>) {
         if self
             .page
@@ -768,7 +749,6 @@ impl PageRows {
             Some(dropped) => {
                 let kept = self.lines.len() - dropped;
                 self.list.splice(1..1 + dropped, 0);
-                // The old last line was the open end of the file; it is read again.
                 self.list.splice(kept..kept + 1, lines.len() + 1 - kept);
             }
             None => {
@@ -778,7 +758,6 @@ impl PageRows {
                 if following {
                     self.list.set_follow_mode(FollowMode::Tail);
                 } else {
-                    // Another page of text keeps the reader's place, as far as it reaches.
                     self.list.scroll_to(ListOffset {
                         item_ix: top.item_ix.min(lines.len() + 1),
                         offset_in_item: top.offset_in_item,
@@ -810,7 +789,6 @@ impl RenderOnce for OutputPage {
                     .font_family(cx.theme().mono_font_family.clone())
                     .text_size(cx.theme().mono_font_size)
                     .whitespace_normal()
-                    // An empty line keeps its height, as in the unsplit text.
                     .child(SharedString::from(
                         if line.is_empty() { " " } else { line }.to_owned(),
                     ))
@@ -907,7 +885,6 @@ mod tests {
         let mut rows = PageRows::new();
         let first = Arc::new(page(10, "a\nb\nc\n"));
         rows.show(&first);
-        // Header, four lines (the last one empty), footer.
         assert_eq!(rows.list.item_count(), 6);
         let lines = rows.lines.clone();
         rows.show(&first);
@@ -943,7 +920,6 @@ mod runtime_tests {
         }
     }
 
-    /// A long page renders as list rows and opens at its end, where new text appears.
     #[gpui_kit::test]
     fn a_long_output_page_opens_at_its_end(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {
@@ -963,7 +939,6 @@ mod runtime_tests {
             Root::new(host, window, cx)
         });
         for _ in 0..2 {
-            // The first frame measures the rows; the second lays out from the end.
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh();
                 window.draw(cx).clear(cx);

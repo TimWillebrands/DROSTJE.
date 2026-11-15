@@ -1,8 +1,5 @@
-//! Projects list cursor and list or scroll motions inside the focused pane.
-
 use super::*;
 
-/// Where the keyboard cursor lands after filtering: the first thread, else the first row.
 pub(super) fn first_thread_row(rows: &[Row]) -> Option<Row> {
     rows.iter()
         .copied()
@@ -11,9 +8,6 @@ pub(super) fn first_thread_row(rows: &[Row]) -> Option<Row> {
 }
 
 impl Workspace {
-    /// Anchor Projects keyboard navigation to the current selection before focus moves in.
-    /// Without a cursor the pane receives focus but draws no focus indication, so the
-    /// first `j`/`k` starts from an unrelated row.
     pub(super) fn prepare_projects_cursor(&mut self, cx: &mut Context<Self>) {
         let query = self.thread_search.read(cx).value();
         let (rows, selected) = {
@@ -85,8 +79,6 @@ impl Workspace {
         if let Row::Thread(id) = row
             && open
         {
-            // Reopening the selected thread shows its tab even when another tab
-            // in its group is displayed.
             self.unrevealed_thread = Some(id);
             self.sync_selection_panels(window, cx);
         }
@@ -142,7 +134,6 @@ impl Workspace {
             Motion::Line(delta) => step(delta),
             Motion::Page(delta) => {
                 let scroll = &self.projects.read(cx).scroll;
-                // Rows share one height; an unmeasured list falls back to a short page.
                 let page = scroll
                     .bounds_for_item(index)
                     .filter(|row| row.size.height > px(0.))
@@ -156,8 +147,6 @@ impl Workspace {
         self.projects.read(cx).scroll.scroll_to_item(next);
         self.projects.update(cx, |_, cx| cx.notify());
     }
-    /// Return focus from the thread filter to the Projects list, optionally clearing
-    /// the filter, with the cursor on the first matching thread.
     pub fn leave_thread_search(
         &mut self,
         clear: bool,

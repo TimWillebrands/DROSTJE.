@@ -1,11 +1,3 @@
-//! File references that a Conversation displays: `src/app.rs:42`, `Cargo.toml`,
-//! `src/ui/browser.rs:149-210`, `path#L12` and the files harness tools read or write.
-//!
-//! Parsing is pure and deliberately conservative: an inline code span or link becomes
-//! a reference only when it looks like a file path, never a code identifier such as
-//! `cx.notify` or a branch such as `origin/main`. Whether the file exists and is text
-//! is decided later, off the UI thread, by [`inspect`].
-
 use serde_json::Value;
 use std::{
     fs,
@@ -13,8 +5,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// A path as displayed (relative to the Conversation's working tree, absolute, or
-/// `~/`-prefixed) and the 1-based position it names, if any.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FileReference {
     pub path: String,
@@ -25,7 +15,6 @@ pub struct FileReference {
 }
 
 impl FileReference {
-    /// `path`, `path:12` or `path:12:3`, the form Neovim's quickfix and most tools use.
     pub fn label(&self) -> String {
         match (self.line, self.column) {
             (Some(line), Some(column)) => format!("{}:{line}:{column}", self.path),
@@ -34,7 +23,6 @@ impl FileReference {
         }
     }
 
-    /// The file this reference names: relative paths resolve against `base`.
     pub fn resolve(&self, base: &Path, home: Option<&Path>) -> PathBuf {
         if let Some(rest) = self.path.strip_prefix("~/")
             && let Some(home) = home
@@ -50,9 +38,6 @@ impl FileReference {
     }
 }
 
-/// Extensions that mark a bare file name (one without a `/`) as a file. Paths with a
-/// directory accept any alphanumeric extension; bare names need a known one, so that
-/// `self.state` or `cx.notify` stay code.
 const BARE_EXTENSIONS: &[&str] = &[
     "astro",
     "bash",
@@ -144,7 +129,6 @@ const BARE_EXTENSIONS: &[&str] = &[
     "zsh",
 ];
 
-/// File names without an extension that are still unmistakably files.
 const BARE_NAMES: &[&str] = &[
     "AGENTS.md",
     "Brewfile",
@@ -163,8 +147,6 @@ const BARE_NAMES: &[&str] = &[
     "makefile",
 ];
 
-/// Parse an inline code span such as `src/app.rs:42`. Returns `None` for anything
-/// that does not look like a file path.
 pub fn parse(text: &str) -> Option<FileReference> {
     let text = text.trim();
     if text.is_empty() || text.len() > 1024 || text.chars().any(char::is_whitespace) {
@@ -181,8 +163,6 @@ pub fn parse(text: &str) -> Option<FileReference> {
     })
 }
 
-/// Parse a Markdown link target: `file:///abs/path#L12`, `src/app.rs#L10-L20` or a
-/// relative path. Web URLs and other schemes are not files.
 pub fn parse_link(url: &str) -> Option<FileReference> {
     if let Some(rest) = url.strip_prefix("file://") {
         let (path, fragment) = rest.split_once('#').unwrap_or((rest, ""));
@@ -191,7 +171,6 @@ pub fn parse_link(url: &str) -> Option<FileReference> {
             return None;
         }
         let mut reference = parse(&path).or_else(|| {
-            // An absolute file URL names a file even without a known extension.
             (!path.ends_with('/')).then(|| FileReference {
                 path: path.clone(),
                 line: None,
@@ -211,15 +190,11 @@ pub fn parse_link(url: &str) -> Option<FileReference> {
             .nth(1)
             .is_some_and(|rest| !rest.chars().next().is_some_and(|c| c.is_ascii_digit()))
     {
-        // `mailto:x`, `vscode:…` and similar schemes.
         return None;
     }
     parse(&percent_decode(url)?)
 }
 
-/// The file a harness tool call read, wrote or edited, at the line it started from.
-/// OMP names the file `path`, Claude Code `file_path`; OMP's `edit` names it in the
-/// patch header.
 pub fn tool_reference(name: &str, input: &Value) -> Option<FileReference> {
     let field = |key: &str| input[key].as_str().filter(|value| !value.trim().is_empty());
     let path = match name.to_ascii_lowercase().as_str() {
@@ -242,7 +217,6 @@ pub fn tool_reference(name: &str, input: &Value) -> Option<FileReference> {
     })
 }
 
-/// Files named in an `edit` patch header line such as `[path/to/file.rs#69AE]`.
 pub fn patch_paths(patch: &str) -> Vec<&str> {
     patch
         .lines()
@@ -255,8 +229,6 @@ pub fn patch_paths(patch: &str) -> Vec<&str> {
         .collect()
 }
 
-/// References in inline code spans of Markdown prose, in order of appearance.
-/// A cheap scan for the file picker; the transcript itself uses the Markdown parser.
 pub fn inline_code_references(text: &str) -> Vec<FileReference> {
     let mut references = Vec::new();
     let mut in_fence = false;
@@ -298,8 +270,6 @@ pub enum InspectError {
     Unreadable { path: String, error: String },
 }
 
-/// Whether `path` is an existing text file. Reads at most the first 8 KiB; a NUL
-/// byte or invalid UTF-8 there means binary. Blocking: call from a background task.
 pub fn inspect(path: &Path) -> Result<(), InspectError> {
     let shown = path.display().to_string();
     let unreadable = |error: std::io::Error| InspectError::Unreadable {
@@ -325,13 +295,11 @@ pub fn inspect(path: &Path) -> Result<(), InspectError> {
     }
     match std::str::from_utf8(&head) {
         Ok(_) => Ok(()),
-        // The 8 KiB cut can split one multi-byte character; that is still text.
         Err(error) if error.error_len().is_none() => Ok(()),
         Err(_) => Err(InspectError::Binary(shown)),
     }
 }
 
-/// Split a trailing `:12`, `:12:3`, `:12-20` or `#L12`/`#L12-L20` position from `text`.
 fn split_position(text: &str) -> (&str, Option<u32>, Option<u32>) {
     if let Some((path, fragment)) = text.rsplit_once('#')
         && let Some(line) = fragment_line(fragment)
@@ -347,7 +315,6 @@ fn split_position(text: &str) -> (&str, Option<u32>, Option<u32>) {
     let Some((head, last)) = text.rsplit_once(':') else {
         return (text, None, None);
     };
-    // `path:12-20` names a range; Neovim opens at its start.
     if let Some((start, end)) = last.split_once('-')
         && let (Some(line), Some(_)) = (number(start), number(end))
     {
@@ -362,7 +329,6 @@ fn split_position(text: &str) -> (&str, Option<u32>, Option<u32>) {
     }
 }
 
-/// `L12`, `L12-L20` or `L12C3` from a GitHub-style fragment.
 fn fragment_line(fragment: &str) -> Option<u32> {
     let digits: String = fragment
         .strip_prefix('L')?
@@ -398,12 +364,10 @@ fn valid_path(path: &str) -> bool {
         return false;
     }
     if !extension.chars().any(|c| c.is_ascii_alphabetic()) {
-        // `v1.2` and `0.6` are versions.
         return false;
     }
     let extension = extension.to_ascii_lowercase();
     if path.contains('/') {
-        // A directory makes a dotted name a path, but `a/b.c` still needs a real stem.
         return !stem.is_empty() || name.len() > 1;
     }
     BARE_EXTENSIONS.contains(&extension.as_str()) && (!stem.is_empty() || name.starts_with('.'))
@@ -580,7 +544,6 @@ mod tests {
             inspect(&dir.join("missing.rs")),
             Err(InspectError::Missing(_))
         ));
-        // A multi-byte character split by the 8 KiB cut is still text.
         let split = dir.join("split.txt");
         let mut bytes = vec![b'a'; 8191];
         bytes.extend("é".as_bytes());

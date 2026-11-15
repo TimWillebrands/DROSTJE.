@@ -40,8 +40,6 @@ impl Dialect {
             Self::Pi => "Pi",
         }
     }
-    /// Largest physical stdout line. Pi has no chunking, so one line may be a whole
-    /// logical frame.
     fn frame_limit(self) -> usize {
         match self {
             Self::Omp => FRAME,
@@ -122,8 +120,6 @@ impl FrameDecoder {
             !encoded.is_empty() && encoded.len() <= CHUNK.div_ceil(3) * 4,
             "Invalid RPC chunk data length"
         );
-        // STANDARD requires canonical padding and zero trailing bits, so only the one
-        // canonical encoding of these bytes decodes.
         let bytes = STANDARD
             .decode(encoded)
             .context("Invalid RPC chunk base64")?;
@@ -135,7 +131,6 @@ impl FrameDecoder {
                 count,
                 length,
                 next: 0,
-                // `length` is validated against LOGICAL above.
                 bytes: Vec::with_capacity(length),
             });
         }
@@ -199,7 +194,6 @@ impl OwnedChild {
                 }
                 _ => break,
             }
-            // Drain pipes so orderly shutdown cannot deadlock on unread output.
             let mut discard = [0u8; 16384];
             if stdout_nonblocking {
                 let _ = self.stdout.read(&mut discard);
@@ -208,7 +202,6 @@ impl OwnedChild {
                 let _ = self.stderr.read(&mut discard);
             }
         }
-        // This PID belongs to the unreaped child whose setsid succeeded at spawn.
         let _ = drostje_platform::terminate_process_group(self.child.id());
         let deadline = Instant::now() + Duration::from_millis(250);
         while Instant::now() < deadline {
@@ -377,7 +370,6 @@ pub(super) async fn open(mut config: ConversationConfig) -> Result<ConversationH
                 }
                 actor.flush_message_update();
                 actor.child.close();
-                // Final lifecycle notifications are delivered after shutdown, never blocking control.
                 for event in actor.events.drain(..) {
                     if actor.output.send_blocking(event).is_err() {
                         break;
@@ -534,14 +526,10 @@ struct Actor {
     history_wait: bool,
     next_poll: Instant,
     current_message: Option<String>,
-    /// The newest `message_update` snapshot not yet normalized, with its message ID. Streaming
-    /// sends the whole partial message per token; only the last one per loop pass is shown.
-    /// [`Actor::emit`] flushes it first, so it never moves past any other event.
     message_update: Option<(String, Value)>,
     sequence: u64,
     closing: bool,
     eof: bool,
-    /// Cleared at stderr end of file, after which a hung-up stderr would end every wait.
     stderr_open: bool,
     submissions: VecDeque<Uuid>,
     images: ImageCache,
@@ -604,8 +592,6 @@ impl Actor {
         }
         Ok(())
     }
-    /// OMP also pushes `available_commands_update` whenever its list changes; Pi has no such
-    /// event, so its list is fetched again after every turn.
     fn request_commands(&mut self) -> Result<()> {
         if self
             .requests
@@ -640,7 +626,6 @@ impl Actor {
         self.flush_message_update();
         self.events.push_back(event);
     }
-    /// Normalizes and queues the coalesced `message_update` snapshot, if any.
     fn flush_message_update(&mut self) {
         if let Some((id, raw)) = self.message_update.take() {
             let message = normalize_message(&raw, &id, &self.config.session_dir, &mut self.images);
@@ -660,7 +645,6 @@ impl Actor {
         } else {
             state
         };
-        // Ready can precede prompt acceptance. Keep protection until that turn settles.
         if state == ConversationState::Disconnected
             || (state == ConversationState::Ready && self.turn.id.is_none())
         {
@@ -846,11 +830,9 @@ impl Actor {
                 }
                 Some(_) => {}
             }
-            // stdout EOF is authoritative: drain buffered terminal frames before reaping.
             self.wait()?;
         }
     }
-    /// Sleeps until the child's pipes, a command or the next deadline check need this loop.
     fn wait(&mut self) -> Result<()> {
         let timeout = if self.lines.buffered() {
             Duration::ZERO
@@ -1405,7 +1387,6 @@ impl Actor {
                     }
                     let id = self.current_message.clone().unwrap();
                     if kind == "message_update" && !peer {
-                        // Coalesced: the next snapshot or any other event replaces or flushes it.
                         if self
                             .message_update
                             .as_ref()
@@ -1517,7 +1498,6 @@ impl Actor {
     fn response(&mut self, value: Value) -> Result<()> {
         let pending = self.requests.take(&value)?;
         let id = value["id"].as_str().and_then(|id| Uuid::parse_str(id).ok());
-        // Prompt scheduling may fail after its successful ID-correlated acknowledgement.
         if pending.is_none()
             && let Some(event) = self.turn.late_failure(&value)
         {
@@ -1782,9 +1762,8 @@ impl Actor {
                 }
             }
             RequestKind::Commands => self.commands(&data["commands"]),
-            RequestKind::Peer(_) => {} // RPC command handling is not a context receipt.
+            RequestKind::Peer(_) => {}
             RequestKind::Abort => {
-                // Abort acknowledgement alone does not prove that the agent stopped.
                 self.next_poll = Instant::now();
                 self.history_wait = true;
             }
@@ -2062,7 +2041,6 @@ fn answer_frame(id: &str, answer: UserAnswer) -> Value {
         UserAnswer::Confirmed(confirmed) => {
             json!({"type":"extension_ui_response","id":id,"confirmed":confirmed})
         }
-        // Claude-only permission semantics must never approve an OMP dialog.
         UserAnswer::PermissionAuto => {
             json!({"type":"extension_ui_response","id":id,"cancelled":true})
         }
@@ -2081,9 +2059,6 @@ fn safe_web_url(url: &str) -> bool {
             .split_once("://")
             .is_some_and(|(_, rest)| !rest.is_empty() && !rest.starts_with('/'))
 }
-/// OMP entries are `{name, aliases?, description, input?: {hint}, source}`; Pi entries are
-/// `{name, description?, source}` plus location details DROSTJE. does not need. Entries
-/// without a name are returned separately so they can be shown as a diagnostic.
 fn parse_commands(dialect: Dialect, raw: &Value) -> Result<(Vec<SlashCommand>, Vec<Value>)> {
     let entries = raw
         .as_array()
@@ -2135,7 +2110,6 @@ fn parse_commands(dialect: Dialect, raw: &Value) -> Result<(Vec<SlashCommand>, V
     }
     Ok((commands, rejected))
 }
-/// OMP builtins that replace the model, session or directory DROSTJE. tracks.
 fn omp_blocked(name: &str) -> Option<&'static str> {
     match name {
         "model" | "switch" => Some(super::commands::MODEL_PICKER),
@@ -2226,7 +2200,6 @@ fn normalize_message(
         exit_code: value["details"]["exitCode"].as_i64(),
     }
 }
-/// OMP sends the purpose line as `intent` and, for most tools, also as the `i` argument.
 fn intent(block: &Value, arguments: &Value) -> Option<String> {
     block["intent"]
         .as_str()
@@ -2512,7 +2485,6 @@ done
             browser_tools: None,
             allow_empty_session: true,
         };
-        // Drive the actual actor handlers; this child requires no external agent or credentials.
         let (child, _) = prepare(&mut config, Dialect::Omp)?;
         let (_commands, input) = async_channel::bounded(64);
         let (output, _events) = async_channel::bounded(128);
@@ -2666,8 +2638,6 @@ done
         assert!(error, "Invalid UTF-8 cannot become a completed message");
     }
 
-    /// The chunk decoder relies on this instead of re-encoding: every string `STANDARD`
-    /// accepts is the canonical encoding of what it decodes to.
     #[test]
     fn standard_base64_accepts_only_canonical_encodings() {
         const SYMBOLS: &[u8] =
@@ -2681,7 +2651,6 @@ done
         for length in 0..=7u8 {
             let bytes: Vec<u8> = (0..length).map(|ix| ix.wrapping_mul(97) ^ 0x5a).collect();
             let encoded = STANDARD.encode(&bytes).into_bytes();
-            // Every one- and two-symbol substitution, plus a dropped and an added symbol.
             let mut variants = vec![encoded.clone()];
             for ix in 0..encoded.len() {
                 let mut shorter = encoded.clone();
@@ -2772,8 +2741,6 @@ done
         assert!(
             matches!(turn.late_failure(&failure),Some(ConversationEvent::TurnSettled { request_id,outcome:TurnOutcome::Failed }) if request_id==id)
         );
-        // The emitted UUID is the durable submission key; no replacement prompt or
-        // new UUID is synthesized, so the app can offer its immutable text/images.
     }
 
     #[test]
@@ -2910,7 +2877,6 @@ done
             }
             other => panic!("unexpected blocks: {other:?}"),
         }
-        // A tool call without an ID cannot be answered; it stays visible as raw data.
         assert!(message.raw.is_some());
     }
 
@@ -2973,7 +2939,6 @@ done
         actor.flush_message_update();
         assert_eq!(shown(&mut actor), [format!("message assistant:7:: {text}")]);
 
-        // A tool event in the same pass first shows the newest snapshot, then itself.
         actor.frame(update("first"))?;
         actor.frame(update("second"))?;
         actor.frame(json!({"type":"tool_execution_start","toolCallId":"call-1","toolName":"bash","args":{}}))?;
@@ -3085,7 +3050,6 @@ done
         assert_eq!(commands[3].source, CommandSource::Custom);
         assert_eq!(commands[4].source, CommandSource::Other("workflow".into()));
 
-        // Pi's documented and shipped shapes differ only in location fields.
         let (commands, rejected) = parse_commands(
             Dialect::Pi,
             &json!([
@@ -3159,7 +3123,6 @@ done
                 .any(|event| matches!(event, ConversationEvent::Failed { .. }))
         );
 
-        // Pi has no change event, so every settled turn asks again.
         actor.writes.clear();
         actor.finish(TurnOutcome::Completed)?;
         assert!(
@@ -3395,7 +3358,7 @@ done
         let attempt = delivery.attempt;
         let messages = delivery.messages.clone();
         actor.deliver_peer(delivery);
-        actor.writes.clear(); // transport has consumed the write; acceptance is not known
+        actor.writes.clear();
         drop(lifetime);
         actor.cancel_peers(false, "cancelled after dispatch")?;
         assert!(actor.events.iter().any(|event| matches!(event,

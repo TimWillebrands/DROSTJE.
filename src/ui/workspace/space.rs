@@ -1,6 +1,3 @@
-//! Space switching, moving projects or threads between Spaces, and the swipe
-//! presentation that follows a sideways scroll.
-
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -11,7 +8,6 @@ pub(super) enum SpaceChange {
     Delete(SpaceId),
 }
 
-/// Presentation only: never changes a Space or its retained editors/layout.
 #[derive(Default)]
 pub(super) struct SpaceSlide {
     pub(super) offset: f32,
@@ -108,7 +104,6 @@ impl Workspace {
                 self.space_slide.settle(now);
             }
         } else if let Some(distance) = self.space_swipe.progress() {
-            // Ordinary vertical scrolling must not redraw or start release timers.
             if distance == 0. && self.space_slide.sample(now).0 == 0. {
                 return;
             }
@@ -295,8 +290,6 @@ impl Workspace {
                 }
             }
         }
-        // A moved terminal is reattached in its project's destination, not duplicated
-        // by a stale cached layout. The process and working directory stay intact.
         let terminal_spaces: BTreeMap<_, _> = self
             .terminals
             .borrow()
@@ -345,7 +338,6 @@ impl Workspace {
         self.space_swipe_idle.take();
         let now = Instant::now();
         let offset = if self.space_slide.neighbor == Some(active) {
-            // Rebase the same two strips: destination becomes active without a jump.
             self.space_slide.sample(now).0 - direction
         } else {
             -direction

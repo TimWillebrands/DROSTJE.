@@ -20,7 +20,6 @@ extern const char *drost_ghostty_surface_expected_program(ghostty_surface_t);
 typedef bool (*gpui_ghostty_make_current_cb)(void *userdata);
 typedef void (*gpui_ghostty_context_cb)(void *userdata);
 typedef void (*gpui_ghostty_wakeup_cb)(void *userdata);
-// Adapter operation values: paste=0, read=1, write=2.
 typedef bool (*gpui_ghostty_approve_clipboard_cb)(void *userdata, int operation, const char *text);
 
 typedef struct gpui_ghostty_surface {
@@ -134,8 +133,6 @@ static void runtime_confirm_read_clipboard(
         int operation = kind == GHOSTTY_CLIPBOARD_REQUEST_PASTE ? 0 : 1;
         bool approved = state->approve_clipboard != NULL &&
             state->approve_clipboard(state->wakeup_userdata, operation, text);
-        // Completing with empty text releases Ghostty's request without exposing
-        // clipboard contents or inserting an unsafe paste.
         ghostty_surface_complete_clipboard_request(state->surface, approved ? text : "", request, true);
     }
 }
@@ -317,10 +314,6 @@ void gpui_ghostty_surface_linux_theme(gpui_ghostty_surface *state, const uint8_t
     ghostty_surface_refresh(state->surface);
 }
 
-// Reports the surface size in `width`, `height` and `length` and, only when
-// `capacity` covers `length`, draws the frame and reads it bottom-up into the
-// caller's `pixels`. A short buffer returns true with nothing read or drawn so the
-// caller can grow it; the shim never allocates or retains pixel memory.
 bool gpui_ghostty_surface_linux_snapshot(
     gpui_ghostty_surface *state,
     uint8_t *pixels,

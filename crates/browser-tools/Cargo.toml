@@ -6,8 +6,6 @@ edition.workspace = true
 publish = false
 
 [features]
-# The desktop's embedded-browser tool. Without it (the headless host) browser operations
-# are refused and neither Servo nor image encoding is built.
 browser = ["dep:drostje-browser", "dep:base64", "dep:image", "dep:smol"]
 
 [dependencies]

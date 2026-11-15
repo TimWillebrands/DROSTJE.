@@ -50,8 +50,6 @@ impl Shutdown {
             }
             let _ = commands.send(ConversationCommand::Close).await;
         }
-        // The adapter enforces its owned-process five-second grace period. Its
-        // pump acknowledges only after all terminal state writes were enqueued.
         for drain in self.drains {
             let _ = drain.recv().await;
         }
@@ -96,10 +94,6 @@ impl Shutdown {
 }
 
 impl AppState {
-    /// Run while the foreground event loop and windows still exist. GPUI's final
-    /// platform shutdown hook allows only 200ms, not enough for durable I/O or RPC.
-    /// The caller must quiesce Neovim and record its persistence-barrier snapshots
-    /// before starting shutdown so the final flush includes every live draft.
     pub fn begin_shutdown(&mut self, allow_data_loss: bool, cx: &mut Context<Self>) {
         if self.shutting_down {
             return;

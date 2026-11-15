@@ -3,7 +3,6 @@ import { registerArtifactQuestions } from "./ask.mjs";
 import { registerBrowserTools } from "./client.mjs";
 import { registerPeerDelivery } from "./peer.mjs";
 
-// Pi aliases @sinclair/typebox to its installed TypeBox implementation.
 export default function (api) {
   function schema(value) {
     const options = value.description ? { description: value.description } : {};

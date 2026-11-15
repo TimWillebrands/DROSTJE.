@@ -5,10 +5,8 @@ use gpui_kit::{
 };
 use std::time::{Duration, SystemTime};
 
-/// Utilisation at or above this share of a window or context reads as a warning.
 const USAGE_WARNING_PERCENT: f32 = 80.;
 
-/// Context and plan-limit meters for the composer toolbar; absent data renders nothing.
 pub(super) fn usage_meters(
     context: Option<ContextUsage>,
     limits: &[UsageLimit],
@@ -94,7 +92,6 @@ fn limit_description(limit: &UsageLimit, now: SystemTime) -> String {
     format!("{window}: {:.0}% used{reset}", limit.percent_used)
 }
 
-/// `84000` → `84k`, `1_000_000` → `1M`, keeping one decimal below ten.
 fn compact_tokens(tokens: u64) -> String {
     let (value, unit) = match tokens {
         0..1_000 => return tokens.to_string(),
@@ -109,7 +106,6 @@ fn compact_tokens(tokens: u64) -> String {
     format!("{}{unit}", text.strip_suffix(".0").unwrap_or(&text))
 }
 
-/// Largest two units: `3d 4h`, `2h 14m`, `5m`.
 fn compact_duration(duration: Duration) -> String {
     let minutes = duration.as_secs() / 60;
     let (days, hours, minutes) = (minutes / 1440, minutes / 60 % 24, minutes % 60);

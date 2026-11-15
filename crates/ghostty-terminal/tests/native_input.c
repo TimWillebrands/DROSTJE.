@@ -31,8 +31,6 @@ void ghostty_surface_text(ghostty_surface_t surface, const char *text, uintptr_t
 #include "../shim/native_input.h"
 
 int main(void) {
-    // Native commits are typing, even when the program enabled bracketed paste.
-    // A normal-mode ':' must reach Neovim as a key, never as a clipboard paste.
     const char *commits[] = {":", "?", "G", "{}|~", "é", "界", "e\xcc\x81", "🙂"};
     for (unsigned index = 0; index < sizeof(commits) / sizeof(commits[0]); index++) {
         expected = commits[index];

@@ -38,7 +38,6 @@ pub(in crate::ui) struct ModelPicker {
     _subscription: Subscription,
 }
 
-/// `None` is the harness default effort.
 #[derive(Clone, PartialEq)]
 pub(super) struct EffortOption {
     value: Option<String>,
@@ -65,8 +64,6 @@ pub(in crate::ui) struct EffortPicker {
     _subscription: Subscription,
 }
 
-/// Permission modes are launch flags of the thread's harness, listed by `harness::permission_modes`;
-/// `None` is the harness default and an empty list hides the picker.
 pub(in crate::ui) struct PermissionModePicker {
     pub(super) thread_id: ThreadId,
     pub(super) options: Vec<EffortOption>,
@@ -75,8 +72,6 @@ pub(in crate::ui) struct PermissionModePicker {
     _subscription: Subscription,
 }
 
-/// Effort levels come from the chosen model, else the harness default entry, else the first
-/// model that lists any; an empty list hides the picker.
 fn effort_levels(state: &AppState, thread: &crate::model::Thread) -> Vec<String> {
     let Some(session) = state.conversations.get(&thread.id) else {
         return Vec::new();

@@ -1,7 +1,3 @@
-//! Parity of the Git plumbing with the one-question-per-process implementation it replaced,
-//! and the number of Git processes each call costs. Every fixture is a fresh `git init` under
-//! the temp directory.
-
 use super::{
     GIT_SPAWNS, RepositoryInfo, branch_is_merged, commit_all, create_worktree, has_changes,
     inspect_repository, inspect_worktree, obviously_valid_branch_name, switch_branch,
@@ -14,8 +10,6 @@ use std::{
     process::Command,
 };
 
-/// The implementations as they were before Git questions were combined, with uncounted
-/// processes: the oracle every new result and error text is compared with.
 mod before {
     use super::*;
 
@@ -91,7 +85,6 @@ mod before {
         }
     }
 
-    /// `validate_source`'s branch checks in `src/ui/factory/form.rs` before the change.
     pub fn factory_branch(root: &Path, branches: &[String], branch: &str) -> Result<(), String> {
         validate_branch(root, branch).map_err(|error| format!("{error:#}"))?;
         if !branches.iter().any(|name| name == branch) {
@@ -101,7 +94,6 @@ mod before {
     }
 }
 
-/// Git processes `f` starts on this thread.
 fn spawns<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let start = GIT_SPAWNS.with(|spawns| spawns.get());
     let value = f();
@@ -117,7 +109,6 @@ impl Fixture {
         Self(path)
     }
 
-    /// A repository on `main` with one commit.
     fn repository() -> Self {
         let fixture = Self::unborn();
         fs::write(fixture.0.join("tracked.txt"), "before\n").unwrap();
@@ -126,7 +117,6 @@ impl Fixture {
         fixture
     }
 
-    /// A repository on `main` with no commits yet.
     fn unborn() -> Self {
         let fixture = Self::empty();
         run(&fixture.0, &["init", "-q", "-b", "main"]);
@@ -168,7 +158,6 @@ fn rendered<T>(result: Result<T>) -> Result<T, String> {
     result.map_err(|error| format!("{error:#}"))
 }
 
-/// The new `inspect_repository` returns what the old one did, error text included.
 fn assert_inspects_like_before(path: &Path) -> Result<RepositoryInfo, String> {
     let now = rendered(inspect_repository(path));
     let before = rendered(before::inspect_repository(path));
@@ -215,8 +204,6 @@ fn dirty_staged_and_untracked_changes_read_as_dirty_like_before() {
 #[test]
 fn a_status_too_large_to_read_stops_early_and_leaves_no_index_lock() {
     let repository = Fixture::repository();
-    // Far more porcelain output than a pipe buffers, so Git is still writing when we stop.
-    // Top-level files: `status --porcelain` collapses an untracked directory to one line.
     for ix in 0..6000 {
         fs::write(
             repository
@@ -233,7 +220,6 @@ fn a_status_too_large_to_read_stops_early_and_leaves_no_index_lock() {
         assert!(!repository.0.join(".git/index.lock").exists());
     }
     assert!(assert_inspects_like_before(&repository.0).unwrap().dirty);
-    // Git still works on the repository afterwards.
     run(&repository.0, &["add", "--all"]);
     commit(&repository.0, "many");
     assert!(!has_changes(&repository.0).unwrap());
@@ -294,13 +280,11 @@ fn detached_unborn_and_ambiguous_heads_name_the_branch_like_before() {
         None
     );
 
-    // A tag with the branch's name: both commands disambiguate to `heads/v1`.
     run(&repository.0, &["tag", "v1"]);
     run(&repository.0, &["switch", "-q", "-c", "v1"]);
     let info = assert_inspects_like_before(&repository.0).unwrap();
     assert_eq!(info.branch.as_deref(), Some("heads/v1"));
 
-    // A remote with the branch's name: only `for-each-ref` disambiguates, so Git is asked.
     run(&repository.0, &["branch", "origin", "main"]);
     run(
         &repository.0,
@@ -311,7 +295,6 @@ fn detached_unborn_and_ambiguous_heads_name_the_branch_like_before() {
     assert_eq!(info.branch.as_deref(), Some("origin"));
     assert!(info.branches.contains(&"heads/origin".to_owned()));
 
-    // HEAD on a symbolic branch: the listing cannot tell which name Git reports, so Git is asked.
     run(&repository.0, &["switch", "-q", "main"]);
     run(
         &repository.0,
@@ -433,7 +416,6 @@ fn verified_branches_are_exactly_ones_validation_would_pass() {
         &repository.0,
         &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
     );
-    // A branch that does not point at a commit, written past Git's own refusal.
     let tree = run(&repository.0, &["rev-parse", "HEAD^{tree}"]);
     fs::write(repository.0.join(".git/refs/heads/tree-branch"), tree).unwrap();
     let info = inspect_repository(&repository.0).unwrap();
@@ -456,7 +438,6 @@ fn verified_branches_are_exactly_ones_validation_would_pass() {
         if info.verified_branch(name) {
             validate_branch(&info.root, name).unwrap();
         }
-        // The Factory form's branch checks, skipping validation when the listing proves it.
         let now = if info.verified_branch(name) {
             Ok(())
         } else {

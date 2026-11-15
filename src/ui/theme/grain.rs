@@ -1,23 +1,14 @@
-//! Film grain over window chrome. One static noise tile is painted at device
-//! resolution, one texel per screen pixel, on a grid anchored to the window origin so
-//! neighbouring surfaces continue the same pattern. Reading surfaces get none.
-
 use std::sync::{Arc, OnceLock};
 
 use gpui_kit::*;
 
-/// Device pixels per tile edge.
 const TILE: u32 = 256;
-/// Opacity of the layer at full strength; the noise itself averages half coverage.
 const MAX_OPACITY: f32 = 0.2;
 
-/// Grey noise: each texel is white or black with a random alpha, so the grain neither
-/// lightens nor darkens a surface on average and reads the same in both modes.
 fn noise(seed: u32) -> Vec<u8> {
     let mut state = seed.max(1);
     let mut pixels = Vec::with_capacity((TILE * TILE * 4) as usize);
     for _ in 0..TILE * TILE {
-        // xorshift32: deterministic, so the grain does not change between launches.
         state ^= state << 13;
         state ^= state >> 17;
         state ^= state << 5;
@@ -47,7 +38,6 @@ fn paint(bounds: Bounds<Pixels>, window: &mut Window) {
     while y < bounds.bottom() {
         let mut x = edge * (bounds.left() / edge).floor();
         while x < bounds.right() {
-            // Decorative: a tile the atlas cannot take is left out, not reported.
             let _ = window.paint_image(
                 bounds,
                 Bounds::new(point(x, y), size(edge, edge)),
@@ -62,8 +52,6 @@ fn paint(bounds: Bounds<Pixels>, window: &mut Window) {
     }
 }
 
-/// A layer over its `relative()` parent at `strength` (0 to 1), or nothing at 0. It has
-/// no hitbox, so the chrome beneath keeps every pointer event.
 pub fn layer(strength: f32) -> Option<AnyElement> {
     (strength > 0.).then(|| {
         div()

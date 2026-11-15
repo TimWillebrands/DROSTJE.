@@ -107,7 +107,6 @@ impl Rpc {
             incoming: incoming_sender,
             stderr: Mutex::new(String::new()),
         });
-        // Establish kill/wait ownership before any fallible thread creation.
         let rpc = Self {
             child,
             outgoing: outgoing.clone(),
@@ -163,10 +162,6 @@ impl Rpc {
                                 }
                             }
                         }
-                        // A reentrant client API call must finish before its enclosing
-                        // Neovim request can receive a reply. Reverse server IDs alone
-                        // are insufficient: sending both replies in one read batch can
-                        // reach Neovim before its inner rpc call stack has unwound.
                         while matches!(
                             stack.last(),
                             Some(CallFrame::Server { reply: Some(_), .. })
@@ -328,8 +323,6 @@ impl Rpc {
         if matches!(self.child.try_wait(), Ok(Some(_))) {
             return;
         }
-        // This PID is the unreaped child whose setsid call succeeded before exec, so its
-        // process group is ours alone.
         let _ = drostje_platform::kill_process_group(self.child.id());
         let _ = self.child.wait();
     }
@@ -342,7 +335,6 @@ impl Drop for Rpc {
     }
 }
 
-/// One decoded msgpack-RPC message, before delivery bookkeeping.
 #[derive(Debug, PartialEq)]
 enum Frame {
     Request {
@@ -357,8 +349,6 @@ enum Frame {
     Notification(String, Vec<Value>),
 }
 
-/// Consumes the decoded frame so argument arrays (a full-screen redraw batch
-/// holds every cell) move into the delivered message instead of being copied.
 fn parse_frame(value: Value) -> Result<Frame> {
     let Value::Array(mut frame) = value else {
         bail!("RPC frame is not an array");
@@ -388,7 +378,6 @@ fn parse_frame(value: Value) -> Result<Frame> {
     }
 }
 
-/// Takes a valid UTF-8 string out of `value`; anything else is left in place.
 fn owned_string(value: &mut Value) -> Option<String> {
     value.as_str()?;
     match std::mem::replace(value, Value::Nil) {
@@ -397,7 +386,6 @@ fn owned_string(value: &mut Value) -> Option<String> {
     }
 }
 
-/// Takes an array out of `value`; anything else is left in place.
 fn owned_array(value: &mut Value) -> Option<Vec<Value>> {
     match value {
         Value::Array(values) => Some(std::mem::take(values)),
@@ -526,7 +514,6 @@ mod tests {
                 "invalid UTF-8 method",
                 frame(vec![
                     2.into(),
-                    // A one-byte msgpack fixstr holding an invalid UTF-8 byte.
                     rmpv::decode::read_value(&mut &[0xa1_u8, 0xff][..]).expect("fixstr"),
                     Value::Array(vec![]),
                 ]),
@@ -647,8 +634,6 @@ mod runtime_tests {
             let outer_request = request(&rpc)
                 .await
                 .context("Receiving outer clipboard request")?;
-            // A nested host API request is serviced while Neovim awaits its outer
-            // clipboard reply. Timers do not run reentrantly inside that wait.
             let inner_call = rpc
                 .call(
                     "nvim_exec_lua",

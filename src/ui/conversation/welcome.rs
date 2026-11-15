@@ -10,10 +10,8 @@ use gpui_kit::{
     *,
 };
 
-/// The centre pane while no thread is open: name the next step and offer it.
 const WORDMARK: &str = "DROSTJE.";
 
-/// The brand in its display face, the full stop in the theme's signature color.
 fn wordmark(cx: &App) -> impl IntoElement {
     let stop = WORDMARK.len() - 1;
     div()

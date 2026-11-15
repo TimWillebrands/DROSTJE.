@@ -536,7 +536,6 @@ impl Workspace {
             return;
         }
         let config = form.read(cx).config(cx);
-        // Capture raw inputs, including incomplete values, before validating or starting work.
         form.update(cx, |form, cx| {
             form.config_changed(|saved| *saved = config.clone(), cx)
         });
@@ -603,7 +602,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A delayed validation result must not interrupt another thread or surface.
         if self.state.read(cx).selected_thread != Some(thread_id)
             || self.has_open_form(cx)
             || self.extension.is_some()
@@ -707,7 +705,6 @@ impl Workspace {
                     .await
                     .context("Factory thread persistence stopped")?
                     .map_err(anyhow::Error::msg)?;
-                // The ACK is a barrier over all queued edits; shutdown or a changed owner still refuses dispatch.
                 workspace.update_in(window, |workspace, _, cx| {
                     let state = workspace.state.read(cx);
                     let thread = editable_thread(state, thread_id)?;
@@ -726,7 +723,6 @@ impl Workspace {
                     .err()
                     .map(|error| FormError::general(format!("Start refused or failed: {error:#}")));
                 workspace.finish_factory_start(thread_id, error, cx);
-                // FactorySnapshot owns the transition, including durable prerequisite failures.
                 workspace.sync_factory_form(window, cx);
             });
         })
@@ -870,8 +866,6 @@ fn factory_spec(
 fn validate_source(mut spec: FactoryLaunchSpec) -> Result<FactoryLaunchSpec, FormError> {
     let repository = platform::inspect_repository(&spec.target_repo)
         .map_err(|error| FormError::general(format!("Repository is unavailable: {error:#}")))?;
-    // The branch listing already proves the common case; only an unlisted or unusual name
-    // needs Git's own checks, whose message comes before the listing's.
     if !repository.verified_branch(&spec.target_branch) {
         platform::validate_branch(&repository.root, &spec.target_branch)
             .map_err(|error| FormError::field("target_branch", format!("{error:#}")))?;

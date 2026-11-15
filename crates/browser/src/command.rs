@@ -1,4 +1,3 @@
-//! Typed worker requests and retained engine events; no process framing.
 use std::io;
 
 use serde::{Deserialize, Serialize};
@@ -17,17 +16,14 @@ pub enum BrowserCommand {
     Back,
     Forward,
     Reload,
-    /// Dimensions are physical pixels; scale is physical pixels per logical pixel.
     Resize {
         width: u32,
         height: u32,
         scale: f32,
     },
-    /// Opt in to natural content-height snapshots for inline artifacts only.
     SetContentSizing {
         enabled: bool,
     },
-    /// Positions are logical pixels. Buttons use DOM numbering (0 left, 1 middle, 2 right).
     Pointer {
         x: f32,
         y: f32,
@@ -38,14 +34,12 @@ pub enum BrowserCommand {
         x: f32,
         y: f32,
     },
-    /// Deltas are logical pixels, positive right/down.
     Scroll {
         x: f32,
         y: f32,
         dx: f32,
         dy: f32,
     },
-    /// DOM key/code names. Printable keydown inserts text; do not also send Text for it.
     Key {
         key: String,
         code: String,
@@ -55,7 +49,6 @@ pub enum BrowserCommand {
         alt: bool,
         meta: bool,
     },
-    /// Committed input-method text, not a synthetic DOM assignment.
     Text {
         text: String,
     },
@@ -66,30 +59,22 @@ pub enum BrowserCommand {
         request_id: String,
         script: String,
     },
-    /// Settle an artifact page's pending `drostje.send` promise. Host-originated only:
-    /// browser tools never construct it, so agents cannot forge delivery.
     Receipt {
         event: String,
         status: ReceiptStatus,
         reason: Option<String>,
     },
-    /// Replace an artifact's theme tokens, for reloads and the current document.
     ArtifactTheme {
         css: String,
     },
 }
 
-/// What happened to one artifact channel event, as its page is told.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptStatus {
-    /// The agent's runtime admitted the event as context.
     Delivered,
-    /// Held until the runtime can receive it.
     Queued,
-    /// Not delivered; the reason says why.
     Failed,
-    /// Dispatched, but admission was not confirmed. Never resent.
     Unknown,
 }
 
@@ -104,24 +89,17 @@ impl ReceiptStatus {
     }
 }
 
-/// One `drostje.send` message from an artifact page, validated by the engine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelEvent {
-    /// The page's event ID, echoed back in its receipt.
     pub id: String,
     pub kind: String,
-    /// The complete `{v,id,type,data}` JSON object.
     pub body: String,
 }
 
-/// Largest encoded channel message accepted, in UTF-8 bytes. The kit bounds messages at
-/// 32 Ki UTF-16 units, which is at most three times as many UTF-8 bytes.
 pub const MAX_CHANNEL_MESSAGE: usize = 3 * 32 * 1024;
 const CHANNEL_PREFIX: &str = "__DROSTJE_CHANNEL__";
 
 impl ChannelEvent {
-    /// `None` when `message` is not a channel message at all. Malformed channel
-    /// messages are errors so the page is told, rather than dropped silently.
     pub fn parse(message: &str) -> Option<Result<Self, String>> {
         let encoded = message.strip_prefix(CHANNEL_PREFIX)?;
         Some((|| {
@@ -149,7 +127,6 @@ impl ChannelEvent {
         })())
     }
 
-    /// The event ID of a malformed message, when one can be read, so its sender can be told.
     pub fn id_of(message: &str) -> Option<String> {
         let encoded = message.strip_prefix(CHANNEL_PREFIX)?;
         if encoded.len() > MAX_CHANNEL_MESSAGE {
@@ -195,8 +172,6 @@ pub(super) enum Request {
         commands: Vec<BrowserCommand>,
         expected_document_revision: Option<u64>,
     },
-    /// Publish a frame of the page's current content, even if no pane shows it, and
-    /// complete `request_id` once the snapshot holds it.
     Capture {
         id: Uuid,
         request_id: String,
@@ -220,8 +195,6 @@ impl Request {
         }
     }
 
-    /// Only adjacent replaceable input may be coalesced: never move a resize/motion
-    /// across a click, navigation or evaluation which observes its effects.
     pub fn supersedes(&self, previous: &Self) -> bool {
         match (self, previous) {
             (
@@ -302,7 +275,6 @@ pub enum Event {
         level: String,
         message: String,
     },
-    /// A validated channel message from an artifact document.
     Channel {
         id: Uuid,
         event: ChannelEvent,
@@ -312,7 +284,6 @@ pub enum Event {
     },
 }
 
-/// Bytes in an RGBA frame of this physical size; fails outside the engine's limits.
 pub fn frame_len(width: u32, height: u32) -> io::Result<usize> {
     if width == 0 || height == 0 || width > 8192 || height > 8192 {
         return Err(invalid(

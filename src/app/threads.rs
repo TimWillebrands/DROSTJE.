@@ -15,13 +15,6 @@ impl AppState {
             .filter(|thread| thread.kind == ThreadKind::Factory)
     }
 
-    /// Whether `thread` was never used: a placeholder made by New conversation or New
-    /// Factory thread that Projects lists only while its tab is open, so an abandoned one
-    /// disappears without being archived or deleted. Every user activity (drafting, sending,
-    /// queueing, renaming, editing a Factory configuration, archiving) bumps `updated_at`,
-    /// so an unused row still carries its creation timestamp and default title. Choosing a
-    /// harness, model or effort is configuration, not activity. A Host-bound draft remains
-    /// discoverable so its Host can be changed or released. Live state also counts as activity.
     pub fn is_untouched(&self, thread: &Thread) -> bool {
         let id = thread.id;
         let unused = !thread.archived
@@ -55,8 +48,6 @@ impl AppState {
             }
     }
 
-    /// Whether Projects and the palette list `thread` in `space`: an untouched thread only
-    /// while its tab is open in that space.
     pub fn thread_listed_in(&self, thread: &Thread, space: SpaceId) -> bool {
         if !self.thread_in_space(thread.id, space) {
             return false;
@@ -64,7 +55,6 @@ impl AppState {
         self.thread_open_in(thread.id, space) || !self.is_untouched(thread)
     }
 
-    /// Whether `id` has a tab in `space`, active or not.
     pub(crate) fn thread_open_in(&self, id: ThreadId, space: SpaceId) -> bool {
         if space == self.active_space {
             self.open_threads.contains(&id)
@@ -87,7 +77,6 @@ impl AppState {
         };
         self.rename_thread_reason_for(thread.id)
     }
-    /// Why `id` cannot be renamed right now, independent of the current selection.
     pub fn rename_thread_reason_for(&self, id: ThreadId) -> Option<String> {
         if !self.thread_in_active_space(id) {
             return Some("This thread belongs to another space.".into());
@@ -125,7 +114,6 @@ impl AppState {
         };
         self.archive_thread_reason_for(thread.id)
     }
-    /// Why `id` cannot be archived right now, independent of the current selection.
     pub fn archive_thread_reason_for(&self, id: ThreadId) -> Option<String> {
         if !self.thread_in_active_space(id) {
             return Some("This thread belongs to another space.".into());
@@ -167,7 +155,6 @@ impl AppState {
         }
     }
 
-    /// Why `id` cannot return from the archive right now.
     pub fn unarchive_thread_reason_for(&self, id: ThreadId) -> Option<String> {
         if !self.thread_in_active_space(id) {
             return Some("This thread belongs to another space.".into());
@@ -200,7 +187,6 @@ impl AppState {
             None => Some("Select a thread first.".into()),
         }
     }
-    /// Returns an archived thread to Projects with its history and draft.
     pub fn unarchive_thread(&mut self, id: ThreadId) -> Result<()> {
         if let Some(reason) = self.unarchive_thread_reason_for(id) {
             anyhow::bail!(reason);
@@ -295,8 +281,6 @@ impl AppState {
         );
         self.new_thread_with_harness(ThreadKind::Conversation, Some(harness))
     }
-    /// Starts a fresh Conversation in an explicit checkout; `None` means the project root,
-    /// regardless of the selected Conversation's worktree.
     pub fn new_conversation_in_workspace(&mut self, worktree_id: Option<WorktreeId>) -> Result<()> {
         if let Some(reason) = self.mutable_project_reason() {
             anyhow::bail!(reason);
@@ -330,8 +314,6 @@ impl AppState {
             anyhow::bail!(reason);
         }
         let project = self.project().context("Select a project")?.clone();
-        // A new thread follows the selected Conversation's checkout: its live worktree or the
-        // project root. Factory threads only borrow the branch as their default target.
         let selected_worktree = self
             .thread()
             .filter(|thread| {
@@ -407,8 +389,6 @@ impl AppState {
         self.select_thread(id);
         Ok(())
     }
-    /// A fresh Conversation row in `project`, on `worktree_id` or the project root. It copies
-    /// the selected Conversation's harness settings (see `conversation_defaults`).
     pub(crate) fn build_conversation(
         &self,
         project: &Project,
@@ -469,7 +449,6 @@ mod tests {
     }
 
     fn open(cx: &mut TestAppContext) -> (TempDirectory, Entity<AppState>, Uuid) {
-        // Persistence acknowledges writes from real background threads, as in production.
         cx.dispatcher.allow_parking();
         let dir = std::env::temp_dir().join(format!("drostje-app-{}", Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
@@ -597,7 +576,6 @@ mod tests {
         });
     }
 
-    /// Gives `id` the activity a sent prompt leaves behind.
     fn use_thread(state: &Entity<AppState>, id: Uuid, cx: &mut TestAppContext) {
         state.update(cx, |state, _| {
             let mut thread = state
@@ -1052,7 +1030,6 @@ mod tests {
                     .clone()
             };
 
-            // A running turn holds the archive back and says why.
             state.active_threads.insert(id);
             state.settle_closed_pull_requests();
             assert!(!find(state).archived);
@@ -1061,7 +1038,6 @@ mod tests {
                 Some(LinkStatus::ArchivePending(_))
             ));
 
-            // The turn ends: the Conversation archives, naming the pull request.
             state.receive(
                 AppEvent::InteractiveActivity {
                     thread_id: id,
@@ -1080,7 +1056,6 @@ mod tests {
                     .any(|notice| notice.text.contains("pull request 3170 was completed"))
             );
 
-            // Unarchived by the user, it stays.
             state.unarchive_thread(id).unwrap();
             state.settle_closed_pull_requests();
             assert!(!find(state).archived);

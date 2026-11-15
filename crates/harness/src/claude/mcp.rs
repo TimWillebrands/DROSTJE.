@@ -1,19 +1,11 @@
-//! `/mcp` in a Claude Code Conversation. Headless Claude Code only counts the servers for
-//! `/mcp` and answers reconnect, enable and disable with "aren't available in this session",
-//! because those run through its terminal dialog. DROSTJE. answers the command itself with the
-//! `mcp_status`, `mcp_reconnect` and `mcp_toggle` control requests, picks servers the way the
-//! terminal command does, and never sends the prompt to the model.
 use super::TurnOutcome;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Claude Code passes server errors through verbatim, including whole HTTP error bodies.
 const ERROR_CHARS: usize = 300;
 const USAGE: &str = "Usage: `/mcp [reconnect|enable|disable [<server>|all]]`. Without a server name the action applies to all servers.";
 
-/// What `/mcp` printed and how its turn settles: `Failed` when nothing it was asked to do
-/// happened, `Unknown` when Claude Code accepted a change but no state confirms it.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Output {
     pub text: String,
@@ -36,12 +28,9 @@ impl Output {
     }
 }
 
-/// What the actor does next for a running `/mcp`.
 #[derive(Debug, PartialEq)]
 pub(super) enum Step {
-    /// Answers are still outstanding.
     Wait,
-    /// Write these control requests to Claude Code.
     Send(Vec<Value>),
     Done(Output),
 }
@@ -78,8 +67,6 @@ impl Change {
         }
     }
 
-    /// Whether a server in `status` after the change shows that it took effect. An enabled
-    /// server may still be connecting.
     fn took_effect(self, status: &str) -> bool {
         match self {
             Self::Reconnect => status == "connected",
@@ -101,8 +88,6 @@ enum Request {
     Change(Change, Target),
 }
 
-/// Reads `/mcp` arguments as the terminal command does: an action word, then the rest of
-/// the line as one server name, since names such as `claude.ai Claude Docs` hold spaces.
 fn parse(arguments: &str) -> Result<Request, Output> {
     let arguments = arguments.trim();
     let (action, rest) = arguments
@@ -128,8 +113,6 @@ fn parse(arguments: &str) -> Result<Request, Output> {
     Ok(Request::Change(change, target))
 }
 
-/// One row of the `mcp_status` answer. `status` stays verbatim so a state this version does
-/// not know is still shown.
 #[derive(Debug)]
 struct Server {
     name: String,
@@ -154,7 +137,6 @@ fn servers(answer: &Value) -> Option<Vec<Server>> {
     )
 }
 
-/// The terminal command's words for each state, with the tool count and Claude Code's error.
 fn describe(server: &Server) -> String {
     let mut text = match server.status.as_str() {
         "connected" => "connected",
@@ -176,7 +158,6 @@ fn describe(server: &Server) -> String {
     text
 }
 
-/// The first line of a server error, cut to `ERROR_CHARS`.
 fn brief(error: &str) -> String {
     let line = error.trim().lines().next().unwrap_or_default();
     match line.char_indices().nth(ERROR_CHARS) {
@@ -201,9 +182,6 @@ fn status_report(servers: &[Server]) -> Output {
     Output::done(text)
 }
 
-/// Chooses the servers a change applies to, or answers without changing anything. `all`
-/// follows the terminal command: reconnect retries servers that failed or need
-/// authentication, enable takes the disabled ones, disable the rest.
 fn plan(
     change: Change,
     target: &Target,
@@ -286,8 +264,6 @@ fn plan(
     }
 }
 
-/// Says per server what the change did, judged by the server list read after it. A server
-/// missing from that list, or a list that could not be read, leaves its state unknown.
 fn change_report(
     change: Change,
     answers: &[(String, Option<Result<(), String>>)],
@@ -352,7 +328,6 @@ fn status_request() -> (String, Value) {
     control(json!({"subtype":"mcp_status"}))
 }
 
-/// The control response `answer` for `request_id` as a result.
 fn outcome(response: &Value) -> Result<&Value, String> {
     if response["subtype"] == "success" {
         Ok(&response["response"])
@@ -366,19 +341,16 @@ fn outcome(response: &Value) -> Result<&Value, String> {
 }
 
 enum Stage {
-    /// Waiting for the server list the request is resolved against.
     Listing {
         request_id: String,
         request: Request,
     },
-    /// Waiting for one answer per changed server.
     Changing {
         change: Change,
         waiting: HashMap<String, usize>,
         answers: Vec<(String, Option<Result<(), String>>)>,
         note: Option<String>,
     },
-    /// Waiting for the server list that shows what the change did.
     Confirming {
         request_id: String,
         change: Change,
@@ -387,14 +359,11 @@ enum Stage {
     },
 }
 
-/// One running `/mcp`. It owns the control requests it sent and nothing else.
 pub(super) struct McpCommand {
     stage: Stage,
 }
 
 impl McpCommand {
-    /// Starts `/mcp arguments`. The command is `None` when it finished without asking Claude
-    /// Code, as for a usage error.
     pub fn start(arguments: &str) -> (Option<Self>, Step) {
         match parse(arguments) {
             Err(output) => (None, Step::Done(output)),
@@ -418,7 +387,6 @@ impl McpCommand {
         }
     }
 
-    /// Takes the control `response` (the frame's `response` object) to a request it owns.
     pub fn answer(&mut self, response: &Value) -> Step {
         let request_id = response["request_id"].as_str().unwrap_or("");
         match &mut self.stage {
@@ -533,8 +501,6 @@ mod tests {
         ]})
     }
 
-    /// Runs `/mcp arguments` against `listing`, answering every change request through
-    /// `change`, and returns the change requests and the output.
     fn run(
         arguments: &str,
         listing: Value,

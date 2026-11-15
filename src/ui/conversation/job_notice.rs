@@ -1,13 +1,3 @@
-//! Background-job notices OMP injects as `<system-notice>` custom messages when
-//! a `task` agent or a background shell command finishes, read back so the
-//! transcript can show one card per job instead of the raw XML the model sees.
-//!
-//! A notice opens with `Background job X has completed.` or `N background jobs
-//! have completed.` and then carries either raw shell output or one
-//! `<task-result …>` block per job with an `<output>` or truncated `<preview>`.
-//! Lines addressed to the model (`X is now idle — message it via hub`, job
-//! separators, structured-output hints) are not part of any job. Unrecognised or
-//! incomplete formats return `None` so the UI can retain them in a generic notice.
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,22 +9,17 @@ pub enum JobOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobResult {
     pub id: String,
-    /// Agent kind for task jobs (`task`, `scout`, …); `None` for shell jobs.
     pub agent: Option<String>,
-    /// Command or name supplied by a batched notice's job separator.
     pub label: Option<String>,
-    /// Explicit task status or shell exit status; completion alone is not success.
     pub status: Option<String>,
     pub duration: Option<String>,
     pub output: JobOutput,
-    /// Set when OMP included only a preview; names where the full output lives.
     pub full_output: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobNotice {
     pub jobs: Vec<JobResult>,
 }
-/// Strip exactly one complete notice wrapper for native and generic UI rendering.
 pub fn system_notice_body(text: &str) -> Option<&str> {
     let body = text
         .trim()
@@ -67,8 +52,6 @@ impl JobNotice {
             return None;
         }
 
-        // Only whole lines outside task results can delimit jobs. In particular,
-        // commands may contain arbitrary parentheses and Unicode.
         let mut separators = Vec::new();
         let mut offset = 0;
         let mut in_task = false;
@@ -157,7 +140,6 @@ fn parse_shell_result(id: &str, label: Option<String>, output: &str) -> JobResul
             .strip_prefix("Command exited with code ")
             .and_then(|code| code.parse::<i32>().ok())
         {
-            // A reported failure must not be overwritten by later success text.
             if code != 0 {
                 status = Some("failed".to_owned());
                 break;
@@ -189,8 +171,6 @@ fn text_output(output: &str) -> JobOutput {
     }
 }
 
-/// Consume all task blocks and only the known model-directed lines around them.
-/// Any unrecognized fragment rejects the entire notice instead of losing a job.
 fn parse_task_sequence(mut text: &str) -> Option<Vec<JobResult>> {
     let mut jobs = Vec::new();
     while !text.trim().is_empty() {
@@ -214,7 +194,6 @@ fn parse_task_sequence(mut text: &str) -> Option<Vec<JobResult>> {
     (!jobs.is_empty()).then_some(jobs)
 }
 
-/// `block` starts at `<task-result ` and ends just before `</task-result>`.
 fn parse_task_result(block: &str) -> Option<JobResult> {
     let (head, mut inner) = block.split_once('>')?;
     let attribute = |name: &str| attribute(head, name);
@@ -262,7 +241,6 @@ fn parse_task_result(block: &str) -> Option<JobResult> {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobKind {
-    /// A background agent; carries the agent kind (`task`, `scout`, `reviewer`, …).
     Agent(String),
     Shell,
 }
@@ -270,12 +248,8 @@ pub enum JobKind {
 pub struct JobStart {
     pub id: String,
     pub kind: JobKind,
-    /// The agent's name or the shell command.
     pub label: String,
 }
-/// Jobs a tool result reports as started: `task` spawns agents and lists them
-/// as `` - `Name` (job `Id`) ``; `bash` with `async` answers
-/// `Backgrounded as job bg_N; …`.
 pub fn job_starts(tool: &str, input: &Value, result: &str) -> Vec<JobStart> {
     match tool {
         "task" => {
@@ -316,8 +290,6 @@ pub fn job_starts(tool: &str, input: &Value, result: &str) -> Vec<JobStart> {
         _ => Vec::new(),
     }
 }
-/// Job ids a `wait` result or historical `hub` snapshot reports as settled:
-/// each `### id [type] — status` entry outside “Still Running”, plus cancellations.
 pub fn settled_job_ids(tool: &str, result: &str) -> Vec<String> {
     if !matches!(tool, "wait" | "hub") {
         return Vec::new();

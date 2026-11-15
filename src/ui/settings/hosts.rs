@@ -1,5 +1,3 @@
-//! Remote Host settings: loading a configured Host into the draft, removing one, the
-//! configuration a save writes, and the Hosts page.
 use super::{DialogKind, SurfaceContent, fields::Choice};
 use crate::app::AppState;
 use crate::ui::commands;

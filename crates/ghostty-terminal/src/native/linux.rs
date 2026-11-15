@@ -124,7 +124,6 @@ pub struct NativeSurface {
     wakeup: NativeWakeup,
     state: NativeSurfaceState,
     expected_program: Option<Arc<CStr>>,
-    /// Byte length of the last readback, so the next one reads into an exact fit.
     snapshot_capacity: usize,
 }
 
@@ -300,8 +299,6 @@ impl NativeSurface {
 
     pub fn set_visible(&mut self, visible: bool) {
         if self.state.update_visibility(visible) {
-            // The EGL child is render-only. GPUI composes completed OpenGL pixels
-            // because its Linux renderer has no public native-buffer import API.
             self.platform.set_visible(false);
             unsafe { gpui_ghostty_surface_linux_set_visible(self.raw.as_ptr(), self.state.visible) }
         }

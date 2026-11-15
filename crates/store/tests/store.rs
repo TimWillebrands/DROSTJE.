@@ -116,8 +116,6 @@ fn launch(project: &Project, owner: &Thread) -> FactoryLaunch {
     }
 }
 
-// Last-handle drop intentionally does not block a GPUI thread. Reopening waits only
-// for the previous background owner to drain/close, never retries recovery errors.
 fn reopen(path: &Path) -> Store {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -136,10 +134,6 @@ fn reopen(path: &Path) -> Store {
     }
 }
 
-// Dropping the last handle is nonblocking: the worker still owns the SQLite connection and
-// the instance lock until it drains. Opening the database file directly while that WAL
-// connection closes deadlocks inside SQLite's unix VFS (the inode mutex against the global
-// VFS mutex), so wait for the worker to release the instance lock before touching the file.
 fn wait_for_release(directory: &Path) {
     let lock = fs::File::options()
         .read(true)
@@ -694,7 +688,6 @@ fn version_6_database_upgrades_in_place_and_persists_pull_request_links() {
         let mut thread = conversation(&project);
         let worktree = worktree(&project, &thread, "amber-heron");
         thread.worktree_id = Some(worktree.id);
-        // Reconstruct version 6 by removing all columns introduced since that schema.
         let store = reopen(&directory.0);
         store.save_project(project.clone()).await.unwrap();
         store.save_worktree(worktree.clone()).await.unwrap();
@@ -725,7 +718,6 @@ fn version_6_database_upgrades_in_place_and_persists_pull_request_links() {
             archived_on_close: true,
         });
         store.save_thread(thread.clone()).await.unwrap();
-        // A project-root Conversation has no branch of its own to link.
         let mut rooted = conversation(&project);
         rooted.pull_request = thread.pull_request.clone();
         assert!(store.save_thread(rooted).await.is_err());
@@ -864,7 +856,6 @@ fn write_failure_is_sticky_preserves_durable_draft_and_blocks_side_effects() {
         let snapshot = store.snapshot().await.unwrap();
         assert_eq!(snapshot.threads[0].draft, durable_draft);
         assert!(snapshot.launches.is_empty());
-        // Receiving the first failure must not reset the write gate or trigger retries.
         assert!(store.failures.try_recv().is_err());
         drop(store);
         let reopened = reopen(&directory.0);
@@ -939,8 +930,6 @@ fn invalid_associations_are_rejected_without_poisoning_healthy_storage() {
         correct_launch.launch_error = Some("Observed process failure".into());
         store.save_launch(correct_launch.clone()).await.unwrap();
 
-        // Worktrees belong to one project; threads never cross into another project's tree
-        // and never move between trees once created.
         let mut orphan = worktree(&first, &thread, "orphan");
         orphan.project_id = Uuid::new_v4();
         assert!(store.save_worktree(orphan).await.is_err());

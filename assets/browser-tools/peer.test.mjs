@@ -3,8 +3,6 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { PEER_COMMAND, registerPeerDelivery } from "./peer.mjs";
 
-// The real extension entrypoint and lifecycle handlers, not a provider or an
-// acceptance stand-in. Native process evidence is a separate sandboxed probe.
 function fixture(dialect, idle) {
   const handlers = new Map(), statuses = [], sends = [];
   let command, aborts = 0, fail;

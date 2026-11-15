@@ -22,11 +22,7 @@ use std::{
 use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 8;
-/// Older schemas gain trailing conversation configuration and location columns transactionally.
 const UPGRADABLE_VERSIONS: [i64; 6] = [2, 3, 4, 5, 6, 7];
-/// Shared by the initial schema and the v5 upgrade. `created_by` names the thread whose title
-/// may rename the branch; it is deliberately not a foreign key because the worktree row is
-/// written before its first thread.
 macro_rules! worktrees_table {
     () => {
         "CREATE TABLE worktrees(
@@ -92,31 +88,22 @@ type Reply<T> = Sender<Result<T>>;
 enum Command {
     Snapshot(Reply<WorkspaceSnapshot>),
     SaveProject(Project, Reply<()>),
-    // Boxed: a Thread dwarfs every other command in the bounded queue.
     SaveThread(Box<Thread>, Reply<()>),
     SaveWorktree(Worktree, Reply<()>),
     SaveLaunch(FactoryLaunch, Reply<()>),
     SetSetting(String, Value, Reply<()>),
-    /// A setting already encoded as JSON text by the caller.
     SetEncodedSetting(String, String, Reply<()>),
     Writable(Reply<()>),
     Flush(Reply<()>),
 }
 
-/// A bounded command handle; the SQLite connection and instance lock belong to its worker.
-/// Dropping the last clone is nonblocking. The worker drains accepted commands before
-/// releasing the lock, so use `flush` after scheduling final draft/layout writes on quit.
 #[derive(Clone)]
 pub struct Store {
     commands: Sender<Command>,
-    /// The first persistence failure. Clones share this single-consumer notification;
-    /// `writable` remains the authoritative sticky health check for every caller.
     pub failures: Receiver<String>,
 }
 
 impl Store {
-    /// Blocking startup only: no handle is returned until recovery checks and schema
-    /// initialization succeed. Existing corrupt/newer databases are checked read-only.
     pub fn open(data_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("Create application data directory {}", data_dir.display()))?;
@@ -177,9 +164,6 @@ impl Store {
             .await
     }
 
-    /// Persist the JSON value `set_setting(key, serde_json::to_value(value)?)` would, encoded
-    /// directly on the caller's executor (object keys in serialization order) without
-    /// building a `Value` tree.
     pub async fn set_setting_encoded<T: Serialize + ?Sized>(
         &self,
         key: String,
@@ -190,14 +174,10 @@ impl Store {
             .await
     }
 
-    /// An ordered health/writer-lock barrier, not a promise about future disk space.
-    /// Submission/dispatch must additionally await its durable record before spawning.
     pub async fn writable(&self) -> Result<()> {
         self.request(Command::Writable).await
     }
 
-    /// Wait for preceding accepted writes and checkpoint the fully synchronous WAL.
-    /// This never discards unsaved UI state; callers retain it if persistence fails.
     pub async fn flush(&self) -> Result<()> {
         self.request(Command::Flush).await
     }
@@ -224,7 +204,6 @@ fn acquire_lock(data_dir: &Path) -> Result<File> {
         .open(&path)
         .with_context(|| format!("Open instance lock {}", path.display()))?;
     loop {
-        // An exclusive flock tied to this open file description, released by File::drop.
         match lock.try_lock() {
             Ok(()) => return Ok(lock),
             Err(TryLockError::WouldBlock) => {
@@ -238,8 +217,6 @@ fn acquire_lock(data_dir: &Path) -> Result<File> {
     }
 }
 
-/// Opens the writable connection, also returning the snapshot that startup validation
-/// decoded from the committed schema so the first `Snapshot` need not decode it again.
 fn open_database(path: &Path) -> Result<(Connection, Option<WorkspaceSnapshot>)> {
     let (version, mut decoded) = if path.try_exists().context("Inspect database path")? {
         inspect_existing(path).map_err(|error| {
@@ -271,7 +248,6 @@ fn open_database(path: &Path) -> Result<(Connection, Option<WorkspaceSnapshot>)>
     )
     .with_context(|| format!("Open writable database {}", path.display()))?;
     connection.busy_timeout(Duration::from_millis(500))?;
-    // Room for every distinct write statement, each prepared once per connection.
     connection.set_prepared_statement_cache_capacity(32);
     connection.execute_batch(
         "PRAGMA foreign_keys = ON; PRAGMA trusted_schema = OFF;
@@ -281,7 +257,6 @@ fn open_database(path: &Path) -> Result<(Connection, Option<WorkspaceSnapshot>)>
         if version == 0 {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            // Never merge a partial/unversioned schema or use IF NOT EXISTS to mask one.
             ensure_empty(&transaction)?;
             transaction.execute_batch(SCHEMA)?;
             validate_schema(&transaction, SCHEMA_VERSION)?;
@@ -291,7 +266,6 @@ fn open_database(path: &Path) -> Result<(Connection, Option<WorkspaceSnapshot>)>
                 .commit()
                 .context("Commit initial workspace schema")?;
         } else if UPGRADABLE_VERSIONS.contains(&version) {
-            // The upgrade is verified in full before it commits; a failure rolls back every byte.
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if version < 3 {
@@ -335,7 +309,6 @@ fn open_database(path: &Path) -> Result<(Connection, Option<WorkspaceSnapshot>)>
         path: path.to_path_buf(),
         reason: format!("{error:#}"),
     })?;
-    // Existing schemas pass read-only preflight before any journal-mode change.
     let journal: String =
         connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     if !journal.eq_ignore_ascii_case("wal") {
@@ -344,8 +317,6 @@ fn open_database(path: &Path) -> Result<(Connection, Option<WorkspaceSnapshot>)>
     Ok((connection, decoded))
 }
 
-/// Read-only preflight. A current-schema database is decoded in full; the instance lock
-/// keeps other DROSTJE. writers out until the writer opens, so the snapshot is returned.
 fn inspect_existing(path: &Path) -> Result<(i64, Option<WorkspaceSnapshot>)> {
     let mut connection = Connection::open_with_flags(
         path,
@@ -393,8 +364,6 @@ fn ensure_empty(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-// Validate the current shape and constraints on which updates rely. Equivalent SQL
-// whitespace and index names do not matter; incompatible schemas are never upgraded.
 fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
     type Column<'a> = (&'a str, &'a str, bool, Option<&'a str>, bool);
     let all_tables: &[(&str, &[Column<'_>])] = &[
@@ -472,7 +441,6 @@ fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
             ],
         ),
     ];
-    // Versions before 6 have no `worktrees` table.
     let tables: Vec<_> = all_tables
         .iter()
         .filter(|(table, _)| version >= 6 || *table != "worktrees")
@@ -493,7 +461,6 @@ fn validate_schema(connection: &Connection, version: i64) -> Result<()> {
         bail!("Database objects do not match workspace schema v{version}");
     }
     for (table, expected) in tables {
-        // Each upgrade appends columns; historical schemas retain their exact prefix.
         let missing = match (*table, version) {
             ("threads", 2) => 7,
             ("threads", 3) => 6,
@@ -627,7 +594,6 @@ fn serve(
 ) {
     let mut failure = None;
     while let Ok(command) = commands.recv_blocking() {
-        // The startup decode answers only a Snapshot that precedes every other command.
         let decoded = decoded.take();
         match command {
             Command::Snapshot(reply) => {
@@ -734,8 +700,6 @@ fn serve(
             }
         }
     }
-    // Each successful commit is durable independently of shutdown/checkpoint success.
-    // Connection drops before the worker's instance lock, including after queued writes.
 }
 
 fn complete_write(
@@ -1058,7 +1022,6 @@ fn save_launch(connection: &mut Connection, launch: FactoryLaunch) -> Result<()>
         }
     }
     if previous.is_some() {
-        // Observations never re-encode descriptors or rewrite launch parameters.
         transaction
             .prepare_cached(
                 "UPDATE factory_launches SET event_path = ?2, work_item_id = ?3, attempt_id = ?4,

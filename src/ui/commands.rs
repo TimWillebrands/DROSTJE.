@@ -132,11 +132,8 @@ gpui_kit::actions!(
     ]
 );
 
-/// `RestartTerminal` as a Neovim tab names it: same command, its own noun.
 pub const RESTART_NEOVIM_LABEL: &str = "Restart Neovim";
 
-/// Open a file a Conversation displays in a Neovim tab. `thread` is the Conversation
-/// whose working tree resolves a relative path; `None` uses the selected Conversation.
 #[derive(Clone, PartialEq, Action)]
 #[action(no_json)]
 pub struct OpenFileReference {
@@ -746,7 +743,6 @@ impl Command {
             },
             Self::SendQueuedNow => match state.conversation_thread() {
                 None => Some("Select a conversation first.".into()),
-                // During a turn, Send now stops that turn first; the row button agrees.
                 Some(thread)
                     if !thread.queued.is_empty() && state.active_threads.contains(&thread.id) =>
                 {
@@ -760,7 +756,6 @@ impl Command {
         }
     }
 
-    /// Tab commands depend on ephemeral panes as well as persisted threads.
     pub fn disabled_reason_in_workspace(self, workspace: &Workspace, cx: &App) -> Option<String> {
         let state = workspace.state.read(cx);
         if state.shutting_down {
@@ -829,9 +824,6 @@ impl Command {
     }
 }
 
-/// The picker row a motion lands on among `count` rows: `delta` steps from `current` (wrapping;
-/// with no highlight, down starts at the top and up at the bottom), or the first or last row
-/// with `edge`. A `skipped` row (the current harness) is stepped over.
 fn picker_row(
     count: usize,
     current: Option<usize>,
@@ -861,20 +853,12 @@ fn picker_row(
     }
 }
 
-// Workspace chords use GPUI's `secondary-` modifier: Cmd on macOS, Ctrl elsewhere.
-// Close and paste keep the terminal convention Ctrl-Shift on Linux, where
-// Ctrl-W and Ctrl-V belong to native editors and shells.
-
-/// The native paste chord: Cmd-V on macOS; Ctrl-Shift-V elsewhere, where
-/// Ctrl-V is Vim's blockwise visual and literal-insert key.
 pub const PASTE_IMAGE_KEY: &str = if cfg!(target_os = "macos") {
     "cmd-v"
 } else {
     "ctrl-shift-v"
 };
 
-/// Close the active thread tab: Cmd-W on macOS; Ctrl-Shift-W elsewhere so
-/// Ctrl-W stays available to native editors and shells.
 pub const CLOSE_THREAD_KEY: &str = if cfg!(target_os = "macos") {
     "cmd-w"
 } else {
@@ -916,7 +900,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-g", SelectLast, picker),
         KeyBinding::new("home", SelectFirst, picker),
         KeyBinding::new("end", SelectLast, picker),
-        // New conversation again from its harness picker steps to the next harness.
         KeyBinding::new("secondary-n", NewConversation, Some("HarnessPicker")),
         KeyBinding::new("ctrl-tab", NextThread, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, workspace),
@@ -939,7 +922,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-escape", LeaveEditor, Some("Browser")),
         KeyBinding::new("secondary-,", Settings, workspace),
         KeyBinding::new("secondary-q", Quit, None),
-        // The native Command rows resolve hints against the palette's own action host.
         KeyBinding::new("secondary-1", FocusProjects, command),
         KeyBinding::new("secondary-2", FocusThread, command),
         KeyBinding::new("secondary-3", FocusOutput, command),
@@ -954,9 +936,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextThread, command),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, command),
         KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, command),
-        // The terminal's shell and the composer's Neovim take Tab and Shift-Tab (completion,
-        // indent), so Root's focus navigation, which GPUI dispatches before their key
-        // handlers, stays out. The caret popup keeps Tab to accept.
         KeyBinding::new(
             "tab",
             NoAction,
@@ -986,8 +965,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("l", ExpandProject, projects),
         KeyBinding::new("right", ExpandProject, projects),
         KeyBinding::new("/", SearchThreads, projects),
-        // The thread filter is a native input: Escape clears it and Down moves into the
-        // rows, both only after the input itself declined the key.
         KeyBinding::new(
             "escape",
             Dismiss,
@@ -999,7 +976,6 @@ pub fn bind_keys(cx: &mut App) {
             Some("ProjectSearch && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new("enter", OpenSelection, list),
-        // The Changes list opens its cursor in Neovim instead of a generic selection.
         KeyBinding::new("enter", OpenChangeInNeovim, changes),
         KeyBinding::new("o", OpenChangeInNeovim, changes),
         KeyBinding::new("s", ToggleChangesLayout, changes),
@@ -1019,8 +995,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("pageup", SelectPageUp, thread),
         KeyBinding::new("pagedown", SelectPageDown, thread),
         KeyBinding::new("i", FocusComposer, thread),
-        // Inside the composer the Neovim view owns the same chord and hands image
-        // clipboards to this Action.
         KeyBinding::new(PASTE_IMAGE_KEY, PasteImage, thread),
         KeyBinding::new(
             "secondary-escape",
@@ -1028,8 +1002,6 @@ pub fn bind_keys(cx: &mut App) {
             Some("NativeSurface && !Command && !PopupMenu && !Dialog && !Sheet"),
         ),
         KeyBinding::new("secondary-enter", Submit, submit),
-        // The composer's caret popup follows Vim's insert-mode completion menu. Its context
-        // is deeper than Root's Tab focus navigation and the workspace's Escape.
         KeyBinding::new("ctrl-n", NextCompletion, caret_popup),
         KeyBinding::new("down", NextCompletion, caret_popup),
         KeyBinding::new("ctrl-p", PreviousCompletion, caret_popup),
@@ -1080,7 +1052,6 @@ pub fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new("escape", Dismiss, Some("InlineRename > Input")),
         KeyBinding::new("secondary-enter", Confirm, Some("InlineRename > Input")),
-        // A multi-line message takes Return as a newline; Cmd-Return still confirms.
         KeyBinding::new(
             "secondary-enter",
             Confirm,
@@ -1116,7 +1087,6 @@ pub enum PaletteTarget {
     Thread(Uuid),
 }
 
-/// File references of one Conversation, most recent first.
 struct FilePicker {
     thread: Uuid,
     references: Vec<crate::file_refs::FileReference>,
@@ -1134,9 +1104,7 @@ pub struct Palette {
     closed: bool,
     hosted: bool,
     spaces: Option<SpacePicker>,
-    /// The Conversation whose harness commands this palette lists instead of the app's.
     slash_commands: Option<Uuid>,
-    /// The Conversation this palette offers to move to another harness.
     harnesses: Option<Uuid>,
     hosts: Option<Uuid>,
     files: Option<FilePicker>,
@@ -1208,7 +1176,6 @@ impl Palette {
         Self::open_with_spaces(owner, state, Some(picker), None, None, None, window, cx)
     }
 
-    /// A picker of the files `thread` displayed; Return opens one in Neovim.
     pub fn open_files(
         owner: WeakEntity<Workspace>,
         state: Entity<AppState>,
@@ -1276,7 +1243,6 @@ impl Palette {
         self.hosted
     }
 
-    /// Rehost the retained picker, including its query, selection and scroll state.
     pub(super) fn reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.closed || self.hosted {
             return;
@@ -1284,7 +1250,6 @@ impl Palette {
         self.hosted = true;
         let content = cx.entity();
         let close_owner = content.downgrade();
-        // Dialog's pixel-only width API is resolved at the window/rem boundary.
         let width =
             (window.rem_size() * 40.).min(window.viewport_size().width - window.rem_size() * 2.);
         window.open_dialog(cx, move |dialog, _, _| {
@@ -1315,7 +1280,6 @@ impl Palette {
         });
     }
 
-    /// Hide only the host; cancellation of Quit must retain the live picker.
     pub(super) fn suspend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.hosted {
             self.hosted = false;
@@ -1323,8 +1287,6 @@ impl Palette {
         }
     }
 
-    /// Workspace takes its retained palette before asking the native host to close.
-    /// Root alone owns restoring the trigger focus.
     pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.closed {
             self.closed = true;
@@ -1377,7 +1339,6 @@ impl Palette {
                 return;
             }
             workspace.palette = None;
-            // Close only this host, before a command can open Settings or another dialog.
             window.close_dialog(cx);
             match target {
                 PaletteTarget::Command(command) => workspace.execute(command, window, cx),
@@ -1413,7 +1374,6 @@ impl Palette {
             .read(cx)
             .selected_index()
             .map(|index| index.row);
-        // The harness picker's current harness is disabled; motion steps over it.
         let skipped = self.harnesses.and_then(|thread| {
             let state = self.state.read(cx);
             let harness = &state
@@ -1750,8 +1710,6 @@ impl Palette {
             group = group.item(
                 CommandItem::new()
                     .label(format!("/{}", command.name))
-                    // The native filter does not rank, so descriptions would bury the
-                    // command whose name was typed.
                     .keywords(command.aliases.iter().map(|alias| format!("/{alias}")))
                     .child(move |_, cx| crate::ui::conversation::slash_commands::row(&shown, cx)),
             );
@@ -1801,8 +1759,6 @@ impl Palette {
             .find(|candidate| candidate.id == thread)
             .map(|thread| thread.harness.clone())
             .unwrap_or_default();
-        // The current harness is checked and disabled, so the highlight opens on the next one:
-        // New conversation then Return switches a fresh Conversation in two keystrokes.
         let mut group = CommandGroup::new().label("Switch harness");
         for harness in crate::harness::CONVERSATION_HARNESSES {
             let name = crate::harness::display_name(harness);
@@ -1830,7 +1786,6 @@ impl Palette {
             .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
                 this.navigate_picker(1, true, window, cx)
             }))
-            // Repeating New conversation steps through the harnesses.
             .on_action(cx.listener(|this, _: &NewConversation, window, cx| {
                 this.navigate_picker(1, false, window, cx)
             }))
@@ -1988,8 +1943,6 @@ impl Render for Palette {
             );
             targets[2].push(PaletteTarget::Thread(thread.id));
         }
-        // Capture the exact unfiltered model installed by this render. Native filtering
-        // preserves group/row coordinates, including when a group has no visible rows.
         let targets = Rc::new(targets);
         let confirm_owner = cx.entity().downgrade();
         let cancel_owner = cx.entity().downgrade();
@@ -2014,15 +1967,12 @@ impl Render for Palette {
                 else {
                     return;
                 };
-                // Action dispatch precedes this deferred callback. Never execute or close
-                // again: the action may already have opened a different native surface.
                 if matches!(target, PaletteTarget::Command(_)) {
                     return;
                 }
                 let _ = confirm_owner.update(cx, |palette, cx| palette.run(target, window, cx));
             })
             .on_cancel(move |_, cx| {
-                // Empty-query Cancel continues to Dialog, which owns the native pop.
                 let _ = cancel_owner.update(cx, |palette, cx| palette.cleanup(cx));
             });
         div()
@@ -2325,8 +2275,6 @@ pub fn region_action(region: Region) -> &'static str {
 mod tests {
     use super::picker_row;
 
-    /// Native inputs retain their editing keys while direct pane shortcuts move
-    /// focus without an escape hatch; overlays suppress workspace navigation.
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
     fn native_surface_keys_bypass_workspace_navigation(cx: &mut gpui_kit::TestAppContext) {
@@ -2582,16 +2530,13 @@ mod tests {
 
     #[test]
     fn harness_picker_motion_steps_over_the_current_harness() {
-        // Three harnesses, the second is current: repeated steps alternate the other two.
         assert_eq!(picker_row(3, Some(0), 1, false, Some(1)), 2);
         assert_eq!(picker_row(3, Some(2), 1, false, Some(1)), 0);
         assert_eq!(picker_row(3, Some(2), -1, false, Some(1)), 0);
         assert_eq!(picker_row(3, None, 1, false, Some(0)), 1);
         assert_eq!(picker_row(3, None, -1, false, Some(2)), 1);
-        // Edges land on the nearest selectable row.
         assert_eq!(picker_row(3, Some(1), -1, true, Some(0)), 1);
         assert_eq!(picker_row(3, Some(0), 1, true, Some(2)), 1);
-        // Without a skipped row motion wraps plainly.
         assert_eq!(picker_row(3, Some(2), 1, false, None), 0);
     }
 }

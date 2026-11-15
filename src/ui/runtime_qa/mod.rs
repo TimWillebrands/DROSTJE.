@@ -1,4 +1,3 @@
-//! Opt-in native component QA with isolated state; never submits provider turns.
 use crate::{
     app::{AppState, Bootstrap},
     model::{DraftKey, ThreadId, ThreadKind},

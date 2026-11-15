@@ -1,5 +1,3 @@
-//! The Settings sheet: building its draft controls, validating and saving them, and the
-//! Settings page with its Tools, Factory and Project groups.
 use super::{
     DialogKind, SurfaceContent,
     appearance::{ThemeNames, theme_choices},
@@ -33,7 +31,6 @@ pub(super) fn retain_concurrent_value(initial: &str, draft: String, current: &st
     }
 }
 
-/// Factory launches require a local branch; blank takes the thread's branch when it starts.
 fn target_branch_choices(branches: Option<&[String]>, selected: &str) -> Vec<Choice> {
     let mut choices = vec![Choice::new("", "Current branch when the thread starts")];
     choices.extend(
@@ -231,7 +228,6 @@ pub(super) fn settings_controls(
         window,
         cx,
     );
-    // Models change outside the app; earlier results show until these land.
     if !state.title_models_loading() {
         state.refresh_title_models();
     }
@@ -483,7 +479,6 @@ impl SurfaceContent {
         Ok(())
     }
 
-    /// What the app knows about a field's options, shown under its label.
     fn field_description(&self, key: &str, state: &AppState) -> Option<String> {
         let installed = state.title_models.as_ref();
         let count = |models: &[String], noun: &str| match models.len() {
@@ -530,7 +525,6 @@ impl SurfaceContent {
         }
     }
 
-    /// A Settings group of the named fields, each with what the app knows about its options.
     pub(super) fn group(
         &self,
         title: &'static str,
@@ -616,7 +610,6 @@ impl SurfaceContent {
         }
         let hosts = self.hosts_group(project_id, state, readonly, owner, cx);
         let diagnostics = diagnostics_group(state, owner);
-        // Kit Settings retains search/navigation; this entity owns the draft controls.
         let settings = Settings::new(self.settings_id.clone())
             .page(
                 SettingPage::new("Settings")
@@ -633,7 +626,6 @@ impl SurfaceContent {
             .min_h_0()
             .overflow_hidden()
             .child(div().flex_1().min_h_0().min_w_0().child(settings))
-            // Search may hide the invalid field, so keep its validation result visible.
             .when_some(self.error.clone(), |view, error| {
                 view.child(Alert::error("settings-validation", error).small())
             })

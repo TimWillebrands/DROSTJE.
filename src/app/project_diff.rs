@@ -1,18 +1,13 @@
 use super::*;
 
-/// Changes are cached per working tree (project root or linked worktree), never per thread.
 #[derive(Default)]
 pub struct ProjectDiffs {
     trees: HashMap<WorkingTree, ProjectDiffState>,
     remote: HashMap<ThreadId, ProjectDiffState>,
 }
 
-/// A working tree has one cached result and at most one Git read, even when several
-/// conversations show it. Hiding invalidates the result of an existing read without
-/// releasing its slot: reopening cannot overlap that read.
 pub struct ProjectDiffState {
     pub result: Option<Result<platform::RepositoryDiff, String>>,
-    /// Identifies `result` without comparing whole diffs on the UI thread.
     fingerprint: Option<DiffFingerprint>,
     pub loading: bool,
     root: PathBuf,
@@ -28,11 +23,8 @@ struct DiffCompletion {
     refresh_again: bool,
 }
 
-/// A diff read, with the fingerprint computed beside it off the UI thread.
 type DiffRead = (Result<platform::RepositoryDiff, String>, DiffFingerprint);
 
-/// Everything a diff shows except `rows`, which are parsed from `patch`: equal
-/// fingerprints mean the result on screen is still current.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DiffFingerprint {
     patch_len: usize,
@@ -148,8 +140,6 @@ impl ProjectDiffState {
         })
     }
 
-    /// Something may have changed the tree: read it again after the settle delay, once,
-    /// however often this is called meanwhile.
     fn queue(&mut self) -> Option<Uuid> {
         self.dirty = true;
         self.schedule()
@@ -203,8 +193,6 @@ impl AppState {
         self.working_tree_of(thread).map(|(key, _)| key)
     }
 
-    /// Supply the actual visible conversation panes, not every retained tab.
-    /// Reconcile again when a pane's Changes sidebar is opened or closed.
     pub fn set_visible_conversations(
         &mut self,
         ids: impl IntoIterator<Item = ThreadId>,
@@ -356,8 +344,6 @@ impl AppState {
                 let Some(completion) = diff.complete(generation, read) else {
                     return;
                 };
-                // As for local trees: an explicit refresh still pending runs now, changes
-                // seen during the read wait for the settle delay.
                 let restart_now = completion.refresh_again && diff.loading;
                 if completion.changed {
                     cx.emit(PresentationChange::Thread(id));
@@ -483,7 +469,6 @@ impl AppState {
     }
 }
 
-/// How long a tree must stay quiet after a tool changed it before it is read again.
 const DIFF_SETTLE: std::time::Duration = std::time::Duration::from_millis(750);
 
 fn decode_remote_diff(value: Value) -> Result<platform::RepositoryDiff, String> {
@@ -574,7 +559,6 @@ mod tests {
         assert!(diff.queue().is_none(), "already scheduled");
         assert!(diff.take_scheduled(token));
         let (generation, _) = diff.begin_refresh(false).0.unwrap();
-        // A change during the read is read again afterwards, not immediately.
         assert!(diff.queue().is_none());
         let completion = diff
             .complete(generation, read(Ok(Default::default())))
@@ -585,7 +569,6 @@ mod tests {
             "so the caller schedules rather than restarts"
         );
         assert!(diff.schedule().is_some());
-        // Hidden trees are not read at all.
         let mut hidden = ProjectDiffState::new(PathBuf::from("project"));
         assert!(hidden.queue().is_none());
     }
@@ -607,7 +590,6 @@ mod tests {
         let (generation, _) = request.unwrap();
         assert!(loading_changed);
         assert!(diff.begin_refresh(true).0.is_none());
-        // Closing one pane neither cancels nor duplicates the shared read.
         assert!(!diff.set_interest(None, HashSet::from([Uuid::from_u128(2)])));
         assert!(diff.begin_refresh(true).0.is_none());
         assert!(

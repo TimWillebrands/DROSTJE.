@@ -61,7 +61,6 @@ impl SocketFixture {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        // Writing a line is not admission; keep the sender alive for native credentials.
         assert!(inbox.tick().is_empty());
         let (stream, _) = self.listener.accept()?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -141,7 +140,6 @@ fn real_socket_write_is_not_acceptance_and_body_cannot_forge_envelope() -> Resul
     assert_eq!(body.matches("</cross-session-message>").count(), 1);
     assert!(!body.contains("from-mode=\"bypass\""));
     assert!(!inbox.known(&attempt));
-    // Neither a matching ordinary user echo nor an unrelated peer PID is our receipt.
     assert!(
         inbox
             .observe(&json!({"type":"user","uuid":attempt}))
@@ -253,7 +251,6 @@ fn actor(fixture: &SocketFixture) -> Result<Actor> {
     };
     let mut session = session(&mut config)?;
     session.id = fixture.session;
-    // A real pipe process, not a fake provider. No model/API process is launched by tests.
     let mut child = Command::new("/bin/cat")
         .process_group(0)
         .stdin(Stdio::piped())
@@ -368,9 +365,6 @@ fn peer_result_does_not_settle_a_separate_queued_user_and_busy_fold_settles_user
     Ok(())
 }
 
-/// Opt-in installed-CLI probe. macOS Seatbelt denies all IP networking for the
-/// native process and descendants; a fail-closed preflight proves that denial and
-/// verifies Unix sockets remain usable. No provider listener or fake response exists.
 #[test]
 #[ignore = "requires installed Claude and macOS sandbox-exec; never launches a CLI by default"]
 fn installed_claude_native_peer_smoke() -> Result<()> {
@@ -552,8 +546,6 @@ fn installed_claude_native_peer_smoke() -> Result<()> {
                     host.peer_cancel_queued,
                     "Installed CLI did not advertise atomic queue-clearing Stop"
                 );
-                // Native replay can be flushed only when the blocked API attempt settles.
-                // Interrupt on real lifecycle admission, then demand its actual delayed echo.
                 host.command(ConversationCommand::Interrupt)?;
                 host.flush()?;
                 interrupted = true;
@@ -694,8 +686,6 @@ fn installed_claude_busy_stop(host: &mut Actor, config_dir: &Path, session: Uuid
     println!("Claude native busy enqueue while ordinary {user} remains active: {queued}");
     assert!(!host.events.iter().any(|event| matches!(event,
         ConversationEvent::PeerTurnStarted { request_id } if *request_id == attempt)));
-    // Native queue persistence is smoke evidence only, never a production receipt.
-    // The host must still avoid asserting delivery from its completed socket write.
     assert!(!host.peer.known(&attempt));
     host.command(ConversationCommand::Interrupt)?;
     host.flush()?;
@@ -930,8 +920,6 @@ fn real_status_socket_correlates_hold_delivery_and_all_native_refusals() -> Resu
     let (_cancel, delivery) = make_delivery(refused);
     actor.peer.send(delivery)?;
     fixture.transmit(&mut actor.peer, refused)?;
-    // Installed 2.1.306 reports refusal as expired + status_detail, sometimes without
-    // a separate reason. Exercise the real return socket rather than a source assertion.
     for frame in status_frame(
         &mut actor.peer,
         &json!({
@@ -986,9 +974,6 @@ fn status_only_address_explicitly_denies_user_replies_and_cleans_up() -> Result<
         .listener
         .accept()
         .context("Accept actual reply-denial transport")?;
-    // On macOS SO_RCVTIMEO can return EINVAL when the sender has already closed
-    // after writing its receipt. A nonblocking, deadline-bounded read handles both
-    // buffered delivery followed by EOF and a still-live sender.
     stream
         .set_nonblocking(true)
         .context("Set actual reply-denial socket nonblocking")?;
@@ -1024,7 +1009,6 @@ fn status_only_address_explicitly_denies_user_replies_and_cleans_up() -> Result<
     assert_eq!(denial["status"], "denied");
     assert!(denial["reason"].as_str().unwrap().contains("network send"));
     assert!(!inbox.known(&attempt));
-    // Cancellation must not strand a live runtime's status-only reply address.
     inbox.stop("cancelled");
     assert!(path.exists());
     drop(inbox);
@@ -1070,7 +1054,6 @@ fn cancelled_unwritten_delivery_is_rejected_and_peer_settlement_resets_interrupt
         }]
     ));
     assert!(actor.peer.observe(&echo(attempt)).0.is_empty());
-    // The cancelled connection has no bytes and must not be confused with the next frame.
     drop(fixture.listener.accept()?);
     for interrupted in [true, false] {
         let attempt = Uuid::new_v4();

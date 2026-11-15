@@ -25,7 +25,6 @@ pub use unix::{
         reason = "only AppKit consumes the icon at runtime; tests decode it everywhere"
     )
 )]
-// Shared with install.sh, which installs the same file as the desktop launcher icon.
 const APPLICATION_ICON: &[u8] = include_bytes!("../../../assets/drostje-app-icon.png");
 
 #[cfg(all(target_os = "macos", feature = "desktop"))]
@@ -50,9 +49,6 @@ pub fn set_application_icon() -> Result<()> {
     Ok(())
 }
 
-/// Keeps background work running through screen lock and display sleep on macOS.
-/// Does not override explicit sleep, lid closure, logout, or low-battery sleep.
-/// Acquire and drop on the worker that owns the activity, never the UI thread.
 pub struct IdleSleepAssertion {
     #[cfg(target_os = "macos")]
     id: u32,
@@ -283,28 +279,22 @@ pub struct RepositoryInfo {
     pub branch: Option<String>,
     pub branches: Vec<String>,
     pub dirty: bool,
-    /// See [`RepositoryInfo::verified_branch`].
     verified_branches: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepositoryDiff {
-    /// The branch checked out when the diff was read; `None` when HEAD is detached.
     pub head_branch: Option<String>,
     pub patch: String,
     pub changed_files: usize,
     pub additions: usize,
     pub deletions: usize,
     pub truncated: bool,
-    /// `patch` split into display rows, parsed here so the UI thread never does.
     pub rows: std::sync::Arc<drostje_diff::Patch>,
 }
 
-/// A working tree's bounded patch and its summary, without display rows: for readers
-/// that forward or filter the text and parse rows only where they are shown.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorkingTreePatch {
-    /// The branch checked out when the diff was read; `None` when HEAD is detached.
     pub head_branch: Option<String>,
     pub patch: String,
     pub changed_files: usize,
@@ -316,7 +306,6 @@ pub struct WorkingTreePatch {
 const MAX_DIFF_BYTES: usize = 512 * 1024;
 const MAX_UNTRACKED_FILE_BYTES: usize = 128 * 1024;
 
-/// `working_tree_patch` with its display rows parsed, off the UI thread.
 pub fn working_tree_diff(root: &Path) -> Result<RepositoryDiff> {
     let WorkingTreePatch {
         head_branch,
@@ -429,7 +418,6 @@ pub fn working_tree_patch(root: &Path) -> Result<WorkingTreePatch> {
     })
 }
 
-/// Added and removed lines in one pass; `+++`/`---` file headers count as neither.
 fn count_changed_lines(patch: &str) -> (usize, usize) {
     patch.lines().fold((0, 0), |(additions, deletions), line| {
         if line.starts_with('+') && !line.starts_with("+++") {
@@ -555,8 +543,6 @@ fn append_diff_text(patch: &mut String, text: &str) -> bool {
     end != text.len()
 }
 
-/// Bound both pipes while reading, not after `Command::output` has allocated the
-/// entire diff. Truncation kills the producer; it is never mistaken for Git failure.
 fn git_bounded(root: &Path, args: &[&str], limit: usize) -> Result<(String, bool)> {
     use std::io::Read;
     use std::process::Stdio;
@@ -608,11 +594,9 @@ fn git_bounded(root: &Path, args: &[&str], limit: usize) -> Result<(String, bool
 }
 #[cfg(test)]
 thread_local! {
-    /// Git processes started on this thread, so tests can prove how many a call costs.
     static GIT_SPAWNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Every Git child process starts here: separated argv, run in `root`.
 fn git_command(root: &Path) -> Command {
     #[cfg(test)]
     GIT_SPAWNS.with(|spawns| spawns.set(spawns.get() + 1));
@@ -638,9 +622,6 @@ pub fn git(root: &Path, args: &[&str]) -> Result<String> {
         .trim_end_matches(['\n', '\r'])
         .to_owned())
 }
-/// Whether a Git command prints anything, without reading more than its first byte. A producer
-/// with more to say dies on the closed pipe once the answer is known; that is not a Git failure.
-/// Errors read exactly as [`git`]'s.
 fn git_prints_anything(root: &Path, args: &[&str]) -> Result<bool> {
     use std::io::Read;
     use std::process::Stdio;
@@ -680,7 +661,6 @@ fn git_prints_anything(root: &Path, args: &[&str]) -> Result<bool> {
     Ok(printed)
 }
 
-/// `git status --porcelain` prints something: modified, staged or untracked files.
 fn has_changes(root: &Path) -> Result<bool> {
     git_prints_anything(root, &["status", "--porcelain"])
 }
@@ -706,9 +686,6 @@ pub fn inspect_repository(path: &Path) -> Result<RepositoryInfo> {
     })
 }
 
-/// `git rev-parse --show-toplevel` of a non-bare repository, asked together with
-/// `--is-bare-repository` in one process. Any failure replays the two questions one by one, so
-/// the error is the one asking them separately gives.
 fn work_tree_root(path: &Path) -> Result<String> {
     if let Ok(output) = git_output(
         path,
@@ -727,19 +704,11 @@ fn work_tree_root(path: &Path) -> Result<String> {
 }
 
 struct BranchListing {
-    /// `git for-each-ref --format=%(refname:short) refs/heads`, line by line.
     branches: Vec<String>,
-    /// The checked-out branch, only when the listing proves `git symbolic-ref --quiet --short
-    /// HEAD` prints exactly this; `None` means ask that command.
     head: Option<String>,
-    /// Names for which [`validate_branch`] is known to pass: a plain branch name whose
-    /// `refs/heads/<name>` is listed and points at a commit.
     verified: Vec<String>,
 }
 
-/// The local branches and, from the same process, what `symbolic-ref` and `validate_branch`
-/// would answer when the listing settles it. Any failure replays the plain listing, so the
-/// error is that command's.
 fn local_branches(root: &Path) -> Result<BranchListing> {
     const FORMAT: &str =
         "--format=%(refname:short)%00%(HEAD)%00%(symref)%00%(refname:lstrip=2)%00%(objecttype)";
@@ -780,8 +749,6 @@ fn parse_branch_listing(listing: &str) -> Option<BranchListing> {
             return None;
         };
         any_symref |= !symref.is_empty();
-        // `symbolic-ref --short` disambiguates against fewer refs than `refname:short`, so the
-        // two agree whenever the listed short name is the plain branch name.
         if marker == "*" && short == name {
             head = Some(name.to_owned());
         }
@@ -790,7 +757,6 @@ fn parse_branch_listing(listing: &str) -> Option<BranchListing> {
         }
         branches.push(short.to_owned());
     }
-    // A symbolic branch can stand between HEAD and the marked ref; let Git name it.
     if any_symref {
         head = None;
     }
@@ -802,15 +768,11 @@ fn parse_branch_listing(listing: &str) -> Option<BranchListing> {
 }
 
 impl RepositoryInfo {
-    /// `validate_branch(&self.root, branch)` is known to pass from the listing alone.
     pub fn verified_branch(&self, branch: &str) -> bool {
         self.verified_branches.iter().any(|name| name == branch)
     }
 }
 
-/// A name `git check-ref-format --branch` certainly accepts: plain ASCII, none of the forms Git
-/// rejects or expands (`@{-1}`, `HEAD`, leading `-`, `..`, `.lock`, dot components). `false`
-/// means only that Git has to be asked.
 fn obviously_valid_branch_name(name: &str) -> bool {
     name != "HEAD"
         && !name.starts_with('-')
@@ -845,7 +807,6 @@ pub fn validate_branch(root: &Path, branch: &str) -> Result<()> {
             &format!("refs/heads/{branch}^{{commit}}"),
         ],
     ) {
-        // An unusable `root` fails `check-ref-format` first; report it from there.
         if obviously_valid {
             check_branch_name(root, branch)?;
         }
@@ -853,8 +814,6 @@ pub fn validate_branch(root: &Path, branch: &str) -> Result<()> {
     }
     Ok(())
 }
-/// Exit code of a Git command whose non-zero exit carries meaning (`merge-base --is-ancestor`,
-/// `show-ref --verify`, `config --get`); the caller decides which codes are answers.
 fn git_exit(root: &Path, args: &[&str]) -> Result<i32> {
     let output = git_output(root, args)?;
     output
@@ -863,19 +822,14 @@ fn git_exit(root: &Path, args: &[&str]) -> Result<i32> {
         .with_context(|| format!("Git {} was terminated by a signal", args.join(" ")))
 }
 
-/// What Git reports about a linked worktree, read at one moment; nothing here is inferred.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WorktreeStatus {
     pub exists: bool,
-    /// `git status --porcelain` is empty: no modified, staged or untracked files.
     pub clean: bool,
-    /// The branch checked out, `None` when detached.
     pub head_branch: Option<String>,
-    /// The worktree's own branch is an ancestor of the base branch.
     pub merged: bool,
 }
 
-/// Creates a linked worktree of `project_root` at `path` on new local `branch` from `base`.
 pub fn create_worktree(
     project_root: &Path,
     path: &Path,
@@ -890,7 +844,6 @@ pub fn create_worktree(
         .context("Worktree path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("Create {}", parent.display()))?;
     let path_arg = path.to_str().context("Worktree path is not valid UTF-8")?;
-    // Stale registrations for directories deleted by hand would otherwise block the add.
     git(project_root, &["worktree", "prune"])?;
     git(
         project_root,
@@ -899,7 +852,6 @@ pub fn create_worktree(
     fs::canonicalize(path).with_context(|| format!("Read worktree {}", path.display()))
 }
 
-/// The branch checked out in a worktree root; `None` when HEAD is detached.
 pub fn worktree_head_branch(path: &Path) -> Result<Option<String>> {
     let toplevel = fs::canonicalize(git(path, &["rev-parse", "--show-toplevel"])?)?;
     ensure!(
@@ -937,10 +889,7 @@ pub fn branch_has_upstream(root: &Path, branch: &str) -> Result<bool> {
     }
 }
 
-/// Whether every commit of `branch` is already in `base`; both must be local branches.
 pub fn branch_is_merged(root: &Path, branch: &str, base: &str) -> Result<bool> {
-    // One process proves both branches exist as commits; otherwise the checks run one by one,
-    // so the first failure reports exactly as `validate_branch` does.
     let both_exist = obviously_valid_branch_name(base)
         && obviously_valid_branch_name(branch)
         && git_exit(
@@ -964,8 +913,6 @@ pub fn branch_is_merged(root: &Path, branch: &str, base: &str) -> Result<bool> {
     }
 }
 
-/// Checks out `branch` in a clean working tree, creating it from HEAD when `create`. Git itself
-/// refuses a branch that is checked out in another worktree.
 pub fn switch_branch(root: &Path, branch: &str, create: bool) -> Result<()> {
     ensure!(
         !has_changes(root)?,
@@ -980,9 +927,6 @@ pub fn switch_branch(root: &Path, branch: &str, create: bool) -> Result<()> {
     Ok(())
 }
 
-/// Stages every change in the working tree, tracked and untracked, and commits it with
-/// `message`; returns the new commit's short hash. Hooks and signing run as the repository
-/// configures them, and a refusal fails with Git's message (the changes stay staged).
 pub fn commit_all(root: &Path, message: &str) -> Result<String> {
     let message = message.trim();
     ensure!(!message.is_empty(), "Write a commit message first");
@@ -995,8 +939,6 @@ pub fn commit_all(root: &Path, message: &str) -> Result<String> {
     git(root, &["rev-parse", "--short", "HEAD"])
 }
 
-/// Renames the branch checked out in `worktree`, only while it is still on `old` and `old`
-/// was never pushed; Git updates the worktree's HEAD with the rename.
 pub fn rename_branch(worktree: &Path, old: &str, new: &str) -> Result<()> {
     ensure!(
         worktree_head_branch(worktree)?.as_deref() == Some(old),
@@ -1031,7 +973,6 @@ pub fn inspect_worktree(
     })
 }
 
-/// Removes a linked worktree directory; Git refuses a dirty one unless `force`.
 pub fn remove_worktree(project_root: &Path, path: &Path, force: bool) -> Result<()> {
     let path_arg = path.to_str().context("Worktree path is not valid UTF-8")?;
     let mut args = vec!["worktree", "remove"];
@@ -1043,13 +984,11 @@ pub fn remove_worktree(project_root: &Path, path: &Path, force: bool) -> Result<
     Ok(())
 }
 
-/// Drops Git's registration of worktrees whose directories are already gone.
 pub fn prune_worktrees(project_root: &Path) -> Result<()> {
     git(project_root, &["worktree", "prune"])?;
     Ok(())
 }
 
-/// Safe delete only: Git refuses a branch that is not merged into HEAD or its upstream.
 pub fn delete_branch(project_root: &Path, branch: &str) -> Result<()> {
     git(project_root, &["branch", "-d", branch])?;
     Ok(())
@@ -1059,7 +998,6 @@ pub fn now() -> String {
     timestamp(std::time::SystemTime::now())
 }
 
-/// The moment `age` ago, comparable with [`now`] values as plain strings.
 pub fn timestamp_before(age: std::time::Duration) -> String {
     let now = std::time::SystemTime::now();
     timestamp(now.checked_sub(age).unwrap_or(now))
@@ -1070,7 +1008,6 @@ fn timestamp(time: std::time::SystemTime) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as libc::time_t;
-    // Zeroed, not uninit: gmtime_r leaves tm untouched when it fails (out-of-range time).
     let mut tm = std::mem::MaybeUninit::<libc::tm>::zeroed();
     // SAFETY: gmtime_r writes only the provided tm and uses no process-global time buffer;
     // an all-zero libc::tm (integers and a null zone pointer) is a valid value if it fails.
@@ -1311,7 +1248,6 @@ mod tests {
             .is_err()
         );
 
-        // Switching creates or checks out branches only in a clean tree.
         use super::switch_branch;
         switch_branch(&created, "drostje/side", true).unwrap();
         assert_eq!(
@@ -1328,7 +1264,6 @@ mod tests {
         fs::remove_file(created.join("dirty.txt")).unwrap();
         delete_branch(&repository.0, "drostje/side").unwrap();
 
-        // A commit on the branch leaves it unmerged and undeletable by the safe delete.
         fs::write(created.join("tracked.txt"), "worktree change\n").unwrap();
         git(&created, &["add", "tracked.txt"]);
         git(
@@ -1349,7 +1284,6 @@ mod tests {
         assert_eq!(status.head_branch.as_deref(), Some("drostje/amber-heron"));
         assert!(delete_branch(&repository.0, "drostje/amber-heron").is_err());
 
-        // The one-time rename follows the worktree's HEAD.
         rename_branch(&created, "drostje/amber-heron", "drostje/fix-login").unwrap();
         assert_eq!(
             worktree_head_branch(&created).unwrap().as_deref(),
@@ -1359,7 +1293,6 @@ mod tests {
         assert!(rename_branch(&created, "drostje/amber-heron", "drostje/x").is_err());
         assert!(worktree_head_branch(&repository.0.join("..")).is_err());
 
-        // Dirty trees are refused without force; detached HEAD reads as no branch.
         fs::write(created.join("scratch.txt"), "untracked\n").unwrap();
         let dirty = inspect_worktree(&repository.0, &created, "drostje/fix-login", "main").unwrap();
         assert!(!dirty.clean);
@@ -1371,7 +1304,6 @@ mod tests {
         let gone = inspect_worktree(&repository.0, &created, "drostje/fix-login", "main").unwrap();
         assert!(!gone.exists);
 
-        // A directory deleted by hand leaves a stale registration that prune drops.
         let second = data.join("worktrees").join("repo").join("bold-otter");
         create_worktree(&repository.0, &second, "drostje/bold-otter", "main").unwrap();
         fs::remove_dir_all(&second).unwrap();

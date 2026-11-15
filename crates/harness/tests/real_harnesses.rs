@@ -1,14 +1,3 @@
-//! Opt-in checks against the real Codex and OpenCode executables. They are ignored by
-//! default and need an explicit executable path, so `cargo test` never starts a harness:
-//!
-//! ```sh
-//! DROSTJE_REAL_CODEX=$(command -v codex) cargo test -p drostje-harness --test real_harnesses codex -- --ignored --nocapture
-//! DROSTJE_REAL_OPENCODE=$(command -v opencode) cargo test -p drostje-harness --test real_harnesses opencode -- --ignored --nocapture
-//! ```
-//!
-//! Opening a conversation sends no prompt. `DROSTJE_REAL_TURN=1` also sends one short
-//! prompt, which uses the logged-in account's quota. Both run in a fresh temp directory,
-//! never in a working repository.
 use anyhow::{Context, Result, bail};
 use drostje_harness::{
     self as harness, ConversationCommand, ConversationConfig, ConversationEvent,

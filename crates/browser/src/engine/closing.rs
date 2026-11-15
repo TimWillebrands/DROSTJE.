@@ -1,14 +1,3 @@
-//! A closed surface's WebView stays alive, hidden, only long enough to delete
-//! the IndexedDB databases of the document origins it loaded.
-//!
-//! Servo keeps IndexedDB per origin for the engine's lifetime, independent of
-//! WebViews, and offers embedders no way to delete it. Deletion therefore runs
-//! as script in a blank same-origin document the engine serves itself: the
-//! site's document (and its open connections) unloads first and none of its
-//! code runs. An origin a live surface has loaded is left alone; that surface
-//! clears it when it closes. Whatever a stuck page cannot delete before the
-//! deadline lives only in the engine's per-run profile (`profile.rs`), which is
-//! removed when the engine stops.
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -22,11 +11,9 @@ use uuid::Uuid;
 
 use super::Page;
 
-/// Same-origin path the engine answers itself, and only for closing WebViews.
 pub(super) const CLEAR_STORAGE_PATH: &str = "/.well-known/drostje/clear-storage";
 pub(super) const CLEAR_STORAGE_DOCUMENT: &[u8] = b"<!doctype html><title></title>";
 const CLEAR_DEADLINE: Duration = Duration::from_secs(5);
-/// Idempotent: the first evaluation starts deletion, later ones poll its status.
 const CLEAR_SCRIPT: &str = r#"(() => {
   const key = '__drostjeClearIndexedDb';
   if (globalThis[key] === undefined) {
@@ -68,7 +55,6 @@ struct Poll {
 }
 
 impl ClosingPage {
-    /// `None` when the page never loaded a document origin with storage.
     pub(super) fn new(page: Page) -> Option<Self> {
         let origins: VecDeque<Url> = page.delegate.loaded_origins.take().into();
         if origins.is_empty() {
@@ -84,7 +70,6 @@ impl ClosingPage {
         })
     }
 
-    /// Advances one step; `false` once the WebView can be dropped.
     pub(super) fn advance(&mut self, live: &HashMap<Uuid, Page>) -> bool {
         if Instant::now() >= self.deadline {
             if let Some(origin) = self.current_origin() {
@@ -177,8 +162,6 @@ impl ClosingPage {
     }
 }
 
-/// The origin URL whose IndexedDB a document at `url` can use; `None` for
-/// opaque origins (`file:`, `data:`, `about:`), which Servo gives no storage key.
 pub(super) fn storage_origin(url: &Url) -> Option<Url> {
     if !matches!(url.scheme(), "http" | "https") {
         return None;

@@ -15,7 +15,6 @@ use gpui_kit::{
     *,
 };
 
-/// `harness` decides whether a permission request offers switching to its auto mode.
 pub(super) fn request_card(
     id: ThreadId,
     harness: &str,

@@ -1,4 +1,3 @@
-//! Conversation transcript, inline requests and harness commands.
 use super::*;
 
 #[gpui_kit::test]
@@ -149,7 +148,6 @@ async fn palette_opens_over_retained_drafts_and_inline_answers(cx: &mut TestAppC
         .await;
     };
 
-    // A Settings draft hidden with Escape stays retained without blocking the palette.
     cx.dispatch_action(fixture.window.into(), commands::Settings);
     until(cx, "Settings opened", Duration::from_secs(5), |cx| {
         fixture
@@ -173,7 +171,6 @@ async fn palette_opens_over_retained_drafts_and_inline_answers(cx: &mut TestAppC
     open_palette(cx, &fixture).await;
     close_palette(cx).await;
 
-    // A hosted surface closed by the Workspace itself is unhosted, not left blocking.
     cx.dispatch_action(fixture.window.into(), commands::Settings);
     until(cx, "Settings reopened", Duration::from_secs(5), |cx| {
         fixture
@@ -195,7 +192,6 @@ async fn palette_opens_over_retained_drafts_and_inline_answers(cx: &mut TestAppC
     open_palette(cx, &fixture).await;
     close_palette(cx).await;
 
-    // An inline answer is Conversation content: the palette opens over it and keeps it.
     let input = UserRequest {
         id: "palette-input-request".into(),
         kind: UserRequestKind::Input,
@@ -310,7 +306,6 @@ async fn conversation_harness_commands_are_visible_and_actionable(cx: &mut TestA
         cx.read(|cx| fixture.state.read(cx).thread().unwrap().harness.clone()),
         "claude-code"
     );
-    // Cmd-N continues with the harness used last, not the project default.
     cx.simulate_keystrokes(fixture.window.into(), "secondary-n");
     until(
         cx,
@@ -323,14 +318,12 @@ async fn conversation_harness_commands_are_visible_and_actionable(cx: &mut TestA
         cx.read(|cx| fixture.state.read(cx).thread().unwrap().harness.clone()),
         "claude-code"
     );
-    // The harness picker lists OMP, Pi, Claude Code; `g g` then `j` selects Pi.
     let unstarted = cx.read(|cx| fixture.state.read(cx).thread().unwrap().id);
     cx.dispatch_action(fixture.window.into(), commands::SwitchHarness);
     until(cx, "harness picker", Duration::from_secs(5), |cx| {
         fixture.workspace.read(cx).palette.is_some()
     })
     .await;
-    // The picker takes focus on its next frame.
     for _ in 0..3 {
         cx.run_until_parked();
         cx.update_window(fixture.window.into(), |_, window, cx| {

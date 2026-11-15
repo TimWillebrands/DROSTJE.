@@ -1,22 +1,8 @@
-//! The artifact channel: the user's interactions with an HTML artifact reach the
-//! Conversation that showed it as artifact-origin context, through the same native
-//! injection path as peer messages. Events live in memory only. Nothing is persisted,
-//! a dispatched event is never resent, and no Draft or prompt is touched.
-//!
-//! Lifecycle per Conversation runtime generation: events queue until the runtime can
-//! receive context (idle, or running locally), then one attempt carries every queued
-//! event. An idle runtime starts an artifact-origin turn; a running one is steered at
-//! its next safe boundary. Every event's page learns its outcome through a receipt:
-//! `queued` is intermediate, and each queued event later gets a final one: delivery, a
-//! failure, or `unknown`. Closing or replacing a runtime settles its events at once
-//! (`close_artifacts`), and a new generation never inherits an older one's events.
 use super::*;
 use crate::browser::{ChannelEvent, ReceiptStatus};
 
-/// Events held per Conversation before the page is asked to wait.
 const MAX_QUEUED: usize = 128;
 
-/// One event from an artifact page, attributed to the browser session that sent it.
 #[derive(Clone, Debug)]
 pub struct ArtifactEvent {
     pub browser: Uuid,
@@ -24,7 +10,6 @@ pub struct ArtifactEvent {
     pub event: ChannelEvent,
 }
 
-/// What an artifact page should be told about one of its events.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactReceipt {
     pub browser: Uuid,
@@ -33,13 +18,8 @@ pub struct ArtifactReceipt {
     pub reason: Option<String>,
 }
 
-/// Owns every Conversation's outbox, and the receipt queue the presentation owner drains
-/// into the pages. Receipts travel on a channel, not as entity events, so even paths that
-/// hold no GPUI context (closing a Conversation) settle their pages immediately.
 pub struct ArtifactChannels {
     outboxes: HashMap<ThreadId, Outbox>,
-    /// Unbounded on purpose: a dropped final receipt would leave a page waiting. Volume
-    /// is bounded by the per-Conversation queue and each page's backlog.
     receipts: (
         async_channel::Sender<Vec<ArtifactReceipt>>,
         async_channel::Receiver<Vec<ArtifactReceipt>>,
@@ -56,20 +36,16 @@ impl Default for ArtifactChannels {
 }
 
 struct Outbox {
-    /// The runtime these events were sent to; a new generation never inherits them.
     generation: Uuid,
     queued: VecDeque<ArtifactEvent>,
     attempt: Option<Attempt>,
-    /// The artifact-origin turn the runtime started for an idle attempt.
     turn: Option<Uuid>,
 }
 
 struct Attempt {
     id: Uuid,
     events: Vec<(Uuid, String)>,
-    /// Dropping this closes admission; already admitted context cannot be recalled.
     _admission: async_channel::Sender<()>,
-    /// Dispatched to an idle runtime: the session is reserved until its turn starts.
     idle: bool,
 }
 
@@ -99,19 +75,16 @@ fn receipt(
 }
 
 impl AppState {
-    /// Receipts for artifact pages, in order; the presentation owner forwards them.
     pub fn artifact_receipts(&self) -> async_channel::Receiver<Vec<ArtifactReceipt>> {
         self.artifacts.receipts.1.clone()
     }
 
     fn send_receipts(&self, receipts: Vec<ArtifactReceipt>) {
         if !receipts.is_empty() {
-            // Closed only when AppState itself is gone, with every page.
             let _ = self.artifacts.receipts.0.try_send(receipts);
         }
     }
 
-    /// The Conversation's runtime is being closed or replaced: settle its pages now.
     pub(super) fn close_artifacts(&mut self, thread: ThreadId) {
         let mut receipts = Vec::new();
         self.fail_outbox(
@@ -122,8 +95,6 @@ impl AppState {
         self.send_receipts(receipts);
     }
 
-    /// Accept events from an artifact this Conversation showed. Each event's page gets
-    /// a receipt: queued, delivered, failed with a reason, or unknown.
     pub fn artifact_events(
         &mut self,
         thread: ThreadId,
@@ -200,7 +171,6 @@ impl AppState {
         self.send_receipts(receipts);
     }
 
-    /// Re-check a Conversation after any runtime event; dispatches what can go now.
     pub(super) fn artifact_runtime_changed(&mut self, thread: ThreadId) {
         if !self.artifacts.outboxes.contains_key(&thread) {
             return;
@@ -236,8 +206,6 @@ impl AppState {
         self.send_receipts(receipts);
     }
 
-    /// The runtime reported an attempt's outcome. Returns the outcome unhandled when the
-    /// attempt is not an artifact delivery, so peer delivery can settle it.
     pub(super) fn artifact_delivery_event(
         &mut self,
         thread: ThreadId,
@@ -262,7 +230,6 @@ impl AppState {
             return Some(outcome);
         };
         let (status, reason, release) = match outcome {
-            // An idle runtime keeps its reservation until the turn it admits starts.
             harness::PeerDeliveryOutcome::Accepted => {
                 if current.idle && !running {
                     outbox.turn = Some(attempt);
@@ -289,7 +256,6 @@ impl AppState {
         None
     }
 
-    /// `true` when the started turn is the artifact attempt's own.
     pub(super) fn artifact_turn_started(&mut self, thread: ThreadId, request_id: Uuid) -> bool {
         let Some(outbox) = self.artifacts.outboxes.get_mut(&thread) else {
             return false;
@@ -319,7 +285,6 @@ impl AppState {
         }
     }
 
-    /// Another artifact turn, or an idle reservation, still keeps the Conversation busy.
     pub(super) fn artifact_has_other_turn(&self, thread: ThreadId, settled: Uuid) -> bool {
         self.artifacts.outboxes.get(&thread).is_some_and(|outbox| {
             outbox.turn.is_some_and(|turn| turn != settled)
@@ -330,7 +295,6 @@ impl AppState {
         })
     }
 
-    /// An artifact attempt awaits admission; peer delivery must not race it.
     pub(super) fn artifact_delivery_in_flight(&self, thread: ThreadId) -> bool {
         self.artifacts
             .outboxes
@@ -356,15 +320,12 @@ impl AppState {
                     && session.peer_delivery
                     && !session.preparing
                     && session.requests.is_empty()
-                    // A remote native queue cannot revoke accepted next-turn context on
-                    // desktop detach, so remote runtimes receive only while idle.
                     && (session.state == ConversationState::Ready
                         || (session.state == ConversationState::Running && !remote))
                     && (!submission || self.active_threads.contains(&thread))
             })
     }
 
-    /// Why queued events wait, shown in the page next to its controls.
     fn artifact_wait_reason(&self, thread: ThreadId) -> Option<String> {
         let session = self.conversations.get(&thread)?;
         Some(if !session.peer_delivery {
@@ -419,7 +380,6 @@ impl AppState {
                 cancelled,
             }))
         {
-            // Nothing reached the runtime: the queue refused it, so the page can resend.
             receipts.extend(events.into_iter().map(|queued| {
                 receipt(
                     queued.browser,
@@ -458,7 +418,6 @@ impl AppState {
         }
     }
 
-    /// A new runtime generation never inherits an older one's events.
     fn reset_stale_outbox(
         &mut self,
         thread: ThreadId,
@@ -479,8 +438,6 @@ impl AppState {
         }
     }
 
-    /// Settle everything an ended runtime held. Dispatched events become unknown, never
-    /// failed: the runtime may have admitted them before it stopped.
     fn fail_outbox(&mut self, thread: ThreadId, reason: &str, receipts: &mut Vec<ArtifactReceipt>) {
         let Some(outbox) = self.artifacts.outboxes.remove(&thread) else {
             return;
@@ -534,7 +491,6 @@ mod tests {
         receipts: Receipts,
     }
 
-    /// Every receipt sent so far, in order.
     struct Receipts(
         async_channel::Receiver<Vec<ArtifactReceipt>>,
         RefCell<Vec<ArtifactReceipt>>,
@@ -549,7 +505,6 @@ mod tests {
     }
 
     fn open(cx: &mut TestAppContext) -> Fixture {
-        // Persistence runs on real background executors, as in production.
         cx.dispatcher.allow_parking();
         let directory =
             Directory(std::env::temp_dir().join(format!("drostje-artifacts-{}", Uuid::new_v4())));
@@ -642,7 +597,6 @@ mod tests {
         });
         assert!(f.receipts.borrow().is_empty(), "dispatch is not delivery");
 
-        // A second event waits for the first attempt; it is never merged into it.
         f.state.update(cx, |state, _| {
             state.artifact_events(thread, browser, "Scope".into(), vec![event("e2")]);
         });
@@ -725,7 +679,6 @@ mod tests {
         let f = open(cx);
         let (thread, browser) = (f.thread, Uuid::new_v4());
         f.state.update(cx, |state, _| {
-            // A pending permission request holds artifact input back.
             state
                 .conversations
                 .get_mut(&thread)

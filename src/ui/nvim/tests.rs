@@ -1,4 +1,3 @@
-//! Native window tests against an installed Neovim.
 use super::NvimView;
 use crate::model::DraftKey;
 use crate::neovim::{NvimCommand, NvimConfig, NvimEditor};
@@ -80,8 +79,6 @@ async fn native_typing_bursts_reach_the_flushed_grid(cx: &mut TestAppContext) {
     until(cx, &view, |view| view.enabled()).await;
     let mut expected = String::new();
     for burst in ["gghjkl", "burst", "visible", ":?{}~", "é"] {
-        // No waits, snapshots or extra key are needed to make the final
-        // character visible. Dispatch reaches the native input handler.
         for character in burst.chars() {
             cx.update_window(window.into(), |_, window, cx| {
                 assert!(window.dispatch_keystroke(

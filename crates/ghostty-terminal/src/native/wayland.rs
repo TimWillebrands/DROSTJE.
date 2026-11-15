@@ -25,7 +25,6 @@ use wayland_protocols::wp::viewporter::client::{
 use super::NativeWakeup;
 
 pub struct WaylandGlSurface {
-    // EGL must be destroyed before the child wl_surface.
     egl: EglSurface,
     wayland: WaylandSurface,
     logical_width: i32,
@@ -462,9 +461,6 @@ impl EglSurface {
             })
             .ok_or_else(|| "load glViewport".to_owned())?;
         unsafe { viewport(0, 0, 1, 1) };
-        // Ghostty renders this child surface from GPUI's event-loop thread. A
-        // blocking, vsynced swap here can stall Wayland key-repeat timers; the
-        // top-level GPUI window already provides frame pacing.
         let _ = api.swap_interval(display, 0);
 
         Ok(Self {
@@ -513,7 +509,6 @@ impl Drop for EglSurface {
         self.clear_current();
         let _ = self.api.destroy_surface(self.display, self.surface);
         let _ = self.api.destroy_context(self.display, self.context);
-        // Do not terminate the shared Wayland EGLDisplay while another terminal may use it.
         // SAFETY: The wl_egl_window is uniquely owned and still live.
         unsafe { (self.wayland_egl.destroy)(self.window.as_ptr()) };
     }

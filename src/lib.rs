@@ -24,15 +24,12 @@ use gpui_kit::{
     *,
 };
 
-// The default Assets bundle omits Lucide icons used by thread and tool controls.
 const APP_ASSETS: AllAssets = AllAssets;
 
 pub fn run() {
-    // Servo content processes re-execute this binary; they must not start the app.
     if browser::serve_content_process() {
         return;
     }
-    // Next, while the process is single-threaded: agents must see the user's terminal PATH.
     if let Err(error) = platform::import_login_shell_environment() {
         eprintln!("Could not import the login shell environment: {error:#}");
     }
@@ -74,14 +71,9 @@ pub fn run() {
             })
             .detach();
             let options = WindowOptions {
-                // Native window geometry is expressed in physical layout pixels.
                 window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
                 window_min_size: Some(size(px(900.), px(600.))),
-                // Ask for client-side decorations so compositors do not stack their own title bar
-                // above ours; `Root` draws the Linux frame, shadow and resize edges.
                 window_decorations: Some(WindowDecorations::Client),
-                // The Wayland/X11 application id. Desktop launchers match it to
-                // `drostje.desktop` and its icon; without it the window is anonymous.
                 app_id: Some("drostje".into()),
                 ..TitleBar::window_options()
             };

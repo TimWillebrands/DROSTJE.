@@ -76,15 +76,12 @@ impl Fixture {
         store.save_project(project.clone()).await.unwrap();
         let folder = directory.0.join("existing-folder");
         fs::create_dir(&folder).unwrap();
-        // Intentionally not normalized: opening an existing folder is pass-through.
         fs::write(
             folder.join("PRD.md"),
             "---\ntitle: Original work item\ntags: []\n---\nUnchanged source text\n",
         )
         .unwrap();
         let executable = directory.0.join("process-fixture");
-        // This finite local process fixture exercises actual spawn/session/fd
-        // behavior. It is not a substitute for Factory's real doctor/e2e proof.
         fs::write(
             &executable,
             format!(
@@ -287,8 +284,6 @@ fn pending_is_durable_blocks_duplicates_and_rechecks_storage_after_doctor() {
         assert_eq!(durable.launches[0].factory_thread_id, owner);
         assert_eq!(durable.launches[0].process_exit, None);
         assert_eq!(fixture.run_count(), 0);
-        // Confirmation only permits an unknown prior outcome, never an owned or
-        // pending duplicate. A second launch ID cannot bypass the pending guard.
         let mut duplicate = fixture.spec();
         duplicate.confirm_unknown = true;
         assert!(
@@ -311,8 +306,6 @@ fn pending_is_durable_blocks_duplicates_and_rechecks_storage_after_doctor() {
                 .iter()
                 .any(|message| message.contains("persistence"))
         );
-        // Failure to persist the refusal must not make the in-memory refusal
-        // disappear, nor claim it was successfully written to the database.
         assert!(
             fixture.store.snapshot().await.unwrap().launches[0]
                 .launch_error
@@ -388,7 +381,6 @@ fn detached_child_keeps_fds_across_manager_close_and_restart_never_replays() {
             .unwrap()
             .parse()
             .unwrap();
-        // Inspect only the newly owned fixture process; never signal a stored PID.
         assert_eq!(drostje_platform::session_id(pid).unwrap(), pid);
         assert_eq!(
             manager.refresh(first_id).await.unwrap().liveness,
@@ -558,7 +550,6 @@ fn a_finished_launch_publishes_only_when_its_event_log_changes() {
         let published = manager.events.recv().await.unwrap();
         assert_eq!(published.reported_state, ReportedState::Completed);
         assert_eq!(published.liveness, Liveness::Exited(0));
-        // Several observer passes over the unchanged, finished launch publish nothing.
         smol::Timer::after(Duration::from_millis(1600)).await;
         assert!(manager.events.try_recv().is_err());
 
@@ -610,8 +601,6 @@ fn factory_idle_sleep_assertions() -> usize {
 fn idle_sleep_protection_tracks_owned_processes_through_overlap_and_observer_close() {
     const ISOLATED: &str = "DROSTJE_FACTORY_POWER_TEST";
     if std::env::var_os(ISOLATED).is_none() {
-        // Other launch tests run concurrently. Isolate this process's native
-        // assertion set rather than depending on the rest of the test suite.
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -645,7 +634,6 @@ fn idle_sleep_protection_tracks_owned_processes_through_overlap_and_observer_clo
         .await;
         wait_until(|| factory_idle_sleep_assertions() == 1).await;
 
-        // A terminal event is only Factory's report, not proof of child exit.
         let events = first_spec.data_root.join("events");
         fs::create_dir_all(&events).unwrap();
         let records = [
@@ -682,7 +670,6 @@ fn idle_sleep_protection_tracks_owned_processes_through_overlap_and_observer_clo
         let snapshot = recovered.refresh(first_spec.id).await.unwrap();
         assert_eq!(snapshot.liveness, Liveness::Unverified);
         assert_eq!(snapshot.reported_state, ReportedState::Pending);
-        // Recovering an unverified launch adds no assertion of its own.
         assert_eq!(factory_idle_sleep_assertions(), 2);
 
         fs::write(second.directory.0.join("release-run"), "release").unwrap();
@@ -703,8 +690,6 @@ fn idle_sleep_protection_tracks_owned_processes_through_overlap_and_observer_clo
         wait_until(|| factory_idle_sleep_assertions() == 1).await;
         fs::write(first.directory.0.join("release-run"), "release").unwrap();
         wait_until(|| factory_idle_sleep_assertions() == 0).await;
-        // The recovered observer remains open with an unknown process outcome,
-        // but it must not leave an indefinite idle-sleep inhibitor.
         assert_eq!(
             recovered.refresh(first_spec.id).await.unwrap().liveness,
             Liveness::Unverified

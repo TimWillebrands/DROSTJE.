@@ -1,5 +1,3 @@
-//! All Servo, WebView and rendering handles are created, pumped and dropped on
-//! the browser worker. Only bounded commands and retained snapshots cross threads.
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
@@ -40,12 +38,6 @@ mod profile;
 const MAX_WEBVIEWS: usize = 16;
 const CONTENT_MEASUREMENT_INTERVAL: Duration = Duration::from_millis(250);
 
-// Do not use document/body.scrollHeight: the root scrolling element is at least
-// viewport-high, so it cannot report a shrink after the embedder grows the viewport.
-// A marked, naturally-sized root is authoritative. Ordinary body content uses
-// child rectangles and text-node ranges, never a range selecting the whole body:
-// Servo 0.7 returns that range's container box, including its viewport-height floor.
-// Neither path changes page styles or installs timers/observers inside the page.
 const CONTENT_HEIGHT_SCRIPT: &str = r#"(() => {
     const body = document.body;
     if (!body) return null;
@@ -106,8 +98,6 @@ impl ContentSizing {
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.next_measurement = Instant::now();
-        // Keep the outstanding slot occupied until Servo calls it back, even
-        // across navigation or disable/re-enable. Never pile up native evaluations.
     }
 
     fn set_enabled(&mut self, enabled: bool) {
@@ -178,11 +168,9 @@ struct Delegate {
     frame_generation: Cell<u64>,
     frame_current: Cell<bool>,
     capture_pending: Cell<bool>,
-    /// Storage origins of every document this surface loaded, frames included.
     loaded_origins: RefCell<Vec<Url>>,
     closing: Cell<bool>,
     crash: Cell<Crash>,
-    /// Artifact surfaces carry the kit and accept channel events from `file:` documents.
     artifact: bool,
 }
 
@@ -302,7 +290,6 @@ impl WebViewDelegate for Delegate {
     }
 
     fn notify_traversal_complete(&self, webview: WebView, _: servo::TraversalId) {
-        // Cached history traversal need not emit a load-status change.
         self.invalidate_content_height();
         self.invalidate_frame();
         self.update(|state| {
@@ -379,10 +366,8 @@ impl WebViewDelegate for Delegate {
                 response.send_body_data(CLEAR_STORAGE_DOCUMENT.to_vec());
                 response.finish();
             }
-            // A closing surface is invisible; its loads are not diagnostics.
             return;
         }
-        // Artifacts load the app's bundled faces from a reserved origin nothing else serves.
         if self.artifact
             && let Some(face) = drostje_fonts::artifact_face(&request.url)
         {
@@ -409,7 +394,6 @@ impl WebViewDelegate for Delegate {
             "info".into(),
             format!("{} {}", load.request().method, load.request().url),
         );
-        // Dropping the responder explicitly leaves Servo's network request intact.
     }
 }
 
@@ -418,19 +402,13 @@ struct Page {
     context: Rc<SoftwareRenderingContext>,
     delegate: Rc<Delegate>,
     user_contents: Rc<UserContentManager>,
-    /// The artifact kit with its current theme tokens; `None` for ordinary pages.
     kit: Option<Rc<UserScript>>,
     last_frame: Instant,
     scale: f32,
-    /// The latest navigation requested while the crash page was settling.
     held_navigation: Option<BrowserCommand>,
     demand: FrameDemand,
 }
 
-/// Servo replaces a crashed document with its crash page, which becomes current
-/// only once loaded; until then Servo drops embedder loads for that WebView.
-/// Its reload replays the crash entry, so Reload of a crashed page loads the
-/// crashed URL afresh instead.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Crash {
     None,
@@ -445,8 +423,6 @@ impl Page {
         context.make_current().map_err(|error| {
             format!("Could not make Servo rendering context current: {error:?}")
         })?;
-        // Retain the opt-in even when an earlier open failed (for example a local
-        // artifact was missing), so navigating to a valid file restores sizing.
         let (sizing_enabled, artifact_theme, visible) = {
             let memory = output.0.memory.lock();
             let session = memory
@@ -535,7 +511,6 @@ impl Page {
         | BrowserCommand::Reload = command
         {
             if self.delegate.crash.get() == Crash::Settling {
-                // Servo drops loads until its crash page replaces the dead document.
                 self.held_navigation = Some(command);
                 return Ok(());
             }
@@ -578,7 +553,6 @@ impl Page {
                 }
             }
             BrowserCommand::Reload => {
-                // A local artifact may have been removed since its previous load.
                 if let Some(url) = self.view.url() {
                     parse_url(url.as_str())?;
                 }
@@ -587,8 +561,6 @@ impl Page {
                 self.delegate.update(|state| {
                     state.error = None;
                     state.loading = true;
-                    // Servo::WebView::reload sets Started internally without
-                    // notifying its delegate, so invalidate this identity here.
                     state.document_revision += 1;
                 });
                 let crashed = self.delegate.crash.replace(Crash::None) == Crash::Settled;
@@ -664,8 +636,6 @@ impl Page {
                 if !dx.is_finite() || !dy.is_finite() {
                     return Err("Scroll deltas must be finite".into());
                 }
-                // Servo wheel deltas have the opposite sign of DOM scroll offsets,
-                // and its default wheel handler expects device-pixel deltas.
                 self.view
                     .notify_input_event(InputEvent::Wheel(WheelEvent::new(
                         WheelDelta {
@@ -798,8 +768,6 @@ impl Page {
                     return;
                 }
                 let Ok(JSValue::Number(height)) = result else {
-                    // Internal measurements must not consume tool evaluation IDs or
-                    // replace the page's loading/error state if a document disappears.
                     return;
                 };
                 let height = height as f32;
@@ -827,8 +795,6 @@ impl Page {
             Paint::Skip => {}
             Paint::Publish => self.publish(),
             Paint::Composite => {
-                // Advances the page's animations; a pending screenshot barrier may
-                // still publish from inside this paint, which is a verified frame.
                 self.delegate.dirty.set(false);
                 self.last_frame = Instant::now();
                 if let Err(error) = self.context.make_current() {
@@ -841,13 +807,9 @@ impl Page {
         }
     }
 
-    /// Paint and publish the current content: through Servo's screenshot barrier for
-    /// a new document or surface, otherwise by reading the framebuffer back.
     fn publish(&mut self) {
         if !self.delegate.frame_current.get() {
             if self.delegate.capture_pending.replace(true) {
-                // Readiness requests trigger a repaint; the callback is delivered
-                // during paint, not spin_event_loop. Do not publish unverified pixels.
                 self.delegate.dirty.set(false);
                 self.last_frame = Instant::now();
                 if let Err(error) = self.context.make_current() {
@@ -864,8 +826,6 @@ impl Page {
             let generation = delegate.frame_generation.get();
             let scale = self.scale;
             let document_revision = delegate.state.borrow().document_revision;
-            // Servo's screenshot barrier waits for the current pipeline's layout
-            // and compositor frames. A normal paint may still contain old pixels.
             self.view.take_screenshot(None, move |result| {
                 delegate.capture_pending.set(false);
                 if delegate.frame_generation.get() != generation || delegate.state.borrow().loading
@@ -907,7 +867,6 @@ impl Page {
         self.delegate.frame(image, self.scale, document_revision);
     }
 
-    /// Answer the captures a published frame of the current content satisfies.
     fn settle_captures(&mut self) {
         let delegate = &self.delegate;
         let current = !delegate.dirty.get()
@@ -982,8 +941,6 @@ fn deliver_commands(
     commands: Vec<BrowserCommand>,
     mut deliver: impl FnMut(BrowserCommand) -> Result<(), String>,
 ) -> Result<Value, String> {
-    // Validate the entire batch before any input is delivered. Runtime surface
-    // failures cannot be rolled back; report the exact delivered prefix instead.
     for command in &commands {
         validate_command(command)?;
     }
@@ -1045,19 +1002,10 @@ fn js_value(value: JSValue) -> Value {
     }
 }
 
-/// Stylo prefs are process-wide statics: the engine process and every content
-/// process, where layout runs, set them before styling anything.
 fn configure_stylo() {
-    // Servo does not expose this Stylo pref. Without it a selector list containing
-    // :has() invalidates its whole rule, which drops DaisyUI's theme variables.
-    // Servo 0.7 matches :has() when an element is styled but does not yet
-    // invalidate it on later DOM or state changes.
     stylo_static_prefs::set_pref!("layout.css.has-selector.enabled", true);
 }
 
-/// Serves one Servo content process until its event loop exits.
-/// A DOM `KeyboardEvent.key` and `.code` as Servo's input types; an empty code is
-/// `Unidentified`.
 pub(super) fn parse_dom_key(key: &str, code: &str) -> Result<(Key, Code), String> {
     let key = key
         .parse::<Key>()
@@ -1077,22 +1025,14 @@ pub(super) fn run_content_process(token: String) {
 }
 
 pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
-    // Respect a provider already selected by the host. Concurrent installers may
-    // win the race; either way Rustls has a process-wide provider before Servo starts.
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
     let output = Arc::new(Output(shared.clone()));
-    // WebGPU runs on Servo's own wgpu device and presents through WebRender
-    // images, so it does not depend on the software GL rendering context.
-    // GPU canvas pages routinely pair it with OffscreenCanvas for 2D scratch work.
     let preferences = Preferences {
         dom_webgpu_enabled: true,
         dom_offscreen_canvas_enabled: true,
-        // A suspended back-forward document keeps its WebGPU devices alive, and a
-        // process gets about ten; navigating discards the old document instead.
         session_history_max_length: 0,
-        // Storage lives in the per-run profile; closing.rs deletes it per closed surface.
         dom_indexeddb_enabled: true,
         ..Preferences::default()
     };
@@ -1102,8 +1042,6 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
     let opts = Opts {
         config_dir: Some(profile.path().to_path_buf()),
         multiprocess: super::CONTENT_PROCESSES.load(Ordering::Relaxed),
-        // Servo's default exits the whole process when a page's script panics;
-        // DROSTJE shows the crash page for that WebView instead.
         hard_fail: false,
         ..Opts::default()
     };
@@ -1112,7 +1050,6 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
         .preferences(preferences)
         .event_loop_waker(Box::new(Waker(thread::current())))
         .build();
-    // Do not call Servo::setup_logging: it replaces the host's process-wide logger.
     servo.set_delegate(Rc::new(EngineDelegate(output.clone())));
     let mut pages = HashMap::<Uuid, Page>::new();
     let mut closing = Vec::<ClosingPage>::new();
@@ -1135,8 +1072,6 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
             let length = memory.queue.len().min(64);
             batch.extend(memory.queue.drain(..length));
         }
-        // Closing is an identity removal, not an unbounded lifecycle queue. Retire
-        // obsolete WebViews here, never under the snapshot lock or on the UI thread.
         let closed: Vec<Uuid> = {
             let memory = shared.memory.lock();
             let mut closed = Vec::new();
@@ -1310,7 +1245,6 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
         if !shared.memory.lock().queue.is_empty() {
             continue;
         }
-        // Hidden pages composite at most at the idle wake-up rate.
         let animating = pages.values().any(|page| {
             page.demand.wanted() && (page.view.animating() || page.delegate.dirty.get())
         }) || !closing.is_empty();
@@ -1320,8 +1254,6 @@ pub(super) fn run(shared: &Arc<Shared>) -> Result<(), String> {
             Duration::from_millis(250)
         });
     }
-    // Cooperative Servo shutdown stays on this worker. Unlike a helper process,
-    // an in-process engine cannot be forcibly killed without killing the app.
     closing.clear();
     pages.clear();
     drop(servo);
@@ -1424,7 +1356,6 @@ mod tests {
         assert!(sizing.finish(first));
         assert!(sizing.begin(now).is_none());
         let next = sizing.begin(now + CONTENT_MEASUREMENT_INTERVAL).unwrap();
-        // Both navigation and viewport changes use this invalidation path.
         sizing.invalidate();
         assert!(sizing.begin(Instant::now()).is_none());
         assert!(!sizing.finish(next));

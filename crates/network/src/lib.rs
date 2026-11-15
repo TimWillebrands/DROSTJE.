@@ -1,9 +1,3 @@
-//! Durable, explicitly authorized peer delivery within a Space.
-//!
-//! Runtime capabilities never enter the saved snapshot. Claims commit before the
-//! host receives them; uncertain attempts are never retried. A receipt denotes
-//! native queue acceptance, not that a model read or acted on a message.
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -24,8 +18,6 @@ pub const MAX_MESSAGES: usize = 256;
 pub const MAX_PENDING: usize = 1024;
 pub const MAX_PENDING_PER_RECIPIENT: usize = 128;
 pub const MAX_BATCH_BYTES: usize = 64 * 1024;
-/// A Conversation with no runtime and no open tab leaves the network after this long without
-/// activity. Open tabs are exempt: every restored tab looks offline right after a restart.
 pub const DORMANT_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const MAX_CONTEXT_BYTES: usize = 8192;
 const MAX_RESPONSE_BYTES: usize = 384 * 1024;
@@ -49,9 +41,7 @@ pub struct Peer {
     pub token: Option<Uuid>,
     pub eligible: bool,
     pub delivery_enabled: bool,
-    /// Temporary readiness, independent of consent or runtime authorization.
     pub can_receive: bool,
-    /// Left behind by the user; see [`DORMANT_AFTER`]. Ends membership like Leave does.
     pub dormant: bool,
 }
 
@@ -128,7 +118,6 @@ pub enum DeliveryOutcome {
     Delivered,
     Failed(String),
     Unknown(String),
-    /// The host has not issued any native write; retry only when readiness changes.
     Deferred,
 }
 
@@ -150,7 +139,6 @@ enum Command {
 }
 
 impl Network {
-    /// Published snapshots are shared read-only; each change publishes a new one.
     pub fn start(
         store: Store,
         saved: Option<&Value>,
@@ -185,7 +173,6 @@ impl Network {
         let (commands, requests) = async_channel::bounded(64);
         let (updates, receiver) = async_channel::bounded(1);
         let pending_updates = receiver.clone();
-        // Migration must commit before publication or processing any command.
         if !startup_write {
             updates
                 .try_send(Arc::clone(&snapshot))
@@ -206,7 +193,6 @@ impl Network {
         self.request(|reply| Command::Sync(peers, reply)).await
     }
 
-    /// Explicit Join or Resume records consent, including for legacy members.
     pub async fn set_joined(&self, thread: Uuid, joined: bool) -> Result<()> {
         self.request(|reply| Command::SetJoined(thread, joined, reply))
             .await
@@ -221,13 +207,10 @@ impl Network {
             .await
     }
 
-    /// Lease queued mail to an authorized runtime, durably before return.
     pub async fn claim(&self, token: Uuid) -> Result<Option<DeliveryBatch>> {
         self.request(|reply| Command::Claim(token, reply)).await
     }
 
-    /// Host-only receipt. Only confirmed acceptance may resolve Unknown later;
-    /// final outcomes and unrelated attempts are never overwritten.
     pub async fn finish(&self, attempt: Uuid, outcome: DeliveryOutcome) -> Result<()> {
         self.request(|reply| Command::Finish(attempt, outcome, reply))
             .await
@@ -248,7 +231,6 @@ impl Network {
 
 struct Actor {
     store: Store,
-    /// The last committed state, shared with the latest publication.
     snapshot: Arc<NetworkSnapshot>,
     peers: BTreeMap<Uuid, Peer>,
     updates: Sender<Arc<NetworkSnapshot>>,
@@ -258,7 +240,6 @@ struct Actor {
 impl Actor {
     async fn run(mut self, requests: Receiver<Command>, startup_write: bool) {
         if startup_write {
-            // The migrated snapshot is already current, so it is written directly.
             let result = self
                 .store
                 .set_setting_encoded(SETTING.into(), &*self.snapshot)
@@ -318,8 +299,6 @@ impl Actor {
         self.publish();
     }
 
-    /// Persist and publish `next`, a copy of the committed snapshot that the caller
-    /// changed; callers skip unchanged copies. On failure the committed state remains.
     async fn commit(&mut self, next: NetworkSnapshot) -> Result<()> {
         self.healthy()?;
         if let Err(error) = self.store.set_setting_encoded(SETTING.into(), &next).await {
@@ -332,7 +311,6 @@ impl Actor {
     }
 
     async fn sync(&mut self, peers: Vec<Peer>) -> Result<()> {
-        // Revoke the old context before validation or Store I/O.
         let previous = std::mem::take(&mut self.peers);
         self.healthy()?;
         let contexts = (|| -> Result<BTreeMap<Uuid, Peer>> {
@@ -401,8 +379,6 @@ impl Actor {
                     })
             });
         if !membership_changed && !revoked_attempt {
-            // Presence is runtime state. Busy/idle/readiness syncs must not
-            // rewrite durable mailbox history, nor copy it unless presence changed.
             let changed = self
                 .snapshot
                 .members
@@ -440,7 +416,6 @@ impl Actor {
                     return false;
                 }
             };
-            // Temporary readiness never revokes a native receipt in flight.
             if peer.token.is_none()
                 || !peer.delivery_enabled
                 || previous
@@ -593,8 +568,6 @@ impl Actor {
             message.deliveries[0].state = DeliveryState::Delivering;
             message.deliveries[0].attempt = Some(batch.attempt);
             let size = encoded_len(&message)? + usize::from(!batch.messages.is_empty());
-            // The batching target is not a new per-message size limit. A single
-            // legacy envelope remains bounded by the body/context/response caps.
             if bytes + size > MAX_BATCH_BYTES && !batch.messages.is_empty() {
                 break;
             }
@@ -609,7 +582,6 @@ impl Actor {
             .iter()
             .map(|message| message.id)
             .collect::<HashSet<_>>();
-        // Every batched delivery moves from Queued to Delivering.
         let mut next = NetworkSnapshot::clone(&self.snapshot);
         for message in &mut next.messages {
             if ids.contains(&message.id) {
@@ -645,7 +617,6 @@ impl Actor {
                 DeliveryState::Unknown { reason }
             }
         };
-        // Each resolvable delivery changes state, so none means nothing to commit.
         let resolves = |delivery: &Delivery| {
             delivery.attempt == Some(attempt)
                 && (delivery.state == DeliveryState::Delivering
@@ -768,7 +739,6 @@ impl From<&Peer> for Member {
 }
 
 impl Member {
-    /// Whether `refresh` with this peer would change anything.
     fn stale(&self, peer: &Peer) -> bool {
         let online = peer.token.is_some();
         let enabled = self.automatic && peer.delivery_enabled && online;
@@ -812,7 +782,6 @@ impl Delivery {
     }
 }
 
-/// Returns whether any attempt was revoked.
 fn revoke_attempts(messages: &mut [NetworkMessage], thread: Uuid, reason: &str) -> bool {
     let mut revoked = false;
     for delivery in messages
@@ -829,7 +798,6 @@ fn revoke_attempts(messages: &mut [NetworkMessage], thread: Uuid, reason: &str) 
     revoked
 }
 
-/// Returns whether any delivery was closed or marked unknown.
 fn close_deliveries(messages: &mut [NetworkMessage], thread: Uuid, reason: &str) -> bool {
     let mut closed = false;
     for delivery in messages
@@ -865,8 +833,6 @@ fn recipient_message(message: &NetworkMessage, delivery: &Delivery) -> NetworkMe
     }
 }
 
-/// One-time conversion, not a second serde/tool API. Reject mixed dispositions
-/// rather than guessing which representation is authoritative.
 fn read_saved(saved: &Value) -> Result<NetworkSnapshot> {
     const LEGACY_RECEIPT: &str =
         "Retrieved through the legacy inbox without a native delivery receipt";
@@ -922,7 +888,6 @@ fn read_saved(saved: &Value) -> Result<NetworkSnapshot> {
     serde_json::from_value(value).context("Read Space network")
 }
 
-// Count escaped JSON bytes without allocating a temporary serialization buffer.
 fn encoded_len(value: &impl Serialize) -> Result<usize> {
     struct Counter(usize);
     impl std::io::Write for Counter {
@@ -1041,7 +1006,6 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
                         "Saved delivery is missing its attempt"
                     );
                 }
-                // Legacy retrieval has no native attempt to correlate with a receipt.
                 DeliveryState::Unknown { .. } => {}
             }
             match &delivery.state {
@@ -1115,8 +1079,6 @@ mod tests {
 
     impl Drop for Directory {
         fn drop(&mut self) {
-            // Store drops nonblocking; allow its actor to drain before removing
-            // the real SQLite/WAL files, matching the Store integration fixtures.
             if let Ok(lock) = fs::File::options()
                 .read(true)
                 .write(true)
@@ -1396,8 +1358,6 @@ mod tests {
                 DeliveryState::Unknown { .. }
             ));
             assert!(migrated.messages[0].deliveries[0].attempt.is_none());
-            // Earlier push checkpoints called legacy retrieval "delivered", without
-            // a native attempt. Reopening those records must not invent a receipt.
             let mut prior = serde_json::to_value(&*migrated).unwrap();
             prior["messages"][0]["deliveries"][0]["state"] = json!({"status":"delivered"});
             assert!(matches!(
@@ -1657,8 +1617,6 @@ mod tests {
                     saved.messages[1].deliveries[0].state, expected,
                     "{operation}"
                 );
-                // A native receipt remains meaningful after membership removal:
-                // correlate the attempt, never a potentially replaced token.
                 fixture
                     .network
                     .finish(batch.attempt, DeliveryOutcome::Delivered)
@@ -1942,7 +1900,6 @@ mod tests {
         });
     }
 
-    /// The saved row's exact text: serde field order, compact, unescaped UTF-8.
     fn saved_text(directory: &Path) -> String {
         rusqlite::Connection::open_with_flags(
             directory.join("drostje.sqlite3"),

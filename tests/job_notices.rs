@@ -1,4 +1,3 @@
-//! Native transcript proof using captured OMP notice shapes; no provider turns.
 fn main() {
     #[cfg(target_os = "macos")]
     macos::run();
@@ -93,7 +92,6 @@ mod macos {
         let batch = "<system-notice>\n2 background jobs have completed. Resume your work using the results below.\n\n── Job bg_16 (cargo run --features runtime-qa --example space_network_smoke 900) ──\nwarning: linker warning\nPASS: real GPUI renderer\n[raw output: artifact://53]\nWall time: 40.52 seconds\n── Job bg_17 (cargo test) ──\nerror: permission denied\nWall time: 20.23 seconds\nCommand exited with code 101\n</system-notice>";
         state.update(&mut cx, |state, cx| {
             let session = state.conversations.get_mut(&thread).unwrap();
-            // Feed recorded transcript content into the production view, as browser QA does.
             session.messages = vec![Arc::new(Message {
                 id: "jobs".into(),
                 role: "custom".into(),
@@ -149,7 +147,6 @@ mod macos {
                             .find(SharedString::from(format!("{first}:body")))
                             .visible()
                     );
-                    // Tab traversal must reach the same disclosure; Enter folds it again.
                     for _ in 0..80 {
                         if window.find(SharedString::from(first.clone())).focused() == Some(true) {
                             break;
@@ -162,8 +159,6 @@ mod macos {
                         Some(true)
                     );
                     window.press("enter", cx);
-                    // Kit's press helper emits key-down only. Native buttons activate
-                    // on key-up; send the matching release through GPUI as well.
                     window.dispatch_event(
                         gpui_kit::PlatformInput::KeyUp(gpui_kit::KeyUpEvent {
                             keystroke: gpui_kit::Keystroke::parse("enter").unwrap(),

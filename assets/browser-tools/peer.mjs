@@ -1,11 +1,8 @@
-// Private native custom-message ingress. All output goes through the runtime's
-// serialized extension UI channel, never process.stdout.
 export const PEER_COMMAND = "__drostje_peer";
 const STATUS = "drostje.peer.v1";
 const TYPE = "drostje-peer";
 
 export function registerPeerDelivery(api, dialect) {
-  // A missing command is reported by the host's command/readiness handshake.
   if (typeof api.registerCommand !== "function" || typeof api.sendMessage !== "function" || typeof api.on !== "function") return;
   const seen = new Map();
   const cancelled = new Set();
@@ -15,10 +12,6 @@ export function registerPeerDelivery(api, dialect) {
   const peer = (message) => message?.role === "custom" && message.customType === TYPE && message.details?.origin === "peer" && message.details?.v === 1;
   const uuid = (value) => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 
-  // agent_start alone has no origin. Attribute a turn only when its first native
-  // input is our custom message, including a busy-host/native-idle race. Pi may
-  // first emit system-policy metadata; it is not the run's input. Never leave
-  // an attempt armed to misattribute a later ordinary user's agent_start.
   api.on("agent_start", () => { firstMessage = true; });
   api.on("agent_end", () => { firstMessage = false; });
   api.on("message_start", (event, ctx) => {
@@ -35,15 +28,9 @@ export function registerPeerDelivery(api, dialect) {
     accepted.add(attempt);
     status(ctx, { event: "accepted", attempt });
   });
-  // The public APIs have no selective custom-message dequeue operation. Prevent
-  // an interrupted, not-yet-observed peer message from entering later LLM context.
-  // Already observed context is never recalled. Keep tombstones after late echoes.
   api.on("context", (event) => ({
     messages: event.messages.filter((message) => !peer(message) || !cancelled.has(message.details.attempt)),
   }));
-  // Pi can be cancelled during asynchronous native run preparation, before any
-  // agent_start. Its custom trigger carries the real attempt, unlike OMP's
-  // ordinary-prompt-only before_agent_start event.
   if (dialect === "pi") api.on("before_agent_start", (event, ctx) => {
     if (event.messageType === "custom" && peer(event.message) && cancelled.has(event.message.details.attempt)) ctx.abort();
   });
@@ -74,7 +61,6 @@ export function registerPeerDelivery(api, dialect) {
         status(ctx, { event: "rejected", attempt, reason: "Invalid peer identities or content" });
         return;
       }
-      // Bound replay/tombstone memory by failing closed, not forgetting IDs.
       if (seen.size >= 4096 || cancelled.size >= 4096) {
         status(ctx, { event: "rejected", attempt, reason: "Peer delivery lifetime limit reached; reopen explicitly" });
         return;
@@ -83,17 +69,12 @@ export function registerPeerDelivery(api, dialect) {
       seen.set(attempt, envelope.trigger_turn);
       status(ctx, { event: "dispatching", attempt, idle: envelope.trigger_turn && nativeIdle });
       try {
-        // Steering uses native tool-call boundaries (and interruptible waits),
-        // rather than OMP's aside queue, which waits for a whole agent step.
-        // Never abort a tool or implement our own wake/retry loop here.
         api.sendMessage({
           customType: TYPE, content, display: true,
           ...(dialect === "omp" ? { attribution: "agent" } : {}),
           details: { v: 1, origin: "peer", attempt, messages },
         }, { deliverAs: "steer", triggerTurn: envelope.trigger_turn });
       } catch (error) {
-        // Even synchronous failure can follow native admission. The lifecycle
-        // observer remains armed for a correlated late echo, never a retry.
         status(ctx, { event: "unknown", attempt, reason: String(error) });
       }
     },

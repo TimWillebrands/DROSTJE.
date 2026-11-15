@@ -1,5 +1,3 @@
-//! The forms the Workspace hosts in a dialog, alert dialog or sheet: spaces, worktrees,
-//! branches, commits and Settings. `SurfaceContent` owns each form's draft controls.
 mod appearance;
 mod commit;
 mod diagnostics;
@@ -41,14 +39,10 @@ pub(in crate::ui) use layer::{close_surface, open_surface};
 pub enum DialogKind {
     NewSpace,
     DeleteSpace(Uuid),
-    /// A Conversation in a fresh worktree of this project, from a chosen base branch.
     NewWorktreeConversation(Uuid),
-    /// Start another Conversation in the project checkout or an existing live worktree.
     NewWorkspaceConversation(Uuid),
     RemoveWorktree(Uuid),
-    /// Check out another local branch, or a new one, in a Conversation's working tree.
     SwitchBranch(Uuid),
-    /// Stage and commit everything in a Conversation's working tree.
     Commit(Uuid),
     Settings(Option<Uuid>),
 }
@@ -56,7 +50,6 @@ pub enum SurfaceOutcome {
     Applied,
     SpaceCreated(Uuid),
     DeleteSpace(Uuid),
-    /// Git is working in the background; the dialog stays open until the request settles.
     Pending(Uuid),
 }
 pub struct Field {
@@ -71,17 +64,12 @@ pub struct SurfaceContent {
     pub fields: Vec<Field>,
     pub error: Option<String>,
     error_field: Option<&'static str>,
-    /// The worktree request this dialog started and is waiting for.
     pub request: Option<Uuid>,
-    /// The latest request this form owns, including a settled request whose error is shown.
     last_request: Option<Uuid>,
-    /// Removal was refused for uncommitted changes; the next confirm discards them.
     force: bool,
     selects: Vec<SelectField>,
     loaded_remote_host: String,
-    /// The installed models the title model choices were built from.
     title_models: Option<InstalledModels>,
-    /// The theme names the theme choices were built from.
     theme_names: ThemeNames,
     commit: Option<CommitDraft>,
     surface_id: Uuid,
@@ -253,8 +241,6 @@ impl SurfaceContent {
         self.last_request
     }
 
-    /// Marks the request this dialog is waiting for; the confirm control is disabled until
-    /// the App layer reports how it ended.
     pub fn begin_request(&mut self, request: Uuid, cx: &mut Context<Self>) {
         self.request = Some(request);
         self.last_request = Some(request);

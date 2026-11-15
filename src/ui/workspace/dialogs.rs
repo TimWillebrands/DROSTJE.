@@ -1,6 +1,3 @@
-//! Hosted surfaces (Settings, worktree and commit forms), their retained drafts and
-//! the notices pushed as notifications.
-
 use super::*;
 
 pub(super) struct WorktreeProgressNotice;
@@ -154,9 +151,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut App,
     ) {
-        // Own the transition instead of using AlertDialog::on_close: the pinned kit's
-        // AlertDialog builder replaces that callback with its separate button props.
-        // Returning false from OK/Cancel avoids a second native close after reopening.
         window.defer(cx, move |window, cx| {
             window.close_dialog(cx);
             let _ = owner.update(cx, |workspace, cx| workspace.open_dialog(kind, window, cx));
@@ -233,7 +227,6 @@ impl Workspace {
         {
             return;
         }
-        // Inline answers are Conversation content with their own Escape, not a layer.
         if self
             .extension
             .as_ref()
@@ -295,7 +288,6 @@ impl Workspace {
         if !dialog.read(cx).hosted() && self.commit_panel_thread.is_none() {
             return;
         }
-        // A request already running owns the dialog until it settles.
         if dialog.read(cx).request.is_some() {
             return;
         }
@@ -350,7 +342,6 @@ impl Workspace {
         }
         cx.notify();
     }
-    /// Closes or reports the result of a worktree request outside a dismissed form.
     pub(super) fn settle_worktree_dialog(
         &mut self,
         request: uuid::Uuid,

@@ -374,14 +374,13 @@ FX=$(mktemp -d) && mkdir "$FX/target-repo" && cd "$FX/target-repo" \
   && git init -q && printf 'before\n' > notes.txt \
   && git add notes.txt && git commit -qm init && cd -
 export DROSTJE_RUNTIME_FIXTURE="$FX"
-# Debug-builds van diepe scenario's passen niet in de standaard 2 MB teststack.
-export RUST_MIN_STACK=8388608
+export RUST_MIN_STACK=8388608 # debug-builds van diepe scenario's passen niet in 2 MB
 cargo test -p drostje --features runtime-qa --lib <testnaam> -- --ignored --nocapture --test-threads=1
 ```
 
 De scenario's staan als `#[ignore]`-tests in `src/ui/runtime_qa/` en `tests/`; de `ignore`-reden noemt wat elk nodig heeft. Een paar scenario's vragen extra omgevingsvariabelen (zoals `DROSTJE_NETWORK_QA_ISOLATED`) en weigeren te draaien zonder. `DROSTJE_QA_SCREENSHOTS=<map>` bewaart screenshots waar een test die maakt.
 
-**Bouwnotities.** GPUI Kit staat vast op `=0.6.6`. Servo 0.7.0 wordt direct in de app gelinkt en draait op een eigen worker-thread. `vendor/` bevat twee kleine patches: `zed-font-kit` (FreeType-versies) en `stylo_derive` (een type-inferentieconflict met GPUI). `Cargo.lock` pint `pkcs1 0.8.0-rc.4` voor Servo's `rsa`; gebruik altijd de lockfile.
+**Bouwnotities.** GPUI Kit staat vast op `=0.6.6`. Servo 0.7.0 wordt direct in de app gelinkt en draait op een eigen worker-thread. `vendor/` bevat gepatchte versies van `zed-font-kit`, `stylo_derive`, `servo-webgpu` en `servo-constellation`; [`vendor/README.md`](vendor/README.md) zegt waarom. `Cargo.lock` pint `pkcs1 0.8.0-rc.4` voor Servo's `rsa`; gebruik altijd de lockfile.
 
 ---
 

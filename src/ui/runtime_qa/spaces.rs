@@ -1,4 +1,3 @@
-//! Spaces: isolation, restore, swipe motion and shared sidebar geometry.
 use super::*;
 
 #[gpui_kit::test]
@@ -34,7 +33,6 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
     cx.dispatch_action(fixture.window.into(), commands::ToggleProjects);
     cx.run_until_parked();
 
-    // Discover creation through the real palette, not a test-only entry point.
     open_palette(cx, &fixture).await;
     cx.simulate_keystrokes(fixture.window.into(), "n e w space s p a c e");
     cx.simulate_keystrokes(fixture.window.into(), "enter");
@@ -88,8 +86,6 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
             .is_some()
     }));
 
-    // Re-adding a registered working tree attaches it to this Space instead of
-    // leaving the empty Space without a usable project.
     cx.dispatch_action(fixture.window.into(), commands::AddProject);
     assert!(cx.did_prompt_for_paths());
     cx.simulate_path_prompt_response(|options| {
@@ -121,9 +117,6 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
         rows.contains(&Row::Thread(research_thread)) && !rows.contains(&Row::Thread(thread))
     }));
 
-    // Exercise the same Workspace transition used by the thread context-menu
-    // destination. The destination gains the project, and the thread disappears
-    // from this Space without being duplicated.
     update_workspace(
         cx,
         fixture.window,
@@ -153,7 +146,6 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
                 .contains(&Row::Thread(research_thread))
     }));
 
-    // The switcher and add control remain usable in both themes at minimum size.
     for (mode, expected) in [("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
         fixture.state.update(cx, |state, cx| {
             state.set_setting("theme_mode", json!(mode));
@@ -248,7 +240,6 @@ async fn spaces_preserve_drafts_tabs_and_shared_projects(cx: &mut TestAppContext
         "returning to Default keeps the shared Projects pane open"
     );
 
-    // Moving from the native picker moves the project and every thread, not its data.
     cx.dispatch_action(fixture.window.into(), commands::MoveProjectToSpace);
     for _ in 0..3 {
         cx.run_until_parked();
@@ -497,7 +488,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
 
     fn near(actual: Pixels, expected: Pixels) {
         assert!(
-            // Layout rounds the two edges independently to device pixels.
             (actual - expected).as_f32().abs() <= 0.5,
             "expected {expected:?}, got {actual:?}"
         );
@@ -559,7 +549,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
         cx.notify();
         id
     });
-    // Keep real project rows in both Spaces and a real thread in the preview.
     update_workspace(
         cx,
         fixture.window,
@@ -590,7 +579,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             let rest = geometry(cx, &fixture, false);
             assert!(rest.rows.size.width > px(80.));
 
-            // Vertical and insufficiently horizontal gestures never switch Spaces.
             scroll(cx, &fixture, -10., 80., TouchPhase::Started);
             let vertical = geometry(cx, &fixture, false);
             stationary(&vertical, &rest);
@@ -603,7 +591,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
             settle(cx, &fixture, &rest).await;
 
-            // Crossing the threshold is still a 1:1 drag, even after a held pause.
             scroll(cx, &fixture, -40.25, 0., TouchPhase::Started);
             dragged(cx, &fixture, &rest, -40.25);
             scroll(cx, &fixture, -44.5, 0., TouchPhase::Moved);
@@ -617,12 +604,10 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             dragged(cx, &fixture, &rest, -19.75);
             scroll(cx, &fixture, 0., 0., TouchPhase::Ended);
             assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
-            // Momentum after a cancelled release must not become a new gesture.
             scroll(cx, &fixture, -200., 0., TouchPhase::Moved);
             assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
             settle(cx, &fixture, &rest).await;
 
-            // OS cancellation never commits, even beyond the release threshold.
             scroll(cx, &fixture, -40.25, 0., TouchPhase::Started);
             scroll(cx, &fixture, -44.5, 0., TouchPhase::Moved);
             dragged(cx, &fixture, &rest, -84.75);
@@ -634,7 +619,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             settle(cx, &fixture, &rest).await;
             assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
 
-            // Exactly 80 pixels commits only on release; the adjacent list enters.
             scroll(cx, &fixture, -40., 0., TouchPhase::Started);
             scroll(cx, &fixture, -40., 0., TouchPhase::Moved);
             dragged(cx, &fixture, &rest, -80.);
@@ -663,7 +647,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             );
             settle(cx, &fixture, &rest).await;
 
-            // Full-width travel is capped without committing before release.
             let content_width = rest.rows.size.width.as_f32();
             scroll(cx, &fixture, -content_width - 70., 0., TouchPhase::Started);
             dragged(cx, &fixture, &rest, -content_width);
@@ -675,7 +658,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
             settle(cx, &fixture, &rest).await;
 
-            // Phaseless platforms release on idle, using the final net distance.
             scroll(cx, &fixture, -84.75, 0., TouchPhase::Moved);
             dragged(cx, &fixture, &rest, -84.75);
             assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
@@ -686,7 +668,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
             settle(cx, &fixture, &rest).await;
 
-            // Positive travel previews the neighbor on the left, including wraparound.
             scroll(cx, &fixture, 40.25, 0., TouchPhase::Moved);
             scroll(cx, &fixture, 44.5, 0., TouchPhase::Moved);
             dragged(cx, &fixture, &rest, 84.75);
@@ -699,7 +680,6 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
             assert_eq!(cx.read(|cx| fixture.state.read(cx).active_space), original);
             settle(cx, &fixture, &rest).await;
 
-            // Reduced motion removes translation, not the held/release boundary.
             cx.update(|cx| cx.set_reduce_motion(true));
             scroll(cx, &fixture, -40., 0., TouchPhase::Started);
             scroll(cx, &fixture, -45., 0., TouchPhase::Moved);

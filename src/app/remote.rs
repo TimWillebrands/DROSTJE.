@@ -28,7 +28,6 @@ impl AppState {
         config.validate()?;
         let mut hosts = self.remote_hosts();
         if let Some(old) = hosts.iter_mut().find(|host| host.id == config.id) {
-            // An established Host identity cannot silently redirect existing conversations.
             if old.relay_url != config.relay_url
                 && self.snapshot.threads.iter().any(|thread| {
                     thread
@@ -306,7 +305,6 @@ mod tests {
 
     #[gpui_kit::test]
     fn remote_threads_never_resolve_the_desktop_checkout(cx: &mut gpui_kit::TestAppContext) {
-        // AppState starts real storage/network workers; use the native QA scheduling mode.
         cx.dispatcher.allow_parking();
         struct Directory(PathBuf);
         impl Drop for Directory {

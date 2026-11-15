@@ -7,6 +7,7 @@ Desktop app (Rust 2024, GPUI through `gpui-kit`; a Cargo workspace whose domain 
 - `cargo check --all-targets` and `cargo test` pass for the whole workspace (both cover every crate). `cargo test` makes no provider calls, so run it freely.
 - `rustfmt --edition 2024 <files>` on the files you touched only (`cargo fmt -- <files>` reformats whole packages); the tree often holds other people's work in progress.
 - `cargo clippy --all-targets` shows no warning your change introduced.
+- No comments and no new Markdown: `cargo test` runs `crates/lint`, which rejects any comment except `// SAFETY:` above `unsafe` and any `.md` file outside its list. Say it in a name, type, test, `expect` message or error instead; report results in the conversation, not in files.
 - Every visible control does real work. Mock conversations, fake rows, placeholder data and simulated providers are never acceptable, not even temporarily.
 - New behaviour has a test at the lowest layer that proves it; a deterministic bug gets its failing test before the fix.
 - A UI change renders each new state (empty, loading, error, disabled with reason) and was driven from the keyboard in a test. "Compiles" and "looks right" are not proof.
@@ -38,12 +39,12 @@ Keep this file short: add a line only when an agent can't find the fact by looki
 
 ### Issue tracker
 
-GitHub Issues on `TimWillebrands/DROSTJE.` via `gh`; external PRs are a triage surface too. The Azure DevOps remote is a code mirror only. See `docs/agents/issue-tracker.md`.
+GitHub Issues on `TimWillebrands/DROSTJE.` via `gh` (pass `-R TimWillebrands/DROSTJE.` if it asks); "publish to the issue tracker" means `gh issue create`. The Azure DevOps remote is a code mirror only: never file or read work items there. PRs are a triage surface too; for external ones keep `authorAssociation` `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR` or `NONE`. Issues and PRs share one number space.
 
 ### Triage labels
 
-Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`, used as named.
 
 ### Domain docs
 
-Single-context: `CONTEXT.md` (glossary) and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context: `CONTEXT.md` is the glossary and binds UI strings, docs and code names. ADRs go in `docs/adr/NNNN-title.md`, created only when the user settles a decision; read the ones that touch your area and say so when your work contradicts one.

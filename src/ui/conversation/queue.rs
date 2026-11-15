@@ -13,8 +13,6 @@ use gpui_kit::{
     *,
 };
 
-/// Rem height the queue bar adds to the composer: a header plus up to four rows; longer
-/// queues scroll inside the bar.
 pub(super) fn queued_messages_height(
     thread: &crate::model::Thread,
     owner: &WeakEntity<Workspace>,
@@ -32,10 +30,6 @@ const QUEUE_HEADER_HEIGHT: f32 = 2.25;
 const QUEUE_ROW_HEIGHT: f32 = 2.;
 const QUEUE_VISIBLE_ROWS: usize = 4;
 
-/// Zed-style queue above the composer: a collapsible header with the count and Clear all,
-/// then one row per waiting prompt with Remove, Edit and Send now. The front row is the
-/// one the queue sends next. `dispatch_reason` disables Send now while the conversation is
-/// idle but unable to start a turn; during a turn, Send now stops that turn first.
 pub(super) fn queued_messages(
     thread: &crate::model::Thread,
     active: bool,

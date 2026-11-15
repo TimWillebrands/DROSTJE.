@@ -71,7 +71,6 @@ impl AppState {
         }
         self.persist_space_session();
     }
-    /// A terminal has a project but no thread; keep open tabs and commit the previous draft.
     pub fn select_terminal_project(&mut self, id: ProjectId) {
         if !self.project_in_active_space(id) {
             return;
@@ -85,7 +84,6 @@ impl AppState {
         self.persist_space_session();
     }
 
-    /// Closes every open tab of `project`, committing their drafts.
     pub fn close_project_threads(&mut self, project: ProjectId) {
         let open: Vec<_> = self
             .open_threads
