@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod mcp;
 mod peer;
 
 const FRAME: usize = 1_048_576;
@@ -388,6 +389,8 @@ struct Actor {
     slash_commands: Option<Value>,
     /// `terminal_slash_commands` from `init`: commands bound to the Claude Code terminal.
     terminal_commands: Vec<String>,
+    /// The `/mcp` DROSTJE. is answering through control requests for the current turn.
+    mcp: Option<mcp::McpCommand>,
 }
 
 impl Actor {
@@ -441,6 +444,7 @@ impl Actor {
             model_requests: HashMap::new(),
             models_reported: false,
             usage_requests: Vec::new(),
+            mcp: None,
         })
     }
 
@@ -765,6 +769,13 @@ impl Actor {
                 }
             }
             ConversationCommand::Interrupt => {
+                if self.mcp.take().is_some() {
+                    // Control requests cannot be withdrawn; Claude Code may still apply them.
+                    self.finish_local(
+                        "Stopped waiting for Claude Code to answer `/mcp`; it may still apply the change. Run `/mcp` to see the servers.".into(),
+                        TurnOutcome::Unknown,
+                    )?;
+                }
                 let attempts = self.peer.written_unsettled();
                 self.stop_peer("Claude runtime was interrupted before native admission");
                 if self.peer_stop.is_some() {
@@ -846,6 +857,22 @@ impl Actor {
                         submission_size(request_id, &text, &images)? <= FRAME as u64,
                         "Prompt exceeds 1 MiB; explicitly optimize images or reduce the draft"
                     );
+                    if let Some(("mcp", arguments)) = super::commands::invocation(&text) {
+                        ensure!(images.is_empty(), "/mcp does not take images");
+                        self.accept_local(request_id, &text)?;
+                        let (command, step) = mcp::McpCommand::start(arguments);
+                        self.mcp = command;
+                        if let Err(error) = self.mcp_step(step) {
+                            self.mcp = None;
+                            self.finish_local(
+                                format!(
+                                    "Couldn't ask Claude Code about its MCP servers: {error:#}"
+                                ),
+                                TurnOutcome::Failed,
+                            )?;
+                        }
+                        return Ok(());
+                    }
                     let mut content = vec![json!({"type":"text","text":text})];
                     for image in &images {
                         let bytes = crate::attachments::read_original(&image.path)?;
@@ -1156,10 +1183,12 @@ impl Actor {
                 } else {
                     TurnOutcome::Completed
                 };
-                let settles_user = self.turn.id.is_some_and(|id| {
-                    native_ids.contains(&id)
-                        || (native_ids.is_empty() && frame["origin"]["kind"] != "peer")
-                });
+                // A `/mcp` turn never reaches the CLI, so no result belongs to it.
+                let settles_user = self.mcp.is_none()
+                    && self.turn.id.is_some_and(|id| {
+                        native_ids.contains(&id)
+                            || (native_ids.is_empty() && frame["origin"]["kind"] != "peer")
+                    });
                 if settles_user {
                     self.settle_user(outcome.clone());
                     // A result can consume both user input and safe-boundary peer context.
@@ -1251,6 +1280,10 @@ impl Actor {
             }
             return Ok(());
         }
+        if let Some(command) = self.mcp.as_mut().filter(|command| command.owns(request_id)) {
+            let step = command.answer(response);
+            return self.mcp_step(step);
+        }
         if let Some(index) = self.usage_requests.iter().position(|id| *id == request_id) {
             let request_id = self.usage_requests.remove(index);
             let parsed = (response["subtype"] == "success")
@@ -1308,6 +1341,66 @@ impl Actor {
                     self.refresh_usage(&[CONTEXT_USAGE_REQUEST])?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Starts a turn for prompt text DROSTJE. answers itself instead of sending it to the CLI.
+    fn accept_local(&mut self, request_id: Uuid, text: &str) -> Result<()> {
+        let history = json!({"type":"drostje_user","id":request_id,"text":text,"images":[]});
+        self.append_history(&history)?;
+        for message in normalize_history(
+            &history,
+            self.sequence,
+            &self.config.session_dir,
+            &mut self.images,
+        )? {
+            self.emit(ConversationEvent::MessageUpdated(message));
+        }
+        self.turn = Turn {
+            id: Some(request_id),
+            accepted: true,
+            interrupting: false,
+        };
+        self.emit(ConversationEvent::SubmissionAccepted { request_id });
+        self.state(ConversationState::Running);
+        Ok(())
+    }
+
+    fn mcp_step(&mut self, step: mcp::Step) -> Result<()> {
+        match step {
+            mcp::Step::Wait => Ok(()),
+            mcp::Step::Send(frames) => frames
+                .into_iter()
+                .try_for_each(|frame| self.queue(frame, None)),
+            mcp::Step::Done(output) => {
+                self.mcp = None;
+                self.finish_local(output.text, output.outcome)
+            }
+        }
+    }
+
+    /// Shows the output of a turn DROSTJE. answered itself and settles that turn.
+    fn finish_local(&mut self, text: String, outcome: TurnOutcome) -> Result<()> {
+        let frame = json!({
+            "type":"drostje_command",
+            "id":Uuid::new_v4(),
+            "command":"mcp",
+            "text":text,
+            "error":outcome != TurnOutcome::Completed,
+        });
+        self.append_history(&frame)?;
+        for message in normalize_history(
+            &frame,
+            self.sequence,
+            &self.config.session_dir,
+            &mut self.images,
+        )? {
+            self.emit(ConversationEvent::MessageUpdated(message));
+        }
+        self.settle_user(outcome);
+        if self.peer_turn.is_none() {
+            self.state(ConversationState::Ready);
         }
         Ok(())
     }
@@ -1904,6 +1997,21 @@ fn normalize_history(
                 exit_code: None,
             }])
         }
+        // Output of a command DROSTJE. answered itself, such as `/mcp`.
+        "drostje_command" => Ok(vec![Message {
+            id: frame["id"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("drostje-command-{sequence}")),
+            role: "system".into(),
+            content: vec![ContentBlock::Text(
+                frame["text"].as_str().unwrap_or_default().into(),
+            )],
+            raw: Some(frame.clone()),
+            tool_call_id: None,
+            error: frame["error"] == true,
+            exit_code: None,
+        }]),
         "assistant" => Ok(vec![normalize_assistant(frame, sequence)?]),
         "user" => normalize_tool_results(frame, sequence, directory, images),
         _ => Ok(Vec::new()),
@@ -2639,6 +2747,182 @@ done
         let history = read_transcript(&session_dir.join(TRANSCRIPT))?;
         assert!(history.iter().any(|frame| frame["type"] == "drostje_user"));
         assert!(history.iter().any(|frame| frame["type"] == "assistant"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fake_cli_answers_mcp_through_control_requests_without_a_model_turn() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("drostje-claude-mcp-{}", Uuid::new_v4()));
+        let cwd = root.join("repo");
+        let session_dir = root.join("session");
+        fs::create_dir_all(&cwd)?;
+        let executable = root.join("claude");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+dir=$(dirname "$0")
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$dir/stdin.jsonl"
+  id=$(printf '%s' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  case "$line" in
+    *'"subtype":"initialize"'*)
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"drostje-initialize","response":{"commands":[{"name":"mcp","description":"Manage MCP servers","argumentHint":"[reconnect|enable|disable [<server>|all]]","builtin":true}]}}}'
+      ;;
+    *'"subtype":"mcp_status"'*)
+      if [ -f "$dir/reconnected" ]; then
+        server='{"name":"excalidraw","status":"connected","tools":[{"name":"draw"},{"name":"export"}]}'
+      else
+        server='{"name":"excalidraw","status":"failed","error":"Connection closed"}'
+      fi
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mcpServers":[%s,{"name":"docs","status":"connected","tools":[]}]}}}\n' "$id" "$server"
+      ;;
+    *'"subtype":"mcp_reconnect"'*)
+      : > "$dir/reconnected"
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      ;;
+    *'"type":"user"'*)
+      : > "$dir/user-frame"
+      ;;
+  esac
+done
+"#,
+        )?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+
+        let handle = smol::block_on(open(ConversationConfig {
+            credential_env: Vec::new(),
+            harness: "claude-code".into(),
+            executable,
+            cwd,
+            session_dir: session_dir.clone(),
+            session_ref: None,
+            model: None,
+            effort: None,
+            permission_mode: None,
+            browser_tools: None,
+            allow_empty_session: true,
+        }))?;
+        let receive = || {
+            smol::block_on(smol::future::race(
+                async { handle.events.recv().await.ok() },
+                async {
+                    smol::Timer::after(Duration::from_secs(5)).await;
+                    None
+                },
+            ))
+            .context("Timed out waiting for fake Claude Code event")
+        };
+        while !matches!(receive()?, ConversationEvent::CommandsUpdated(_)) {}
+
+        // Runs one `/mcp` turn until it settles, returning the output text and outcome.
+        let run = |text: &str, interrupt: bool| -> Result<(String, TurnOutcome)> {
+            let request_id = Uuid::new_v4();
+            handle.commands.send_blocking(ConversationCommand::Submit {
+                request_id,
+                text: text.into(),
+                images: Vec::new(),
+            })?;
+            let mut accepted = false;
+            let mut output = None;
+            loop {
+                match receive()? {
+                    ConversationEvent::SubmissionAccepted { request_id: seen } => {
+                        accepted = seen == request_id;
+                        if interrupt {
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !fs::read_to_string(root.join("stdin.jsonl"))?
+                                .contains(r#""subtype":"mcp_toggle""#)
+                            {
+                                ensure!(Instant::now() < deadline, "mcp_toggle was not sent");
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            handle
+                                .commands
+                                .send_blocking(ConversationCommand::Interrupt)?;
+                        }
+                    }
+                    ConversationEvent::MessageUpdated(message) if message.role == "system" => {
+                        if let [ContentBlock::Text(text)] = &message.content[..] {
+                            output = Some(text.clone());
+                        }
+                    }
+                    ConversationEvent::TurnSettled {
+                        request_id: seen,
+                        outcome,
+                    } => {
+                        assert_eq!(seen, request_id);
+                        assert!(accepted, "{text} was accepted before it settled");
+                        return Ok((output.context("no command output")?, outcome));
+                    }
+                    ConversationEvent::Failed { message, .. } => bail!("{message}"),
+                    _ => {}
+                }
+            }
+        };
+
+        let (text, outcome) = run("/mcp reconnect", false)?;
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(
+            text,
+            "Reconnected `excalidraw`.\n\n- `excalidraw`: connected, 2 tools"
+        );
+        let (text, outcome) = run("/mcp", false)?;
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert!(text.contains("- `docs`: connected, 0 tools"), "{text}");
+
+        // Claude Code never answers this toggle; Stop abandons the wait without claiming an outcome.
+        let (text, outcome) = run("/mcp disable excalidraw", true)?;
+        assert_eq!(outcome, TurnOutcome::Unknown);
+        assert!(text.starts_with("Stopped waiting"), "{text}");
+
+        let (text, outcome) = run("/mcp restart", false)?;
+        assert_eq!(outcome, TurnOutcome::Failed);
+        assert!(text.contains("\"restart\" isn't a `/mcp` action"), "{text}");
+        handle.commands.send_blocking(ConversationCommand::Close)?;
+
+        assert!(
+            !root.join("user-frame").exists(),
+            "/mcp never reaches the model as a prompt"
+        );
+        let sent: Vec<Value> = fs::read_to_string(root.join("stdin.jsonl"))?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let reconnects: Vec<_> = sent
+            .iter()
+            .filter(|frame| frame["request"]["subtype"] == "mcp_reconnect")
+            .map(|frame| frame["request"]["serverName"].clone())
+            .collect();
+        assert_eq!(reconnects, [json!("excalidraw")], "only the failed server");
+        let history = read_transcript(&session_dir.join(TRANSCRIPT))?;
+        let replayed: Vec<_> = history
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                normalize_history(frame, index, &session_dir, &mut ImageCache::default())
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .map(|message| (message.role, message.error))
+            .collect();
+        assert_eq!(
+            replayed,
+            [
+                ("user".into(), false),
+                ("system".into(), false),
+                ("user".into(), false),
+                ("system".into(), false),
+                ("user".into(), false),
+                ("system".into(), true),
+                ("user".into(), false),
+                ("system".into(), true),
+            ],
+            "prompts and their output survive a reopen"
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }
