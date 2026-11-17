@@ -27,7 +27,7 @@ if [ "$(uname -s)" = Darwin ]; then
     fi
 fi
 
-VERSION=$(grep '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
 if [ -z "$VERSION" ]; then
     VERSION="0.1.0"
     echo "Warning: Could not determine version from Cargo.toml. Defaulting to 0.1.0"
