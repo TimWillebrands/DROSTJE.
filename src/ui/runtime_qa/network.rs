@@ -140,6 +140,7 @@ async fn send(
         fixture,
         sender,
         Action::Send {
+            priority: crate::network::Priority::Urgent,
             recipient,
             body: body.into(),
         },

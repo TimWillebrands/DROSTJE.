@@ -1803,6 +1803,8 @@ mod tests {
     #[test]
     fn replayed_prompts_regain_peer_identity_and_images_only_on_exact_text() -> Result<()> {
         let peer = PeerMessage {
+            reply_to: None,
+            expect_reply: false,
             id: Uuid::new_v4(),
             sender: Uuid::new_v4(),
             sender_name: "Research peer".into(),
@@ -2218,6 +2220,8 @@ done
                 PeerDelivery {
                     attempt: Uuid::new_v4(),
                     messages: vec![PeerMessage {
+                        reply_to: None,
+                        expect_reply: false,
                         id: Uuid::new_v4(),
                         sender: Uuid::new_v4(),
                         sender_name: "Peer".into(),

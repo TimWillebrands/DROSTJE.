@@ -86,6 +86,8 @@ fn make_delivery(attempt: Uuid) -> (async_channel::Sender<()>, PeerDelivery) {
             attempt,
             cancelled,
             messages: vec![PeerMessage {
+                reply_to: None,
+                expect_reply: false,
                 id: Uuid::new_v4(),
                 sender: Uuid::new_v4(),
                 sender_name: "A \"peer\"".into(),

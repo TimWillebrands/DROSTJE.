@@ -217,11 +217,27 @@ impl AppState {
                     } => {
                         let result = async {
                             network.sync(peers).await?;
-                            network.call(token, action).await
+                            network.begin_call(token, action).await
                         }
-                        .await
-                        .map_err(|error| format!("{error:#}"));
-                        let _ = reply.send(result);
+                        .await;
+                        match result {
+                            Ok(response) => {
+                                smol::spawn(async move {
+                                    let result = response
+                                        .recv()
+                                        .await
+                                        .map_err(|_| "Network stopped while waiting".to_owned())
+                                        .and_then(|result| {
+                                            result.map_err(|error| format!("{error:#}"))
+                                        });
+                                    let _ = reply.send(result);
+                                })
+                                .detach();
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(format!("{error:#}")));
+                            }
+                        }
                     }
                     Request::Claim {
                         peers,
@@ -781,7 +797,15 @@ impl AppState {
             .snapshot
             .messages
             .iter()
-            .flat_map(|message| &message.deliveries)
+            .flat_map(|message| {
+                message.deliveries.iter().filter(|delivery| {
+                    self.network.snapshot.members.iter().any(|member| {
+                        member.thread == delivery.recipient
+                            && member.inbound == crate::network::InboundPolicy::Accept
+                            && message.priority.can_push(&member.status)
+                    })
+                })
+            })
             .filter(|delivery| matches!(delivery.state, DeliveryState::Queued))
             .map(|delivery| delivery.recipient)
             .collect();
@@ -857,7 +881,25 @@ impl AppState {
             );
             return;
         }
-        if !self.network_can_receive(thread) {
+        let accepts = self.network.snapshot.members.iter().any(|member| {
+            member.thread == thread && member.inbound == crate::network::InboundPolicy::Accept
+        });
+        let status = if self
+            .conversations
+            .get(&thread)
+            .is_some_and(|session| session.state == ConversationState::Ready)
+        {
+            "Idle"
+        } else {
+            "Working"
+        };
+        if !self.network_can_receive(thread)
+            || !accepts
+            || batch
+                .messages
+                .iter()
+                .any(|message| !message.priority.can_push(status))
+        {
             self.finish_network_delivery(batch.attempt, DeliveryOutcome::Deferred);
             return;
         }
@@ -883,6 +925,8 @@ impl AppState {
                 sender_name: message.sender_name,
                 space: message.space,
                 body: message.body,
+                reply_to: message.reply_to,
+                expect_reply: message.expect_reply,
                 origin: harness::ContextOrigin::Peer,
             })
             .collect();
@@ -1520,6 +1564,7 @@ mod tests {
                     .call(
                         generation,
                         Action::Send {
+                            priority: crate::network::Priority::Urgent,
                             recipient: thread,
                             body: "Keep this peer message queued while the user decides".into(),
                         },

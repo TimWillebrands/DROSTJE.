@@ -1,3 +1,8 @@
+mod coordination;
+
+pub use coordination::{InboundPolicy, Priority};
+use coordination::{MessageOptions, Waiter};
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -69,6 +74,12 @@ pub struct Member {
     pub automatic: bool,
     #[serde(default)]
     pub delivery_enabled: bool,
+    #[serde(default)]
+    pub activity: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub inbound: InboundPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +93,14 @@ pub struct NetworkMessage {
     pub broadcast: bool,
     pub created_at: String,
     pub deliveries: Vec<Delivery>,
+    #[serde(default = "Priority::legacy")]
+    pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange: Option<Uuid>,
+    #[serde(default)]
+    pub expect_reply: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +119,8 @@ pub enum DeliveryState {
     Queued,
     Delivering,
     Delivered,
+    Read,
+    Refused { reason: String },
     Failed { reason: String },
     Unknown { reason: String },
     Closed { reason: String },
@@ -121,12 +142,63 @@ pub enum DeliveryOutcome {
     Deferred,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     Members,
-    Send { recipient: Uuid, body: String },
-    Broadcast { body: String },
+    Discover {
+        selector: String,
+    },
+    Send {
+        recipient: Uuid,
+        body: String,
+        #[serde(default)]
+        priority: Priority,
+    },
+    Broadcast {
+        body: String,
+        #[serde(default)]
+        priority: Priority,
+    },
+    Multicast {
+        selector: String,
+        body: String,
+        #[serde(default)]
+        priority: Priority,
+    },
+    Reply {
+        message: Uuid,
+        body: String,
+        #[serde(default)]
+        priority: Priority,
+    },
+    Ask {
+        recipient: Uuid,
+        body: String,
+        #[serde(default = "coordination::default_timeout")]
+        timeout_ms: u64,
+    },
+    Wait {
+        event: String,
+        #[serde(default = "coordination::default_timeout")]
+        timeout_ms: u64,
+    },
+    Inbox,
+    History {
+        #[serde(default)]
+        message: Option<Uuid>,
+        #[serde(default)]
+        query: Option<String>,
+    },
+    SetIdentity {
+        #[serde(default)]
+        activity: Option<String>,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
+    },
+    SetInbound {
+        policy: InboundPolicy,
+    },
 }
 
 enum Command {
@@ -184,6 +256,7 @@ impl Network {
             peers: BTreeMap::new(),
             updates,
             pending_updates,
+            waiters: Vec::new(),
         };
         smol::spawn(actor.run(requests, startup_write)).detach();
         Ok((Self { commands }, receiver))
@@ -202,9 +275,21 @@ impl Network {
         self.request(Command::Barrier).await
     }
 
-    pub async fn call(&self, token: Uuid, action: Action) -> Result<Value> {
-        self.request(|reply| Command::Call(token, action, reply))
+    pub async fn begin_call(&self, token: Uuid, action: Action) -> Result<Receiver<Result<Value>>> {
+        let (reply, response) = async_channel::bounded(1);
+        self.commands
+            .send(Command::Call(token, action, reply))
             .await
+            .map_err(|_| anyhow!("Space network is unavailable"))?;
+        Ok(response)
+    }
+
+    pub async fn call(&self, token: Uuid, action: Action) -> Result<Value> {
+        self.begin_call(token, action)
+            .await?
+            .recv()
+            .await
+            .map_err(|_| anyhow!("Space network stopped before replying"))?
     }
 
     pub async fn claim(&self, token: Uuid) -> Result<Option<DeliveryBatch>> {
@@ -235,6 +320,7 @@ struct Actor {
     peers: BTreeMap<Uuid, Peer>,
     updates: Sender<Arc<NetworkSnapshot>>,
     pending_updates: Receiver<Arc<NetworkSnapshot>>,
+    waiters: Vec<Waiter>,
 }
 
 impl Actor {
@@ -250,7 +336,25 @@ impl Actor {
                 self.publish();
             }
         }
-        while let Ok(command) = requests.recv().await {
+        loop {
+            let next = self.waiters.iter().map(|waiter| waiter.deadline).min();
+            let command = match next {
+                Some(deadline) => {
+                    smol::future::or(async { requests.recv().await.ok() }, async {
+                        smol::Timer::at(deadline).await;
+                        None
+                    })
+                    .await
+                }
+                None => requests.recv().await.ok(),
+            };
+            let Some(command) = command else {
+                if requests.is_closed() {
+                    break;
+                }
+                self.resolve_waiters().await;
+                continue;
+            };
             match command {
                 Command::Sync(peers, reply) => {
                     let _ = reply.try_send(self.sync(peers).await);
@@ -262,7 +366,7 @@ impl Actor {
                     let _ = reply.try_send(self.healthy());
                 }
                 Command::Call(token, action, reply) => {
-                    let _ = reply.try_send(self.call(token, action).await);
+                    self.handle_call(token, action, reply).await;
                 }
                 Command::Claim(token, reply) => {
                     let _ = reply.try_send(self.claim(token).await);
@@ -271,6 +375,7 @@ impl Actor {
                     let _ = reply.try_send(self.finish(attempt, outcome).await);
                 }
             }
+            self.resolve_waiters().await;
         }
     }
 
@@ -501,7 +606,11 @@ impl Actor {
         match action {
             Action::Members => bounded_response(json!({"members": self.snapshot.members.iter()
                 .filter(|member| member.space == caller.space).collect::<Vec<_>>()})),
-            Action::Send { recipient, body } => {
+            Action::Send {
+                recipient,
+                body,
+                priority,
+            } => {
                 let sender = caller.clone();
                 let recipient = self
                     .snapshot
@@ -510,9 +619,16 @@ impl Actor {
                     .find(|member| member.thread == recipient && member.space == sender.space)
                     .context("Recipient is not a joined member of this Space")?
                     .clone();
-                self.send(sender, vec![recipient], body, false).await
+                self.send(
+                    sender,
+                    vec![recipient],
+                    body,
+                    false,
+                    MessageOptions::new(priority),
+                )
+                .await
             }
-            Action::Broadcast { body } => {
+            Action::Broadcast { body, priority } => {
                 let sender = caller.clone();
                 let recipients = self
                     .snapshot
@@ -525,7 +641,24 @@ impl Actor {
                     !recipients.is_empty(),
                     "There are no other joined members in this Space"
                 );
-                self.send(sender, recipients, body, true).await
+                self.send(
+                    sender,
+                    recipients,
+                    body,
+                    true,
+                    MessageOptions::new(priority),
+                )
+                .await
+            }
+            action @ (Action::Discover { .. }
+            | Action::Multicast { .. }
+            | Action::Reply { .. }
+            | Action::Inbox
+            | Action::History { .. }
+            | Action::SetIdentity { .. }
+            | Action::SetInbound { .. }) => self.coordinate(token, action).await,
+            Action::Ask { .. } | Action::Wait { .. } => {
+                bail!("Waits must be registered with the coordinator")
             }
         }
     }
@@ -533,7 +666,11 @@ impl Actor {
     async fn claim(&mut self, token: Uuid) -> Result<Option<DeliveryBatch>> {
         let caller = self.caller(token)?;
         let peer = &self.peers[&caller.thread];
-        if !caller.automatic || !peer.delivery_enabled || !peer.can_receive {
+        if !caller.automatic
+            || !peer.delivery_enabled
+            || !peer.can_receive
+            || caller.inbound != InboundPolicy::Accept
+        {
             return Ok(None);
         }
         if self
@@ -553,12 +690,9 @@ impl Actor {
             messages: Vec::new(),
         };
         let mut bytes = encoded_len(&batch)?;
-        for message in self
-            .snapshot
-            .messages
-            .iter()
-            .filter(|message| message.space == caller.space)
-        {
+        for message in self.snapshot.messages.iter().filter(|message| {
+            message.space == caller.space && message.priority.can_push(&peer.status)
+        }) {
             let Some(delivery) = message.deliveries.iter().find(|delivery| {
                 delivery.recipient == caller.thread && delivery.state == DeliveryState::Queued
             }) else {
@@ -645,6 +779,14 @@ impl Actor {
                 delivery.state = state.clone();
                 if state == DeliveryState::Queued {
                     delivery.attempt = None;
+                    if self.snapshot.members.iter().any(|member| {
+                        member.thread == delivery.recipient
+                            && member.inbound == InboundPolicy::Refuse
+                    }) {
+                        delivery.state = DeliveryState::Refused {
+                            reason: "Recipient refused before native dispatch".into(),
+                        };
+                    }
                 }
             }
         }
@@ -657,6 +799,7 @@ impl Actor {
         recipients: Vec<Member>,
         body: String,
         broadcast: bool,
+        options: MessageOptions,
     ) -> Result<Value> {
         let body = body.trim();
         validate_body(body)?;
@@ -704,12 +847,22 @@ impl Actor {
             body: body.into(),
             broadcast,
             created_at: drostje_platform::now(),
+            priority: options.priority,
+            reply_to: options.reply_to,
+            exchange: options.exchange,
+            expect_reply: options.expect_reply,
             deliveries: recipients
                 .into_iter()
                 .map(|recipient| Delivery {
                     recipient: recipient.thread,
                     recipient_name: recipient.title,
-                    state: DeliveryState::Queued,
+                    state: if recipient.inbound == InboundPolicy::Refuse {
+                        DeliveryState::Refused {
+                            reason: "Recipient refuses incoming messages".into(),
+                        }
+                    } else {
+                        DeliveryState::Queued
+                    },
                     attempt: None,
                 })
                 .collect(),
@@ -734,6 +887,9 @@ impl From<&Peer> for Member {
             online: peer.token.is_some(),
             automatic: false,
             delivery_enabled: false,
+            activity: String::new(),
+            tags: Vec::new(),
+            inbound: InboundPolicy::Accept,
         }
     }
 }
@@ -830,6 +986,10 @@ fn recipient_message(message: &NetworkMessage, delivery: &Delivery) -> NetworkMe
         broadcast: message.broadcast,
         created_at: message.created_at.clone(),
         deliveries: vec![delivery.clone()],
+        priority: message.priority,
+        reply_to: message.reply_to,
+        exchange: message.exchange,
+        expect_reply: message.expect_reply,
     }
 }
 
@@ -949,6 +1109,7 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
     );
     let mut members = HashMap::new();
     for member in &snapshot.members {
+        coordination::validate_identity(&member.activity, &member.tags)?;
         validate_context(
             &member.title,
             &member.project,
@@ -977,10 +1138,6 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
             !message.deliveries.is_empty() && message.deliveries.len() <= MAX_MEMBERS,
             "Invalid saved delivery count"
         );
-        ensure!(
-            message.broadcast || message.deliveries.len() == 1,
-            "Invalid direct message delivery count"
-        );
         let mut recipients = HashSet::new();
         for delivery in &message.deliveries {
             ensure!(
@@ -992,7 +1149,10 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
                 "Oversized saved recipient name"
             );
             match &delivery.state {
-                DeliveryState::Queued | DeliveryState::Closed { .. } => {
+                DeliveryState::Queued
+                | DeliveryState::Read
+                | DeliveryState::Refused { .. }
+                | DeliveryState::Closed { .. } => {
                     ensure!(
                         delivery.attempt.is_none(),
                         "Unclaimed saved delivery has an attempt"
@@ -1009,7 +1169,8 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
                 DeliveryState::Unknown { .. } => {}
             }
             match &delivery.state {
-                DeliveryState::Failed { reason }
+                DeliveryState::Refused { reason }
+                | DeliveryState::Failed { reason }
                 | DeliveryState::Unknown { reason }
                 | DeliveryState::Closed { reason } => {
                     ensure!(
@@ -1059,6 +1220,7 @@ fn validate_snapshot(snapshot: &NetworkSnapshot) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    include!("coordination_tests.rs");
     use super::*;
     use drostje_store::StoreError;
     use std::{
@@ -1138,6 +1300,7 @@ mod tests {
                 .call(
                     token(sender),
                     Action::Send {
+                        priority: Priority::Urgent,
                         recipient: recipient.thread,
                         body: body.into(),
                     },
@@ -1257,6 +1420,7 @@ mod tests {
                     .call(
                         token(&a),
                         Action::Send {
+                            priority: Priority::Urgent,
                             recipient: c.thread,
                             body: "cross-Space".into(),
                         }
@@ -1280,7 +1444,7 @@ mod tests {
                     .contains(&token(&b).to_string())
             );
             for action in [
-                json!({"action": "inbox"}),
+                json!({"action": "receive"}),
                 json!({"action": "wait"}),
                 json!({"action": "send", "recipient": b.thread, "body": "spoof", "sender": c.thread}),
                 json!({"action": "send", "recipient": b.thread}),
@@ -1741,6 +1905,7 @@ mod tests {
                     .call(
                         token(&a),
                         Action::Broadcast {
+                            priority: Priority::Urgent,
                             body: "nobody".into()
                         }
                     )
@@ -1755,6 +1920,7 @@ mod tests {
                 .call(
                     token(&a),
                     Action::Broadcast {
+                        priority: Priority::Urgent,
                         body: "frozen".into(),
                     },
                 )
@@ -1941,7 +2107,7 @@ mod tests {
             store.flush().await.unwrap();
             let members = |alice: &str, bob: &str| {
                 format!(
-                    r#"{{"members":[{{"thread":"{}","space":"{}","title":"Alice","project":"project","worktree":"worktree","harness":"omp",{alice}}},{{"thread":"{}","space":"{}","title":"Bob","project":"project","worktree":"worktree","harness":"omp",{bob}}}],"#,
+                    r#"{{"members":[{{"thread":"{}","space":"{}","title":"Alice","project":"project","worktree":"worktree","harness":"omp",{alice},"activity":"","tags":[],"inbound":"accept"}},{{"thread":"{}","space":"{}","title":"Bob","project":"project","worktree":"worktree","harness":"omp",{bob},"activity":"","tags":[],"inbound":"accept"}}],"#,
                     id(1),
                     id(10),
                     id(2),
@@ -1949,7 +2115,7 @@ mod tests {
                 )
             };
             let messages = format!(
-                r#""messages":[{{"id":"{}","space":"{}","sender":"{}","sender_name":"Alice","body":"hello \"Bob\" 日本語","broadcast":false,"created_at":"2026-09-15T12:00:00Z","deliveries":[{{"recipient":"{}","recipient_name":"Bob","state":{{"status":"unknown","reason":"Application restarted before delivery receipt"}},"attempt":"{}"}}]}}]}}"#,
+                r#""messages":[{{"id":"{}","space":"{}","sender":"{}","sender_name":"Alice","body":"hello \"Bob\" 日本語","broadcast":false,"created_at":"2026-09-15T12:00:00Z","deliveries":[{{"recipient":"{}","recipient_name":"Bob","state":{{"status":"unknown","reason":"Application restarted before delivery receipt"}},"attempt":"{}"}}],"priority":"urgent","expect_reply":false}}]}}"#,
                 id(20),
                 id(10),
                 id(1),
@@ -2099,6 +2265,7 @@ mod tests {
                         .call(
                             token,
                             Action::Send {
+                                priority: Priority::Urgent,
                                 recipient,
                                 body: format!("message {index}"),
                             },
@@ -2178,6 +2345,7 @@ mod tests {
                     .call(
                         token(&a),
                         Action::Send {
+                            priority: Priority::Urgent,
                             recipient: b.thread,
                             body: "overflow".into()
                         }
@@ -2191,6 +2359,7 @@ mod tests {
                     .call(
                         token(&a),
                         Action::Broadcast {
+                            priority: Priority::Urgent,
                             body: "atomic overflow".into()
                         }
                     )
@@ -2209,6 +2378,7 @@ mod tests {
                 .call(
                     token(&a),
                     Action::Broadcast {
+                        priority: Priority::Urgent,
                         body: "room now".into(),
                     },
                 )
@@ -2246,6 +2416,7 @@ mod tests {
                     .call(
                         token(&a),
                         Action::Broadcast {
+                            priority: Priority::Urgent,
                             body: "eight deliveries".into(),
                         },
                     )
@@ -2273,6 +2444,7 @@ mod tests {
                     .call(
                         token(&a),
                         Action::Send {
+                            priority: Priority::Urgent,
                             recipient: extra.thread,
                             body: "overflow".into()
                         }
@@ -2320,6 +2492,7 @@ mod tests {
                     .call(
                         token(&a),
                         Action::Send {
+                            priority: Priority::Urgent,
                             recipient: recipients[1].thread,
                             body: "full history".into(),
                         }
@@ -2357,6 +2530,7 @@ mod tests {
                         .call(
                             token(&a),
                             Action::Send {
+                                priority: Priority::Urgent,
                                 recipient: b.thread,
                                 body
                             }
@@ -2534,7 +2708,10 @@ mod tests {
     #[test]
     fn store_failures_never_publish_uncommitted_send_claim_receipt_or_revocation() {
         smol::block_on(async {
-            for operation in ["send", "claim", "finish", "move", "leave", "disable"] {
+            for operation in [
+                "send", "claim", "finish", "move", "leave", "disable", "identity", "inbound",
+                "inbox",
+            ] {
                 let fixture = Fixture::new();
                 let a = peer(Uuid::new_v4(), "Alice");
                 let mut b = peer(a.space, "Bob");
@@ -2559,11 +2736,38 @@ mod tests {
                         .unwrap();
                 blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
                 let result = match operation {
+                    "identity" => fixture
+                        .network
+                        .call(
+                            token(&b),
+                            Action::SetIdentity {
+                                activity: Some("Uncommitted".into()),
+                                tags: None,
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    "inbound" => fixture
+                        .network
+                        .call(
+                            token(&b),
+                            Action::SetInbound {
+                                policy: InboundPolicy::Refuse,
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    "inbox" => fixture
+                        .network
+                        .call(token(&b), Action::Inbox)
+                        .await
+                        .map(|_| ()),
                     "send" => fixture
                         .network
                         .call(
                             token(&a),
                             Action::Send {
+                                priority: Priority::Urgent,
                                 recipient: b.thread,
                                 body: "must not appear".into(),
                             },

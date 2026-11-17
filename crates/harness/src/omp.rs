@@ -2488,7 +2488,7 @@ done
         let (child, _) = prepare(&mut config, Dialect::Omp)?;
         let (_commands, input) = async_channel::bounded(64);
         let (output, _events) = async_channel::bounded(128);
-        let mut actor = Actor::new(config, child, input, output, Dialect::Omp);
+        let mut actor = Actor::new(config, child, Commands::new(input)?, output, Dialect::Omp);
         actor.initialized = true;
         actor.negotiated = true;
         actor.state(ConversationState::Ready);
@@ -3139,6 +3139,8 @@ done
             PeerDelivery {
                 attempt: Uuid::new_v4(),
                 messages: vec![PeerMessage {
+                    reply_to: None,
+                    expect_reply: false,
                     id: Uuid::new_v4(),
                     sender: Uuid::new_v4(),
                     sender_name: "Research peer".into(),

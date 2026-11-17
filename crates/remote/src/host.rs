@@ -1111,15 +1111,7 @@ impl Host {
                 self.network.len() < 64,
                 "Remote network request queue is full"
             );
-            let action = match action {
-                drostje_network::Action::Members => json!({"action":"members"}),
-                drostje_network::Action::Send { recipient, body } => {
-                    json!({"action":"send","recipient":recipient,"body":body})
-                }
-                drostje_network::Action::Broadcast { body } => {
-                    json!({"action":"broadcast","body":body})
-                }
-            };
+            let action = serde_json::to_value(action)?;
             Ok((runtime.generation, action))
         })();
         match result {

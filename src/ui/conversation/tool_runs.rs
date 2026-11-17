@@ -365,6 +365,8 @@ mod tests {
     #[test]
     fn peer_context_is_visible_and_never_folded_into_tool_calls() {
         let peer = ContentBlock::PeerMessage(crate::harness::PeerMessage {
+            reply_to: None,
+            expect_reply: false,
             id: uuid::Uuid::new_v4(),
             sender: uuid::Uuid::new_v4(),
             sender_name: "Reviewer".into(),

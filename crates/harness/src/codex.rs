@@ -2649,6 +2649,8 @@ mod tests {
     #[test]
     fn local_records_restore_user_images_and_peer_identity() -> Result<()> {
         let peer = PeerMessage {
+            reply_to: None,
+            expect_reply: false,
             id: Uuid::new_v4(),
             sender: Uuid::new_v4(),
             sender_name: "Research".into(),
@@ -2908,6 +2910,8 @@ done
         let (lifetime, cancelled) = async_channel::bounded(1);
         let attempt = Uuid::new_v4();
         let message = PeerMessage {
+            reply_to: None,
+            expect_reply: false,
             id: Uuid::new_v4(),
             sender: Uuid::new_v4(),
             sender_name: "Research".into(),

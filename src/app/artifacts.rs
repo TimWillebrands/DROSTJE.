@@ -364,6 +364,8 @@ impl AppState {
         let messages = events
             .iter()
             .map(|queued| harness::PeerMessage {
+                reply_to: None,
+                expect_reply: false,
                 id: Uuid::new_v4(),
                 sender: queued.browser,
                 sender_name: queued.title.clone(),

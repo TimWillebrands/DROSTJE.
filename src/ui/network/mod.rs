@@ -7,7 +7,7 @@ use super::{
 use crate::{
     app::{AppState, PresentationChange},
     model::ThreadId,
-    network::{DeliveryState, Member, NetworkMessage},
+    network::{DeliveryState, InboundPolicy, Member, NetworkMessage, Priority},
 };
 use agents::Activity;
 use gpui_kit::{
@@ -168,6 +168,10 @@ fn network_readiness(member: &Member, state: &AppState) -> &'static str {
         "Network: consent needed"
     } else if !member.delivery_enabled {
         "Network: paused"
+    } else if member.inbound == InboundPolicy::Hold {
+        "Network: holding"
+    } else if member.inbound == InboundPolicy::Refuse {
+        "Network: refusing"
     } else if state.network_delivery_reason(member.thread).is_some() {
         "Network: blocked"
     } else {
@@ -180,6 +184,8 @@ fn delivery_label(state: &DeliveryState) -> &'static str {
         DeliveryState::Queued => "Queued",
         DeliveryState::Delivering => "Delivering",
         DeliveryState::Delivered => "Delivered",
+        DeliveryState::Read => "Retrieved",
+        DeliveryState::Refused { .. } => "Refused",
         DeliveryState::Failed { .. } => "Failed",
         DeliveryState::Unknown { .. } => "Unknown",
         DeliveryState::Closed { .. } => "Closed",
@@ -187,7 +193,7 @@ fn delivery_label(state: &DeliveryState) -> &'static str {
 }
 
 fn delivery_summary(message: &NetworkMessage) -> String {
-    let mut counts = [0; 6];
+    let mut counts = [0; 8];
     for delivery in &message.deliveries {
         let index = match &delivery.state {
             DeliveryState::Queued => 0,
@@ -196,6 +202,8 @@ fn delivery_summary(message: &NetworkMessage) -> String {
             DeliveryState::Failed { .. } => 3,
             DeliveryState::Unknown { .. } => 4,
             DeliveryState::Closed { .. } => 5,
+            DeliveryState::Read => 6,
+            DeliveryState::Refused { .. } => 7,
         };
         counts[index] += 1;
     }
@@ -206,6 +214,8 @@ fn delivery_summary(message: &NetworkMessage) -> String {
         "Failed",
         "Unknown",
         "Closed",
+        "Retrieved",
+        "Refused",
     ]
     .into_iter()
     .zip(counts)
@@ -595,6 +605,26 @@ impl Render for NetworkPanel {
     }
 }
 
+fn queued_reason(priority: Priority, recipient: ThreadId, state: &AppState) -> String {
+    if let Some(reason) = state.network_delivery_reason(recipient) {
+        return reason;
+    }
+    if state
+        .network
+        .snapshot
+        .members
+        .iter()
+        .any(|member| member.thread == recipient && member.inbound == InboundPolicy::Hold)
+    {
+        return "Recipient holds incoming messages; inbox can retrieve them".into();
+    }
+    match priority {
+        Priority::Fyi => "Waiting in the inbox; this message will not wake the recipient".into(),
+        Priority::Normal => "Waiting for the recipient to be idle".into(),
+        Priority::Urgent => "Waiting for the next eligible native safe boundary".into(),
+    }
+}
+
 fn detail_view(
     row: Row,
     focus: &FocusHandle,
@@ -631,6 +661,19 @@ fn detail_view(
                     crate::harness::display_name(&member.harness),
                     member.status
                 )))
+                .child(
+                    Label::new("Activity").secondary(if member.activity.is_empty() {
+                        "Not stated".into()
+                    } else {
+                        member.activity.clone()
+                    }),
+                )
+                .child(Label::new("Tags").secondary(if member.tags.is_empty() {
+                    "None".into()
+                } else {
+                    member.tags.join(", ")
+                }))
+                .child(Label::new("Incoming messages").secondary(member.inbound.label()))
                 .child(Label::new(readiness).secondary(reason))
                 .child(Label::new(
                     "Return opens this Thread; absence of a message is not a file reservation",
@@ -640,20 +683,31 @@ fn detail_view(
         Row::Message(message) => v_flex()
             .gap_2()
             .child(Label::new(message.sender_name).secondary(message.created_at))
+            .child(Label::new("Priority").secondary(message.priority.label()))
+            .when_some(message.reply_to, |view, id| {
+                view.child(Label::new("Reply to").secondary(id.to_string()))
+            })
+            .when(message.expect_reply, |view| {
+                view.child(Label::new(
+                    "Reply requested; a reply does not prove task completion",
+                ))
+            })
             .child("Return focuses this message; j/k scroll, Escape returns to the list")
             .child(div().whitespace_normal().child(message.body))
             .children(message.deliveries.into_iter().map(|delivery| {
                 let detail = match &delivery.state {
-                    DeliveryState::Queued => state
-                        .network_delivery_reason(delivery.recipient)
-                        .unwrap_or_else(|| {
-                            "Waiting for the next native safe boundary or idle turn".into()
-                        }),
+                    DeliveryState::Queued => {
+                        queued_reason(message.priority, delivery.recipient, state)
+                    }
                     DeliveryState::Delivering => "Awaiting native runtime acceptance".to_owned(),
                     DeliveryState::Delivered => {
                         "Accepted by the native runtime; not proof of model action".to_owned()
                     }
-                    DeliveryState::Failed { reason }
+                    DeliveryState::Read => {
+                        "Returned through a network tool; not proof of understanding".into()
+                    }
+                    DeliveryState::Refused { reason }
+                    | DeliveryState::Failed { reason }
                     | DeliveryState::Unknown { reason }
                     | DeliveryState::Closed { reason } => reason.clone(),
                 };
@@ -706,3 +760,6 @@ fn detail_view(
         .child(content)
         .into_any_element()
 }
+
+#[cfg(all(test, feature = "runtime-qa"))]
+mod tests;

@@ -1,5 +1,5 @@
 export const ASK_TOOL = "ask";
-export const ASK_GUIDANCE = "The ask tool is not available in DROSTJE. To ask the user, write an HTML page with a <form data-drostje=\"answer\"> (or data-drostje-send buttons) and call show_artifact; the user's answers arrive as artifact events. For a simple question, ask in plain text instead.";
+export const ASK_GUIDANCE = "ask is unavailable. For choices or forms: write HTML with <form data-drostje=\"answer\"> or data-drostje-send buttons; call show_artifact with placement=\"composer\"; end your turn. Answers arrive as artifact events. For a single yes/no or short free-form question, use plain chat.";
 
 export function registerArtifactQuestions(api) {
   if (typeof api.on !== "function") return;
