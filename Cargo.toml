@@ -24,6 +24,7 @@ smol = "2"
 thiserror = "2"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 url = "2"
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 uuid = { version = "1", features = ["v4", "serde", "v5"] }
 servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "multiprocess", "webcrypto", "webgpu"] }
 content-security-policy = { version = "=0.9.0", default-features = false }
@@ -49,6 +50,7 @@ drostje-browser = { path = "crates/browser" }
 drostje-browser-tools = { path = "crates/browser-tools" }
 drostje-harness = { path = "crates/harness" }
 drostje-remote = { path = "crates/remote" }
+drostje-ntfy = { path = "crates/ntfy" }
 
 [package]
 name = "drostje"
