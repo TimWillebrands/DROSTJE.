@@ -7,8 +7,6 @@ use crate::ui::{
 };
 use crate::{
     app::AppState,
-    factory::{Liveness, ReportedState},
-    harness::{ConversationState, TurnOutcome},
     model::{Project, ProjectId, PullRequestLink, SpaceId, Thread, ThreadId, ThreadKind},
 };
 use gpui_kit::{
@@ -241,70 +239,6 @@ pub fn relative_age(timestamp: &str, now: i64) -> Option<String> {
         s if s < 365 * DAY => format!("{}mo", s / (30 * DAY)),
         s => format!("{}y", s / (365 * DAY)),
     })
-}
-
-fn exceptional_state(state: &AppState, thread: &Thread) -> Option<(&'static str, bool)> {
-    match thread.kind {
-        ThreadKind::Conversation => {
-            if let Some(session) = state.conversations.get(&thread.id) {
-                if !session.requests.is_empty()
-                    || session.state == ConversationState::WaitingForInput
-                {
-                    return Some(("Waiting", false));
-                }
-                match session.state {
-                    ConversationState::Starting => return Some(("Starting", false)),
-                    ConversationState::Running => return Some(("Running", false)),
-                    ConversationState::Interrupting => return Some(("Stopping", false)),
-                    ConversationState::Failed => return Some(("Failed", true)),
-                    ConversationState::Disconnected => return Some(("Disconnected", true)),
-                    _ => {}
-                }
-                if session.error.is_some() || session.outcome == Some(TurnOutcome::Failed) {
-                    return Some(("Failed", true));
-                }
-                if session.outcome == Some(TurnOutcome::Unknown) {
-                    return Some(("Unresolved", true));
-                }
-            }
-            thread.submission.as_ref().map(|_| ("Unresolved", true))
-        }
-        ThreadKind::Factory => {
-            if state.pending_factory.contains(&thread.id) {
-                return Some(("Starting", false));
-            }
-            let launch = state
-                .snapshot
-                .launches
-                .iter()
-                .find(|launch| launch.factory_thread_id == thread.id)?;
-            if let Some(run) = state.factory_runs.get(&launch.id) {
-                match run.reported_state {
-                    ReportedState::Completed => return None,
-                    ReportedState::Failed => return Some(("Failed", true)),
-                    ReportedState::Paused => return Some(("Paused", false)),
-                    _ => {}
-                }
-                if run.launch.launch_error.is_some() {
-                    return Some(("Failed", true));
-                }
-                return Some(match run.liveness {
-                    Liveness::OwnedRunning if run.reported_state == ReportedState::Pending => {
-                        ("Waiting", false)
-                    }
-                    Liveness::OwnedRunning => ("Running", false),
-                    Liveness::Exited(_) | Liveness::Unverified => ("Unresolved", true),
-                });
-            }
-            Some(if launch.launch_error.is_some() {
-                ("Failed", true)
-            } else if state.owned_launches.contains(&launch.id) {
-                ("Running", false)
-            } else {
-                ("Unresolved", true)
-            })
-        }
-    }
 }
 
 fn thread_item(
@@ -692,7 +626,9 @@ impl ThreadFacts {
         Self {
             index,
             tooltip: tooltip.into(),
-            status: exceptional_state(state, thread),
+            status: state
+                .thread_condition(thread)
+                .map(|condition| (condition.label(), condition.is_problem())),
             branch: branch.map(Into::into),
             reference: tracker_reference(thread.pull_request.as_ref(), work_item).map(Into::into),
             untouched: state.is_untouched(thread),

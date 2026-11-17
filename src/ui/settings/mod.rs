@@ -5,6 +5,7 @@ mod fields;
 mod hosts;
 mod layer;
 mod page;
+mod phones;
 mod presentation;
 mod title_models;
 mod worktrees;
@@ -34,6 +35,7 @@ use uuid::Uuid;
 pub(in crate::ui) use commit::render_commit_panel;
 pub(in crate::ui) use fields::Choice;
 pub(in crate::ui) use layer::{close_surface, open_surface};
+pub(in crate::ui) use phones::selected_phone;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum DialogKind {
@@ -45,6 +47,7 @@ pub enum DialogKind {
     SwitchBranch(Uuid),
     Commit(Uuid),
     Settings(Option<Uuid>),
+    PairPhone,
 }
 pub enum SurfaceOutcome {
     Applied,
@@ -334,6 +337,9 @@ impl SurfaceContent {
             }
 
             DialogKind::Settings(project_id) => self.apply_settings(project_id, state, cx)?,
+            DialogKind::PairPhone => {
+                anyhow::bail!("Pair phone is confirmed from its own buttons")
+            }
         }
         Ok(SurfaceOutcome::Applied)
     }
@@ -347,6 +353,7 @@ impl SurfaceContent {
             DialogKind::SwitchBranch(_) => "Switch branch",
             DialogKind::Commit(_) => "Commit changes",
             DialogKind::Settings(_) => "Settings",
+            DialogKind::PairPhone => "Pair phone",
         }
     }
 
@@ -374,6 +381,9 @@ impl SurfaceContent {
             }
             DialogKind::NewSpace => {
                 body = body.child(Form::new().child(self.form_field("name", readonly, cx)));
+            }
+            DialogKind::PairPhone => {
+                body = self.pair_phone_body(body, cx);
             }
             DialogKind::DeleteSpace(id) => {
                 let name = state

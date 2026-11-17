@@ -483,6 +483,14 @@ impl Workspace {
                 self.confirm_remove_remote_host(window, cx);
                 None
             }
+            Command::PairPhone => {
+                self.open_pair_phone(window, cx);
+                None
+            }
+            Command::RemovePhone => {
+                self.confirm_remove_phone(window, cx);
+                None
+            }
             Command::RemoveWorktree => self
                 .state
                 .read(cx)

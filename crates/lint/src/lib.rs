@@ -22,7 +22,7 @@ impl Language {
         Some(match extension {
             "rs" => Self::Rust,
             "js" | "mjs" | "ts" => Self::Script,
-            "c" | "h" | "m" => Self::C,
+            "c" | "h" | "m" | "java" | "kts" => Self::C,
             "css" => Self::Css,
             "lua" => Self::Lua,
             "toml" => Self::Toml,

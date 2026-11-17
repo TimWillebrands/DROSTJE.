@@ -1,0 +1,21 @@
+services:
+  host:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.host
+    environment:
+      DROSTJE_HOST_TOKEN: ${DROSTJE_HOST_TOKEN:?Set the Host machine token before starting}
+    volumes:
+      - type: bind
+        source: ./host.json
+        target: /config/host.json
+        read_only: true
+      - type: bind
+        source: ${DROSTJE_HOST_CHECKOUT:?Set the absolute checkout path on the Host}
+        target: /projects/app
+      - type: volume
+        source: host-data
+        target: /data
+
+volumes:
+  host-data:

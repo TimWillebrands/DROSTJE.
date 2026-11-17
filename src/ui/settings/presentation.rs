@@ -6,6 +6,8 @@ pub(super) struct SurfacePresentation {
     pub(super) readonly: bool,
     project: Option<(String, bool)>,
     diagnostics: BTreeMap<String, String>,
+    pub(super) pairing: Option<super::phones::PairingView>,
+    phones: Vec<super::phones::PhoneRow>,
 }
 
 impl SurfacePresentation {
@@ -30,6 +32,16 @@ impl SurfacePresentation {
             } else {
                 BTreeMap::new()
             },
+            phones: if matches!(kind, DialogKind::Settings(_)) {
+                super::phones::PhoneRow::read(state)
+            } else {
+                Vec::new()
+            },
+            pairing: if matches!(kind, DialogKind::PairPhone) {
+                super::phones::PairingView::read(state)
+            } else {
+                None
+            },
         }
     }
 
@@ -41,5 +53,9 @@ impl SurfacePresentation {
                 .map(|(name, archived)| (name.as_str(), *archived))
                 == Self::project(kind, state)
             && (!matches!(kind, DialogKind::Settings(_)) || self.diagnostics == state.diagnostics)
+            && (!matches!(kind, DialogKind::Settings(_))
+                || self.phones == super::phones::PhoneRow::read(state))
+            && (!matches!(kind, DialogKind::PairPhone)
+                || self.pairing == super::phones::PairingView::read(state))
     }
 }

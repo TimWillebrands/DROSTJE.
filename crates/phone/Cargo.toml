@@ -1,0 +1,31 @@
+[package]
+name = "drostje-phone"
+description = "Phone link protocol: QR pairing, end-to-end sealed messages and the shared Space and Thread view with its patches."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+drostje-ntfy.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+qrcodegen.workspace = true
+rqrr = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+x25519-dalek.workspace = true
+
+[features]
+scan = ["dep:rqrr"]
+
+[dev-dependencies]
+drostje-phone = { path = ".", features = ["scan"] }
+drostje-ntfy = { workspace = true, features = ["test-server"] }

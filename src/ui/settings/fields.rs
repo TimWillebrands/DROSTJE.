@@ -168,6 +168,12 @@ impl SurfaceContent {
             .map(|field| &field.state)
     }
 
+    pub fn clear_error(&mut self, cx: &mut Context<Self>) {
+        self.error = None;
+        self.error_field = None;
+        cx.notify();
+    }
+
     pub fn set_error(&mut self, error: &anyhow::Error, cx: &mut Context<Self>) {
         self.error_field = error.downcast_ref::<FieldError>().map(|error| error.key);
         self.error = Some(format!("{error:#}"));

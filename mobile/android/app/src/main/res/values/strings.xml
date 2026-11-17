@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">DROSTJE.</string>
+    <string name="scan_title">Scan pairing code</string>
+    <string name="scan_close">Close</string>
+    <string name="scan_hint">On your computer, choose Pair phone… in DROSTJE. Then point the camera at the code.</string>
+    <string name="scan_wrong_code">That is not a DROSTJE. pairing code</string>
+    <string name="scan_permission">DROSTJE. uses the camera only to scan the pairing code on your computer.</string>
+    <string name="scan_allow">Allow camera</string>
+    <string name="scan_settings">Open settings</string>
+    <string name="scan_no_camera">This phone has no camera DROSTJE. can use. Open the pairing link on this phone instead.</string>
+</resources>

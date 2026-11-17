@@ -1,0 +1,23 @@
+[package]
+name = "drostje-ntfy"
+description = "Plain ntfy client: publish text or attachments, subscribe with replay and download attachments from the same server."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tungstenite.workspace = true
+ureq.workspace = true
+url.workspace = true
+parking_lot = { workspace = true, optional = true }
+
+[features]
+test-server = ["dep:parking_lot"]
+
+[dev-dependencies]
+drostje-ntfy = { path = ".", features = ["test-server"] }

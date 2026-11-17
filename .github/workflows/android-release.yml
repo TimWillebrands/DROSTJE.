@@ -1,0 +1,108 @@
+name: Release Android
+
+on:
+  push:
+    tags:
+      - 'android-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      ANDROID_NDK_VERSION: 27.1.12297006
+      ANDROID_BUILD_TOOLS_VERSION: 36.0.0
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Test release versioning
+        run: python3 -B -m unittest discover -s mobile -p 'test_release_version.py'
+
+      - name: Read tag version
+        id: version
+        run: python3 mobile/release_version.py "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Require release signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+
+      - name: Set up Java 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android build tools
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platforms;android-36' "build-tools;$ANDROID_BUILD_TOOLS_VERSION" "ndk;$ANDROID_NDK_VERSION"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install Rust Android target and cargo-ndk
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target aarch64-linux-android
+          rustup default 1.98.1
+          cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Build release APK
+        env:
+          ANDROID_VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          ANDROID_VERSION_CODE: ${{ steps.version.outputs.version_code }}
+        run: bash mobile/build.sh release release
+
+      - name: Sign and verify APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          keystore=$(mktemp "$RUNNER_TEMP/android-signing.XXXXXX")
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          tools="$ANDROID_HOME/build-tools/$ANDROID_BUILD_TOOLS_VERSION"
+          mkdir -p dist
+          apk="dist/drostje-$GITHUB_REF_NAME-arm64-v8a.apk"
+          "$tools/zipalign" -P 16 -f 4 mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk "$apk"
+          "$tools/apksigner" sign --ks "$keystore" --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEY_PASSWORD "$apk"
+          "$tools/apksigner" verify --verbose --print-certs "$apk"
+          "$tools/zipalign" -c -P 16 4 "$apk"
+          cd dist
+          sha256sum ./*.apk > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          flags=()
+          if [[ "$PRERELEASE" == true ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/*.apk dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            --title "Android $VERSION_NAME" "${flags[@]}"
