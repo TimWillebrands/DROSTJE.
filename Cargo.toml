@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*"]
+exclude = ["mobile"]
 default-members = [".", "crates/*"]
 resolver = "3"
 

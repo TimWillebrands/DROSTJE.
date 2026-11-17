@@ -1,0 +1,45 @@
+plugins {
+    id("com.android.application")
+}
+
+android {
+    namespace = "app.drostje.phone"
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "app.drostje.phone"
+        minSdk = 30
+        targetSdk = 36
+        versionCode = 1
+        versionName = "0.1.0"
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+        manifestPlaceholders["nativeLibraryName"] = "drostje_mobile"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+}
+
+dependencies {
+    implementation("androidx.activity:activity:1.10.1")
+    implementation("androidx.camera:camera-camera2:1.4.2")
+    implementation("androidx.camera:camera-lifecycle:1.4.2")
+    implementation("androidx.camera:camera-view:1.4.2")
+}

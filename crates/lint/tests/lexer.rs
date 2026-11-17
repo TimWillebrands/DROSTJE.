@@ -107,5 +107,13 @@ fn language_follows_file_name() {
     assert_eq!(Language::of("crates/a/src/lib.rs"), Some(Language::Rust));
     assert_eq!(Language::of("Dockerfile.host"), Some(Language::Shell));
     assert_eq!(Language::of("assets/x.mjs"), Some(Language::Script));
+    assert_eq!(
+        Language::of("mobile/android/app/src/main/java/app/drostje/phone/ScanActivity.java"),
+        Some(Language::C)
+    );
+    assert_eq!(
+        Language::of("mobile/android/build.gradle.kts"),
+        Some(Language::C)
+    );
     assert_eq!(Language::of("README.md"), None);
 }

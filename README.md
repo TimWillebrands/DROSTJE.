@@ -8,7 +8,7 @@ DROSTJE. is een desktop-app (macOS en Linux) waarin je coding agents aan het wer
 
 > Een **drost** was vroeger de rentmeester van de heer: degene die de boel draaiende hield als de baas er even niet was. Jij zegt wat er moet gebeuren; DROSTJE. zorgt dat het gebeurt en laat zien hoe het loopt.
 
-**Inhoud:** [In het kort](#in-het-kort) · [Installeren](#installeren) · [Eerste stappen](#eerste-stappen) · [Begrippen](#begrippen) · [De werkruimte](#de-werkruimte) · [Sneltoetsen](#sneltoetsen) · [Onderdelen](#onderdelen) · [Conversations op een Host](#conversations-op-een-host) · [Uiterlijk](#uiterlijk) · [Problemen oplossen](#problemen-oplossen) · [Ontwikkelen](#ontwikkelen)
+**Inhoud:** [In het kort](#in-het-kort) · [Installeren](#installeren) · [Eerste stappen](#eerste-stappen) · [Begrippen](#begrippen) · [De werkruimte](#de-werkruimte) · [Sneltoetsen](#sneltoetsen) · [Onderdelen](#onderdelen) · [Conversations op een Host](#conversations-op-een-host) · [Meekijken op je telefoon](#meekijken-op-je-telefoon) · [Uiterlijk](#uiterlijk) · [Problemen oplossen](#problemen-oplossen) · [Ontwikkelen](#ontwikkelen)
 
 ## In het kort
 
@@ -96,6 +96,7 @@ Kwijt? `Cmd-Shift-P` opent de command palette met elke opdracht en zijn sneltoet
 | **Turn** | Eén ronde: jouw prompt en het werk van de agent tot die klaar is. |
 | **Worktree** | Een aparte Git-werkboom met een eigen branch, zodat agents elkaar niet in de weg zitten. |
 | **Host** | Een andere machine waarop een Conversation draait. |
+| **Phone** | Een gekoppelde Android-telefoon die je Spaces, Threads en de geopende Conversation volgt. |
 
 ## De werkruimte
 
@@ -309,6 +310,19 @@ Een Host is een vooraf ingerichte machine waarop Conversations draaien. DROSTJE.
 Valt de verbinding weg, dan maakt een lopende turn zijn werk af en bewaart de Host de events. Na een herstart van het Host-proces kies je zelf **Reconnect conversation**; een onbekende turn wordt nooit opnieuw gestart. Bewaar `/data`.
 
 > **Vertrouwensgrens:** TLS beschermt beide verbindingen, maar SEINTJE kan de inhoud lezen; dit is geen end-to-endversleuteling. Gebruik vertrouwde machines en aparte tokens per Host.
+
+## Meekijken op je telefoon
+
+Met de Android-app **DROSTJE.** volg je Spaces, Threads en de Conversation die je opent vanaf je telefoon, ook onderweg. De telefoon kijkt mee: prompts sturen en vragen beantwoorden doe je op de computer.
+
+1. **Server.** Vul in **Settings → Phones** een ntfy-server in, bijvoorbeeld je SEINTJE (`https://seintje.example.org`) of `https://ntfy.sh`. Staat er al een Host, dan stelt DROSTJE. de SEINTJE-server voor. Vraagt de server een token, zet dat in een omgevingsvariabele en vul de naam in; het token gaat mee in de koppelcode.
+2. **Koppelen.** Kies **Pair phone…** in DROSTJE. Tik in de app op **Scan code** en richt de camera op de QR-code. Beide schermen tonen een getal van zes cijfers; klopt het, kies dan **Allow phone**. De code werkt vijf minuten en koppelt één telefoon. Scant de camera-app van je telefoon de code, dan opent die ook de app.
+3. **Gebruiken.** De app toont je Spaces en per Project de Threads met hun status: bezig, wacht op jou, mislukt. Open een Conversation om de nieuwste berichten live te volgen; oudere berichten blijven op de computer. Staat DROSTJE. uit, dan zie je de laatst bekende stand.
+4. **Ontkoppelen.** Op de telefoon via ⚙ → **Unpair this phone**, op de computer via **Settings → Phones → Remove phone…**.
+
+> **Vertrouwensgrens:** berichten zijn end-to-end versleuteld tussen telefoon en computer; de server ziet alleen willekeurige topicnamen en versleutelde gegevens. De sleutel voor een telefoon staat in de instellingen van DROSTJE. en in de app-opslag van de telefoon.
+
+**App bouwen.** Nodig: Android SDK en NDK, `rustup target add aarch64-linux-android` en `cargo install cargo-ndk`. Daarna `mobile/build.sh`; de APK staat in `mobile/android/app/build/outputs/apk/debug/`. Installeren met `adb install -r <apk>`. Schermtests op macOS: `cd mobile && DROSTJE_PHONE_SHOTS=/tmp/shots cargo test --test screens` schrijft per toestand een licht en donker beeld.
 
 ## Uiterlijk
 
