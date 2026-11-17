@@ -2,3 +2,5 @@ target/
 /dist
 /reports
 /research_notes
+*.jks
+*.keystore

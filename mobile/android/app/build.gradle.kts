@@ -10,8 +10,8 @@ android {
         applicationId = "app.drostje.phone"
         minSdk = 30
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = providers.environmentVariable("ANDROID_VERSION_CODE").orElse("1").get().toInt()
+        versionName = providers.environmentVariable("ANDROID_VERSION_NAME").orElse("0.1.0").get()
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
@@ -21,7 +21,6 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
         }
     }
 

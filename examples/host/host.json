@@ -1,0 +1,12 @@
+{
+  "relay": {
+    "id": "build-linux",
+    "name": "Linux build machine",
+    "relay_url": "wss://seintje.example.org/v1/relay/build-linux",
+    "token_env": "DROSTJE_HOST_TOKEN",
+    "projects": {}
+  },
+  "data_dir": "/data",
+  "projects": {"app": "/projects/app"},
+  "executables": {"pi": "/usr/local/bin/pi"}
+}
