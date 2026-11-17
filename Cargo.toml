@@ -25,6 +25,13 @@ thiserror = "2"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+chacha20poly1305 = "0.11.0"
+hkdf = "0.13.0"
+sha2 = "0.11.1"
+getrandom = "0.4.3"
+qrcodegen = "1.8.0"
+rqrr = "0.11.0"
 uuid = { version = "1", features = ["v4", "serde", "v5"] }
 servo = { version = "=0.7.0", default-features = false, features = ["bundled", "js_jit", "multiprocess", "webcrypto", "webgpu"] }
 content-security-policy = { version = "=0.9.0", default-features = false }
@@ -51,6 +58,7 @@ drostje-browser-tools = { path = "crates/browser-tools" }
 drostje-harness = { path = "crates/harness" }
 drostje-remote = { path = "crates/remote" }
 drostje-ntfy = { path = "crates/ntfy" }
+drostje-phone = { path = "crates/phone" }
 
 [package]
 name = "drostje"
