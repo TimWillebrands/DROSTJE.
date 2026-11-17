@@ -6,6 +6,7 @@ use gpui_kit::{
         button::{Button, ButtonVariants},
         h_flex,
     },
+    prelude::FluentBuilder,
     *,
 };
 use uuid::Uuid;
@@ -27,6 +28,15 @@ impl Render for SurfaceFooter {
 pub(super) fn footer(dialog: &SurfaceContent) -> AnyElement {
     let readonly = dialog.presentation.readonly;
     let pending = dialog.request.is_some();
+    let pairing = matches!(dialog.kind, DialogKind::PairPhone).then(|| {
+        super::phones::pairing_confirm(
+            dialog
+                .presentation
+                .pairing
+                .as_ref()
+                .map(|pairing| &pairing.status),
+        )
+    });
     let id = dialog.surface_id;
     let cancel = dialog.owner.clone();
     let confirm = dialog.owner.clone();
@@ -38,7 +48,10 @@ pub(super) fn footer(dialog: &SurfaceContent) -> AnyElement {
             Button::new("dialog-cancel")
                 .ghost()
                 .label(
-                    if matches!(dialog.kind, DialogKind::Settings(_) | DialogKind::Commit(_)) {
+                    if matches!(
+                        dialog.kind,
+                        DialogKind::Settings(_) | DialogKind::Commit(_) | DialogKind::PairPhone
+                    ) {
                         "Close"
                     } else {
                         "Cancel"
@@ -59,9 +72,19 @@ pub(super) fn footer(dialog: &SurfaceContent) -> AnyElement {
         .child(
             Button::new("dialog-confirm")
                 .primary()
-                .disabled(readonly || pending)
-                .loading(pending)
-                .label(if matches!(dialog.kind, DialogKind::DeleteSpace(_)) {
+                .disabled(
+                    readonly
+                        || pending
+                        || pairing.is_some_and(|pairing| pairing.disabled.is_some()),
+                )
+                .loading(pending || pairing.is_some_and(|pairing| pairing.loading))
+                .when_some(
+                    pairing.and_then(|pairing| pairing.disabled),
+                    |button, reason| button.tooltip(reason),
+                )
+                .label(if let Some(pairing) = pairing {
+                    pairing.label
+                } else if matches!(dialog.kind, DialogKind::DeleteSpace(_)) {
                     "Delete space"
                 } else if matches!(dialog.kind, DialogKind::NewSpace) {
                     "Create space"
@@ -115,6 +138,10 @@ fn unhost_surface(owner: &WeakEntity<Workspace>, id: Uuid, cx: &mut App) {
             .as_ref()
             .filter(|dialog| dialog.read(cx).surface_id == id)
         {
+            if matches!(dialog.read(cx).kind, DialogKind::PairPhone) {
+                workspace.end_phone_pairing(id, cx);
+                return;
+            }
             dialog.update(cx, |dialog, _| dialog.hosted = false);
             cx.notify();
         }

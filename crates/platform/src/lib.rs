@@ -994,6 +994,30 @@ pub fn delete_branch(project_root: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+pub fn host_name() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the pointer and length describe `buffer`, which stays alive and writable for the call.
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+    let end = buffer
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(buffer.len());
+    let name = String::from_utf8_lossy(&buffer[..end]);
+    let name = name.trim().trim_end_matches(".local").trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+#[cfg(not(unix))]
+pub fn host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+}
+
 pub fn now() -> String {
     timestamp(std::time::SystemTime::now())
 }
@@ -1028,6 +1052,15 @@ fn timestamp(time: std::time::SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_name_is_a_trimmed_name_without_the_local_suffix() {
+        if let Some(name) = super::host_name() {
+            assert!(!name.is_empty());
+            assert!(!name.ends_with(".local"));
+            assert_eq!(name.trim(), name);
+        }
+    }
+
     use super::{
         APPLICATION_ICON, count_changed_lines, timestamp, timestamp_before, working_tree_diff,
         working_tree_patch,

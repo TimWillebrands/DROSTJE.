@@ -87,6 +87,152 @@ impl Workspace {
             .then_some(id)
     }
 
+    pub(in crate::ui) fn selected_phone(&self, cx: &App) -> Option<uuid::Uuid> {
+        let dialog = self.dialog.as_ref()?.read(cx);
+        if !matches!(dialog.kind, DialogKind::Settings(_)) {
+            return None;
+        }
+        crate::ui::settings::selected_phone(&dialog.value("phone", cx), self.state.read(cx))
+    }
+
+    pub(super) fn confirm_remove_phone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_phone(cx) else {
+            return;
+        };
+        let Some(surface) = self.dialog.clone() else {
+            return;
+        };
+        let kind = surface.read(cx).kind.clone();
+        let name = self
+            .state
+            .read(cx)
+            .paired_phones()
+            .into_iter()
+            .find(|phone| phone.id == id)
+            .map(|phone| phone.name)
+            .unwrap_or_else(|| "this phone".into());
+        self.dismiss(window, cx);
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        let owner = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let confirm = owner.clone();
+            let accepted_owner = owner.clone();
+            let accepted_kind = kind.clone();
+            let restore = owner.clone();
+            let surface = surface.clone();
+            let kind = kind.clone();
+            alert
+                .title(
+                    div()
+                        .id("remove-phone-confirmation")
+                        .test_support()
+                        .child(format!("Remove phone “{name}”?")),
+                )
+                .description("The phone stops receiving updates and shows that it was removed. Pair it again with a new code to reconnect.")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Remove phone")
+                        .cancel_text("Cancel")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    let _ = confirm.update(cx, |workspace, cx| {
+                        let result = workspace.state.update(cx, |state, cx| {
+                            let result = state.remove_phone(id);
+                            cx.notify();
+                            result
+                        });
+                        surface.update(cx, |surface, cx| match result {
+                            Ok(_) => surface.phone_removed(window, cx),
+                            Err(error) => surface.set_error(&error, cx),
+                        });
+                    });
+                    Self::restore_host_settings(accepted_owner.clone(), accepted_kind.clone(), window, cx);
+                    false
+                })
+                .on_cancel(move |_, window, cx| {
+                    Self::restore_host_settings(restore.clone(), kind.clone(), window, cx);
+                    false
+                })
+        });
+    }
+
+    pub(super) fn open_pair_phone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_dialog(DialogKind::PairPhone, window, cx);
+        let Some(dialog) = self
+            .dialog
+            .clone()
+            .filter(|dialog| dialog.read(cx).kind == DialogKind::PairPhone)
+        else {
+            return;
+        };
+        let result = self.state.update(cx, |state, cx| {
+            let result = state.start_phone_pairing(cx);
+            cx.notify();
+            result
+        });
+        if let Err(error) = result {
+            dialog.update(cx, |dialog, cx| dialog.set_error(&error, cx));
+        }
+    }
+
+    fn confirm_phone_pairing(
+        &mut self,
+        dialog: Entity<SurfaceContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let status = self
+            .state
+            .read(cx)
+            .phones
+            .pairing
+            .as_ref()
+            .map(|pairing| pairing.status.clone());
+        let result = match status {
+            Some(crate::app::PhonePairingStatus::Incoming { .. }) => {
+                self.state.update(cx, |state, cx| {
+                    let result = state.accept_phone_pairing();
+                    cx.notify();
+                    result
+                })
+            }
+            Some(crate::app::PhonePairingStatus::Paired { .. }) => {
+                self.dismiss(window, cx);
+                Ok(())
+            }
+            Some(
+                crate::app::PhonePairingStatus::Expired
+                | crate::app::PhonePairingStatus::Problem(_),
+            )
+            | None => self.state.update(cx, |state, cx| {
+                let result = state.start_phone_pairing(cx);
+                cx.notify();
+                result
+            }),
+            Some(
+                crate::app::PhonePairingStatus::Connecting
+                | crate::app::PhonePairingStatus::Showing
+                | crate::app::PhonePairingStatus::Accepting { .. },
+            ) => Ok(()),
+        };
+        match result {
+            Ok(()) => dialog.update(cx, |dialog, cx| dialog.clear_error(cx)),
+            Err(error) => dialog.update(cx, |dialog, cx| dialog.set_error(&error, cx)),
+        }
+    }
+
+    pub(in crate::ui) fn end_phone_pairing(&mut self, id: uuid::Uuid, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.cancel_phone_pairing();
+            cx.notify();
+        });
+        self.discard_surface(id, cx);
+        cx.notify();
+    }
+
     pub(super) fn confirm_remove_remote_host(
         &mut self,
         window: &mut Window,
@@ -248,6 +394,11 @@ impl Workspace {
         if let Some(editor) = self.theme_editor.take() {
             editor.update(cx, |editor, cx| editor.dismiss(window, cx));
         }
+        let pairing = self
+            .dialog
+            .as_ref()
+            .filter(|dialog| dialog.read(cx).kind == DialogKind::PairPhone)
+            .map(|dialog| dialog.read(cx).surface_id());
         if let Some(dialog) = self.dialog.as_ref() {
             let (kind, hosted, request) = {
                 let dialog = dialog.read(cx);
@@ -268,6 +419,9 @@ impl Workspace {
                 );
             }
         }
+        if let Some(id) = pairing {
+            self.end_phone_pairing(id, cx);
+        }
         if closed_commit {
             self.focus_region(Region::Thread, window, cx);
         }
@@ -286,6 +440,10 @@ impl Workspace {
             return;
         };
         if !dialog.read(cx).hosted() && self.commit_panel_thread.is_none() {
+            return;
+        }
+        if dialog.read(cx).kind == DialogKind::PairPhone {
+            self.confirm_phone_pairing(dialog, window, cx);
             return;
         }
         if dialog.read(cx).request.is_some() {

@@ -36,6 +36,8 @@ gpui_kit::actions!(
         RetryConversation,
         RetryRemoteFile,
         RemoveRemoteHost,
+        PairPhone,
+        RemovePhone,
         NewFactoryThread,
         NewTerminal,
         ToggleTerminal,
@@ -164,6 +166,8 @@ pub enum Command {
     RetryConversation,
     RetryRemoteFile,
     RemoveRemoteHost,
+    PairPhone,
+    RemovePhone,
     NewFactoryThread,
     NewTerminal,
     ToggleTerminal,
@@ -234,7 +238,7 @@ pub enum Command {
     InsertSlashCommand,
 }
 impl Command {
-    pub const ALL: [Self; 89] = [
+    pub const ALL: [Self; 91] = [
         Self::NewSpace,
         Self::RenameSpace,
         Self::DeleteSpace,
@@ -256,6 +260,8 @@ impl Command {
         Self::RetryConversation,
         Self::RetryRemoteFile,
         Self::RemoveRemoteHost,
+        Self::PairPhone,
+        Self::RemovePhone,
         Self::NewFactoryThread,
         Self::NewTerminal,
         Self::ToggleTerminal,
@@ -349,6 +355,8 @@ impl Command {
             Self::RetryConversation => "Reconnect conversation",
             Self::RetryRemoteFile => "Read Host file again",
             Self::RemoveRemoteHost => "Remove configured Host…",
+            Self::PairPhone => "Pair phone…",
+            Self::RemovePhone => "Remove phone…",
             Self::NewFactoryThread => "New Factory thread",
             Self::NewTerminal => "New terminal",
             Self::ToggleTerminal => "Toggle terminal sidebar",
@@ -443,6 +451,8 @@ impl Command {
             Self::RetryConversation => Box::new(RetryConversation),
             Self::RetryRemoteFile => Box::new(RetryRemoteFile),
             Self::RemoveRemoteHost => Box::new(RemoveRemoteHost),
+            Self::PairPhone => Box::new(PairPhone),
+            Self::RemovePhone => Box::new(RemovePhone),
             Self::NewFactoryThread => Box::new(NewFactoryThread),
             Self::NewTerminal => Box::new(NewTerminal),
             Self::ToggleTerminal => Box::new(ToggleTerminal),
@@ -561,6 +571,7 @@ impl Command {
             | Self::NewCodexConversation
             | Self::NewOpenCodeConversation
             | Self::RenameProject => state.mutable_project_reason(),
+            Self::PairPhone => state.pair_phone_reason(),
             Self::InstallPi if state.installing_pi => {
                 Some("Pi installation is already running.".into())
             }
@@ -765,6 +776,10 @@ impl Command {
             Self::RemoveRemoteHost => workspace.selected_remote_host(cx).map_or_else(
                 || Some("Choose a configured Host in Settings first.".into()),
                 |host| state.remove_remote_host_reason(&host),
+            ),
+            Self::RemovePhone => workspace.selected_phone(cx).map_or_else(
+                || Some("Choose a paired phone in Settings › Phones first.".into()),
+                |phone| state.remove_phone_reason(phone),
             ),
             Self::OpenChangeInNeovim => workspace.open_change_reason(cx),
             Self::WidenSidebar | Self::NarrowSidebar if state.thread().is_none() => {
@@ -2058,6 +2073,12 @@ impl Render for Palette {
             }))
             .on_action(cx.listener(|this, _: &RemoveRemoteHost, w, cx| {
                 this.run(PaletteTarget::Command(Command::RemoveRemoteHost), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PairPhone, w, cx| {
+                this.run(PaletteTarget::Command(Command::PairPhone), w, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RemovePhone, w, cx| {
+                this.run(PaletteTarget::Command(Command::RemovePhone), w, cx)
             }))
             .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| {
                 this.run(PaletteTarget::Command(Command::RemoveWorktree), w, cx)

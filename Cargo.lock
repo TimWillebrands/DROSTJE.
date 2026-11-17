@@ -2316,6 +2316,8 @@ dependencies = [
  "drostje-model",
  "drostje-neovim",
  "drostje-network",
+ "drostje-ntfy",
+ "drostje-phone",
  "drostje-platform",
  "drostje-remote",
  "drostje-store",

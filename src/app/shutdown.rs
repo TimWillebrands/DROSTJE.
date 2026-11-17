@@ -6,6 +6,7 @@ pub(super) struct Shutdown {
     drains: Vec<async_channel::Receiver<()>>,
     writes: async_channel::Sender<Write>,
     network: Option<super::network::NetworkDrain>,
+    phones: Vec<async_channel::Receiver<()>>,
 }
 
 impl Shutdown {
@@ -40,6 +41,7 @@ impl Shutdown {
                 .collect(),
             writes: state.writes.clone(),
             network: state.network.drain(),
+            phones: state.close_phone_links(),
         }
     }
 
@@ -53,6 +55,20 @@ impl Shutdown {
         for drain in self.drains {
             let _ = drain.recv().await;
         }
+        let phones = self.phones.into_iter().map(|finished| async move {
+            let _ = finished.recv().await;
+        });
+        smol::future::or(
+            async {
+                for phone in phones {
+                    phone.await;
+                }
+            },
+            async {
+                smol::Timer::after(std::time::Duration::from_secs(3)).await;
+            },
+        )
+        .await;
         let network_drained = match self.network {
             Some(network) => network.wait().await,
             None => Ok(()),

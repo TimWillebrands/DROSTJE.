@@ -193,6 +193,28 @@ pub(super) fn settings_controls(
             cx,
         );
     }
+    controls.field(
+        crate::app::PHONE_SERVER_SETTING,
+        "Server (https://…)",
+        state.phone_server(),
+        window,
+        cx,
+    );
+    controls.field(
+        crate::app::PHONE_TOKEN_ENV_SETTING,
+        "Token environment variable name (optional)",
+        state.phone_token_env(),
+        window,
+        cx,
+    );
+    controls.select(
+        "phone",
+        "Paired phone",
+        super::phones::phone_choices(state),
+        "",
+        window,
+        cx,
+    );
     let hosts = state.remote_hosts();
     controls.select(
         "remote_host",
@@ -427,6 +449,12 @@ impl SurfaceContent {
         if let Some(host) = self.remote_host_config(state, project_id, cx)? {
             state.save_remote_host(host)?;
         }
+        state
+            .save_phone_server(
+                &self.value(crate::app::PHONE_SERVER_SETTING, cx),
+                &self.value(crate::app::PHONE_TOKEN_ENV_SETTING, cx),
+            )
+            .map_err(|error| field_error(crate::app::PHONE_SERVER_SETTING, format!("{error:#}")))?;
         let pi = {
             let value = self.value("pi", cx);
             let initial = &self
@@ -610,6 +638,7 @@ impl SurfaceContent {
         }
         let hosts = self.hosts_group(project_id, state, readonly, owner, cx);
         let diagnostics = diagnostics_group(state, owner);
+        let phones = self.phones_groups(state, readonly, owner);
         let settings = Settings::new(self.settings_id.clone())
             .page(
                 SettingPage::new("Settings")
@@ -617,7 +646,8 @@ impl SurfaceContent {
                     .resettable(false)
                     .groups([appearance, tools, titles, factory, project, diagnostics]),
             )
-            .page(SettingPage::new("Hosts").resettable(false).groups([hosts]));
+            .page(SettingPage::new("Hosts").resettable(false).groups([hosts]))
+            .page(SettingPage::new("Phones").resettable(false).groups(phones));
         v_flex()
             .id("dialog-body")
             .key_context("NativeInput")

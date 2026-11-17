@@ -129,6 +129,12 @@ impl Workspace {
         .on_action(cx.listener(|this, _: &RemoveRemoteHost, w, cx| {
             this.execute(Command::RemoveRemoteHost, w, cx)
         }))
+        .on_action(
+            cx.listener(|this, _: &PairPhone, w, cx| this.execute(Command::PairPhone, w, cx)),
+        )
+        .on_action(
+            cx.listener(|this, _: &RemovePhone, w, cx| this.execute(Command::RemovePhone, w, cx)),
+        )
         .on_action(cx.listener(|this, _: &RemoveWorktree, w, cx| {
             this.execute(Command::RemoveWorktree, w, cx)
         }))

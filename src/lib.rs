@@ -10,6 +10,7 @@ pub use drostje_harness::attachments;
 pub use drostje_model as model;
 pub use drostje_neovim as neovim;
 pub use drostje_network as network;
+pub use drostje_phone as phone;
 pub use drostje_platform as platform;
 pub use drostje_remote as remote;
 pub use drostje_store as store;

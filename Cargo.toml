@@ -90,6 +90,7 @@ drostje-browser.workspace = true
 drostje-browser-tools = { workspace = true, features = ["browser"] }
 drostje-harness.workspace = true
 drostje-remote = { workspace = true, features = ["browser"] }
+drostje-phone.workspace = true
 gpui-kit = "=0.6.6"
 rusqlite.workspace = true
 serde.workspace = true
@@ -105,6 +106,7 @@ log.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+drostje-ntfy = { workspace = true, features = ["test-server"] }
 
 [[test]]
 name = "markdown_rendering"

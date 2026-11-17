@@ -18,7 +18,9 @@ pub use remote::RemoteFileView;
 mod network;
 pub use network::NetworkState;
 mod persistence;
+mod phones;
 use persistence::Write;
+pub use phones::{PHONE_SERVER_SETTING, PHONE_TOKEN_ENV_SETTING, PairedPhone, PhonePairingStatus};
 mod project_diff;
 mod session;
 pub use session::ConversationSession;
@@ -86,6 +88,7 @@ pub struct AppState {
     pub diagnostics: BTreeMap<String, String>,
     pub browser_tools: Option<crate::browser_tools::BrowserToolServer>,
     pub network: NetworkState,
+    pub phones: phones::Phones,
     artifacts: artifacts::ArtifactChannels,
     pub remote_client: crate::remote::Client,
     pub remote_file: Option<RemoteFileView>,
@@ -314,6 +317,7 @@ impl AppState {
             diagnostics,
             browser_tools,
             network: NetworkState::default(),
+            phones: phones::Phones::default(),
             artifacts: Default::default(),
             remote_client: crate::remote::Client::new(),
             remote_file: None,
@@ -358,6 +362,7 @@ impl AppState {
         state.reconcile_worktrees();
         state.start_pull_request_polling(cx);
         state.start_network(cx);
+        state.start_phone_links(cx);
         state
     }
 }
