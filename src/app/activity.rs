@@ -1,7 +1,42 @@
 use super::AppState;
+use crate::factory::{Liveness, ReportedState};
 use crate::harness::{ConversationState, TurnOutcome};
-use crate::model::ThreadId;
+use crate::model::{Thread, ThreadId, ThreadKind};
 use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadCondition {
+    Waiting,
+    Starting,
+    Running,
+    Stopping,
+    Paused,
+    Failed,
+    Disconnected,
+    Unresolved,
+}
+
+impl ThreadCondition {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Waiting => "Waiting",
+            Self::Starting => "Starting",
+            Self::Running => "Running",
+            Self::Stopping => "Stopping",
+            Self::Paused => "Paused",
+            Self::Failed => "Failed",
+            Self::Disconnected => "Disconnected",
+            Self::Unresolved => "Unresolved",
+        }
+    }
+
+    pub fn is_problem(self) -> bool {
+        match self {
+            Self::Failed | Self::Disconnected | Self::Unresolved => true,
+            Self::Waiting | Self::Starting | Self::Running | Self::Stopping | Self::Paused => false,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadActivity {
@@ -36,6 +71,75 @@ impl UnseenTurns {
 }
 
 impl AppState {
+    pub fn thread_condition(&self, thread: &Thread) -> Option<ThreadCondition> {
+        match thread.kind {
+            ThreadKind::Conversation => {
+                if let Some(session) = self.conversations.get(&thread.id) {
+                    if !session.requests.is_empty()
+                        || session.state == ConversationState::WaitingForInput
+                    {
+                        return Some(ThreadCondition::Waiting);
+                    }
+                    match session.state {
+                        ConversationState::Starting => return Some(ThreadCondition::Starting),
+                        ConversationState::Running => return Some(ThreadCondition::Running),
+                        ConversationState::Interrupting => return Some(ThreadCondition::Stopping),
+                        ConversationState::Failed => return Some(ThreadCondition::Failed),
+                        ConversationState::Disconnected => {
+                            return Some(ThreadCondition::Disconnected);
+                        }
+                        ConversationState::Ready | ConversationState::WaitingForInput => {}
+                    }
+                    if session.error.is_some() || session.outcome == Some(TurnOutcome::Failed) {
+                        return Some(ThreadCondition::Failed);
+                    }
+                    if session.outcome == Some(TurnOutcome::Unknown) {
+                        return Some(ThreadCondition::Unresolved);
+                    }
+                }
+                thread
+                    .submission
+                    .as_ref()
+                    .map(|_| ThreadCondition::Unresolved)
+            }
+            ThreadKind::Factory => {
+                if self.pending_factory.contains(&thread.id) {
+                    return Some(ThreadCondition::Starting);
+                }
+                let launch = self
+                    .snapshot
+                    .launches
+                    .iter()
+                    .find(|launch| launch.factory_thread_id == thread.id)?;
+                if let Some(run) = self.factory_runs.get(&launch.id) {
+                    match run.reported_state {
+                        ReportedState::Completed => return None,
+                        ReportedState::Failed => return Some(ThreadCondition::Failed),
+                        ReportedState::Paused => return Some(ThreadCondition::Paused),
+                        _ => {}
+                    }
+                    if run.launch.launch_error.is_some() {
+                        return Some(ThreadCondition::Failed);
+                    }
+                    return Some(match run.liveness {
+                        Liveness::OwnedRunning if run.reported_state == ReportedState::Pending => {
+                            ThreadCondition::Waiting
+                        }
+                        Liveness::OwnedRunning => ThreadCondition::Running,
+                        Liveness::Exited(_) | Liveness::Unverified => ThreadCondition::Unresolved,
+                    });
+                }
+                Some(if launch.launch_error.is_some() {
+                    ThreadCondition::Failed
+                } else if self.owned_launches.contains(&launch.id) {
+                    ThreadCondition::Running
+                } else {
+                    ThreadCondition::Unresolved
+                })
+            }
+        }
+    }
+
     pub fn thread_activity(&self, id: ThreadId) -> ThreadActivity {
         self.unseen_turns
             .activity(id, self.active_threads.contains(&id))

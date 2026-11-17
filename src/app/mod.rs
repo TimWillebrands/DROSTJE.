@@ -34,7 +34,7 @@ use crate::harness::{
     UsageLimit, UserAnswer, UserRequest, UserRequestKind,
 };
 use crate::{model::*, platform, store::Store};
-pub use activity::ThreadActivity;
+pub use activity::{ThreadActivity, ThreadCondition};
 use anyhow::{Context as _, Result};
 pub use commit::{CommitSubjectRequest, CommitSubjectStatus};
 use gpui_kit::*;
