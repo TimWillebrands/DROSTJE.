@@ -2,7 +2,10 @@ mod appearance;
 mod screens;
 mod widgets;
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use drostje_phone::{
     phone_side::{PairedDesktop, PhoneEvent, PhoneLink, PhonePairing, PromptPosted},
@@ -51,6 +54,7 @@ pub struct PhoneRoot {
     look: Option<Look>,
     extras: appearance::Extras,
     composers: HashMap<Uuid, Entity<TextareaState>>,
+    expanded_runs: HashSet<String>,
     sent: Vec<(Uuid, String)>,
     _composer_events: Vec<Subscription>,
     _appearance: Subscription,
@@ -101,6 +105,7 @@ impl PhoneRoot {
             look: None,
             extras: appearance::Extras::default(),
             composers: HashMap::new(),
+            expanded_runs: HashSet::new(),
             sent: Vec::new(),
             _composer_events: Vec::new(),
             _appearance: appearance,

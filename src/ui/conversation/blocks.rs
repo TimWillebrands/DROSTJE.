@@ -2,10 +2,11 @@ use super::{
     disclosure::{disclosure, is_expanded, toggle},
     images::image_thumbnail,
     markdown::{Markdown, markdown_text},
-    tools::{ToolCall, ToolOutcome, ToolResult, tool_card},
+    tools::{ToolCall, ToolResult, tool_card},
 };
 use crate::harness::{ContentBlock, ContextOrigin, PeerMessage};
 use crate::model::ThreadId;
+use crate::transcript::ToolOutcome;
 use crate::ui::workspace::Workspace;
 use gpui_kit::{
     assets::IconName as Lucide,

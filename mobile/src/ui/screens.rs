@@ -13,10 +13,11 @@ use crate::{
 use drostje_phone::{
     link::Connection,
     view::{
-        ItemKind, PhoneView, SpaceView, ThreadKind, ThreadStatus, ThreadView, ToolState,
-        Transcript, TranscriptItem,
+        ItemKind, PhoneView, SpaceView, ThreadKind, ThreadStatus, ThreadView, ToolCallView,
+        ToolRunView, Transcript, TranscriptItem,
     },
 };
+use drostje_transcript::{ToolKind, ToolOutcome};
 use gpui_kit::{
     assets::IconName,
     base::TestSupportExt,
@@ -771,7 +772,10 @@ impl PhoneRoot {
             );
         }
         for item in &transcript.items {
-            list = list.child(transcript_item(item, &self.extras, cx));
+            list = list.child(match item.tool_run() {
+                Some(run) => self.tool_run(&item.id, &run, cx),
+                None => transcript_item(item, &self.extras, cx),
+            });
         }
         if thread.status.busy() {
             list = list.child(
@@ -787,6 +791,116 @@ impl PhoneRoot {
             );
         }
         list
+    }
+
+    fn tool_run(&mut self, item: &str, run: &ToolRunView, cx: &mut Context<Self>) -> AnyElement {
+        let card = div()
+            .id(SharedString::from(format!("run-{item}")))
+            .test_support()
+            .flex()
+            .flex_col()
+            .rounded(cx.theme().radius_lg)
+            .border_1()
+            .border_color(cx.theme().border);
+        if !run.tally.folds() {
+            return card
+                .children(
+                    run.calls
+                        .iter()
+                        .map(|call| tool_call(format!("call-{item}"), call, cx)),
+                )
+                .into_any_element();
+        }
+        let expanded = self.expanded_runs.contains(item);
+        let muted = cx.theme().muted_foreground;
+        let danger = cx.theme().danger;
+        let key = item.to_owned();
+        let header = div()
+            .id(SharedString::from(format!("run-header-{item}")))
+            .test_support()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .child(icon(IconName::Wrench, 16., muted))
+            .child(
+                div()
+                    .flex_none()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(run.tally.title()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_sm()
+                    .text_color(muted)
+                    .when_some(run.calls.last().filter(|_| !expanded), |line, call| {
+                        line.child(call.label().to_owned())
+                    }),
+            )
+            .when_some(run.tally.without_result(), |row, label| {
+                row.child(div().flex_none().text_xs().text_color(muted).child(label))
+            })
+            .when_some(run.tally.failures(), |row, label| {
+                row.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(danger)
+                        .child(icon(IconName::CircleX, 14., danger))
+                        .child(label),
+                )
+            })
+            .when(run.tally.running > 0, |row| row.child(spinner(16., muted)))
+            .child(icon(
+                if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                },
+                16.,
+                muted,
+            ))
+            .on_click(cx.listener(move |root, _, _, cx| {
+                if !root.expanded_runs.remove(&key) {
+                    root.expanded_runs.insert(key.clone());
+                }
+                cx.notify();
+            }));
+        let earlier = run.tally.calls.saturating_sub(run.calls.len());
+        card.child(header)
+            .when(expanded, |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .when(earlier > 0, |calls| {
+                            calls.child(div().px_3().pt_2().text_xs().text_color(muted).child(
+                                match earlier {
+                                    1 => "1 earlier call is on your computer".to_owned(),
+                                    earlier => {
+                                        format!("{earlier} earlier calls are on your computer")
+                                    }
+                                },
+                            ))
+                        })
+                        .children(run.calls.iter().enumerate().map(|(index, call)| {
+                            tool_call(format!("call-{item}-{index}"), call, cx)
+                        })),
+                )
+            })
+            .into_any_element()
     }
 
     fn link_screen(&mut self, linked: &Linked, cx: &mut Context<Self>) -> Div {
@@ -898,6 +1012,76 @@ fn prose(content: impl IntoElement, extras: &Extras) -> Div {
         .child(content)
 }
 
+fn tool_icon(kind: ToolKind) -> IconName {
+    match kind {
+        ToolKind::Shell => IconName::Terminal,
+        ToolKind::Read => IconName::FileText,
+        ToolKind::Write => IconName::FilePlus,
+        ToolKind::Edit => IconName::FilePen,
+        ToolKind::Grep => IconName::Search,
+        ToolKind::Glob => IconName::FolderSearch,
+        ToolKind::Todo => IconName::ListTodo,
+        ToolKind::Task => IconName::Workflow,
+        ToolKind::Eval => IconName::FlaskConical,
+        ToolKind::Ask => IconName::CircleQuestionMark,
+        ToolKind::WebSearch | ToolKind::WebFetch => IconName::Globe,
+        ToolKind::Other => IconName::Wrench,
+    }
+}
+
+fn tool_call(id: String, call: &ToolCallView, cx: &App) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let (mark, color) = match call.outcome {
+        ToolOutcome::Running => (spinner(16., muted).into_any_element(), muted),
+        ToolOutcome::Succeeded => (
+            icon(IconName::CircleCheck, 16., cx.theme().success).into_any_element(),
+            cx.theme().success,
+        ),
+        ToolOutcome::Failed => (
+            icon(IconName::CircleX, 16., cx.theme().danger).into_any_element(),
+            cx.theme().danger,
+        ),
+        ToolOutcome::Unknown => (
+            div()
+                .text_xs()
+                .text_color(muted)
+                .child("No result")
+                .into_any_element(),
+            muted,
+        ),
+    };
+    div()
+        .id(SharedString::from(id))
+        .test_support()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .child(icon(tool_icon(ToolKind::of(&call.name)), 16., color))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(div().truncate().text_sm().child(call.label().to_owned()))
+                .when(!call.summary.is_empty(), |text| {
+                    text.child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_color(muted)
+                            .child(call.summary.clone()),
+                    )
+                }),
+        )
+        .child(div().flex_none().child(mark))
+        .into_any_element()
+}
+
 fn transcript_item(item: &TranscriptItem, extras: &Extras, cx: &App) -> AnyElement {
     let clipped = |element: Div| {
         element.when(item.clipped, |element| {
@@ -948,53 +1132,7 @@ fn transcript_item(item: &TranscriptItem, extras: &Extras, cx: &App) -> AnyEleme
             .line_clamp(4)
             .child(item.text.clone())
             .into_any_element(),
-        ItemKind::Tool { name, state } => {
-            let (status, color) = match state {
-                ToolState::Running => (
-                    spinner(16., cx.theme().muted_foreground).into_any_element(),
-                    cx.theme().muted_foreground,
-                ),
-                ToolState::Done => (
-                    icon(IconName::CircleCheck, 16., cx.theme().success).into_any_element(),
-                    cx.theme().success,
-                ),
-                ToolState::Failed => (
-                    icon(IconName::CircleX, 16., cx.theme().danger).into_any_element(),
-                    cx.theme().danger,
-                ),
-            };
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_2()
-                .rounded(cx.theme().radius_lg)
-                .border_1()
-                .border_color(cx.theme().border)
-                .child(icon(IconName::Wrench, 16., color))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .font_family(cx.theme().mono_font_family.clone())
-                        .child(name.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(item.text.clone()),
-                )
-                .child(status)
-                .into_any_element()
-        }
-        ItemKind::Notice => div()
+        ItemKind::Notice | ItemKind::Tool { .. } => div()
             .w_full()
             .text_xs()
             .text_center()

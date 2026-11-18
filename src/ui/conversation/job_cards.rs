@@ -1,10 +1,10 @@
 use super::{
     blocks::guarded_text,
     disclosure::{disclosure, is_expanded, toggle},
-    job_notice::{JobOutput, JobResult},
     markdown::{Markdown, code_block, markdown_text},
     mono,
 };
+use crate::transcript::jobs::{JobOutput, JobResult};
 use crate::ui::workspace::Workspace;
 use gpui_kit::{
     assets::IconName as Lucide,

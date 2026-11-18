@@ -16,10 +16,11 @@ use drostje_phone::{
     desktop_side::{DesktopLink, LinkEvent, PairingEvent, PairingSession},
     view::{
         Appearance, ItemKind, PhoneView, ProjectView, PromptOutcome, PromptReceipt, Prompting,
-        SpaceView, ThemeView, ThreadKind, ThreadStatus, ThreadView, ToolState, Transcript,
-        TranscriptItem,
+        SpaceView, ThemeView, ThreadKind, ThreadStatus, ThreadView, ToolCallView, ToolRunView,
+        ToolState, Transcript, TranscriptItem,
     },
 };
+use drostje_transcript::ToolOutcome;
 use gpui_kit::{
     AnyWindowHandle, Bounds, Entity, HeadlessAppContext, WindowBounds, WindowOptions,
     component::{Theme, ThemeMode},
@@ -304,6 +305,7 @@ fn transcript() -> Transcript {
         kind,
         text: text.into(),
         clipped: false,
+        run: None,
     };
     Transcript {
         thread: id(1),
@@ -734,6 +736,104 @@ fn a_declined_phone_returns_to_welcome() {
     let _ = std::fs::remove_dir_all(data);
 }
 
+fn tool_call(
+    name: &str,
+    caption: Option<&str>,
+    summary: &str,
+    outcome: ToolOutcome,
+) -> ToolCallView {
+    ToolCallView {
+        name: name.into(),
+        caption: caption.map(str::to_owned),
+        summary: summary.into(),
+        outcome,
+    }
+}
+
+fn a_phone_folds_tool_runs_like_the_desktop() {
+    let ntfy = TestServer::start();
+    let data = std::env::temp_dir().join(format!("drostje-phone-{}", Uuid::new_v4()));
+    let (mut phone, desktop) = paired_phone(&ntfy, &data);
+    desktop.show(desktop_view(None));
+    phone.wait(
+        "sync",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.synced),
+    );
+    phone.click(&format!("space-{}", id(100)));
+    phone.click(&format!("thread-{}", id(1)));
+    next(&desktop.events, |event| {
+        (event == LinkEvent::Watch(Some(id(1)))).then_some(())
+    });
+    let calls = vec![
+        tool_call(
+            "read",
+            Some("Read the middleware"),
+            "src/middleware.ts",
+            ToolOutcome::Succeeded,
+        ),
+        tool_call("bash", None, "npm test -- auth", ToolOutcome::Failed),
+        tool_call(
+            "edit",
+            Some("Move the session read"),
+            "src/middleware.ts",
+            ToolOutcome::Unknown,
+        ),
+    ];
+    let folded = ToolRunView {
+        tally: [ToolOutcome::Succeeded, ToolOutcome::Succeeded]
+            .into_iter()
+            .chain(calls.iter().map(|call| call.outcome))
+            .collect(),
+        calls,
+    };
+    let lone = tool_call(
+        "bash",
+        Some("Run the auth tests"),
+        "npm test",
+        ToolOutcome::Running,
+    );
+    let mut transcript = transcript();
+    transcript.items.truncate(4);
+    transcript
+        .items
+        .push(TranscriptItem::of_run("tool:r1".into(), folded));
+    transcript.items.push(TranscriptItem::of_run(
+        "tool:r2".into(),
+        ToolRunView {
+            tally: [lone.outcome].into_iter().collect(),
+            calls: vec![lone],
+        },
+    ));
+    desktop.show(desktop_view(Some(transcript)));
+    phone.wait(
+        "the transcript",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.view.transcript.is_some()),
+    );
+    assert!(
+        phone.visible("call-tool:c1"),
+        "a tool row from a desktop before tool runs still shows"
+    );
+    assert!(phone.visible("run-header-tool:r1"));
+    assert!(!phone.visible("call-tool:r1-0"), "a run starts folded");
+    assert!(phone.visible("call-tool:r2"), "a single call is not folded");
+    phone.shot("30-tool-run-folded");
+    phone.click("run-header-tool:r1");
+    for index in 0..3 {
+        assert!(
+            phone.visible(&format!("call-tool:r1-{index}")),
+            "call {index}"
+        );
+    }
+    phone.shot("31-tool-run-expanded");
+    phone.click("run-header-tool:r1");
+    assert!(
+        !phone.visible("call-tool:r1-0"),
+        "a second tap folds the run"
+    );
+    drop(desktop);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
 fn main() {
     if cfg!(not(target_os = "macos")) {
         println!("screens: skipped; the offscreen phone renderer runs on macOS (Metal)");
@@ -755,6 +855,10 @@ fn main() {
         (
             "a_phone_sends_prompts_and_learns_what_the_desktop_did_with_them",
             a_phone_sends_prompts_and_learns_what_the_desktop_did_with_them,
+        ),
+        (
+            "a_phone_folds_tool_runs_like_the_desktop",
+            a_phone_folds_tool_runs_like_the_desktop,
         ),
     ] {
         scenario();

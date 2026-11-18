@@ -1,14 +1,20 @@
 use super::{
     disclosure::{disclosure, is_expanded},
     inset,
-    job_notice::{JobKind, JobNotice, JobStart},
     memo::Memo,
     spinner::Spinner,
-    todo_list::{TodoList, TodoStatus},
     todos::todo_checklist,
 };
 use crate::ui::workspace::Workspace;
-use crate::{app::ConversationSession, harness::ContentBlock, model::ThreadId};
+use crate::{
+    app::ConversationSession,
+    harness::ContentBlock,
+    model::ThreadId,
+    transcript::{
+        jobs::{JobKind, JobNotice, JobStart, job_starts, settled_job_ids},
+        todo::{TodoList, TodoStatus},
+    },
+};
 use gpui_kit::{
     assets::IconName as Lucide,
     component::{ActiveTheme, Icon, Sizable, h_flex, v_flex},
@@ -51,11 +57,11 @@ fn running_jobs(session: &ConversationSession) -> Vec<JobStart> {
             continue;
         };
         if matches!(name.as_str(), "wait" | "hub") {
-            settled.extend(super::job_notice::settled_job_ids(name, text));
+            settled.extend(settled_job_ids(name, text));
             continue;
         }
         if let Some(ContentBlock::ToolCall { input, .. }) = session.tool_call_block(id) {
-            jobs.extend(super::job_notice::job_starts(name, input, text));
+            jobs.extend(job_starts(name, input, text));
         }
     }
     for notice in session.notices() {

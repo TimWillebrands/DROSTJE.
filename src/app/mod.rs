@@ -29,6 +29,8 @@ mod shutdown;
 mod spaces;
 mod threads;
 mod tracker;
+mod transcript;
+pub use transcript::{CallRef, harness_note_hidden, trailing_calls};
 mod worktrees;
 use crate::harness::{
     self, CommandCatalog, ContentBlock, ContextUsage, ConversationCommand, ConversationEvent,

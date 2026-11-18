@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
+use drostje_transcript::{RunTally, ToolOutcome};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -138,6 +139,91 @@ pub struct TranscriptItem {
     pub kind: ItemKind,
     pub text: String,
     pub clipped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<ToolRunView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRunView {
+    pub tally: RunTally,
+    pub calls: Vec<ToolCallView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallView {
+    pub name: String,
+    pub caption: Option<String>,
+    pub summary: String,
+    pub outcome: ToolOutcome,
+}
+
+impl ToolCallView {
+    pub fn label(&self) -> &str {
+        self.caption.as_deref().unwrap_or(&self.name)
+    }
+}
+
+impl TranscriptItem {
+    pub fn of_run(id: String, run: ToolRunView) -> Self {
+        let latest = run.calls.last();
+        let name = match latest {
+            Some(call) if !run.tally.folds() => call.name.clone(),
+            _ => run.tally.title(),
+        };
+        let caption = latest.map(ToolCallView::label).unwrap_or_default();
+        let (kind, text) = match run.tally.outcome() {
+            ToolOutcome::Unknown => (
+                ItemKind::Notice,
+                [name.as_str(), caption]
+                    .into_iter()
+                    .chain(run.tally.without_result().as_deref())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            ),
+            outcome => (
+                ItemKind::Tool {
+                    name,
+                    state: match outcome {
+                        ToolOutcome::Running => ToolState::Running,
+                        ToolOutcome::Failed => ToolState::Failed,
+                        ToolOutcome::Succeeded | ToolOutcome::Unknown => ToolState::Done,
+                    },
+                },
+                caption.to_owned(),
+            ),
+        };
+        Self {
+            id,
+            kind,
+            text,
+            clipped: false,
+            run: Some(run),
+        }
+    }
+
+    pub fn tool_run(&self) -> Option<Cow<'_, ToolRunView>> {
+        if let Some(run) = &self.run {
+            return Some(Cow::Borrowed(run));
+        }
+        let ItemKind::Tool { name, state } = &self.kind else {
+            return None;
+        };
+        let outcome = match state {
+            ToolState::Running => ToolOutcome::Running,
+            ToolState::Done => ToolOutcome::Succeeded,
+            ToolState::Failed => ToolOutcome::Failed,
+        };
+        Some(Cow::Owned(ToolRunView {
+            tally: [outcome].into_iter().collect(),
+            calls: vec![ToolCallView {
+                name: name.clone(),
+                caption: Some(self.text.clone()).filter(|text| !text.is_empty()),
+                summary: String::new(),
+                outcome,
+            }],
+        }))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +478,7 @@ mod tests {
             kind: ItemKind::Assistant,
             text: text.into(),
             clipped: false,
+            run: None,
         }
     }
 
@@ -635,5 +722,123 @@ mod tests {
         assert_eq!(view.space_threads(space).count(), 2);
         assert_eq!(view.thread_space(id(2)).unwrap().name, "Default");
         assert!(view.thread_space(id(9)).is_none());
+    }
+
+    fn call(name: &str, outcome: ToolOutcome) -> ToolCallView {
+        ToolCallView {
+            name: name.into(),
+            caption: None,
+            summary: format!("{name} input"),
+            outcome,
+        }
+    }
+
+    fn run(calls: Vec<ToolCallView>) -> ToolRunView {
+        ToolRunView {
+            tally: calls.iter().map(|call| call.outcome).collect(),
+            calls,
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[expect(
+        dead_code,
+        reason = "mirrors the fields a phone from before tool runs decodes"
+    )]
+    struct EarlierItem {
+        id: String,
+        kind: ItemKind,
+        text: String,
+        clipped: bool,
+    }
+
+    #[test]
+    fn a_phone_from_before_tool_runs_reads_a_run_as_one_row_without_claiming_an_outcome() {
+        let earlier = |item: &TranscriptItem| -> EarlierItem {
+            serde_json::from_value(serde_json::to_value(item).unwrap()).unwrap()
+        };
+        let folded = TranscriptItem::of_run(
+            "tool:a".into(),
+            run(vec![
+                call("read", ToolOutcome::Succeeded),
+                call("bash", ToolOutcome::Running),
+            ]),
+        );
+        assert_eq!(
+            earlier(&folded).kind,
+            ItemKind::Tool {
+                name: "2 tool calls".into(),
+                state: ToolState::Running
+            }
+        );
+        let lone = TranscriptItem::of_run(
+            "tool:b".into(),
+            run(vec![ToolCallView {
+                caption: Some("Run the tests".into()),
+                ..call("bash", ToolOutcome::Failed)
+            }]),
+        );
+        let lone = earlier(&lone);
+        assert_eq!(
+            lone.kind,
+            ItemKind::Tool {
+                name: "bash".into(),
+                state: ToolState::Failed
+            }
+        );
+        assert_eq!(lone.text, "Run the tests");
+        let unknown = TranscriptItem::of_run(
+            "tool:c".into(),
+            run(vec![
+                call("read", ToolOutcome::Succeeded),
+                call("bash", ToolOutcome::Unknown),
+            ]),
+        );
+        let unknown = earlier(&unknown);
+        assert_eq!(unknown.kind, ItemKind::Notice);
+        assert_eq!(unknown.text, "2 tool calls · bash · 1 without result");
+    }
+
+    #[test]
+    fn a_tool_item_from_a_desktop_before_tool_runs_reads_as_a_one_call_run() {
+        let sent: TranscriptItem = serde_json::from_value(serde_json::json!({
+            "id": "tool:c1",
+            "kind": {"Tool": {"name": "bash", "state": "Done"}},
+            "text": "Run the tests",
+            "clipped": false
+        }))
+        .unwrap();
+        let run = sent.tool_run().expect("a tool item is a run");
+        assert_eq!(run.tally.calls, 1);
+        assert!(!run.tally.folds());
+        assert_eq!(run.calls[0].label(), "Run the tests");
+        assert_eq!(run.calls[0].outcome, ToolOutcome::Succeeded);
+        assert!(item("a", "prose").tool_run().is_none());
+    }
+
+    #[test]
+    fn a_changed_call_in_a_run_resends_only_that_run() {
+        let mut old = view();
+        let first = TranscriptItem::of_run(
+            "tool:a".into(),
+            run(vec![
+                call("read", ToolOutcome::Succeeded),
+                call("bash", ToolOutcome::Running),
+            ]),
+        );
+        old.transcript.as_mut().unwrap().items.push(first.clone());
+        let mut new = old.clone();
+        let mut finished = first.run.clone().unwrap();
+        finished.calls[1].outcome = ToolOutcome::Failed;
+        finished.tally = finished.calls.iter().map(|call| call.outcome).collect();
+        *new.transcript.as_mut().unwrap().items.last_mut().unwrap() =
+            TranscriptItem::of_run("tool:a".into(), finished);
+        let patch = roundtrip(&old, &new);
+        let Some(TranscriptPatch::Changed { order, items, .. }) = patch.transcript else {
+            panic!("expected a transcript change")
+        };
+        assert!(order.is_none());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].run.as_ref().unwrap().tally.failed, 1);
     }
 }

@@ -102,7 +102,7 @@ fn late_prompt_reason(sent_at: i64, now: i64) -> Option<String> {
     })
 }
 
-type TranscriptKey = (Uuid, u64, u64, usize);
+type TranscriptKey = (Uuid, u64, u64, usize, bool);
 
 #[derive(Default)]
 pub struct Phones {
@@ -790,24 +790,20 @@ impl AppState {
         {
             return None;
         }
+        let active = self.active_threads.contains(&thread);
         let key = (
             session.generation,
             session.transcript_revision,
             session.tools_revision,
             session.requests.len() + usize::from(session.error.is_some()),
+            active,
         );
         if let Some((cached, transcript)) = self.phones.transcripts.get(&thread)
             && *cached == key
         {
             return Some(transcript.clone());
         }
-        let transcript = transcript_tail(
-            thread,
-            &session.messages,
-            &session.tools,
-            session.requests.values(),
-            session.error.as_deref(),
-        );
+        let transcript = transcript_tail(thread, session, active);
         self.phones
             .transcripts
             .insert(thread, (key, transcript.clone()));

@@ -17,6 +17,7 @@ pub use drostje_store as store;
 pub use drostje_themes as themes;
 pub use drostje_titles as titles;
 pub use drostje_tracker as tracker;
+pub use drostje_transcript as transcript;
 pub mod ui;
 pub use drostje_worktrees as worktrees;
 

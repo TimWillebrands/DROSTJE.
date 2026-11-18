@@ -2263,6 +2263,7 @@ dependencies = [
  "drostje-themes",
  "drostje-titles",
  "drostje-tracker",
+ "drostje-transcript",
  "drostje-worktrees",
  "ghostty-terminal",
  "gpui-kit",
@@ -2438,6 +2439,7 @@ dependencies = [
  "chacha20poly1305",
  "drostje-ntfy",
  "drostje-phone",
+ "drostje-transcript",
  "getrandom 0.4.3",
  "hkdf 0.13.0",
  "qrcodegen",
@@ -2537,6 +2539,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "uuid",
+]
+
+[[package]]
+name = "drostje-transcript"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

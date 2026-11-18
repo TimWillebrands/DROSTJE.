@@ -76,6 +76,7 @@ fn transcript(text: &str) -> Transcript {
             kind: ItemKind::Assistant,
             text: text.into(),
             clipped: false,
+            run: None,
         }],
         prompting: Prompting::Open,
     }

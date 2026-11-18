@@ -1,10 +1,16 @@
 use super::{
     disclosure::{disclosure, is_expanded, toggle},
     spinner::Spinner,
-    todo_list::{TodoList, TodoStatus},
-    tools::{ToolCall, ToolOutcome, text_field},
+    tools::ToolCall,
 };
-use crate::{model::ThreadId, ui::workspace::Workspace};
+use crate::{
+    model::ThreadId,
+    transcript::{
+        ToolOutcome, text_field,
+        todo::{TodoList, TodoStatus, describe_change},
+    },
+    ui::workspace::Workspace,
+};
 use gpui_kit::{
     assets::IconName as Lucide,
     component::{ActiveTheme, Icon, Sizable, h_flex, v_flex},
@@ -26,7 +32,7 @@ pub(super) fn todo_card(
         intent,
         input,
     } = call;
-    let change = super::todo_list::describe_change(input).unwrap_or_else(|| name.to_owned());
+    let change = describe_change(input).unwrap_or_else(|| name.to_owned());
     let open_by_default = matches!(text_field(input, "op"), Some("init" | "block"));
     let open = open_by_default != is_expanded(owner, &key, cx);
     let (done, total) = list.progress();

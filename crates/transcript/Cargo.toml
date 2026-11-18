@@ -1,0 +1,10 @@
+[package]
+name = "drostje-transcript"
+description = "Reads an agent transcript the same way on the desktop and the phone: tool runs and their outcomes, tool summaries, harness notes, todo lists and background job notices."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

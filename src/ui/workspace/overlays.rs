@@ -796,7 +796,7 @@ impl DetailContent {
         for (index, tool) in session.tools.values().enumerate() {
             let owner = owner.clone();
             let tool_id = tool.id.clone();
-            let summary = crate::ui::conversation::tool_summary(&tool.name, &tool.input);
+            let summary = crate::transcript::tool_summary(&tool.name, &tool.input);
             body = body.child(
                 Button::new(("detail-tool", index))
                     .small()

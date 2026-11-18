@@ -2,17 +2,20 @@ use super::{
     blocks::block,
     disclosure::{is_expanded, toggle},
     job_cards::{job_card, system_notice},
-    job_notice::JobNotice,
     markdown::Markdown,
-    tool_runs::{RunCache, tool_run_header, trailing_calls},
+    tool_runs::{RunCache, tool_run_header},
     tools::{ToolCall, ToolResult, tool_call_row, tool_card},
     {inset, mono},
 };
 use crate::ui::{theme, workspace::Workspace};
 use crate::{
-    app::ConversationSession,
+    app::{ConversationSession, harness_note_hidden, trailing_calls},
     harness::{ContentBlock, Message},
     model::ThreadId,
+    transcript::{
+        ToolOutcome,
+        jobs::{JobNotice, system_notice_body},
+    },
 };
 use gpui_kit::{
     assets::IconName as Lucide,
@@ -40,25 +43,6 @@ pub(super) fn prose(content: AnyElement, cx: &App) -> AnyElement {
         })
         .child(content)
         .into_any_element()
-}
-
-pub(super) fn harness_note_hidden(message: &Message) -> bool {
-    const HIDDEN: [(&str, &str); 3] = [
-        ("<system-reminder>", "</system-reminder>"),
-        ("<irc>", "</irc>"),
-        ("<critical>", "</critical>"),
-    ];
-    message.role == "custom"
-        && !message.content.is_empty()
-        && message.content.iter().all(|block| match block {
-            ContentBlock::Text(text) => {
-                let text = text.trim();
-                HIDDEN
-                    .iter()
-                    .any(|(open, close)| text.starts_with(open) && text.ends_with(close))
-            }
-            _ => false,
-        })
 }
 
 #[expect(
@@ -92,7 +76,7 @@ pub(super) fn message(
                 input: &Value::Null,
             },
             ToolResult {
-                outcome: ToolResult::recorded(message.error, message.exit_code),
+                outcome: ToolOutcome::recorded(message.error, message.exit_code),
                 content: &message.content,
                 exit_code: message.exit_code,
             },
@@ -265,7 +249,7 @@ pub(super) fn message(
                     }
                 }
                 None => {
-                    body = body.child(match super::job_notice::system_notice_body(text) {
+                    body = body.child(match system_notice_body(text) {
                         Some(text) => system_notice(identity, text, owner, markdown, cx),
                         None => block(item, identity, owner, markdown, cx),
                     });
@@ -318,20 +302,6 @@ pub(super) fn message(
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentBlock, Message, harness_note_hidden};
-
-    fn custom(role: &str, text: &str) -> Message {
-        Message {
-            id: "m".into(),
-            role: role.into(),
-            content: vec![ContentBlock::Text(text.into())],
-            raw: None,
-            tool_call_id: None,
-            error: false,
-            exit_code: None,
-        }
-    }
-
     #[cfg(feature = "runtime-qa")]
     #[gpui_kit::test]
     fn agent_prose_fills_its_column_in_every_theme(cx: &mut gpui_kit::TestAppContext) {
@@ -383,36 +353,5 @@ mod tests {
         theme(cx, "Delft Light");
         let (delft, pane) = width(cx);
         assert_eq!(delft, pane, "Delft prose fills its column");
-    }
-
-    #[test]
-    fn harness_notes_hide_only_when_injected_by_the_harness() {
-        assert!(harness_note_hidden(&custom(
-            "custom",
-            "<system-reminder>\n2 todo items still open.\n</system-reminder>"
-        )));
-        assert!(harness_note_hidden(&custom(
-            "custom",
-            "<irc>\nIncoming IRC message from agent `Review`:\n</irc>\n"
-        )));
-        assert!(harness_note_hidden(&custom(
-            "custom",
-            "<critical>\nPlan mode active.\n</critical>"
-        )));
-        assert!(!harness_note_hidden(&custom(
-            "user",
-            "<system-reminder>look</system-reminder>"
-        )));
-        assert!(!harness_note_hidden(&custom(
-            "custom",
-            "<system-notice>\nBackground job bg_1 has completed.\n</system-notice>"
-        )));
-        assert!(!harness_note_hidden(&custom(
-            "custom",
-            "<irc>partial</irc> and a trailing remark"
-        )));
-        let mut empty = custom("custom", "");
-        empty.content.clear();
-        assert!(!harness_note_hidden(&empty));
     }
 }
