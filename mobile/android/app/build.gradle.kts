@@ -2,6 +2,29 @@ plugins {
     id("com.android.application")
 }
 
+abstract class DesktopLauncherIcon : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val artwork: RegularFileProperty
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val destination = outputDirectory.file("drawable-nodpi/ic_launcher_desktop.png").get().asFile
+        destination.parentFile.mkdirs()
+        artwork.get().asFile.copyTo(destination, overwrite = true)
+    }
+}
+
+androidComponents.onVariants { variant ->
+    val icon = tasks.register<DesktopLauncherIcon>("${variant.name}DesktopLauncherIcon") {
+        artwork.set(rootProject.layout.projectDirectory.file("../../assets/drostje-app-icon.png"))
+    }
+    variant.sources.res?.addGeneratedSourceDirectory(icon, DesktopLauncherIcon::outputDirectory)
+}
+
 android {
     namespace = "app.drostje.phone"
     compileSdk = 36

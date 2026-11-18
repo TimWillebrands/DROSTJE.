@@ -63,11 +63,14 @@ if [ -z "${ANDROID_NDK_HOME:-}" ]; then
 fi
 export ANDROID_HOME ANDROID_NDK_HOME
 cd "$here"
+printf 'Building Android native library with profile %s\n' "$profile"
 cargo ndk -t arm64-v8a --platform 30 build --locked --profile "$profile"
+printf 'Preparing Android native library\n'
 strip="$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip | head -1)"
 mkdir -p android/app/src/main/jniLibs/arm64-v8a
 "$strip" --strip-all -o android/app/src/main/jniLibs/arm64-v8a/libdrostje_mobile.so \
     "target/aarch64-linux-android/$profile/libdrostje_mobile.so"
 cd android
-./gradlew --no-daemon --quiet "$task"
+printf 'Packaging Android APK with %s\n' "$task"
+./gradlew --no-daemon --console=plain --info --stacktrace "$task"
 echo "$here/android/app/build/outputs/apk/$variant/$apk"
