@@ -7,7 +7,7 @@ pub struct Insets {
 }
 
 #[cfg(target_os = "android")]
-pub use crate::android::{device_name, insets, leave, start_scanner, system_bars};
+pub use crate::android::{device_name, frame_drawn, insets, leave, start_scanner, system_bars};
 
 #[cfg(not(target_os = "android"))]
 pub fn start_scanner() -> Result<(), String> {
@@ -29,3 +29,6 @@ pub fn insets() -> Insets {
 
 #[cfg(not(target_os = "android"))]
 pub fn system_bars(_dark: bool) {}
+
+#[cfg(not(target_os = "android"))]
+pub fn frame_drawn(_storage: &crate::storage::Storage) {}

@@ -1,11 +1,20 @@
 use std::{
     ffi::{CStr, CString, c_char},
     path::PathBuf,
+    sync::Mutex,
 };
 
 use drostje_phone::qr::{LumaFrame, decode_frame};
-use gpui_mobile::android::jni::{activity, android_app, get_string, platform, with_env};
+use gpui_mobile::android::{
+    host::{GpuBackend, GpuOutcome, on_gpu_outcome, set_gpu_backend},
+    jni::{activity, android_app, get_string, platform, with_env},
+};
 use jni::sys::{JNIEnv, jclass, jint, jobject, jstring};
+
+use crate::{
+    graphics::{self, Backend, StartOn},
+    storage::Storage,
+};
 
 unsafe fn java_string(env: *mut JNIEnv, value: jstring) -> Option<String> {
     if env.is_null() || value.is_null() {
@@ -122,6 +131,36 @@ pub fn device_name() -> String {
     .ok()
     .filter(|name| !name.trim().is_empty())
     .unwrap_or_else(|| "Android phone".into())
+}
+
+static DRAWING_ON: Mutex<Option<Backend>> = Mutex::new(None);
+
+pub fn choose_graphics(storage: &Storage) {
+    set_gpu_backend(match graphics::start(storage) {
+        StartOn::VulkanThenGl => GpuBackend::Auto,
+        StartOn::Gl => GpuBackend::Gl,
+    });
+    on_gpu_outcome(|outcome| {
+        let backend = match outcome {
+            GpuOutcome::Vulkan => Backend::Vulkan,
+            GpuOutcome::Gl | GpuOutcome::GlAfterVulkanFailed => Backend::Gl,
+            GpuOutcome::Failed => return,
+        };
+        *DRAWING_ON.lock().expect("graphics backend lock poisoned") = Some(backend);
+    });
+}
+
+pub fn frame_drawn(storage: &Storage) {
+    let Some(backend) = *DRAWING_ON.lock().expect("graphics backend lock poisoned") else {
+        return;
+    };
+    let storage = storage.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("phone-graphics".into())
+        .spawn(move || graphics::drew(&storage, backend))
+    {
+        log::warn!("Drawing on {backend:?} not recorded: {error}");
+    }
 }
 
 pub fn files_dir() -> PathBuf {
