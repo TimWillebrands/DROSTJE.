@@ -1,8 +1,9 @@
 use super::{
     PhoneRoot,
+    appearance::Extras,
     widgets::{
-        Tone, app_bar, banner, empty_state, icon, icon_button, loading, row, section, spinner,
-        tone_color, wide_button,
+        Emphasis, Tone, app_bar, banner, dot, empty_state, icon, icon_button, loading, row,
+        section, spinner, tone_color, wide_button,
     },
 };
 use crate::{
@@ -19,10 +20,33 @@ use drostje_phone::{
 use gpui_kit::{
     assets::IconName,
     base::TestSupportExt,
-    component::{ActiveTheme, text::TextView},
+    component::{ActiveTheme, alert::Alert, button::Button, text::TextView},
     prelude::FluentBuilder,
     *,
 };
+
+const WORDMARK: &str = "DROSTJE.";
+
+fn wordmark(extras: &Extras, cx: &App) -> impl IntoElement {
+    let stop = WORDMARK.len() - 1;
+    div()
+        .id("wordmark")
+        .font_family(drostje_fonts::DISPLAY_FAMILY)
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_size(rems(2.25))
+        .line_height(relative(1.))
+        .child(StyledText::new(WORDMARK).with_highlights([(
+            stop..WORDMARK.len(),
+            HighlightStyle {
+                color: Some(extras.signature(cx)),
+                ..Default::default()
+            },
+        )]))
+}
+
+fn strip(alert: Alert) -> Div {
+    div().flex_none().px_4().pb_2().child(alert)
+}
 
 fn status_tone(status: ThreadStatus) -> Tone {
     match status {
@@ -33,11 +57,11 @@ fn status_tone(status: ThreadStatus) -> Tone {
     }
 }
 
-fn thread_leading(thread: &ThreadView, cx: &App) -> AnyElement {
+fn thread_leading(thread: &ThreadView, extras: &Extras, cx: &App) -> AnyElement {
     let color = tone_color(status_tone(thread.status), cx);
     match (&thread.kind, thread.status) {
         (_, ThreadStatus::Running | ThreadStatus::Starting | ThreadStatus::Stopping) => {
-            spinner(22., color).into_any_element()
+            spinner(22., extras.signature(cx)).into_any_element()
         }
         (_, ThreadStatus::Waiting) => icon(IconName::CircleAlert, 24., color).into_any_element(),
         (_, ThreadStatus::Failed | ThreadStatus::Disconnected | ThreadStatus::Unresolved) => {
@@ -120,12 +144,7 @@ impl PhoneRoot {
                             .flex_col()
                             .gap_2()
                             .child(icon(IconName::Smartphone, 40., cx.theme().foreground))
-                            .child(
-                                div()
-                                    .text_3xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .child("DROSTJE."),
-                            )
+                            .child(wordmark(&self.extras, cx))
                             .child(
                                 div()
                                     .text_base()
@@ -153,16 +172,15 @@ impl PhoneRoot {
                         .id("welcome-notice")
                         .mb_4()
                         .on_click(cx.listener(|root, _, _, cx| root.input(Input::DismissNotice, cx)))
-                        .child(banner(name, text, tone, cx).mx_0()),
+                        .child(banner("welcome-notice-text", name, text, tone)),
                 )
             })
             .when_some(problem, |screen, problem| {
-                screen.child(div().mb_4().child(banner(IconName::CircleAlert, problem, Tone::Bad, cx).mx_0()))
+                screen.child(div().mb_4().child(banner("scan-problem", IconName::CircleAlert, problem, Tone::Bad)))
             })
             .child(
-                wide_button("scan-code", "Scan code", Some(IconName::ScanQrCode), true, false, cx)
-                    .on_click(cx.listener(|root, _, _, cx| root.scan(cx)))
-                    .test_support(),
+                wide_button("scan-code", "Scan code", Some(IconName::ScanQrCode), Emphasis::Primary)
+                    .on_click(cx.listener(|root, _, _, cx| root.scan(cx))),
             )
     }
 
@@ -172,7 +190,7 @@ impl PhoneRoot {
         check: Option<String>,
         cx: &mut Context<Self>,
     ) -> Div {
-        let back = icon_button("pairing-back", IconName::ChevronLeft, cx)
+        let back = icon_button("pairing-back", IconName::ChevronLeft, "Back")
             .on_click(cx.listener(|root, _, _, cx| root.input(Input::CancelPairing, cx)));
         let body = match check {
             None => loading(format!("Contacting your computer through {server}…"), cx),
@@ -236,11 +254,9 @@ impl PhoneRoot {
             .child(body)
             .child(
                 div().px_6().pb_6().child(
-                    wide_button("pairing-cancel", "Cancel", None, false, false, cx)
-                        .on_click(
-                            cx.listener(|root, _, _, cx| root.input(Input::CancelPairing, cx)),
-                        )
-                        .test_support(),
+                    wide_button("pairing-cancel", "Cancel", None, Emphasis::Secondary).on_click(
+                        cx.listener(|root, _, _, cx| root.input(Input::CancelPairing, cx)),
+                    ),
                 ),
             )
     }
@@ -300,38 +316,39 @@ impl PhoneRoot {
         }
     }
 
-    fn status_banner(&self, linked: &Linked, cx: &App) -> Option<Div> {
+    fn status_banner(&self, linked: &Linked) -> Option<Div> {
         let desktop = linked.desktop_name().to_owned();
-        match (&linked.connection, linked.presence(self.now)) {
-            (Connection::Problem(reason), _) => Some(banner(
+        let alert = match (&linked.connection, linked.presence(self.now)) {
+            (Connection::Problem(reason), _) => banner(
+                "server-unreachable",
                 IconName::WifiOff,
                 format!("Can't reach the server. Retrying… ({reason})"),
                 Tone::Bad,
-                cx,
-            )),
-            (_, DesktopPresence::Offline) => Some(banner(
+            ),
+            (_, DesktopPresence::Offline) => banner(
+                "desktop-offline",
                 IconName::Monitor,
                 format!("{desktop} is not running DROSTJE. You see the last known state."),
                 Tone::Warn,
-                cx,
-            )),
-            (_, DesktopPresence::Quiet) => Some(banner(
+            ),
+            (_, DesktopPresence::Quiet) => banner(
+                "desktop-quiet",
                 IconName::Monitor,
                 format!("No updates from {desktop} for a while. It may be asleep."),
                 Tone::Warn,
-                cx,
-            )),
-            (_, DesktopPresence::Connecting | DesktopPresence::Online) => None,
-        }
+            ),
+            (_, DesktopPresence::Connecting | DesktopPresence::Online) => return None,
+        };
+        Some(strip(alert))
     }
 
-    fn settings_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        icon_button("open-link", IconName::Settings, cx)
+    fn settings_button(&self, cx: &mut Context<Self>) -> Button {
+        icon_button("open-link", IconName::Settings, "This phone")
             .on_click(cx.listener(|root, _, _, cx| root.input(Input::Open(Route::Link), cx)))
     }
 
-    fn back_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        icon_button("back", IconName::ChevronLeft, cx)
+    fn back_button(&self, cx: &mut Context<Self>) -> Button {
+        icon_button("back", IconName::ChevronLeft, "Back")
             .on_click(cx.listener(|root, _, _, cx| root.input(Input::Back, cx)))
     }
 
@@ -365,13 +382,7 @@ impl PhoneRoot {
                     (count, 0) => format!("{count} Threads"),
                     (count, needs) => format!("{count} Threads · {needs} need you"),
                 };
-                let trailing = (needs > 0).then(|| {
-                    div()
-                        .size(px(10.))
-                        .rounded_full()
-                        .bg(cx.theme().warning)
-                        .into_any_element()
-                });
+                let trailing = (needs > 0).then(|| dot(cx.theme().warning).into_any_element());
                 list = list.child(
                     row(
                         SharedString::from(format!("space-{id}")),
@@ -402,7 +413,7 @@ impl PhoneRoot {
                 Some(self.settings_button(cx)),
                 cx,
             ))
-            .when_some(self.status_banner(linked, cx), |screen, banner| {
+            .when_some(self.status_banner(linked), |screen, banner| {
                 screen.child(banner)
             })
             .child(body)
@@ -458,17 +469,13 @@ impl PhoneRoot {
                 list = list.child(section(project.name.clone(), cx));
                 for thread in listed {
                     let id = thread.id;
-                    let trailing = thread.unseen.then(|| {
-                        div()
-                            .size(px(10.))
-                            .rounded_full()
-                            .bg(cx.theme().primary)
-                            .into_any_element()
-                    });
+                    let trailing = thread
+                        .unseen
+                        .then(|| dot(self.extras.signature(cx)).into_any_element());
                     list = list.child(
                         row(
                             SharedString::from(format!("thread-{id}")),
-                            thread_leading(thread, cx),
+                            thread_leading(thread, &self.extras, cx),
                             thread.title.clone(),
                             Some(thread_subtitle(thread, self.now)),
                             trailing,
@@ -496,7 +503,7 @@ impl PhoneRoot {
                 Some(self.settings_button(cx)),
                 cx,
             ))
-            .when_some(self.status_banner(linked, cx), |screen, banner| {
+            .when_some(self.status_banner(linked), |screen, banner| {
                 screen.child(banner)
             })
             .child(body)
@@ -531,20 +538,20 @@ impl PhoneRoot {
             .as_ref()
             .filter(|transcript| transcript.thread == thread.id)
             .cloned();
-        let strip = match thread.status {
-            ThreadStatus::Waiting => Some(banner(
+        let attention = match thread.status {
+            ThreadStatus::Waiting => Some(strip(banner(
+                "thread-waiting",
                 IconName::CircleAlert,
                 "Waiting for your answer on the computer",
                 Tone::Warn,
-                cx,
-            )),
+            ))),
             ThreadStatus::Failed | ThreadStatus::Disconnected | ThreadStatus::Unresolved => {
-                Some(banner(
+                Some(strip(banner(
+                    "thread-failed",
                     IconName::CircleX,
                     format!("{} — check it on the computer", thread.status.label()),
                     Tone::Bad,
-                    cx,
-                ))
+                )))
             }
             ThreadStatus::Idle
             | ThreadStatus::Running
@@ -586,10 +593,10 @@ impl PhoneRoot {
                 None,
                 cx,
             ))
-            .when_some(self.status_banner(linked, cx), |screen, banner| {
+            .when_some(self.status_banner(linked), |screen, banner| {
                 screen.child(banner)
             })
-            .when_some(strip, |screen, strip| screen.child(strip))
+            .when_some(attention, |screen, attention| screen.child(attention))
             .child(body)
     }
 
@@ -643,7 +650,7 @@ impl PhoneRoot {
             );
         }
         for item in &transcript.items {
-            list = list.child(transcript_item(item, cx));
+            list = list.child(transcript_item(item, &self.extras, cx));
         }
         if thread.status.busy() {
             list = list.child(
@@ -702,9 +709,8 @@ impl PhoneRoot {
             )
             .child(
                 div().px_6().pb_6().child(
-                    wide_button("unpair", "Unpair this phone", Some(IconName::Unplug), false, true, cx)
-                        .on_click(cx.listener(|root, _, _, cx| root.input(Input::AskUnpair, cx)))
-                        .test_support(),
+                    wide_button("unpair", "Unpair this phone", Some(IconName::Unplug), Emphasis::Danger)
+                        .on_click(cx.listener(|root, _, _, cx| root.input(Input::AskUnpair, cx))),
                 ),
             )
     }
@@ -730,7 +736,7 @@ impl PhoneRoot {
                     .id("unpair-sheet")
                     .relative()
                     .bg(cx.theme().popover)
-                    .rounded_t(px(28.))
+                    .rounded_t(cx.theme().radius_lg)
                     .px_6()
                     .pt_6()
                     .pb_6()
@@ -746,20 +752,32 @@ impl PhoneRoot {
                             .child(format!("This phone stops following {desktop}. To follow it again, pair with a new code.")),
                     )
                     .child(
-                        wide_button("confirm-unpair", "Unpair", None, false, true, cx)
-                            .on_click(cx.listener(|root, _, _, cx| root.input(Input::ConfirmUnpair, cx)))
-                            .test_support(),
+                        wide_button("confirm-unpair", "Unpair", None, Emphasis::Danger)
+                            .on_click(cx.listener(|root, _, _, cx| root.input(Input::ConfirmUnpair, cx))),
                     )
                     .child(
-                        wide_button("cancel-unpair", "Cancel", None, false, false, cx)
-                            .on_click(cx.listener(|root, _, _, cx| root.input(Input::CancelUnpair, cx)))
-                            .test_support(),
+                        wide_button("cancel-unpair", "Cancel", None, Emphasis::Secondary)
+                            .on_click(cx.listener(|root, _, _, cx| root.input(Input::CancelUnpair, cx))),
                     ),
             )
     }
 }
 
-fn transcript_item(item: &TranscriptItem, cx: &App) -> AnyElement {
+fn prose(content: impl IntoElement, extras: &Extras) -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .when_some(extras.prose_family.clone(), |prose, family| {
+            prose.font_family(family)
+        })
+        .when_some(extras.prose_size, |prose, size| prose.text_size(size))
+        .when_some(extras.prose_line_height, |prose, height| {
+            prose.line_height(relative(height))
+        })
+        .child(content)
+}
+
+fn transcript_item(item: &TranscriptItem, extras: &Extras, cx: &App) -> AnyElement {
     let clipped = |element: Div| {
         element.when(item.clipped, |element| {
             element.child(
@@ -780,7 +798,7 @@ fn transcript_item(item: &TranscriptItem, cx: &App) -> AnyElement {
                     .max_w(relative(0.85))
                     .px_4()
                     .py_2()
-                    .rounded(px(20.))
+                    .rounded(cx.theme().radius_lg)
                     .bg(cx.theme().secondary)
                     .text_color(cx.theme().secondary_foreground)
                     .text_base()
@@ -788,13 +806,15 @@ fn transcript_item(item: &TranscriptItem, cx: &App) -> AnyElement {
             ))
             .into_any_element(),
         ItemKind::Assistant => clipped(
-            div().w_full().text_base().child(
+            prose(
                 TextView::markdown(
                     SharedString::from(format!("item-{}", item.id)),
                     item.text.clone(),
                 )
                 .selectable(true),
-            ),
+                extras,
+            )
+            .text_base(),
         )
         .into_any_element(),
         ItemKind::Thinking => div()
@@ -860,8 +880,12 @@ fn transcript_item(item: &TranscriptItem, cx: &App) -> AnyElement {
             .text_color(cx.theme().muted_foreground)
             .child(item.text.clone())
             .into_any_element(),
-        ItemKind::Error => banner(IconName::CircleX, item.text.clone(), Tone::Bad, cx)
-            .mx_0()
-            .into_any_element(),
+        ItemKind::Error => banner(
+            SharedString::from(format!("item-{}", item.id)),
+            IconName::CircleX,
+            item.text.clone(),
+            Tone::Bad,
+        )
+        .into_any_element(),
     }
 }

@@ -1590,7 +1590,7 @@ mod quit_tests {
             let state = cx.new(|cx| AppState::new(bootstrap, cx));
             let view = cx.new(|cx| Workspace::new(state.clone(), window, cx));
             workspace = Some(view.clone());
-            let root = cx.new(|_| crate::ui::workspace::WorkspaceRoot { workspace: view });
+            let root = cx.new(|_| crate::ui::workspace::WorkspaceRoot::new(view));
             Root::new(root, window, cx)
         });
         (window.into(), workspace.unwrap())

@@ -461,9 +461,7 @@ async fn spaces_restore_active_context_and_inactive_tabs(cx: &mut TestAppContext
 #[gpui_kit::test]
 #[ignore = "requires disposable fixture; exercises gesture-linked Space motion and reduced motion"]
 async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
-    use gpui_kit::{
-        Bounds, Pixels, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, point,
-    };
+    use gpui_kit::{Bounds, Pixels, PlatformInput, ScrollDelta, ScrollEvent, TouchPhase, point};
 
     struct Geometry {
         rows: Bounds<Pixels>,
@@ -521,7 +519,7 @@ async fn space_swipes_track_reverse_cancel_and_settle(cx: &mut TestAppContext) {
         cx.update_window(fixture.window.into(), |_, window, cx| {
             let position = window.find("space-switcher").bounds().center();
             window.dispatch_event(
-                PlatformInput::ScrollWheel(ScrollWheelEvent {
+                PlatformInput::Scroll(ScrollEvent {
                     position,
                     delta: ScrollDelta::Pixels(point(px(x), px(y))),
                     touch_phase: phase,

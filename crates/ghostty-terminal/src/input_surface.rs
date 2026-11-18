@@ -56,9 +56,16 @@ mod tests {
                 modifiers,
             }));
         }
+        let os = if cfg!(target_os = "macos") {
+            gpui_kit::OperatingSystem::Mac
+        } else {
+            gpui_kit::OperatingSystem::Linux
+        };
         for key in ["enter", "tab", "escape", "ctrl-w", "secondary-escape"] {
             assert!(!native_text_key(
-                &Keystroke::parse(key).unwrap().with_simulated_ime()
+                &Keystroke::parse_with_os(key, os)
+                    .unwrap()
+                    .with_simulated_ime()
             ));
         }
     }

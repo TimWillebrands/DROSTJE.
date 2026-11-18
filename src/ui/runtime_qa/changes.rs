@@ -504,9 +504,7 @@ async fn dismissed_commit_reports_git_failure_and_retains_the_form(cx: &mut Test
         message.focus_handle(cx).focus(window, cx);
     });
     cx.update_window(fixture.window.into(), |_, window, cx| {
-        Root::update(window, cx, |root, window, cx| {
-            root.clear_notifications(window, cx);
-        });
+        window.clear_notifications(cx);
     })
     .unwrap();
     settle_frames(cx, &fixture);
@@ -525,7 +523,7 @@ async fn dismissed_commit_reports_git_failure_and_retains_the_form(cx: &mut Test
                 window.find("notification").visible(),
                 "background progress is visible"
             );
-            let notifications = Root::read(window, cx).notification.read(cx).notifications();
+            let notifications = window.notifications(cx);
             assert_eq!(notifications.len(), 1, "closing shows one progress toast");
             (request, notifications[0].clone())
         })
@@ -542,7 +540,7 @@ async fn dismissed_commit_reports_git_failure_and_retains_the_form(cx: &mut Test
     cx.update_window(fixture.window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("commit-changes-panel").is_none());
-        let notifications = Root::read(window, cx).notification.read(cx).notifications();
+        let notifications = window.notifications(cx);
         assert_eq!(notifications.len(), 1, "the outcome replaces progress");
         assert_ne!(
             notifications[0], progress,

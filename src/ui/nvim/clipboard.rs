@@ -92,7 +92,12 @@ mod tests {
     fn native_clipboard_chord_uses_the_platform_paste_key_and_leaves_vim_keys_alone() {
         use super::{ClipboardChord, clipboard_chord};
         use gpui_kit::Keystroke;
-        let chord = |source: &str| clipboard_chord(&Keystroke::parse(source).unwrap());
+        let os = if cfg!(target_os = "macos") {
+            gpui_kit::OperatingSystem::Mac
+        } else {
+            gpui_kit::OperatingSystem::Linux
+        };
+        let chord = |source: &str| clipboard_chord(&Keystroke::parse_with_os(source, os).unwrap());
         let (native, vim) = if cfg!(target_os = "macos") {
             ("cmd", "ctrl-shift")
         } else {

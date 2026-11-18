@@ -6,8 +6,8 @@ use crate::phone::{
     desktop_side::{DesktopLink, LinkEvent, PairingEvent, PairingSession},
     link::{Connection, LinkRecord, PAIRING_TTL},
     view::{
-        PhoneView, ProjectView, SpaceView, ThreadKind as PhoneThreadKind, ThreadStatus, ThreadView,
-        Transcript,
+        PhoneView, ProjectView, SpaceView, ThemeView, ThreadKind as PhoneThreadKind, ThreadStatus,
+        ThreadView, Transcript,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,7 @@ pub struct Phones {
     pub links: BTreeMap<Uuid, PhoneLinkState>,
     ticking: bool,
     transcripts: HashMap<ThreadId, (TranscriptKey, Transcript)>,
+    theme: Option<ThemeView>,
 }
 
 fn http_origin(relay_url: &str) -> Option<String> {
@@ -574,6 +575,14 @@ impl AppState {
             spaces,
             threads,
             transcript: None,
+            theme: self.phones.theme.clone(),
+        }
+    }
+
+    pub fn set_phone_theme(&mut self, theme: ThemeView) {
+        if self.phones.theme.as_ref() != Some(&theme) {
+            self.phones.theme = Some(theme);
+            self.publish_phone_views();
         }
     }
 

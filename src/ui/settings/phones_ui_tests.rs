@@ -43,7 +43,7 @@ fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<AppState>) {
     });
     let window = cx.add_window(|window, cx| {
         let workspace = cx.new(|cx| Workspace::new(state.clone(), window, cx));
-        let content = cx.new(|_| crate::ui::workspace::WorkspaceRoot { workspace });
+        let content = cx.new(|_| crate::ui::workspace::WorkspaceRoot::new(workspace));
         Root::new(content, window, cx)
     });
     (window.into(), state)

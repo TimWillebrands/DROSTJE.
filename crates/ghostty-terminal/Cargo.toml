@@ -9,7 +9,7 @@ build = "build.rs"
 runtime-qa = ["gpui-kit/test-support"]
 
 [dependencies]
-gpui-kit = "=0.6.6"
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "fbc3ebf145d0d4593c883271f8ac7a7e6b74c6d6", version = "=0.8.1" }
 async-channel = "2.5"
 image = { version = "0.25", default-features = false }
 raw-window-handle = "0.6"

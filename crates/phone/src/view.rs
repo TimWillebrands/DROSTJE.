@@ -9,6 +9,23 @@ pub struct PhoneView {
     pub spaces: Vec<SpaceView>,
     pub threads: BTreeMap<Uuid, ThreadView>,
     pub transcript: Option<Transcript>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<ThemeView>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Appearance {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThemeView {
+    pub appearance: Appearance,
+    pub light: serde_json::Value,
+    pub dark: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +145,8 @@ pub struct Patch {
     pub removed: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<TranscriptPatch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<ThemeView>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +177,7 @@ impl Patch {
             && self.threads.is_empty()
             && self.removed.is_empty()
             && self.transcript.is_none()
+            && self.theme.is_none()
     }
 }
 
@@ -218,6 +238,10 @@ impl PhoneView {
                 .copied()
                 .collect(),
             transcript: transcript_patch(self.transcript.as_ref(), new.transcript.as_ref()),
+            theme: new
+                .theme
+                .clone()
+                .filter(|theme| self.theme.as_ref() != Some(theme)),
         }
     }
 
@@ -276,6 +300,9 @@ impl PhoneView {
             self.threads.remove(&id);
         }
         self.transcript = transcript;
+        if let Some(theme) = patch.theme {
+            self.theme = Some(theme);
+        }
         Ok(())
     }
 
@@ -355,6 +382,15 @@ mod tests {
                 earlier: false,
                 items: vec![item("a", "one"), item("b", "two")],
             }),
+            theme: Some(theme(Appearance::System, "#2453a6")),
+        }
+    }
+
+    fn theme(appearance: Appearance, primary: &str) -> ThemeView {
+        ThemeView {
+            appearance,
+            light: serde_json::json!({"name": "Delft Light", "colors": {"primary.background": primary}}),
+            dark: serde_json::json!({"name": "Delft Dark", "grain": 0.25}),
         }
     }
 
@@ -471,6 +507,36 @@ mod tests {
             ..Patch::default()
         };
         assert_eq!(phone.apply(orderless), Err(PatchError::OtherThread));
+    }
+
+    #[test]
+    fn the_desktop_theme_travels_once_and_again_only_when_it_changes() {
+        assert!(roundtrip(&PhoneView::default(), &view()).theme.is_some());
+        let mut retinted = view();
+        retinted.theme = Some(theme(Appearance::Dark, "#3a7545"));
+        let patch = roundtrip(&view(), &retinted);
+        assert_eq!(patch.theme, retinted.theme);
+        assert!(patch.spaces.is_none() && patch.threads.is_empty());
+        assert!(view().diff(&view()).theme.is_none());
+    }
+
+    #[test]
+    fn views_from_before_themes_still_load_and_keep_the_last_theme() {
+        let mut old = serde_json::to_value(view()).unwrap();
+        old.as_object_mut().unwrap().remove("theme");
+        let cached: PhoneView = serde_json::from_value(old).unwrap();
+        assert_eq!(cached.theme, None);
+        let mut phone = view();
+        let silent = Patch {
+            desktop: Some("Mac".into()),
+            ..Patch::default()
+        };
+        phone.apply(silent).unwrap();
+        assert_eq!(
+            phone.theme,
+            view().theme,
+            "a desktop without themes keeps the last one"
+        );
     }
 
     #[test]

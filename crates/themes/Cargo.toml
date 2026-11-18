@@ -1,0 +1,10 @@
+[package]
+name = "drostje-themes"
+description = "Themes bundled with DROSTJE., their extensions beyond the Kit theme format and the grain texture, shared by the desktop and the phone."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true

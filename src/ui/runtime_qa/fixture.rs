@@ -180,7 +180,7 @@ pub(super) async fn open_fixture_with_tools(
         let state = cx.new(|cx| AppState::new(bootstrap, cx));
         let workspace = cx.new(|cx| Workspace::new(state, window, cx));
         view = Some(workspace.clone());
-        let content = cx.new(|_| crate::ui::workspace::WorkspaceRoot { workspace });
+        let content = cx.new(|_| crate::ui::workspace::WorkspaceRoot::new(workspace));
         Root::new(content, window, cx)
     });
     let workspace = view.unwrap();

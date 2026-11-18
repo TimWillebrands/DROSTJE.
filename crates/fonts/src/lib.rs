@@ -24,6 +24,8 @@ macro_rules! face {
     };
 }
 
+pub const DISPLAY_FAMILY: &str = "Dosis";
+
 pub const FACES: [Face; 22] = [
     face!(
         "IBM Plex Sans",

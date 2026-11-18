@@ -70,7 +70,7 @@ impl Workspace {
 
     pub(in crate::ui) fn swipe_space(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {

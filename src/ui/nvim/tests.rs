@@ -81,10 +81,16 @@ async fn native_typing_bursts_reach_the_flushed_grid(cx: &mut TestAppContext) {
     for burst in ["gghjkl", "burst", "visible", ":?{}~", "é"] {
         for character in burst.chars() {
             cx.update_window(window.into(), |_, window, cx| {
-                assert!(window.dispatch_keystroke(
-                    gpui_kit::Keystroke::parse(&character.to_string()).unwrap(),
-                    cx,
-                ));
+                assert!(
+                    window.dispatch_keystroke(
+                        gpui_kit::Keystroke::parse_with_os(
+                            &character.to_string(),
+                            cx.platform_info().os,
+                        )
+                        .unwrap(),
+                        cx,
+                    )
+                );
                 assert!(!window.has_pending_keystrokes());
             })
             .unwrap();

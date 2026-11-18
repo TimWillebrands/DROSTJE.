@@ -12,7 +12,7 @@ pub enum Down {
         epoch: Uuid,
         seq: u64,
         reset: bool,
-        patch: Patch,
+        patch: Box<Patch>,
     },
     Presence {
         epoch: Uuid,
@@ -125,10 +125,10 @@ mod tests {
             epoch: Uuid::from_u128(9),
             seq: 1,
             reset: true,
-            patch: Patch {
+            patch: Box::new(Patch {
                 threads,
                 ..Patch::default()
-            },
+            }),
         };
         let Sealed::Attachment(bytes) = seal_down(&key(), &topic, &down) else {
             panic!("200 threads do not fit in a text message")
@@ -147,10 +147,10 @@ mod tests {
                 epoch: Uuid::nil(),
                 seq: 1,
                 reset: false,
-                patch: Patch {
+                patch: Box::new(Patch {
                     desktop: Some("x".repeat(size)),
                     ..Patch::default()
-                },
+                }),
             };
             if let Sealed::Text(text) = seal_down(&key(), &topic, &down) {
                 assert!(text.len() <= TEXT_LIMIT, "{size}: {}", text.len());

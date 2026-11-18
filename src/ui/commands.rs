@@ -880,6 +880,20 @@ pub const CLOSE_THREAD_KEY: &str = if cfg!(target_os = "macos") {
     "ctrl-shift-w"
 };
 
+#[cfg(target_os = "macos")]
+macro_rules! secondary {
+    ($keys:literal) => {
+        concat!("cmd-", $keys)
+    };
+}
+
+#[cfg(not(target_os = "macos"))]
+macro_rules! secondary {
+    ($keys:literal) => {
+        concat!("ctrl-", $keys)
+    };
+}
+
 pub fn bind_keys(cx: &mut App) {
     let workspace = Some("Workspace && !Command && !PopupMenu && !Sheet && !Dialog");
     let command = Some("DrostjePalette");
@@ -906,48 +920,48 @@ pub fn bind_keys(cx: &mut App) {
     );
     let caret_popup = Some("PromptEditor && CaretPopup && !Command && !Sheet && !Dialog");
     cx.bind_keys(vec![
-        KeyBinding::new("secondary-shift-p", OpenPalette, workspace),
-        KeyBinding::new("secondary-alt-]", NextSpace, navigation),
-        KeyBinding::new("secondary-alt-[", PreviousSpace, navigation),
+        KeyBinding::new(secondary!("shift-p"), OpenPalette, workspace),
+        KeyBinding::new(secondary!("alt-]"), NextSpace, navigation),
+        KeyBinding::new(secondary!("alt-["), PreviousSpace, navigation),
         KeyBinding::new("j", SelectNext, picker),
         KeyBinding::new("k", SelectPrevious, picker),
         KeyBinding::new("g g", SelectFirst, picker),
         KeyBinding::new("shift-g", SelectLast, picker),
         KeyBinding::new("home", SelectFirst, picker),
         KeyBinding::new("end", SelectLast, picker),
-        KeyBinding::new("secondary-n", NewConversation, Some("HarnessPicker")),
+        KeyBinding::new(secondary!("n"), NewConversation, Some("HarnessPicker")),
         KeyBinding::new("ctrl-tab", NextThread, workspace),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, workspace),
         KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, workspace),
-        KeyBinding::new("secondary-1", FocusProjects, workspace),
-        KeyBinding::new("secondary-2", FocusThread, workspace),
-        KeyBinding::new("secondary-3", FocusOutput, workspace),
-        KeyBinding::new("secondary-b", ToggleProjects, workspace),
-        KeyBinding::new("secondary-j", ToggleOutput, workspace),
-        KeyBinding::new("secondary-n", NewConversation, workspace),
-        KeyBinding::new("secondary-alt-n", NewConversationInWorktree, workspace),
-        KeyBinding::new("secondary-shift-n", NewFactoryThread, workspace),
-        KeyBinding::new("secondary-alt-t", NewTerminal, workspace),
-        KeyBinding::new("secondary-alt-o", OpenConversationFile, workspace),
-        KeyBinding::new("secondary-l", BrowserAddress, Some("BrowserPane || Browser")),
-        KeyBinding::new("secondary-r", BrowserReload, Some("BrowserPane || Browser")),
-        KeyBinding::new("secondary-shift-a", ToggleArtifact, Some("BrowserPane")),
+        KeyBinding::new(secondary!("1"), FocusProjects, workspace),
+        KeyBinding::new(secondary!("2"), FocusThread, workspace),
+        KeyBinding::new(secondary!("3"), FocusOutput, workspace),
+        KeyBinding::new(secondary!("b"), ToggleProjects, workspace),
+        KeyBinding::new(secondary!("j"), ToggleOutput, workspace),
+        KeyBinding::new(secondary!("n"), NewConversation, workspace),
+        KeyBinding::new(secondary!("alt-n"), NewConversationInWorktree, workspace),
+        KeyBinding::new(secondary!("shift-n"), NewFactoryThread, workspace),
+        KeyBinding::new(secondary!("alt-t"), NewTerminal, workspace),
+        KeyBinding::new(secondary!("alt-o"), OpenConversationFile, workspace),
+        KeyBinding::new(secondary!("l"), BrowserAddress, Some("BrowserPane || Browser")),
+        KeyBinding::new(secondary!("r"), BrowserReload, Some("BrowserPane || Browser")),
+        KeyBinding::new(secondary!("shift-a"), ToggleArtifact, Some("BrowserPane")),
         KeyBinding::new("enter", ToggleArtifact, Some("ArtifactDisclosure")),
         KeyBinding::new("space", ToggleArtifact, Some("ArtifactDisclosure")),
-        KeyBinding::new("secondary-escape", LeaveEditor, Some("Browser")),
-        KeyBinding::new("secondary-,", Settings, workspace),
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("secondary-1", FocusProjects, command),
-        KeyBinding::new("secondary-2", FocusThread, command),
-        KeyBinding::new("secondary-3", FocusOutput, command),
-        KeyBinding::new("secondary-b", ToggleProjects, command),
-        KeyBinding::new("secondary-j", ToggleOutput, command),
-        KeyBinding::new("secondary-n", NewConversation, command),
-        KeyBinding::new("secondary-alt-n", NewConversationInWorktree, command),
-        KeyBinding::new("secondary-shift-n", NewFactoryThread, command),
-        KeyBinding::new("secondary-alt-t", NewTerminal, command),
-        KeyBinding::new("secondary-alt-o", OpenConversationFile, command),
-        KeyBinding::new("secondary-,", Settings, command),
+        KeyBinding::new(secondary!("escape"), LeaveEditor, Some("Browser")),
+        KeyBinding::new(secondary!(","), Settings, workspace),
+        KeyBinding::new(secondary!("q"), Quit, None),
+        KeyBinding::new(secondary!("1"), FocusProjects, command),
+        KeyBinding::new(secondary!("2"), FocusThread, command),
+        KeyBinding::new(secondary!("3"), FocusOutput, command),
+        KeyBinding::new(secondary!("b"), ToggleProjects, command),
+        KeyBinding::new(secondary!("j"), ToggleOutput, command),
+        KeyBinding::new(secondary!("n"), NewConversation, command),
+        KeyBinding::new(secondary!("alt-n"), NewConversationInWorktree, command),
+        KeyBinding::new(secondary!("shift-n"), NewFactoryThread, command),
+        KeyBinding::new(secondary!("alt-t"), NewTerminal, command),
+        KeyBinding::new(secondary!("alt-o"), OpenConversationFile, command),
+        KeyBinding::new(secondary!(","), Settings, command),
         KeyBinding::new("ctrl-tab", NextThread, command),
         KeyBinding::new("ctrl-shift-tab", PreviousThread, command),
         KeyBinding::new(CLOSE_THREAD_KEY, CloseThread, command),
@@ -957,14 +971,14 @@ pub fn bind_keys(cx: &mut App) {
             Some("Terminal || (PromptEditor && !CaretPopup)"),
         ),
         KeyBinding::new("shift-tab", NoAction, Some("Terminal || PromptEditor")),
-        KeyBinding::new("secondary-alt-h", FocusLeft, pane_navigation),
-        KeyBinding::new("secondary-alt-j", FocusDown, pane_navigation),
-        KeyBinding::new("secondary-alt-k", FocusUp, pane_navigation),
-        KeyBinding::new("secondary-alt-l", FocusRight, pane_navigation),
-        KeyBinding::new("secondary-alt-left", FocusLeft, pane_navigation),
-        KeyBinding::new("secondary-alt-down", FocusDown, pane_navigation),
-        KeyBinding::new("secondary-alt-up", FocusUp, pane_navigation),
-        KeyBinding::new("secondary-alt-right", FocusRight, pane_navigation),
+        KeyBinding::new(secondary!("alt-h"), FocusLeft, pane_navigation),
+        KeyBinding::new(secondary!("alt-j"), FocusDown, pane_navigation),
+        KeyBinding::new(secondary!("alt-k"), FocusUp, pane_navigation),
+        KeyBinding::new(secondary!("alt-l"), FocusRight, pane_navigation),
+        KeyBinding::new(secondary!("alt-left"), FocusLeft, pane_navigation),
+        KeyBinding::new(secondary!("alt-down"), FocusDown, pane_navigation),
+        KeyBinding::new(secondary!("alt-up"), FocusUp, pane_navigation),
+        KeyBinding::new(secondary!("alt-right"), FocusRight, pane_navigation),
         KeyBinding::new("j", SelectNext, list),
         KeyBinding::new("down", SelectNext, list),
         KeyBinding::new("k", SelectPrevious, list),
@@ -1012,11 +1026,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("i", FocusComposer, thread),
         KeyBinding::new(PASTE_IMAGE_KEY, PasteImage, thread),
         KeyBinding::new(
-            "secondary-escape",
+            secondary!("escape"),
             LeaveEditor,
             Some("NativeSurface && !Command && !PopupMenu && !Dialog && !Sheet"),
         ),
-        KeyBinding::new("secondary-enter", Submit, submit),
+        KeyBinding::new(secondary!("enter"), Submit, submit),
         KeyBinding::new("ctrl-n", NextCompletion, caret_popup),
         KeyBinding::new("down", NextCompletion, caret_popup),
         KeyBinding::new("ctrl-p", PreviousCompletion, caret_popup),
@@ -1026,49 +1040,49 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-e", DismissCompletion, caret_popup),
         KeyBinding::new("escape", DismissCompletion, caret_popup),
         KeyBinding::new(
-            "secondary-enter",
+            secondary!("enter"),
             Submit,
             Some("Input && PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "secondary-.",
+            secondary!("."),
             Interrupt,
             Some("Input && PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "secondary-.",
+            secondary!("."),
             Interrupt,
             Some("(Thread || PromptEditor) && !Browser && !BrowserPane && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "secondary-alt-backspace",
+            secondary!("alt-backspace"),
             ClearQueuedMessages,
             Some("Input && PromptEditor && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "secondary-alt-backspace",
+            secondary!("alt-backspace"),
             ClearQueuedMessages,
             Some("(Thread || PromptEditor) && !Browser && !BrowserPane && !Command && !PopupMenu && !Sheet && !Dialog"),
         ),
         KeyBinding::new(
-            "secondary-enter",
+            secondary!("enter"),
             gpui_kit::base::actions::Confirm { secondary: false },
             Some("Dialog && !DrostjeForm && !Command && !PopupMenu"),
         ),
         KeyBinding::new(
-            "secondary-enter",
+            secondary!("enter"),
             Confirm,
             Some("DrostjeForm && !Command && !PopupMenu"),
         ),
         KeyBinding::new(
-            "secondary-enter",
+            secondary!("enter"),
             Confirm,
             Some("Input && PromptEditor && DrostjeForm && !Command && !PopupMenu"),
         ),
         KeyBinding::new("escape", Dismiss, Some("InlineRename > Input")),
-        KeyBinding::new("secondary-enter", Confirm, Some("InlineRename > Input")),
+        KeyBinding::new(secondary!("enter"), Confirm, Some("InlineRename > Input")),
         KeyBinding::new(
-            "secondary-enter",
+            secondary!("enter"),
             Confirm,
             Some("CommitMessage > Input && !Command && !PopupMenu"),
         ),
@@ -2356,7 +2370,8 @@ mod tests {
                                 this.keys.push("accept".into());
                             }))
                             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                                this.keys.push(event.keystroke.unparse());
+                                this.keys
+                                    .push(event.keystroke.unparse(cx.platform_info().os));
                                 cx.stop_propagation();
                             })),
                     )
@@ -2433,8 +2448,12 @@ mod tests {
                     assert!(view.read(cx).navigation.is_empty(), "{context}");
                     assert_eq!(
                         view.read(cx).keys,
-                        shortcuts
-                            .map(|(key, _, _)| gpui_kit::Keystroke::parse(key).unwrap().unparse()),
+                        shortcuts.map(|(key, _, _)| {
+                            let os = cx.platform_info().os;
+                            gpui_kit::Keystroke::parse_with_os(key, os)
+                                .unwrap()
+                                .unparse(os)
+                        }),
                         "{context}: navigation keystrokes must remain overlay-owned"
                     );
                 })
@@ -2507,9 +2526,10 @@ mod tests {
             })
             .unwrap();
             cx.read(|cx| {
-                let submit_key = gpui_kit::Keystroke::parse("secondary-enter")
+                let os = cx.platform_info().os;
+                let submit_key = gpui_kit::Keystroke::parse_with_os("secondary-enter", os)
                     .unwrap()
-                    .unparse();
+                    .unparse(os);
                 let submit = if context.starts_with("Terminal") {
                     submit_key.as_str()
                 } else {

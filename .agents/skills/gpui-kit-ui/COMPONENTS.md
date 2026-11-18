@@ -5,7 +5,7 @@ Paths are `gpui_kit::component::<module>::<Type>` unless marked *root*
 whether the component fits; verify the rest in the pinned source:
 
 ```sh
-K=~/.cargo/registry/src/*/gpui-component-0.6.6/src   # B=~/.cargo/registry/src/*/gpui-base-0.6.6/src
+K=~/.cargo/git/checkouts/gpui-kit-*/fbc3ebf/crates/component/src   # B=~/.cargo/git/checkouts/gpui-kit-*/fbc3ebf/crates/base/src
 grep -n "pub fn " $K/<module>.rs            # flat module
 grep -rn "pub fn " $K/<module>/             # directory module
 ```

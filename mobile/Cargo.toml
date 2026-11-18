@@ -14,8 +14,11 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 anyhow = "1"
 async-channel = "2"
+drostje-fonts = { version = "0.1.0", path = "../crates/fonts" }
 drostje-phone = { path = "../crates/phone", features = ["scan"] }
-gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "ae6a3fdfef416e7040e773415ac9cbd8c623e5d5", default-features = false, features = ["component", "assets"] }
+drostje-themes = { version = "0.1.0", path = "../crates/themes" }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "fbc3ebf145d0d4593c883271f8ac7a7e6b74c6d6", version = "=0.8.1", default-features = false, features = ["component", "assets"] }
+image = { version = "0.25", default-features = false }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,7 +32,7 @@ jni = "0.22"
 
 [dev-dependencies]
 drostje-ntfy = { path = "../crates/ntfy", features = ["test-server"] }
-gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "ae6a3fdfef416e7040e773415ac9cbd8c623e5d5", default-features = false, features = ["component", "assets", "test-support"] }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "fbc3ebf145d0d4593c883271f8ac7a7e6b74c6d6", version = "=0.8.1", default-features = false, features = ["component", "assets", "test-support"] }
 
 [[test]]
 name = "screens"
