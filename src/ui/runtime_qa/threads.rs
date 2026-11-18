@@ -457,9 +457,7 @@ async fn thread_archive_action_guards_and_palette_are_immediate(cx: &mut TestApp
     let tabs = cx.read(|cx| fixture.state.read(cx).open_threads.clone());
     let project = cx.read(|cx| fixture.state.read(cx).project().unwrap().id);
     cx.update_window(fixture.window.into(), |_, window, cx| {
-        Root::update(window, cx, |root, window, cx| {
-            root.clear_notifications(window, cx)
-        });
+        window.clear_notifications(cx);
     })
     .unwrap();
     open_palette(cx, &fixture).await;

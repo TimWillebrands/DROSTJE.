@@ -148,12 +148,7 @@ impl NvimView {
         }
     }
 
-    pub(super) fn scroll(
-        &mut self,
-        event: &ScrollWheelEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.enabled() || !self.grid.mouse_enabled || self.has_composition() {
             return;
         }

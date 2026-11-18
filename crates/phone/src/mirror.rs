@@ -71,7 +71,7 @@ impl Mirror {
                 patch,
             } => {
                 let mut view = PhoneView::default();
-                if view.apply(patch).is_err() {
+                if view.apply(*patch).is_err() {
                     let applied = self.gap();
                     self.awaiting_reset = true;
                     return applied;
@@ -88,7 +88,7 @@ impl Mirror {
                 Ok(false) => Applied::Unchanged,
                 Ok(true) => {
                     let mut view = self.view.clone();
-                    if view.apply(patch).is_err() {
+                    if view.apply(*patch).is_err() {
                         self.awaiting_reset = true;
                         return Applied::NeedsSync;
                     }
@@ -131,10 +131,10 @@ mod tests {
             epoch: Uuid::from_u128(epoch),
             seq,
             reset,
-            patch: Patch {
+            patch: Box::new(Patch {
                 desktop: Some(desktop.into()),
                 ..Patch::default()
-            },
+            }),
         }
     }
 

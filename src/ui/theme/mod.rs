@@ -13,10 +13,13 @@ use gpui_kit::{
 };
 use serde_json::Value;
 
-use crate::app::{AppState, NoticeLevel};
+use crate::{
+    app::{AppState, NoticeLevel},
+    phone::view::{Appearance as PhoneAppearance, ThemeView},
+    themes,
+};
 use color::{Oklch, hex};
 
-const BUNDLED_THEMES: &str = include_str!("../../../assets/themes/drostje.json");
 const RENAMED_THEMES: [(&str, &str); 2] = [
     ("DROSTJE. Light", "Delft Light"),
     ("DROSTJE. Dark", "Delft Dark"),
@@ -27,7 +30,7 @@ fn bundled_fonts() -> Vec<Cow<'static, [u8]>> {
         .map(|face| Cow::Borrowed(face.bytes))
         .collect()
 }
-pub const DISPLAY_FONT: &str = "Dosis";
+pub const DISPLAY_FONT: &str = crate::fonts::DISPLAY_FAMILY;
 const UI_FONT_SIZE: Pixels = px(15.);
 
 pub(super) fn terminal_theme(cx: &App) -> ghostty_terminal::TerminalTheme {
@@ -79,23 +82,19 @@ struct Extensions {
 }
 
 impl Extensions {
-    fn from_theme(theme: &Value) -> Self {
+    fn from_portable(portable: &themes::Extensions) -> Self {
         Self {
-            prose: Prose::from_theme(theme),
-            signature: theme.get("signature").map(|color| {
-                color
-                    .as_str()
-                    .and_then(|color| Rgba::try_from(color).ok())
-                    .expect("bundled signature is a hex color")
+            prose: Prose {
+                family: portable.prose.family.clone().map(SharedString::from),
+                size: portable.prose.size.map(px),
+                line_height: portable.prose.line_height,
+            },
+            signature: portable.signature.as_deref().map(|color| {
+                Rgba::try_from(color)
+                    .expect("drostje-themes accepts only hex signatures")
                     .into()
             }),
-            grain: theme.get("grain").map(|grain| {
-                grain
-                    .as_f64()
-                    .map(|grain| grain as f32)
-                    .filter(|grain| (0. ..=1.).contains(grain))
-                    .expect("bundled grain is a strength from 0 to 1")
-            }),
+            grain: portable.grain,
         }
     }
 }
@@ -107,44 +106,27 @@ pub struct Prose {
     pub line_height: Option<f32>,
 }
 
-impl Prose {
-    fn from_theme(theme: &Value) -> Self {
-        let number = |key: &str| {
-            theme.get(key).map(|value| {
-                value
-                    .as_f64()
-                    .filter(|value| *value > 0.)
-                    .unwrap_or_else(|| panic!("bundled {key} is a positive number"))
-                    as f32
-            })
-        };
-        Self {
-            family: theme
-                .get("prose.font.family")
-                .and_then(Value::as_str)
-                .map(|family| SharedString::from(family.to_owned())),
-            size: number("prose.font.size").map(px),
-            line_height: number("prose.line_height"),
-        }
-    }
-}
-
 struct Bundled {
     config: Rc<ThemeConfig>,
+    portable: themes::Extensions,
     extensions: Extensions,
 }
 
 fn parse_bundled() -> Vec<Bundled> {
-    let set: ThemeSet =
-        serde_json::from_str(BUNDLED_THEMES).expect("assets/themes/drostje.json is valid Kit JSON");
-    let raw: Value = serde_json::from_str(BUNDLED_THEMES).expect("bundled themes are JSON");
+    let set: ThemeSet = serde_json::from_str(themes::BUNDLED)
+        .expect("assets/themes/drostje.json is valid Kit JSON");
     let bundled: Vec<_> = set
         .themes
         .into_iter()
-        .zip(raw["themes"].as_array().expect("bundled themes are a list"))
-        .map(|(config, raw)| Bundled {
-            config: Rc::new(config),
-            extensions: Extensions::from_theme(raw),
+        .zip(themes::bundled())
+        .map(|(config, raw)| {
+            let portable = themes::Extensions::from_theme(&raw)
+                .unwrap_or_else(|error| panic!("bundled theme {}: {error}", config.name));
+            Bundled {
+                config: Rc::new(config),
+                extensions: Extensions::from_portable(&portable),
+                portable,
+            }
         })
         .collect();
     for mode in [ThemeMode::Light, ThemeMode::Dark] {
@@ -398,6 +380,7 @@ struct Coordinator {
     extensions: Extensions,
     fonts_error: Option<String>,
     warnings: Vec<String>,
+    phone_theme: Option<ThemeView>,
 }
 
 impl Coordinator {
@@ -411,6 +394,7 @@ impl Coordinator {
             extensions: Extensions::default(),
             fonts_error,
             warnings: Vec::new(),
+            phone_theme: None,
         }
     }
 
@@ -439,6 +423,36 @@ impl Coordinator {
             .map(|bundled| bundled.extensions.clone())
             .unwrap_or_default()
     }
+}
+
+fn phone_face(adjusted: &Value, own: Option<&themes::Extensions>, grain: Option<f32>) -> Value {
+    let mut extensions = own.cloned().unwrap_or_default();
+    extensions.grain = grain.or(extensions.grain);
+    themes::portable(adjusted.clone(), &extensions)
+}
+
+fn phone_theme(coordinator: &Coordinator) -> Option<ThemeView> {
+    if coordinator.preview.is_some() {
+        return None;
+    }
+    let applied = coordinator.applied.as_ref()?;
+    let own = |config: &Rc<ThemeConfig>| {
+        coordinator
+            .bundled
+            .iter()
+            .find(|bundled| Rc::ptr_eq(&bundled.config, config))
+            .map(|bundled| &bundled.portable)
+    };
+    let grain = coordinator.preferences.adjustments.grain;
+    Some(ThemeView {
+        appearance: match coordinator.preferences.appearance {
+            Appearance::System => PhoneAppearance::System,
+            Appearance::Light => PhoneAppearance::Light,
+            Appearance::Dark => PhoneAppearance::Dark,
+        },
+        light: phone_face(&applied.light, own(&applied.light_config), grain),
+        dark: phone_face(&applied.dark, own(&applied.dark_config), grain),
+    })
 }
 
 fn find_theme<'a>(name: &str, cx: &'a App) -> Option<&'a Rc<ThemeConfig>> {
@@ -871,6 +885,13 @@ fn apply(window: Option<&mut Window>, cx: &mut App) -> Vec<String> {
 fn update(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     let warnings = apply(Some(window), cx);
     let coordinator = cx.global_mut::<Coordinator>();
+    let phone =
+        phone_theme(coordinator).filter(|theme| coordinator.phone_theme.as_ref() != Some(theme));
+    if let Some(theme) = phone {
+        coordinator.phone_theme = Some(theme.clone());
+        state.update(cx, |state, _| state.set_phone_theme(theme));
+    }
+    let coordinator = cx.global_mut::<Coordinator>();
     let new_warnings: Vec<_> = warnings
         .iter()
         .filter(|warning| !coordinator.warnings.contains(warning))
@@ -1108,6 +1129,38 @@ mod tests {
     }
 
     #[test]
+    fn the_phone_gets_each_theme_with_its_own_extensions_and_the_saved_grain() {
+        let bundled = parse_bundled();
+        let cootje = bundled
+            .iter()
+            .find(|theme| theme.config.name.as_ref() == "Cootje Dark")
+            .unwrap();
+        let adjusted =
+            serde_json::to_value(with_accent(&cootje.config, Accent::new(140., 0.12))).unwrap();
+        let face = super::phone_face(&adjusted, Some(&cootje.portable), None);
+        assert_eq!(face["name"], "Cootje Dark");
+        assert_eq!(face["signature"], "#f2b33d");
+        assert_eq!(face["grain"], 0.25);
+        assert_eq!(
+            face["colors"]["primary.background"], adjusted["colors"]["primary.background"],
+            "the accent the desktop shows"
+        );
+        assert!(
+            face.as_object()
+                .unwrap()
+                .values()
+                .all(|value| !value.is_null()),
+            "unset fields stay home"
+        );
+        let regrained = super::phone_face(&adjusted, Some(&cootje.portable), Some(0.6));
+        assert_eq!(regrained["grain"], 0.6f32 as f64);
+        let custom = super::phone_face(&json!({"name": "Mine", "mode": "light"}), None, None);
+        assert_eq!(custom, json!({"name": "Mine", "mode": "light"}));
+        let reread: gpui_kit::component::ThemeConfig = serde_json::from_value(face).unwrap();
+        assert_eq!(reread.font_family.as_deref(), Some("Dosis"));
+    }
+
+    #[test]
     fn saved_defaults_from_before_delft_mean_delft() {
         assert_eq!(saved_theme_name("DROSTJE. Light"), "Delft Light");
         assert_eq!(saved_theme_name("DROSTJE. Dark"), "Delft Dark");
@@ -1207,6 +1260,38 @@ mod runtime_tests {
             assert!(
                 (primary.h - 140.).abs() > 10.,
                 "no accent left over: {primary:?}"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_phone_follows_the_saved_appearance_themes_and_accent(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            let settings = BTreeMap::from([
+                ("theme_mode".to_owned(), json!("dark")),
+                ("theme_dark".to_owned(), json!("Cootje Dark")),
+                (
+                    ADJUSTMENTS_SETTING.to_owned(),
+                    json!({"accent": {"hue": 140.0, "chroma": 0.12}, "grain": null}),
+                ),
+            ]);
+            initialize(Some(&settings), None, cx);
+            let theme = super::phone_theme(cx.global::<super::Coordinator>())
+                .expect("an applied theme is shared");
+            assert_eq!(theme.appearance, crate::phone::view::Appearance::Dark);
+            assert_eq!(theme.light["name"], "Delft Light");
+            assert_eq!(theme.dark["name"], "Cootje Dark");
+            assert_eq!(theme.dark["signature"], "#f2b33d");
+            assert_eq!(theme.dark["grain"], 0.25);
+            let primary = theme.dark["colors"]["primary.background"].as_str().unwrap();
+            let primary = Oklch::from_rgba(gpui_kit::Rgba::try_from(primary).unwrap());
+            assert!((primary.h - 140.).abs() < 2., "{primary:?}");
+
+            cx.global_mut::<super::Coordinator>().preview = Some(Default::default());
+            assert!(
+                super::phone_theme(cx.global::<super::Coordinator>()).is_none(),
+                "a preview stays on the desktop"
             );
         });
     }

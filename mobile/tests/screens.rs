@@ -15,8 +15,8 @@ use drostje_phone::{
     PairingOffer, Server,
     desktop_side::{DesktopLink, LinkEvent, PairingEvent, PairingSession},
     view::{
-        ItemKind, PhoneView, ProjectView, SpaceView, ThreadKind, ThreadStatus, ThreadView,
-        ToolState, Transcript, TranscriptItem,
+        Appearance, ItemKind, PhoneView, ProjectView, SpaceView, ThemeView, ThreadKind,
+        ThreadStatus, ThreadView, ToolState, Transcript, TranscriptItem,
     },
 };
 use gpui_kit::{
@@ -134,6 +134,17 @@ impl Phone {
         }
     }
 
+    fn look<T>(&mut self, read: impl FnOnce(&drostje_mobile::look::Look) -> T) -> T {
+        let root = self.root.clone();
+        self.cx.update(|cx| {
+            read(
+                root.read(cx)
+                    .look()
+                    .expect("the phone always wears a theme"),
+            )
+        })
+    }
+
     fn linked<T>(&mut self, read: impl FnOnce(&drostje_mobile::state::Linked) -> T) -> T {
         self.phase(|phase| match phase {
             Phase::Linked(linked) => read(linked),
@@ -244,6 +255,25 @@ fn desktop_view(transcript: Option<Transcript>) -> PhoneView {
             .map(|thread| (thread.id, thread))
             .collect(),
         transcript,
+        theme: None,
+    }
+}
+
+fn bundled_theme(name: &str) -> serde_json::Value {
+    drostje_themes::bundled()
+        .into_iter()
+        .find(|theme| theme["name"] == name)
+        .unwrap_or_else(|| panic!("{name} is bundled"))
+}
+
+fn themed(view: PhoneView, light: &str, dark: &str) -> PhoneView {
+    PhoneView {
+        theme: Some(ThemeView {
+            appearance: Appearance::System,
+            light: bundled_theme(light),
+            dark: bundled_theme(dark),
+        }),
+        ..view
     }
 }
 
@@ -379,6 +409,35 @@ fn a_phone_pairs_follows_spaces_and_threads_and_unpairs() {
         |phase| matches!(phase, Phase::Linked(linked) if linked.view.transcript.is_some()),
     );
     phone.shot("09-thread");
+
+    desktop.show(themed(
+        desktop_view(Some(transcript())),
+        "Ink Light",
+        "Cootje Dark",
+    ));
+    phone.wait(
+        "the desktop theme",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.view.theme.is_some()),
+    );
+    let faces = phone.look(|look| {
+        (
+            look.light["name"].as_str().map(str::to_owned),
+            look.dark["name"].as_str().map(str::to_owned),
+        )
+    });
+    assert_eq!(
+        faces,
+        (Some("Ink Light".into()), Some("Cootje Dark".into()))
+    );
+    phone.shot("09-thread-desktop-theme");
+    desktop.show(themed(
+        desktop_view(Some(transcript())),
+        "Delft Light",
+        "Delft Dark",
+    ));
+    phone.wait("Delft again", |phase| {
+        matches!(phase, Phase::Linked(linked) if linked.view.theme.as_ref().is_some_and(|theme| theme.dark["name"] == "Delft Dark"))
+    });
 
     phone.press("escape");
     assert_eq!(

@@ -1323,7 +1323,7 @@ pub(in crate::ui) fn render(
             MouseButton::Navigate(NavigationDirection::Forward),
             |_, window, cx| window.dispatch_action(Box::new(NextSpace), cx),
         )
-        .on_scroll_wheel(move |event, window, cx| {
+        .on_scroll(move |event, window, cx| {
             let _ = swipe_owner.update(cx, |workspace, cx| {
                 workspace.swipe_space(event, window, cx);
             });

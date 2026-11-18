@@ -59,7 +59,7 @@ impl Outbox {
                 epoch: self.epoch,
                 seq,
                 reset: true,
-                patch: PhoneView::default().diff(current),
+                patch: Box::new(PhoneView::default().diff(current)),
             }
         } else {
             let patch = self.sent.diff(current);
@@ -80,7 +80,7 @@ impl Outbox {
                     epoch: self.epoch,
                     seq,
                     reset: false,
-                    patch,
+                    patch: Box::new(patch),
                 }
             }
         };

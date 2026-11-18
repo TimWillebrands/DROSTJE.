@@ -4,7 +4,7 @@ use drostje_phone::{
     PairingOffer,
     link::Connection,
     phone_side::{PairedDesktop, PhoneEvent, PhonePairingEvent, Snapshot},
-    view::{PhoneView, SpaceView},
+    view::{PhoneView, SpaceView, ThemeView},
 };
 use uuid::Uuid;
 
@@ -156,6 +156,13 @@ impl Linked {
 }
 
 impl PhoneApp {
+    pub fn theme(&self) -> Option<&ThemeView> {
+        match &self.phase {
+            Phase::Linked(linked) => linked.view.theme.as_ref(),
+            Phase::Welcome { .. } | Phase::Pairing { .. } => None,
+        }
+    }
+
     pub fn start(paired: Option<PairedDesktop>, cached: Option<PhoneView>) -> (Self, Vec<Effect>) {
         match paired {
             Some(paired) => (
@@ -420,6 +427,7 @@ mod tests {
                 .map(|n| (Uuid::from_u128(n + 1), thread(n + 1)))
                 .collect(),
             transcript: None,
+            theme: None,
         }
     }
 
@@ -448,6 +456,26 @@ mod tests {
         assert_eq!(linked(&app).view.spaces.len(), 1);
         assert!(!linked(&app).synced);
         assert!(matches!(&effects[..], [Effect::StartLink(_, Some(_))]));
+    }
+
+    #[test]
+    fn the_desktop_theme_applies_while_linked_and_ends_with_the_pairing() {
+        let themed = PhoneView {
+            theme: Some(ThemeView {
+                appearance: drostje_phone::view::Appearance::Dark,
+                light: serde_json::json!({"name": "Ink Light"}),
+                dark: serde_json::json!({"name": "Ink Dark"}),
+            }),
+            ..view(1)
+        };
+        let (mut app, _) = PhoneApp::start(Some(paired()), Some(view(1)));
+        assert_eq!(app.theme(), None, "a cache from before themes");
+        app.update(snapshot(themed.clone()));
+        assert_eq!(app.theme(), themed.theme.as_ref());
+        app.update(Input::AskUnpair);
+        app.update(Input::ConfirmUnpair);
+        assert!(matches!(app.phase, Phase::Welcome { .. }));
+        assert_eq!(app.theme(), None, "an unpaired phone wears Delft again");
     }
 
     #[test]

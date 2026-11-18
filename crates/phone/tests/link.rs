@@ -61,6 +61,7 @@ fn desktop_view(status: ThreadStatus, transcript: Option<Transcript>) -> PhoneVi
         )]
         .into(),
         transcript,
+        theme: None,
     }
 }
 

@@ -140,6 +140,8 @@ Met de Android-app volg je Spaces, Threads en de geopende Conversation, ook onde
 2. Kies **Pair phone…** op de computer en **Scan code** in de app. Scan de QR-code en vergelijk het getal van zes cijfers. Klopt het, kies dan **Allow phone**. De code is vijf minuten geldig.
 3. Open een Conversation op je telefoon om live mee te lezen. Als DROSTJE. uitstaat, zie je de laatst bekende stand. Oudere berichten blijven op de computer.
 
+De app neemt het thema van de computer over: Delft, Ink, Cootje of je eigen thema, met accentkleur en papierkorrel. Kies je in **Settings → Appearance** voor System, dan volgt de telefoon zijn eigen lichte of donkere stand. Zolang de telefoon nog niet gekoppeld is, gebruikt hij Delft.
+
 Ontkoppelen kan op de telefoon via **Unpair this phone** of op de computer via **Settings → Phones → Remove phone…**. Berichten zijn end-to-end versleuteld; de server ziet alleen versleutelde gegevens en willekeurige topicnamen.
 
 ## Als iets niet lukt

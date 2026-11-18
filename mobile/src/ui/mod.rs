@@ -1,3 +1,4 @@
+mod appearance;
 mod screens;
 mod widgets;
 
@@ -7,14 +8,12 @@ use drostje_phone::{
     phone_side::{PairedDesktop, PhoneLink, PhonePairing},
     view::PhoneView,
 };
-use gpui_kit::{
-    base::TestSupportExt,
-    component::{ActiveTheme, Theme, ThemeMode},
-    *,
-};
+use drostje_themes::Mode;
+use gpui_kit::{base::TestSupportExt, component::ActiveTheme, *};
 
 use crate::{
     device, links,
+    look::Look,
     state::{Effect, Input, Notice, Phase, PhoneApp},
     storage::Storage,
     time,
@@ -40,6 +39,9 @@ pub struct PhoneRoot {
     transcript_signature: (Option<uuid::Uuid>, usize, usize),
     now: i64,
     problem: Option<String>,
+    system_dark: bool,
+    look: Option<Look>,
+    extras: appearance::Extras,
     _appearance: Subscription,
 }
 
@@ -55,26 +57,8 @@ fn persist_loop(storage: Storage, jobs: async_channel::Receiver<Persist>) {
     }
 }
 
-fn apply_appearance(window: &Window, cx: &mut App) {
-    let dark = matches!(
-        window.appearance(),
-        WindowAppearance::Dark | WindowAppearance::VibrantDark
-    );
-    Theme::change(
-        if dark {
-            ThemeMode::Dark
-        } else {
-            ThemeMode::Light
-        },
-        None,
-        cx,
-    );
-    device::system_bars(dark);
-}
-
 impl PhoneRoot {
     pub fn new(storage: Storage, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        apply_appearance(window, cx);
         let (persist, jobs) = async_channel::unbounded();
         let worker = storage.clone();
         std::thread::Builder::new()
@@ -84,8 +68,9 @@ impl PhoneRoot {
         let (app, effects) = PhoneApp::start(storage.pairing(), storage.view());
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        let appearance = cx.observe_window_appearance(window, |_, window, cx| {
-            apply_appearance(window, cx);
+        let appearance = cx.observe_window_appearance(window, |root, window, cx| {
+            root.system_dark = appearance::is_dark(window.appearance());
+            root.refresh_look(cx);
             cx.notify();
         });
         let mut root = Self {
@@ -101,8 +86,12 @@ impl PhoneRoot {
             transcript_signature: (None, 0, 0),
             now: time::now(),
             problem: None,
+            system_dark: appearance::is_dark(window.appearance()),
+            look: None,
+            extras: appearance::Extras::default(),
             _appearance: appearance,
         };
+        root.refresh_look(cx);
         root.run(effects, cx);
         root.listen_for_links(cx);
         root.tick(cx);
@@ -147,7 +136,18 @@ impl PhoneRoot {
     pub fn input(&mut self, input: Input, cx: &mut Context<Self>) {
         let effects = self.app.update(input);
         self.run(effects, cx);
+        self.refresh_look(cx);
         cx.notify();
+    }
+
+    fn refresh_look(&mut self, cx: &mut Context<Self>) {
+        let look = Look::resolve(self.app.theme(), self.system_dark);
+        if self.look.as_ref() == Some(&look) {
+            return;
+        }
+        appearance::apply(&look, cx);
+        device::system_bars(look.mode == Mode::Dark);
+        self.look = Some(look);
     }
 
     fn run(&mut self, effects: Vec<Effect>, cx: &mut Context<Self>) {
@@ -252,6 +252,7 @@ impl PhoneRoot {
 impl Render for PhoneRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let insets = device::insets();
+        self.extras = appearance::Extras::of(self.look.as_ref(), cx);
         if !self.focus.is_focused(window) {
             self.focus.focus(window, cx);
         }
@@ -269,6 +270,7 @@ impl Render for PhoneRoot {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(cx.theme().background)
@@ -278,6 +280,7 @@ impl Render for PhoneRoot {
             .pb(px(insets.bottom))
             .pl(px(insets.left))
             .pr(px(insets.right))
+            .children(appearance::grain_layer(self.extras.grain))
             .child(body)
     }
 }
@@ -287,6 +290,7 @@ pub fn open_window(
     options: WindowOptions,
     cx: &mut App,
 ) -> anyhow::Result<(AnyWindowHandle, Entity<PhoneRoot>)> {
+    appearance::load_fonts(cx);
     gpui_kit::open_window(options, cx, |window, cx| {
         cx.new(|cx| PhoneRoot::new(storage, window, cx))
     })
@@ -303,5 +307,9 @@ pub fn open(storage: Storage, options: WindowOptions, cx: &mut App) {
 impl PhoneRoot {
     pub fn phase(&self) -> &Phase {
         &self.app.phase
+    }
+
+    pub fn look(&self) -> Option<&Look> {
+        self.look.as_ref()
     }
 }

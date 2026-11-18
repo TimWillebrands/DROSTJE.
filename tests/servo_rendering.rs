@@ -374,7 +374,7 @@ mod macos {
                 cx.update_window(window.into(), |_, w, cx| {
                     w.click_at("servo-surface", point(px(1.), px(1.)), cx);
                     w.dispatch_event(
-                        PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        PlatformInput::Scroll(ScrollEvent {
                             position: bounds.origin + point(px(1.), px(1.)),
                             delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
                             ..Default::default()

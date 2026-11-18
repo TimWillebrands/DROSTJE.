@@ -14,7 +14,7 @@ Desktop app (Rust 2024, GPUI through `gpui-kit`; a Cargo workspace whose domain 
 
 ## Invariants that break silently
 
-- GPUI is reached only through the `gpui_kit` facade; `gpui`, `gpui-component`, `gpui-base` and Zed crates stay out of `Cargo.toml`, and `gpui-kit` stays pinned with `=`. Look up APIs in the pinned source under `~/.cargo/registry/src/*/gpui-component-0.6.6/src` and `gpui-base-0.6.6/src`.
+- GPUI is reached only through the `gpui_kit` facade; `gpui`, `gpui-component`, `gpui-base` and Zed crates stay out of `Cargo.toml`, and `gpui-kit` stays pinned to one git `rev` with `version = "=…"`, the same in the root, `crates/ghostty-terminal` and `mobile/`. Look up APIs in the pinned source under `~/.cargo/git/checkouts/gpui-kit-*/fbc3ebf/crates/component/src` and `crates/base/src`.
 - Only `crates/harness/src/omp.rs` knows OMP wire fields; only `crates/factory/src/launch.rs` builds Factory argv.
 - Child processes get separated argv, never a shell string, and never `--yolo`, `--ignore-capacity`, `--clean` or `--tui`.
 - `unsafe` lives only in `crates/platform` or a transport module (`crates/ghostty-terminal` FFI), each block with a `// SAFETY:` comment; callers use its safe wrappers (`platform::new_session`, `kill_process_group`, …).

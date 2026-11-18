@@ -648,8 +648,8 @@ mod tests {
         use super::{RowChanges, update_rows};
         use gpui_kit::{
             AppContext, Context, FollowMode, IntoElement, ListAlignment, ListState, Pixels,
-            PlatformInput, Render, ScrollDelta, ScrollWheelEvent, Styled, Window, component::Root,
-            div, list, point, px,
+            PlatformInput, Render, ScrollDelta, ScrollEvent, Styled, Window, component::Root, div,
+            list, point, px,
         };
         use std::{cell::Cell, rc::Rc};
 
@@ -687,7 +687,7 @@ mod tests {
             cx.update_window(window.into(), |_, window, cx| {
                 let size = window.viewport_size();
                 window.dispatch_event(
-                    PlatformInput::ScrollWheel(ScrollWheelEvent {
+                    PlatformInput::Scroll(ScrollEvent {
                         position: point(size.width / 2., size.height / 2.),
                         delta: ScrollDelta::Pixels(point(px(0.), up)),
                         ..Default::default()

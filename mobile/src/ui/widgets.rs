@@ -1,7 +1,11 @@
 use gpui_kit::{
     assets::IconName,
-    base::TestSupportExt,
-    component::{ActiveTheme, Icon, Sizable, spinner::Spinner},
+    component::{
+        ActiveTheme, Icon, Sizable, Size,
+        alert::Alert,
+        button::{Button, ButtonVariants},
+        spinner::Spinner,
+    },
     prelude::FluentBuilder,
     *,
 };
@@ -16,6 +20,13 @@ pub enum Tone {
     Good,
     Warn,
     Bad,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Emphasis {
+    Primary,
+    Secondary,
+    Danger,
 }
 
 pub fn tone_color(tone: Tone, cx: &App) -> Hsla {
@@ -35,29 +46,49 @@ pub fn spinner(size: f32, color: Hsla) -> Spinner {
     Spinner::new().with_size(px(size)).color(color)
 }
 
-pub fn icon_button(id: impl Into<ElementId>, name: IconName, cx: &App) -> Stateful<Div> {
-    div()
-        .id(id)
+pub fn dot(color: Hsla) -> Div {
+    div().flex_none().size(px(10.)).rounded_full().bg(color)
+}
+
+pub fn icon_button(id: impl Into<ElementId>, name: IconName, label: &'static str) -> Button {
+    Button::new(id)
+        .ghost()
+        .with_size(Size::Large)
+        .icon(name)
+        .accessibility_label(label)
         .flex_none()
         .size(px(TOUCH))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .cursor_pointer()
-        .active(|style| style.bg(cx.theme().list_active))
-        .child(icon(name, 24., cx.theme().foreground))
+}
+
+pub fn wide_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    leading: Option<IconName>,
+    emphasis: Emphasis,
+) -> Button {
+    let button = Button::new(id)
+        .label(label)
+        .with_size(Size::Large)
+        .w_full()
+        .h(px(TOUCH));
+    let button = match emphasis {
+        Emphasis::Primary => button.primary(),
+        Emphasis::Secondary => button.secondary(),
+        Emphasis::Danger => button.danger(),
+    };
+    match leading {
+        Some(name) => button.icon(name),
+        None => button,
+    }
 }
 
 pub fn app_bar(
-    leading: Option<Stateful<Div>>,
+    leading: Option<Button>,
     title: impl Into<SharedString>,
     subtitle: Option<(SharedString, Tone)>,
-    trailing: Option<Stateful<Div>>,
+    trailing: Option<Button>,
     cx: &App,
 ) -> Div {
-    let leading = leading.map(TestSupportExt::test_support);
-    let trailing = trailing.map(TestSupportExt::test_support);
     let title = title.into();
     div()
         .flex_none()
@@ -96,22 +127,20 @@ pub fn app_bar(
         .when_some(trailing, |bar, trailing| bar.child(trailing))
 }
 
-pub fn banner(name: IconName, text: impl Into<SharedString>, tone: Tone, cx: &App) -> Div {
-    let color = tone_color(tone, cx);
-    div()
-        .flex_none()
-        .mx_4()
-        .mb_2()
-        .px_3()
-        .py_2()
-        .rounded(cx.theme().radius_lg)
-        .bg(color.opacity(0.12))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_3()
-        .child(icon(name, 20., color))
-        .child(div().flex_1().min_w_0().text_sm().child(text.into()))
+pub fn banner(
+    id: impl Into<ElementId>,
+    name: IconName,
+    text: impl Into<SharedString>,
+    tone: Tone,
+) -> Alert {
+    let text: SharedString = text.into();
+    let alert = match tone {
+        Tone::Neutral => Alert::info(id, text),
+        Tone::Good => Alert::success(id, text),
+        Tone::Warn => Alert::warning(id, text),
+        Tone::Bad => Alert::error(id, text),
+    };
+    alert.icon(name)
 }
 
 pub fn section(title: impl Into<SharedString>, cx: &App) -> Div {
@@ -225,57 +254,5 @@ pub fn loading(text: impl Into<SharedString>, cx: &App) -> Div {
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
                 .child(text.into()),
-        )
-}
-
-pub fn wide_button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    leading: Option<IconName>,
-    primary: bool,
-    danger: bool,
-    cx: &App,
-) -> Stateful<Div> {
-    let (background, foreground, pressed) = if danger {
-        (
-            cx.theme().danger,
-            cx.theme().danger_foreground,
-            cx.theme().danger_active,
-        )
-    } else if primary {
-        (
-            cx.theme().primary,
-            cx.theme().primary_foreground,
-            cx.theme().primary_active,
-        )
-    } else {
-        (
-            cx.theme().secondary,
-            cx.theme().secondary_foreground,
-            cx.theme().secondary_active,
-        )
-    };
-    div()
-        .id(id)
-        .w_full()
-        .h(px(TOUCH + 4.))
-        .rounded_full()
-        .bg(background)
-        .text_color(foreground)
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .cursor_pointer()
-        .active(move |style| style.bg(pressed))
-        .when_some(leading, |button, name| {
-            button.child(icon(name, 22., foreground))
-        })
-        .child(
-            div()
-                .text_base()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(label.into()),
         )
 }

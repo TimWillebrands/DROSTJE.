@@ -1059,7 +1059,7 @@ impl Render for BrowserPane {
                     this.send(BrowserCommand::Move { x, y });
                 }
             }))
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                 if this.artifact.is_some()
                     && this.fixed_viewport.is_none()
                     && this

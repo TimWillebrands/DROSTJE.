@@ -134,7 +134,7 @@ public final class ScanActivity extends ComponentActivity {
         hint.setPadding(dp(24), dp(12), dp(24), dp(12));
         GradientDrawable pill = new GradientDrawable();
         pill.setColor(Color.argb(160, 0, 0, 0));
-        pill.setCornerRadius(dp(16));
+        pill.setCornerRadius(dp(6));
         hint.setBackground(pill);
         FrameLayout.LayoutParams hintParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
         hintParams.setMargins(dp(24), 0, dp(24), dp(32));

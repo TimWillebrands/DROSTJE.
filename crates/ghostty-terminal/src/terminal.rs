@@ -457,7 +457,7 @@ impl Terminal {
             )
         });
     }
-    fn scroll(&mut self, event: &ScrollWheelEvent) {
+    fn scroll(&mut self, event: &ScrollEvent) {
         self.mouse_position(event.position, event.modifiers);
         let (x, y, precision) = match event.delta {
             ScrollDelta::Pixels(delta) => (
@@ -530,7 +530,7 @@ impl Render for Terminal {
                 gpui_kit::MouseButton::Right,
                 cx.listener(|terminal, event, _, _| terminal.mouse_up(event)),
             )
-            .on_scroll_wheel(cx.listener(|terminal, event, _, _| terminal.scroll(event)))
+            .on_scroll(cx.listener(|terminal, event, _, _| terminal.scroll(event)))
     }
 }
 

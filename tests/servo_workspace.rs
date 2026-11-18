@@ -1522,7 +1522,7 @@ mod macos {
             .open_window(size(px(1440.), px(900.)), |window, cx| {
                 let view = cx.new(|cx| Workspace::new(state.clone(), window, cx));
                 workspace = Some(view.clone());
-                let root = cx.new(|_| WorkspaceRoot { workspace: view });
+                let root = cx.new(|_| WorkspaceRoot::new(view));
                 cx.new(|cx| Root::new(root, window, cx))
             })
             .unwrap();

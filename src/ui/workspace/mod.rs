@@ -33,7 +33,7 @@ use crate::{
 use browser::{Browsers, browser_of};
 use gpui_kit::{
     component::{
-        ActiveTheme, IconName, Root, Sizable, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
+        ActiveTheme, IconName, Sizable, TITLE_BAR_HEIGHT, TitleBar, WindowExt,
         button::{Button, ButtonVariants},
         dialog::DialogButtonProps,
         dock::{
@@ -572,7 +572,17 @@ impl Workspace {
 }
 
 pub struct WorkspaceRoot {
-    pub workspace: Entity<Workspace>,
+    workspace: Entity<Workspace>,
+    layers_cleared_for_shutdown: bool,
+}
+
+impl WorkspaceRoot {
+    pub fn new(workspace: Entity<Workspace>) -> Self {
+        Self {
+            workspace,
+            layers_cleared_for_shutdown: false,
+        }
+    }
 }
 
 impl Render for WorkspaceRoot {
@@ -580,19 +590,16 @@ impl Render for WorkspaceRoot {
         self.workspace.update(cx, |workspace, cx| {
             workspace.sync_terminal_visibility(window, cx)
         });
-        let show_layers = !self.workspace.read(cx).state.read(cx).shutting_down;
-        let sheet = Root::render_sheet_layer(window, cx);
-        let dialog = Root::render_dialog_layer(window, cx);
-        let notifications = Root::render_notification_layer(window, cx);
-        div()
-            .relative()
-            .size_full()
-            .child(self.workspace.clone())
-            .when(show_layers, |view| {
-                view.children(sheet)
-                    .children(dialog)
-                    .children(notifications)
-            })
+        if self.workspace.read(cx).state.read(cx).shutting_down && !self.layers_cleared_for_shutdown
+        {
+            self.layers_cleared_for_shutdown = true;
+            window.defer(cx, |window, cx| {
+                window.close_all_dialogs(cx);
+                window.close_sheet(cx);
+                window.clear_notifications(cx);
+            });
+        }
+        div().relative().size_full().child(self.workspace.clone())
     }
 }
 
@@ -679,3 +686,7 @@ impl Render for Recovery {
                     .child(Button::new("quit-recovery").label("Quit DROSTJE.").on_click(|_, _, cx| cx.quit()))))
     }
 }
+
+#[cfg(all(test, feature = "runtime-qa"))]
+#[path = "shutdown_ui_tests.rs"]
+mod shutdown_ui_tests;

@@ -14,6 +14,7 @@ pub use drostje_phone as phone;
 pub use drostje_platform as platform;
 pub use drostje_remote as remote;
 pub use drostje_store as store;
+pub use drostje_themes as themes;
 pub use drostje_titles as titles;
 pub use drostje_tracker as tracker;
 pub mod ui;
@@ -85,7 +86,7 @@ pub fn run() {
                             let state = cx.new(|cx| app::AppState::new(bootstrap, cx));
                             let workspace =
                                 cx.new(|cx| ui::workspace::Workspace::new(state, window, cx));
-                            cx.new(|_| ui::workspace::WorkspaceRoot { workspace })
+                            cx.new(|_| ui::workspace::WorkspaceRoot::new(workspace))
                                 .into()
                         }
                         Err(error) => {
