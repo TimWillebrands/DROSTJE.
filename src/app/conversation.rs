@@ -295,6 +295,11 @@ impl AppState {
     }
 
     fn turn_start_reason(&self, id: ThreadId, ignore_active: bool) -> Option<String> {
+        self.turn_reason(id, ignore_active)
+            .or_else(|| self.attachments_reason(id))
+    }
+
+    pub(super) fn turn_reason(&self, id: ThreadId, ignore_active: bool) -> Option<String> {
         if self.shutting_down {
             return Some("Application is shutting down".into());
         }
@@ -350,6 +355,12 @@ impl AppState {
         if thread.submission.is_some() && !(ignore_active && busy) {
             return Some("Review the previous submitted draft before starting another turn".into());
         }
+        None
+    }
+
+    fn attachments_reason(&self, id: ThreadId) -> Option<String> {
+        let thread = self.snapshot.threads.iter().find(|t| t.id == id)?;
+        let session = self.conversations.get(&id)?;
         if !thread.attachments.is_empty()
             && !session.models.is_empty()
             && !session.models.iter().any(|m| {
@@ -529,7 +540,7 @@ impl AppState {
         self.submit_message(id, draft.text.clone(), images, Some(draft), cx);
     }
 
-    fn submit_message(
+    pub(super) fn submit_message(
         &mut self,
         id: ThreadId,
         text: String,

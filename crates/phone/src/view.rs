@@ -11,6 +11,28 @@ pub struct PhoneView {
     pub transcript: Option<Transcript>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<ThemeView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<PromptReceipt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptReceipt {
+    pub id: Uuid,
+    pub outcome: PromptOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PromptOutcome {
+    Started,
+    Refused(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Prompting {
+    #[default]
+    Unsupported,
+    Open,
+    Closed(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +128,8 @@ pub struct Transcript {
     pub thread: Uuid,
     pub earlier: bool,
     pub items: Vec<TranscriptItem>,
+    #[serde(default)]
+    pub prompting: Prompting,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +171,8 @@ pub struct Patch {
     pub transcript: Option<TranscriptPatch>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<ThemeView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipts: Option<Vec<PromptReceipt>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +185,8 @@ pub enum TranscriptPatch {
         order: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         items: Vec<TranscriptItem>,
+        #[serde(default)]
+        prompting: Prompting,
     },
 }
 
@@ -178,6 +206,7 @@ impl Patch {
             && self.removed.is_empty()
             && self.transcript.is_none()
             && self.theme.is_none()
+            && self.receipts.is_none()
     }
 }
 
@@ -205,8 +234,9 @@ fn transcript_patch(old: Option<&Transcript>, new: Option<&Transcript>) -> Optio
                 .filter(|item| previous.get(item.id.as_str()) != Some(item))
                 .cloned()
                 .collect();
-            let earlier_changed = same_thread.is_none_or(|old| old.earlier != new.earlier);
-            if !order_changed && items.is_empty() && !earlier_changed {
+            let header_changed = same_thread
+                .is_none_or(|old| old.earlier != new.earlier || old.prompting != new.prompting);
+            if !order_changed && items.is_empty() && !header_changed {
                 return None;
             }
             Some(TranscriptPatch::Changed {
@@ -215,6 +245,7 @@ fn transcript_patch(old: Option<&Transcript>, new: Option<&Transcript>) -> Optio
                 order: order_changed
                     .then(|| new.items.iter().map(|item| item.id.clone()).collect()),
                 items,
+                prompting: new.prompting.clone(),
             })
         }
     }
@@ -242,6 +273,7 @@ impl PhoneView {
                 .theme
                 .clone()
                 .filter(|theme| self.theme.as_ref() != Some(theme)),
+            receipts: (self.receipts != new.receipts).then(|| new.receipts.clone()),
         }
     }
 
@@ -254,6 +286,7 @@ impl PhoneView {
                 earlier,
                 order,
                 items,
+                prompting,
             }) => {
                 let current = self.transcript.as_ref().filter(|old| old.thread == thread);
                 let mut known: BTreeMap<String, TranscriptItem> = current
@@ -284,6 +317,7 @@ impl PhoneView {
                     thread,
                     earlier,
                     items,
+                    prompting,
                 })
             }
         };
@@ -302,6 +336,9 @@ impl PhoneView {
         self.transcript = transcript;
         if let Some(theme) = patch.theme {
             self.theme = Some(theme);
+        }
+        if let Some(receipts) = patch.receipts {
+            self.receipts = receipts;
         }
         Ok(())
     }
@@ -381,8 +418,10 @@ mod tests {
                 thread: id(1),
                 earlier: false,
                 items: vec![item("a", "one"), item("b", "two")],
+                prompting: Prompting::Open,
             }),
             theme: Some(theme(Appearance::System, "#2453a6")),
+            receipts: Vec::new(),
         }
     }
 
@@ -474,6 +513,7 @@ mod tests {
             thread: id(2),
             earlier: false,
             items: vec![item("a", "one")],
+            prompting: Prompting::Closed("Busy".into()),
         });
         roundtrip(&old, &other);
         let mut closed = view();
@@ -493,6 +533,7 @@ mod tests {
                 earlier: false,
                 order: Some(vec!["a".into()]),
                 items: vec![],
+                prompting: Prompting::Open,
             }),
             ..Patch::default()
         };
@@ -503,6 +544,7 @@ mod tests {
                 earlier: false,
                 order: None,
                 items: vec![item("a", "x")],
+                prompting: Prompting::Open,
             }),
             ..Patch::default()
         };
@@ -537,6 +579,53 @@ mod tests {
             view().theme,
             "a desktop without themes keeps the last one"
         );
+    }
+
+    #[test]
+    fn closing_the_composer_sends_only_the_transcript_header() {
+        let old = view();
+        let mut busy = view();
+        busy.transcript.as_mut().unwrap().prompting =
+            Prompting::Closed("Wait for this Turn to finish".into());
+        let patch = roundtrip(&old, &busy);
+        let Some(TranscriptPatch::Changed { order, items, .. }) = patch.transcript else {
+            panic!("expected a transcript change")
+        };
+        assert!(order.is_none() && items.is_empty());
+    }
+
+    #[test]
+    fn prompt_receipts_travel_until_the_desktop_forgets_them() {
+        let mut answered = view();
+        answered.receipts = vec![
+            PromptReceipt {
+                id: id(7),
+                outcome: PromptOutcome::Started,
+            },
+            PromptReceipt {
+                id: id(8),
+                outcome: PromptOutcome::Refused("Archived history is read-only".into()),
+            },
+        ];
+        let patch = roundtrip(&view(), &answered);
+        assert_eq!(patch.receipts.as_deref(), Some(&answered.receipts[..]));
+        assert!(answered.diff(&answered).receipts.is_none());
+        assert_eq!(roundtrip(&answered, &view()).receipts, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_desktop_from_before_phone_prompts_leaves_prompting_unsupported() {
+        let mut old = serde_json::to_value(view()).unwrap();
+        old["transcript"]
+            .as_object_mut()
+            .unwrap()
+            .remove("prompting");
+        let cached: PhoneView = serde_json::from_value(old).unwrap();
+        assert_eq!(cached.transcript.unwrap().prompting, Prompting::Unsupported);
+        let patch = serde_json::json!({"transcript": {"Changed": {"thread": id(1), "earlier": false, "items": []}}});
+        let mut phone = view();
+        phone.apply(serde_json::from_value(patch).unwrap()).unwrap();
+        assert_eq!(phone.transcript.unwrap().prompting, Prompting::Unsupported);
     }
 
     #[test]

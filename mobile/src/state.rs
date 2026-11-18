@@ -3,12 +3,14 @@ use std::sync::Arc;
 use drostje_phone::{
     PairingOffer,
     link::Connection,
-    phone_side::{PairedDesktop, PhoneEvent, PhonePairingEvent, Snapshot},
-    view::{PhoneView, SpaceView, ThemeView},
+    phone_side::{PairedDesktop, PhoneEvent, PhonePairingEvent, PromptPosted, Snapshot},
+    view::{PhoneView, PromptOutcome, Prompting, SpaceView, ThemeView, ThreadKind},
 };
 use uuid::Uuid;
 
 pub const QUIET_AFTER_SECONDS: i64 = 5 * 60;
+pub const PROMPT_WAIT_SECONDS: i64 = 60;
+pub const PROMPT_CHARS: usize = 20_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -46,6 +48,32 @@ pub struct Linked {
     pub connection: Connection,
     pub stack: Vec<Route>,
     pub confirm_unpair: bool,
+    pub prompt: Option<SentPrompt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentPrompt {
+    pub id: Uuid,
+    pub thread: Uuid,
+    pub text: String,
+    pub sent_at: i64,
+    pub status: PromptStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptStatus {
+    Sending,
+    Unconfirmed(String),
+    Refused(String),
+    NotSent(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Composer {
+    Hidden,
+    Closed(String),
+    Sending,
+    Open,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +86,15 @@ pub enum Effect {
     Unpair,
     SavePairing(Option<PairedDesktop>),
     SaveView(PhoneView),
+    Prompt {
+        id: Uuid,
+        thread: Uuid,
+        text: String,
+    },
+    ClearComposer {
+        thread: Uuid,
+        text: String,
+    },
     LeaveApp,
 }
 
@@ -73,6 +110,13 @@ pub enum Input {
     CancelUnpair,
     ConfirmUnpair,
     DismissNotice,
+    Prompt {
+        id: Uuid,
+        thread: Uuid,
+        text: String,
+        now: i64,
+    },
+    DismissPrompt,
 }
 
 pub struct PhoneApp {
@@ -98,6 +142,7 @@ impl Linked {
             connection: Connection::Connecting,
             stack: vec![Route::Home],
             confirm_unpair: false,
+            prompt: None,
         }
     }
 
@@ -132,6 +177,142 @@ impl Linked {
         match self.view.spaces.as_slice() {
             [space] => Some(space),
             _ => None,
+        }
+    }
+
+    pub fn composer(&self, thread: Uuid) -> Composer {
+        let Some(known) = self.view.threads.get(&thread) else {
+            return Composer::Hidden;
+        };
+        if known.kind == ThreadKind::Factory {
+            return Composer::Hidden;
+        }
+        let desktop = self.desktop_name();
+        if let Connection::Problem(_) = self.connection {
+            return Composer::Closed("Can't reach the server".into());
+        }
+        if self.desktop_online == Some(false) {
+            return Composer::Closed(format!("{desktop} is not running DROSTJE."));
+        }
+        if !self.synced {
+            return Composer::Closed(format!("Connecting to {desktop}…"));
+        }
+        if self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.thread == thread && prompt.status == PromptStatus::Sending)
+        {
+            return Composer::Sending;
+        }
+        let transcript = self
+            .view
+            .transcript
+            .as_ref()
+            .filter(|transcript| transcript.thread == thread);
+        match transcript.map(|transcript| &transcript.prompting) {
+            None => Composer::Closed("Loading the Conversation…".into()),
+            Some(Prompting::Unsupported) => Composer::Closed(format!(
+                "Update DROSTJE. on {desktop} to send prompts from this phone"
+            )),
+            Some(Prompting::Closed(reason)) => Composer::Closed(reason.clone()),
+            Some(Prompting::Open) => Composer::Open,
+        }
+    }
+
+    pub fn prompt_status(&self, thread: Uuid, now: i64) -> Option<PromptStatus> {
+        let prompt = self
+            .prompt
+            .as_ref()
+            .filter(|prompt| prompt.thread == thread)?;
+        Some(match &prompt.status {
+            PromptStatus::Sending if now - prompt.sent_at > PROMPT_WAIT_SECONDS => {
+                PromptStatus::Unconfirmed(format!(
+                    "{} has not confirmed the prompt",
+                    self.desktop_name()
+                ))
+            }
+            status => status.clone(),
+        })
+    }
+
+    fn send_prompt(&mut self, id: Uuid, thread: Uuid, text: String, now: i64) -> Vec<Effect> {
+        if self.watched() != Some(thread) || self.composer(thread) != Composer::Open {
+            return Vec::new();
+        }
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let status = if text.chars().count() > PROMPT_CHARS {
+            PromptStatus::NotSent(format!(
+                "A prompt from the phone can have at most {PROMPT_CHARS} characters"
+            ))
+        } else {
+            PromptStatus::Sending
+        };
+        let effects = match status {
+            PromptStatus::Sending => vec![Effect::Prompt {
+                id,
+                thread,
+                text: text.clone(),
+            }],
+            _ => Vec::new(),
+        };
+        self.prompt = Some(SentPrompt {
+            id,
+            thread,
+            text,
+            sent_at: now,
+            status,
+        });
+        effects
+    }
+
+    fn posted(&mut self, id: Uuid, posted: PromptPosted) {
+        let Some(prompt) = self
+            .prompt
+            .as_mut()
+            .filter(|prompt| prompt.id == id && prompt.status == PromptStatus::Sending)
+        else {
+            return;
+        };
+        match posted {
+            PromptPosted::Published => {}
+            PromptPosted::NotSent(reason) => prompt.status = PromptStatus::NotSent(reason),
+            PromptPosted::Unknown(reason) => prompt.status = PromptStatus::Unconfirmed(reason),
+        }
+    }
+
+    fn answered(&mut self) -> Vec<Effect> {
+        let Some(prompt) = self.prompt.as_mut().filter(|prompt| {
+            matches!(
+                prompt.status,
+                PromptStatus::Sending | PromptStatus::Unconfirmed(_)
+            )
+        }) else {
+            return Vec::new();
+        };
+        let Some(receipt) = self
+            .view
+            .receipts
+            .iter()
+            .find(|receipt| receipt.id == prompt.id)
+        else {
+            return Vec::new();
+        };
+        match &receipt.outcome {
+            PromptOutcome::Started => {
+                let cleared = Effect::ClearComposer {
+                    thread: prompt.thread,
+                    text: prompt.text.clone(),
+                };
+                self.prompt = None;
+                vec![cleared]
+            }
+            PromptOutcome::Refused(reason) => {
+                prompt.status = PromptStatus::Refused(reason.clone());
+                Vec::new()
+            }
         }
     }
 
@@ -224,6 +405,26 @@ impl PhoneApp {
                 }
                 Vec::new()
             }
+            Input::Prompt {
+                id,
+                thread,
+                text,
+                now,
+            } => match &mut self.phase {
+                Phase::Linked(linked) => linked.send_prompt(id, thread, text, now),
+                Phase::Welcome { .. } | Phase::Pairing { .. } => Vec::new(),
+            },
+            Input::DismissPrompt => {
+                if let Phase::Linked(linked) = &mut self.phase
+                    && linked
+                        .prompt
+                        .as_ref()
+                        .is_some_and(|prompt| prompt.status != PromptStatus::Sending)
+                {
+                    linked.prompt = None;
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -301,11 +502,15 @@ impl PhoneApp {
                 linked.desktop_online = desktop_online;
                 linked.heard_at = heard_at.or(linked.heard_at);
                 linked.prune_missing();
+                let mut effects = linked.answered();
                 if changed {
-                    vec![Effect::SaveView((*linked.view).clone())]
-                } else {
-                    Vec::new()
+                    effects.push(Effect::SaveView((*linked.view).clone()));
                 }
+                effects
+            }
+            PhoneEvent::Prompt { id, posted } => {
+                linked.posted(id, posted);
+                Vec::new()
             }
             PhoneEvent::Position(position) => {
                 linked.paired.since = Some(position);
@@ -428,6 +633,7 @@ mod tests {
                 .collect(),
             transcript: None,
             theme: None,
+            receipts: Vec::new(),
         }
     }
 
@@ -607,6 +813,234 @@ mod tests {
             heard_at: Some(2_000),
         })));
         assert_eq!(linked(&app).presence(2_001), DesktopPresence::Offline);
+    }
+
+    fn watching(prompting: Prompting) -> PhoneView {
+        PhoneView {
+            transcript: Some(drostje_phone::view::Transcript {
+                thread: Uuid::from_u128(1),
+                earlier: false,
+                items: Vec::new(),
+                prompting,
+            }),
+            ..view(1)
+        }
+    }
+
+    fn receipt(view: PhoneView, id: u128, outcome: PromptOutcome) -> PhoneView {
+        PhoneView {
+            receipts: vec![drostje_phone::view::PromptReceipt {
+                id: Uuid::from_u128(id),
+                outcome,
+            }],
+            ..view
+        }
+    }
+
+    fn in_thread(prompting: Prompting) -> PhoneApp {
+        let (mut app, _) = PhoneApp::start(Some(paired()), None);
+        app.update(snapshot(watching(prompting)));
+        app.update(Input::Open(Route::Thread(Uuid::from_u128(1))));
+        app
+    }
+
+    fn prompt(id: u128, text: &str, now: i64) -> Input {
+        Input::Prompt {
+            id: Uuid::from_u128(id),
+            thread: Uuid::from_u128(1),
+            text: text.into(),
+            now,
+        }
+    }
+
+    #[test]
+    fn the_composer_says_why_it_cannot_send() {
+        let thread = Uuid::from_u128(1);
+        let app = in_thread(Prompting::Open);
+        assert_eq!(linked(&app).composer(thread), Composer::Open);
+        let app = in_thread(Prompting::Closed(
+            "Answer the agent's question first".into(),
+        ));
+        assert_eq!(
+            linked(&app).composer(thread),
+            Composer::Closed("Answer the agent's question first".into())
+        );
+        let app = in_thread(Prompting::Unsupported);
+        assert_eq!(
+            linked(&app).composer(thread),
+            Composer::Closed("Update DROSTJE. on Studio to send prompts from this phone".into())
+        );
+        let (mut app, _) = PhoneApp::start(Some(paired()), Some(watching(Prompting::Open)));
+        assert_eq!(
+            linked(&app).composer(thread),
+            Composer::Closed("Connecting to Studio…".into()),
+            "a cached view never sends"
+        );
+        app.update(Input::Phone(PhoneEvent::Snapshot(Snapshot {
+            view: Arc::new(watching(Prompting::Open)),
+            synced: true,
+            desktop_online: Some(false),
+            heard_at: Some(1_000),
+        })));
+        assert_eq!(
+            linked(&app).composer(thread),
+            Composer::Closed("Studio is not running DROSTJE.".into())
+        );
+        let mut factory = view(1);
+        factory.threads.get_mut(&thread).unwrap().kind = ThreadKind::Factory;
+        let (mut app, _) = PhoneApp::start(Some(paired()), None);
+        app.update(snapshot(factory));
+        assert_eq!(linked(&app).composer(thread), Composer::Hidden);
+    }
+
+    #[test]
+    fn a_started_prompt_clears_the_composer_once_the_desktop_confirms() {
+        let mut app = in_thread(Prompting::Open);
+        assert!(app.update(prompt(7, "   ", 100)).is_empty());
+        assert_eq!(
+            app.update(prompt(7, " Also the logout page ", 100)),
+            vec![Effect::Prompt {
+                id: Uuid::from_u128(7),
+                thread: Uuid::from_u128(1),
+                text: "Also the logout page".into(),
+            }]
+        );
+        assert_eq!(linked(&app).composer(Uuid::from_u128(1)), Composer::Sending);
+        assert!(
+            app.update(prompt(8, "Again", 101)).is_empty(),
+            "one prompt at a time"
+        );
+        app.update(Input::Phone(PhoneEvent::Prompt {
+            id: Uuid::from_u128(7),
+            posted: PromptPosted::Published,
+        }));
+        let effects = app.update(snapshot(receipt(
+            watching(Prompting::Closed("Claude Code is working".into())),
+            7,
+            PromptOutcome::Started,
+        )));
+        assert_eq!(
+            effects[0],
+            Effect::ClearComposer {
+                thread: Uuid::from_u128(1),
+                text: "Also the logout page".into(),
+            }
+        );
+        assert!(linked(&app).prompt.is_none());
+        let again = app.update(snapshot(receipt(
+            watching(Prompting::Open),
+            7,
+            PromptOutcome::Started,
+        )));
+        assert!(
+            !again.iter().any(|effect| matches!(
+                effect,
+                Effect::ClearComposer { .. } | Effect::Prompt { .. }
+            )),
+            "a receipt seen twice does nothing"
+        );
+    }
+
+    #[test]
+    fn a_refused_prompt_keeps_its_text_and_shows_the_reason() {
+        let mut app = in_thread(Prompting::Open);
+        app.update(prompt(7, "Hello", 100));
+        let effects = app.update(snapshot(receipt(
+            watching(Prompting::Open),
+            7,
+            PromptOutcome::Refused("Archived history is read-only".into()),
+        )));
+        assert!(
+            effects
+                .iter()
+                .all(|effect| matches!(effect, Effect::SaveView(_)))
+        );
+        assert_eq!(
+            linked(&app).prompt_status(Uuid::from_u128(1), 101),
+            Some(PromptStatus::Refused(
+                "Archived history is read-only".into()
+            ))
+        );
+        app.update(Input::DismissPrompt);
+        assert_eq!(linked(&app).prompt_status(Uuid::from_u128(1), 101), None);
+    }
+
+    #[test]
+    fn an_unconfirmed_prompt_stays_unknown_and_is_never_resent() {
+        let thread = Uuid::from_u128(1);
+        let mut app = in_thread(Prompting::Open);
+        app.update(prompt(7, "Hello", 100));
+        assert_eq!(
+            linked(&app).prompt_status(thread, 100 + PROMPT_WAIT_SECONDS),
+            Some(PromptStatus::Sending)
+        );
+        assert!(matches!(
+            linked(&app).prompt_status(thread, 101 + PROMPT_WAIT_SECONDS),
+            Some(PromptStatus::Unconfirmed(_))
+        ));
+        let mut app = in_thread(Prompting::Open);
+        app.update(prompt(7, "Hello", 100));
+        app.update(Input::Phone(PhoneEvent::Prompt {
+            id: Uuid::from_u128(7),
+            posted: PromptPosted::Unknown("Server is unreachable: timed out".into()),
+        }));
+        assert_eq!(
+            linked(&app).prompt_status(thread, 100),
+            Some(PromptStatus::Unconfirmed(
+                "Server is unreachable: timed out".into()
+            ))
+        );
+        assert_eq!(linked(&app).composer(thread), Composer::Open);
+        for input in [
+            Input::Phone(PhoneEvent::Connection(Connection::Connected)),
+            snapshot(watching(Prompting::Open)),
+            Input::Back,
+            Input::Open(Route::Thread(thread)),
+        ] {
+            assert!(
+                !app.update(input)
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Prompt { .. })),
+                "nothing resends a prompt by itself"
+            );
+        }
+        let late = app.update(snapshot(receipt(
+            watching(Prompting::Open),
+            7,
+            PromptOutcome::Started,
+        )));
+        assert!(
+            late.iter()
+                .any(|effect| matches!(effect, Effect::ClearComposer { .. })),
+            "a late confirmation still settles it"
+        );
+    }
+
+    #[test]
+    fn prompts_the_server_refused_or_that_are_too_long_are_not_sent() {
+        let thread = Uuid::from_u128(1);
+        let mut app = in_thread(Prompting::Open);
+        app.update(prompt(7, "Hello", 100));
+        app.update(Input::Phone(PhoneEvent::Prompt {
+            id: Uuid::from_u128(7),
+            posted: PromptPosted::NotSent("Server rate limit reached".into()),
+        }));
+        assert_eq!(
+            linked(&app).prompt_status(thread, 100),
+            Some(PromptStatus::NotSent("Server rate limit reached".into()))
+        );
+        let long = "x".repeat(PROMPT_CHARS + 1);
+        assert!(app.update(prompt(8, &long, 100)).is_empty());
+        assert!(matches!(
+            linked(&app).prompt_status(thread, 100),
+            Some(PromptStatus::NotSent(reason)) if reason.contains("20000")
+        ));
+        let (mut elsewhere, _) = PhoneApp::start(Some(paired()), None);
+        elsewhere.update(snapshot(watching(Prompting::Open)));
+        assert!(
+            elsewhere.update(prompt(9, "Hello", 100)).is_empty(),
+            "only the open Thread takes prompts"
+        );
     }
 
     #[test]

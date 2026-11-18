@@ -6,7 +6,7 @@ use std::{
 
 use drostje_mobile::{
     links,
-    state::{Notice, Phase, Route},
+    state::{Composer, Notice, Phase, PromptStatus, Route},
     storage::Storage,
     ui::{self, PhoneRoot},
 };
@@ -15,8 +15,9 @@ use drostje_phone::{
     PairingOffer, Server,
     desktop_side::{DesktopLink, LinkEvent, PairingEvent, PairingSession},
     view::{
-        Appearance, ItemKind, PhoneView, ProjectView, SpaceView, ThemeView, ThreadKind,
-        ThreadStatus, ThreadView, ToolState, Transcript, TranscriptItem,
+        Appearance, ItemKind, PhoneView, ProjectView, PromptOutcome, PromptReceipt, Prompting,
+        SpaceView, ThemeView, ThreadKind, ThreadStatus, ThreadView, ToolState, Transcript,
+        TranscriptItem,
     },
 };
 use gpui_kit::{
@@ -109,6 +110,25 @@ impl Phone {
             .update_window(self.window, |_, window, cx| window.press(key, cx))
             .expect("key reaches the window");
         self.settle();
+    }
+
+    fn type_text(&mut self, text: &str) {
+        self.cx
+            .update_window(self.window, |_, window, cx| window.input(text, cx))
+            .expect("text reaches the window");
+        self.settle();
+    }
+
+    fn disabled(&mut self, id: &str) -> Option<bool> {
+        let id = id.to_owned();
+        self.cx
+            .update_window(self.window, |_, window, _| window.find(id).disabled())
+            .expect("window can be queried")
+    }
+
+    fn composer_text(&mut self, thread: Uuid) -> Option<String> {
+        let root = self.root.clone();
+        self.cx.update(|cx| root.read(cx).composer_text(thread, cx))
     }
 
     fn visible(&mut self, id: &str) -> bool {
@@ -256,6 +276,7 @@ fn desktop_view(transcript: Option<Transcript>) -> PhoneView {
             .collect(),
         transcript,
         theme: None,
+        receipts: Vec::new(),
     }
 }
 
@@ -320,7 +341,159 @@ fn transcript() -> Transcript {
                 "Move the session read after the callback",
             ),
         ],
+        prompting: Prompting::Closed("Claude Code is working. Wait for this Turn to finish".into()),
     }
+}
+
+fn paired_phone(ntfy: &TestServer, data: &std::path::Path) -> (Phone, DesktopLink) {
+    let mut phone = Phone::open(Storage::new(data.to_path_buf()));
+    let session = PairingSession::start(
+        Server::new(ntfy.address(), None).unwrap(),
+        None,
+        Duration::from_secs(60),
+    );
+    next(&session.events, |event| {
+        (event == PairingEvent::Listening).then_some(())
+    });
+    links::deliver(session.offer.to_link());
+    phone.wait("the pairing request", |phase| {
+        matches!(phase, Phase::Pairing { check: Some(_), .. })
+    });
+    next(&session.events, |event| {
+        matches!(event, PairingEvent::Incoming { .. }).then_some(())
+    });
+    session.accept("Studio Mac".into());
+    let link = next(&session.events, |event| match event {
+        PairingEvent::Paired { link, .. } => Some(link),
+        _ => None,
+    });
+    phone.wait("pairing", |phase| matches!(phase, Phase::Linked(_)));
+    let desktop = DesktopLink::start(Server::new(ntfy.address(), None).unwrap(), link, None);
+    (phone, desktop)
+}
+
+fn conversation(prompting: Prompting, receipts: Vec<PromptReceipt>, asked: bool) -> PhoneView {
+    let mut transcript = transcript();
+    transcript.prompting = prompting;
+    transcript.items.truncate(3);
+    if asked {
+        let mut prompt = transcript.items[0].clone();
+        prompt.id = "u2".into();
+        prompt.text = "Also cover the logout redirect".into();
+        transcript.items.push(prompt);
+    }
+    PhoneView {
+        receipts,
+        ..desktop_view(Some(transcript))
+    }
+}
+
+fn the_desktop_prompt(desktop: &DesktopLink) -> (Uuid, String) {
+    next(&desktop.events, |event| match event {
+        LinkEvent::Prompt { id, text, .. } => Some((id, text)),
+        _ => None,
+    })
+}
+
+fn a_phone_sends_prompts_and_learns_what_the_desktop_did_with_them() {
+    let ntfy = TestServer::start();
+    let data = std::env::temp_dir().join(format!("drostje-phone-{}", Uuid::new_v4()));
+    let (mut phone, desktop) = paired_phone(&ntfy, &data);
+    desktop.show(desktop_view(None));
+    phone.wait(
+        "sync",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.synced),
+    );
+    phone.click(&format!("space-{}", id(100)));
+    phone.click(&format!("thread-{}", id(1)));
+    next(&desktop.events, |event| {
+        (event == LinkEvent::Watch(Some(id(1)))).then_some(())
+    });
+    desktop.show(conversation(
+        Prompting::Closed("Claude Code is working. Wait for this Turn to finish".into()),
+        Vec::new(),
+        false,
+    ));
+    phone.wait("a busy agent", |phase| {
+        matches!(phase, Phase::Linked(linked) if matches!(linked.composer(id(1)), Composer::Closed(reason) if reason.contains("working")))
+    });
+    assert!(phone.visible("composer-status"));
+    phone.click("prompt-input");
+    phone.type_text("Also cover the logout redirect");
+    assert_eq!(phone.disabled("send-prompt"), Some(true));
+    phone.shot("17-composer-busy");
+
+    desktop.show(conversation(Prompting::Open, Vec::new(), false));
+    phone.wait(
+        "an idle agent",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.composer(id(1)) == Composer::Open),
+    );
+    assert_ne!(phone.disabled("send-prompt"), Some(true));
+    phone.shot("18-composer-ready");
+    phone.press("enter");
+    assert_eq!(
+        phone.linked(|linked| linked.composer(id(1))),
+        Composer::Sending
+    );
+    phone.shot("19-prompt-sending");
+    let (first, text) = the_desktop_prompt(&desktop);
+    assert_eq!(text, "Also cover the logout redirect");
+    desktop.show(conversation(
+        Prompting::Closed("Claude Code is working. Wait for this Turn to finish".into()),
+        vec![PromptReceipt {
+            id: first,
+            outcome: PromptOutcome::Started,
+        }],
+        true,
+    ));
+    phone.wait(
+        "the started Turn",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.prompt.is_none()),
+    );
+    assert_eq!(phone.composer_text(id(1)).as_deref(), Some(""));
+    phone.shot("20-prompt-started");
+
+    desktop.show(conversation(Prompting::Open, Vec::new(), true));
+    phone.wait(
+        "the agent to finish",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.composer(id(1)) == Composer::Open),
+    );
+    phone.click("prompt-input");
+    phone.type_text("Ship");
+    phone.press("shift-enter");
+    phone.type_text("it");
+    assert_eq!(phone.composer_text(id(1)).as_deref(), Some("Ship\nit"));
+    phone.click("send-prompt");
+    let (second, text) = the_desktop_prompt(&desktop);
+    assert_eq!(text, "Ship\nit");
+    assert_ne!(second, first);
+    desktop.show(conversation(
+        Prompting::Open,
+        vec![PromptReceipt {
+            id: second,
+            outcome: PromptOutcome::Refused(
+                "The last prompt needs a look on the computer before the next one".into(),
+            ),
+        }],
+        true,
+    ));
+    phone.wait("the refusal", |phase| {
+        matches!(phase, Phase::Linked(linked) if linked.prompt.as_ref().is_some_and(|prompt| matches!(prompt.status, PromptStatus::Refused(_))))
+    });
+    assert!(phone.visible("prompt-note"));
+    assert_eq!(phone.composer_text(id(1)).as_deref(), Some("Ship\nit"));
+    phone.shot("21-prompt-refused");
+    phone.click("prompt-note");
+    assert!(!phone.visible("prompt-note"));
+
+    phone.click("prompt-input");
+    phone.press("escape");
+    assert_eq!(
+        phone.linked(|linked| linked.route().clone()),
+        Route::Space(id(100)),
+        "Back leaves the Conversation even from the composer"
+    );
+    let _ = std::fs::remove_dir_all(data);
 }
 
 fn a_phone_pairs_follows_spaces_and_threads_and_unpairs() {
@@ -578,6 +751,10 @@ fn main() {
         (
             "a_declined_phone_returns_to_welcome",
             a_declined_phone_returns_to_welcome,
+        ),
+        (
+            "a_phone_sends_prompts_and_learns_what_the_desktop_did_with_them",
+            a_phone_sends_prompts_and_learns_what_the_desktop_did_with_them,
         ),
     ] {
         scenario();

@@ -2,14 +2,22 @@ mod appearance;
 mod screens;
 mod widgets;
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use drostje_phone::{
-    phone_side::{PairedDesktop, PhoneLink, PhonePairing},
+    phone_side::{PairedDesktop, PhoneEvent, PhoneLink, PhonePairing, PromptPosted},
     view::PhoneView,
 };
 use drostje_themes::Mode;
-use gpui_kit::{base::TestSupportExt, component::ActiveTheme, *};
+use gpui_kit::{
+    base::TestSupportExt,
+    component::{
+        ActiveTheme,
+        input::{InputEvent, TextareaState},
+    },
+    *,
+};
+use uuid::Uuid;
 
 use crate::{
     device, links,
@@ -42,6 +50,9 @@ pub struct PhoneRoot {
     system_dark: bool,
     look: Option<Look>,
     extras: appearance::Extras,
+    composers: HashMap<Uuid, Entity<TextareaState>>,
+    sent: Vec<(Uuid, String)>,
+    _composer_events: Vec<Subscription>,
     _appearance: Subscription,
 }
 
@@ -89,6 +100,9 @@ impl PhoneRoot {
             system_dark: appearance::is_dark(window.appearance()),
             look: None,
             extras: appearance::Extras::default(),
+            composers: HashMap::new(),
+            sent: Vec::new(),
+            _composer_events: Vec::new(),
             _appearance: appearance,
         };
         root.refresh_look(cx);
@@ -231,7 +245,79 @@ impl PhoneRoot {
                 Effect::SaveView(view) => {
                     let _ = self.persist.try_send(Persist::View(view));
                 }
+                Effect::Prompt { id, thread, text } => {
+                    let queued = match &self.link {
+                        Some(link) => link.prompt(id, thread, text),
+                        None => Err("This phone is not connected to the server".into()),
+                    };
+                    if let Err(reason) = queued {
+                        let posted = PromptPosted::NotSent(reason);
+                        let follow = self
+                            .app
+                            .update(Input::Phone(PhoneEvent::Prompt { id, posted }));
+                        self.run(follow, cx);
+                    }
+                }
+                Effect::ClearComposer { thread, text } => self.sent.push((thread, text)),
                 Effect::LeaveApp => device::leave(),
+            }
+        }
+    }
+
+    fn composer(
+        &mut self,
+        thread: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextareaState> {
+        if let Some(composer) = self.composers.get(&thread) {
+            return composer.clone();
+        }
+        let composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 6)
+                .submit_on_enter(true)
+                .autocorrect(true)
+                .placeholder("Send a prompt…")
+        });
+        let events = cx.subscribe_in(
+            &composer,
+            window,
+            move |root, _, event: &InputEvent, _, cx| match event {
+                InputEvent::PressEnter { shift: false, .. } => root.send_prompt(thread, cx),
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { shift: true, .. }
+                | InputEvent::Focus
+                | InputEvent::Blur => {}
+            },
+        );
+        self._composer_events.push(events);
+        self.composers.insert(thread, composer.clone());
+        composer
+    }
+
+    fn send_prompt(&mut self, thread: Uuid, cx: &mut Context<Self>) {
+        let Some(composer) = self.composers.get(&thread) else {
+            return;
+        };
+        let text = composer.read(cx).value().to_string();
+        self.input(
+            Input::Prompt {
+                id: Uuid::new_v4(),
+                thread,
+                text,
+                now: time::now(),
+            },
+            cx,
+        );
+    }
+
+    fn clear_sent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (thread, text) in std::mem::take(&mut self.sent) {
+            if let Some(composer) = self.composers.get(&thread)
+                && composer.read(cx).value().trim() == text
+            {
+                composer.update(cx, |composer, cx| composer.set_value("", window, cx));
             }
         }
     }
@@ -253,7 +339,8 @@ impl Render for PhoneRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let insets = device::insets();
         self.extras = appearance::Extras::of(self.look.as_ref(), cx);
-        if !self.focus.is_focused(window) {
+        self.clear_sent(window, cx);
+        if !self.focus.contains_focused(window, cx) {
             self.focus.focus(window, cx);
         }
         let body = match &self.app.phase {
@@ -322,5 +409,11 @@ impl PhoneRoot {
 
     pub fn look(&self) -> Option<&Look> {
         self.look.as_ref()
+    }
+
+    pub fn composer_text(&self, thread: Uuid, cx: &App) -> Option<String> {
+        self.composers
+            .get(&thread)
+            .map(|composer| composer.read(cx).value().to_string())
     }
 }

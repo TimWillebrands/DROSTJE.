@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_channel::{Receiver, Sender, TryRecvError};
-use drostje_ntfy::{Event, Server};
+use drostje_ntfy::{Event, PublishError, Server};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -124,9 +124,33 @@ pub struct Snapshot {
     pub heard_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptPosted {
+    Published,
+    NotSent(String),
+    Unknown(String),
+}
+
+impl PromptPosted {
+    fn of(result: &Result<drostje_ntfy::Published, PublishError>) -> Self {
+        match result {
+            Ok(_) => Self::Published,
+            Err(
+                error @ (PublishError::RateLimited { .. }
+                | PublishError::Refused { .. }
+                | PublishError::TooLarge),
+            ) => Self::NotSent(error.to_string()),
+            Err(error @ (PublishError::Network(_) | PublishError::Response(_))) => {
+                Self::Unknown(error.to_string())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum PhoneEvent {
     Snapshot(Snapshot),
+    Prompt { id: Uuid, posted: PromptPosted },
     Position(String),
     Connection(Connection),
     Revoked,
@@ -135,6 +159,11 @@ pub enum PhoneEvent {
 
 enum PhoneCommand {
     Watch(Option<Uuid>),
+    Prompt {
+        id: Uuid,
+        thread: Uuid,
+        text: String,
+    },
     Unpair,
     Close,
 }
@@ -159,6 +188,12 @@ impl PhoneLink {
 
     pub fn watch(&self, thread: Option<Uuid>) {
         let _ = self.commands.try_send(PhoneCommand::Watch(thread));
+    }
+
+    pub fn prompt(&self, id: Uuid, thread: Uuid, text: String) -> Result<(), String> {
+        self.commands
+            .try_send(PhoneCommand::Prompt { id, thread, text })
+            .map_err(|_| "The connection to the server is busy; try again".to_owned())
     }
 
     pub fn unpair(&self) {
@@ -198,7 +233,13 @@ fn run(
     };
     let send = |up: &Up, connection: &mut ConnectionState| {
         let result = publish(&server, &link.up, seal_up(&link.key, &link.up, up));
-        connection.published(result.map(|_| ()).map_err(|error| error.to_string()));
+        connection.published(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        );
+        result
     };
     let snapshot = |mirror: &Mirror, heard_at: Option<i64>| {
         PhoneEvent::Snapshot(Snapshot {
@@ -216,11 +257,19 @@ fn run(
         match commands.try_recv() {
             Ok(PhoneCommand::Watch(thread)) => {
                 watch = thread;
-                send(&Up::Watch { thread }, &mut connection);
+                let _ = send(&Up::Watch { thread }, &mut connection);
+                continue;
+            }
+            Ok(PhoneCommand::Prompt { id, thread, text }) => {
+                let result = send(&Up::Prompt { id, thread, text }, &mut connection);
+                emit(PhoneEvent::Prompt {
+                    id,
+                    posted: PromptPosted::of(&result),
+                });
                 continue;
             }
             Ok(PhoneCommand::Unpair) => {
-                send(&Up::Unpaired, &mut connection);
+                let _ = send(&Up::Unpaired, &mut connection);
                 emit(PhoneEvent::Closed);
                 return;
             }
@@ -236,7 +285,7 @@ fn run(
         if needs_sync {
             mirror.request_reset();
             sync_sent = Some(Instant::now());
-            send(&Up::Sync { watch }, &mut connection);
+            let _ = send(&Up::Sync { watch }, &mut connection);
             continue;
         }
         match subscription.events.try_recv() {
@@ -262,14 +311,14 @@ fn run(
                         sync_sent = None;
                         let showing = mirror.view.transcript.as_ref().map(|t| t.thread);
                         if watch.is_some() && showing != watch {
-                            send(&Up::Watch { thread: watch }, &mut connection);
+                            let _ = send(&Up::Watch { thread: watch }, &mut connection);
                         }
                         emit(snapshot(&mirror, heard_at));
                     }
                     Applied::Changed => emit(snapshot(&mirror, heard_at)),
                     Applied::NeedsSync => {
                         sync_sent = Some(Instant::now());
-                        send(&Up::Sync { watch }, &mut connection);
+                        let _ = send(&Up::Sync { watch }, &mut connection);
                     }
                     Applied::Unchanged => {}
                 }

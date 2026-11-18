@@ -5,10 +5,11 @@ use drostje_phone::{
     PairingOffer, Server,
     desktop_side::{DesktopLink, LinkEvent, PairingEvent, PairingSession},
     link::Connection,
+    phone_side::PromptPosted,
     phone_side::{PairedDesktop, PhoneEvent, PhoneLink, PhonePairing, PhonePairingEvent, Snapshot},
     view::{
-        ItemKind, PhoneView, ProjectView, SpaceView, ThreadKind, ThreadStatus, ThreadView,
-        Transcript, TranscriptItem,
+        ItemKind, PhoneView, ProjectView, PromptOutcome, PromptReceipt, Prompting, SpaceView,
+        ThreadKind, ThreadStatus, ThreadView, Transcript, TranscriptItem,
     },
 };
 use uuid::Uuid;
@@ -62,6 +63,7 @@ fn desktop_view(status: ThreadStatus, transcript: Option<Transcript>) -> PhoneVi
         .into(),
         transcript,
         theme: None,
+        receipts: Vec::new(),
     }
 }
 
@@ -75,6 +77,7 @@ fn transcript(text: &str) -> Transcript {
             text: text.into(),
             clipped: false,
         }],
+        prompting: Prompting::Open,
     }
 }
 
@@ -166,6 +169,86 @@ fn a_paired_phone_mirrors_threads_and_follows_the_watched_transcript() {
     wait_for(&phone.events, |event| {
         matches!(event, PhoneEvent::Revoked).then_some(())
     });
+}
+
+#[test]
+fn a_prompt_from_the_phone_reaches_the_desktop_sealed_and_its_receipt_comes_back() {
+    let ntfy = TestServer::start();
+    let (paired, link) = pair(&ntfy);
+    let up = link.up.clone();
+    let server = Server::new(ntfy.address(), None).unwrap();
+    let desktop = DesktopLink::start(server, link, None);
+    desktop.show(desktop_view(ThreadStatus::Idle, Some(transcript("Done"))));
+    let phone = PhoneLink::start(paired, None).unwrap();
+    snapshot(&phone.events, |snapshot| snapshot.synced);
+
+    let id = Uuid::from_u128(42);
+    phone
+        .prompt(id, thread_id(), "Also cover the logout redirect".into())
+        .unwrap();
+    let posted = wait_for(&phone.events, |event| match event {
+        PhoneEvent::Prompt { id: sent, posted } if sent == id => Some(posted),
+        _ => None,
+    });
+    assert_eq!(posted, PromptPosted::Published);
+    let (thread, text, sent_at) = wait_for(&desktop.events, |event| match event {
+        LinkEvent::Prompt {
+            id: received,
+            thread,
+            text,
+            sent_at,
+        } if received == id => Some((thread, text, sent_at)),
+        _ => None,
+    });
+    assert_eq!(thread, thread_id());
+    assert_eq!(text, "Also cover the logout redirect");
+    assert!(sent_at > 0, "the server time travels with the prompt");
+    for message in ntfy.messages(up.as_str()) {
+        assert!(!message.contains("logout"), "plaintext leaked: {message}");
+    }
+
+    desktop.show(PhoneView {
+        receipts: vec![PromptReceipt {
+            id,
+            outcome: PromptOutcome::Started,
+        }],
+        ..desktop_view(ThreadStatus::Running, Some(transcript("Done")))
+    });
+    snapshot(&phone.events, |snapshot| {
+        snapshot
+            .view
+            .receipts
+            .iter()
+            .any(|receipt| receipt.id == id)
+    });
+}
+
+#[test]
+fn a_prompt_the_server_cannot_take_is_reported_as_unknown() {
+    let server = Server::new("http://127.0.0.1:9", None).unwrap();
+    let paired = PairedDesktop {
+        desktop: "Studio Mac".into(),
+        token: None,
+        link: drostje_phone::link::LinkRecord {
+            server: server.address().into(),
+            down: drostje_phone::Topic::random(),
+            up: drostje_phone::Topic::random(),
+            key: drostje_phone::LinkKey::from_bytes([1; 32]),
+        },
+        since: None,
+    };
+    let phone = PhoneLink::start(paired, None).unwrap();
+    phone
+        .prompt(Uuid::from_u128(1), thread_id(), "Hello".into())
+        .unwrap();
+    let posted = wait_for(&phone.events, |event| match event {
+        PhoneEvent::Prompt { posted, .. } => Some(posted),
+        _ => None,
+    });
+    assert!(
+        matches!(&posted, PromptPosted::Unknown(reason) if reason.contains("unreachable")),
+        "{posted:?}"
+    );
 }
 
 #[test]

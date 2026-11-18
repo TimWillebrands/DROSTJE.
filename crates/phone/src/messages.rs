@@ -24,8 +24,17 @@ pub enum Down {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Up {
-    Sync { watch: Option<Uuid> },
-    Watch { thread: Option<Uuid> },
+    Sync {
+        watch: Option<Uuid>,
+    },
+    Watch {
+        thread: Option<Uuid>,
+    },
+    Prompt {
+        id: Uuid,
+        thread: Uuid,
+        text: String,
+    },
     Unpaired,
 }
 
@@ -136,6 +145,23 @@ mod tests {
         assert_eq!(
             open_down(&key(), &topic, Received::Attachment(&bytes)).unwrap(),
             down
+        );
+    }
+
+    #[test]
+    fn long_prompts_travel_up_as_attachments() {
+        let topic = Topic::random();
+        let up = Up::Prompt {
+            id: Uuid::from_u128(4),
+            thread: Uuid::from_u128(1),
+            text: "Explain the redirect loop. ".repeat(400),
+        };
+        let Sealed::Attachment(bytes) = seal_up(&key(), &topic, &up) else {
+            panic!("a 10 kB prompt does not fit in a text message")
+        };
+        assert_eq!(
+            open_up(&key(), &topic, Received::Attachment(&bytes)).unwrap(),
+            up
         );
     }
 

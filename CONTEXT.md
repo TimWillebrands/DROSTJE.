@@ -17,6 +17,6 @@ Use these terms, spelled this way, in UI strings, the palette, menus, tooltips, 
 | **Task** | One unit of work inside a Run, as Factory reports it (`TaskSnapshot`). |
 | **Worktree** | A Git worktree DROSTJE created for Conversations, on its own `drostje/<name>` branch. |
 | **Host** | A remote machine that runs Conversations, reached through the SEINTJE relay. |
-| **Phone** | An Android device paired with a QR code that follows Spaces, Threads and the opened Conversation, read-only, over an ntfy server with end-to-end encryption. |
+| **Phone** | An Android device paired with a QR code that follows Spaces, Threads and the opened Conversation and can send it prompts, over an ntfy server with end-to-end encryption. Questions from the agent are answered on the computer. |
 | **Region** | A keyboard focus area of the workspace: Projects or Thread. |
 | **Changes** | The sidebar tab showing a Thread's uncommitted working-tree diff. |

@@ -7,7 +7,7 @@ use super::{
     },
 };
 use crate::{
-    state::{DesktopPresence, Input, Linked, Notice, Phase, Route},
+    state::{Composer, DesktopPresence, Input, Linked, Notice, Phase, PromptStatus, Route},
     time,
 };
 use drostje_phone::{
@@ -20,7 +20,10 @@ use drostje_phone::{
 use gpui_kit::{
     assets::IconName,
     base::TestSupportExt,
-    component::{ActiveTheme, alert::Alert, button::Button, text::TextView},
+    component::{
+        ActiveTheme, Disableable, alert::Alert, button::Button, button::ButtonVariants,
+        input::Textarea, text::TextView,
+    },
     prelude::FluentBuilder,
     *,
 };
@@ -513,7 +516,7 @@ impl PhoneRoot {
         &mut self,
         linked: &Linked,
         thread: &ThreadView,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let project = linked
@@ -572,8 +575,8 @@ impl PhoneRoot {
             (_, None) => loading("Loading the Conversation…", cx).into_any_element(),
             (_, Some(transcript)) if transcript.items.is_empty() => empty_state(
                 IconName::MessageSquare,
-                "Nothing to show yet",
-                "Open this Conversation on your computer to follow it here.",
+                "No messages yet",
+                "Send the first prompt below, or start the Conversation on your computer.",
                 cx,
             )
             .into_any_element(),
@@ -598,6 +601,124 @@ impl PhoneRoot {
             })
             .when_some(attention, |screen, attention| screen.child(attention))
             .child(body)
+            .when_some(
+                self.composer_bar(linked, thread, window, cx),
+                |screen, bar| screen.child(bar),
+            )
+    }
+
+    fn composer_bar(
+        &mut self,
+        linked: &Linked,
+        thread: &ThreadView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let state = linked.composer(thread.id);
+        if state == Composer::Hidden {
+            return None;
+        }
+        let id = thread.id;
+        let composer = self.composer(id, window, cx);
+        let empty = composer.read(cx).value().trim().is_empty();
+        let muted = cx.theme().muted_foreground;
+        let note = match linked.prompt_status(id, self.now) {
+            Some(PromptStatus::Refused(reason)) => Some(banner(
+                "prompt-refused",
+                IconName::CircleX,
+                format!("Not sent: {reason}"),
+                Tone::Bad,
+            )),
+            Some(PromptStatus::NotSent(reason)) => Some(banner(
+                "prompt-not-sent",
+                IconName::CircleX,
+                format!("Not sent: {reason}"),
+                Tone::Bad,
+            )),
+            Some(PromptStatus::Unconfirmed(reason)) => Some(banner(
+                "prompt-unconfirmed",
+                IconName::CircleAlert,
+                format!("{reason}. Check the Conversation before you send it again."),
+                Tone::Warn,
+            )),
+            Some(PromptStatus::Sending) | None => None,
+        };
+        let status = match &state {
+            Composer::Closed(reason) => Some(
+                div()
+                    .id("composer-status")
+                    .test_support()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(reason.clone())
+                    .into_any_element(),
+            ),
+            Composer::Sending => Some(
+                div()
+                    .id("composer-status")
+                    .test_support()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(spinner(14., muted))
+                    .child(format!("Sending to {}…", linked.desktop_name()))
+                    .into_any_element(),
+            ),
+            Composer::Open | Composer::Hidden => None,
+        };
+        let can_send = state == Composer::Open && !empty;
+        Some(
+            div()
+                .id("composer")
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_3()
+                .pt_2()
+                .pb_3()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .bg(cx.theme().background)
+                .when_some(note, |bar, note| {
+                    bar.child(
+                        div()
+                            .id("prompt-note")
+                            .test_support()
+                            .on_click(
+                                cx.listener(|root, _, _, cx| root.input(Input::DismissPrompt, cx)),
+                            )
+                            .child(note),
+                    )
+                })
+                .when_some(status, |bar, status| bar.child(status))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("prompt-input")
+                                .test_support()
+                                .flex_1()
+                                .min_w_0()
+                                .child(Textarea::new(&composer)),
+                        )
+                        .child(
+                            icon_button("send-prompt", IconName::ArrowUp, "Send prompt")
+                                .primary()
+                                .disabled(!can_send)
+                                .on_click(
+                                    cx.listener(move |root, _, _, cx| root.send_prompt(id, cx)),
+                                ),
+                        ),
+                ),
+        )
     }
 
     fn transcript_list(
@@ -704,7 +825,7 @@ impl PhoneRoot {
                             .py_3()
                             .text_sm()
                             .text_color(cx.theme().muted_foreground)
-                            .child("Messages are end-to-end encrypted between this phone and your computer. The server only passes them on. This phone can read along; it cannot send prompts or answer questions."),
+                            .child("Messages are end-to-end encrypted between this phone and your computer. The server only passes them on. This phone can read along and send prompts to the Conversation it shows. Questions from the agent are answered on your computer."),
                     ),
             )
             .child(

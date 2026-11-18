@@ -240,7 +240,7 @@ impl SurfaceContent {
                 )
                 .child("Allow it only when your phone shows the same code.")
                 .child(muted(
-                    "The phone sees your Spaces, Threads and the Conversation you open on it. It cannot send prompts or answer questions.",
+                    "The phone sees your Spaces, Threads and the Conversation you open on it, and can send prompts to that Conversation. Questions from the agent are still answered here.",
                     cx,
                 )),
             PhonePairingStatus::Paired { name } => body.child(
@@ -296,7 +296,7 @@ impl SurfaceContent {
                 "No phones are paired. Choose Pair phone… and scan the code with the DROSTJE. app."
                     .to_owned()
             } else {
-                "Each phone shows Spaces, Threads and the Conversation it opens. Phones cannot send prompts.".to_owned()
+                "Each phone shows Spaces, Threads and the Conversation it opens, and can send prompts to that Conversation.".to_owned()
             })
             .item(
                 SettingItem::new(

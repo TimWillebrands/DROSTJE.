@@ -6,12 +6,12 @@ use crate::phone::{
     desktop_side::{DesktopLink, LinkEvent, PairingEvent, PairingSession},
     link::{Connection, LinkRecord, PAIRING_TTL},
     view::{
-        PhoneView, ProjectView, SpaceView, ThemeView, ThreadKind as PhoneThreadKind, ThreadStatus,
-        ThreadView, Transcript,
+        PhoneView, ProjectView, PromptOutcome, PromptReceipt, Prompting, SpaceView, ThemeView,
+        ThreadKind as PhoneThreadKind, ThreadStatus, ThreadView, Transcript,
     },
 };
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub use transcript::transcript_tail;
 
@@ -19,6 +19,8 @@ pub const PHONE_SERVER_SETTING: &str = "phone_server";
 pub const PHONE_TOKEN_ENV_SETTING: &str = "phone_token_env";
 const PHONES_SETTING: &str = "phones";
 const PUBLISH_EVERY: Duration = Duration::from_millis(400);
+pub const PROMPT_TTL_SECONDS: i64 = 120;
+const RECEIPTS_KEPT: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedPhone {
@@ -59,6 +61,45 @@ pub struct PhoneLinkState {
     pub connection: Connection,
     shown: Option<PhoneView>,
     generation: Uuid,
+    prompts: PhonePrompts,
+}
+
+#[derive(Debug, Default)]
+struct PhonePrompts {
+    receipts: VecDeque<PromptReceipt>,
+}
+
+impl PhonePrompts {
+    fn answered(&self, id: Uuid) -> bool {
+        self.receipts.iter().any(|receipt| receipt.id == id)
+    }
+
+    fn record(&mut self, id: Uuid, outcome: PromptOutcome) {
+        if self.answered(id) {
+            return;
+        }
+        if self.receipts.len() == RECEIPTS_KEPT {
+            self.receipts.pop_front();
+        }
+        self.receipts.push_back(PromptReceipt { id, outcome });
+    }
+
+    fn receipts(&self) -> Vec<PromptReceipt> {
+        self.receipts.iter().cloned().collect()
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn late_prompt_reason(sent_at: i64, now: i64) -> Option<String> {
+    (now - sent_at > PROMPT_TTL_SECONDS).then(|| {
+        "The prompt reached the computer too late and was not sent. Send it again if you still want it".into()
+    })
 }
 
 type TranscriptKey = (Uuid, u64, u64, usize);
@@ -400,13 +441,14 @@ impl AppState {
                 connection: Connection::Connecting,
                 shown: None,
                 generation,
+                prompts: PhonePrompts::default(),
             },
         );
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 if this
                     .update(cx, |state, cx| {
-                        state.phone_link_event(id, generation, event);
+                        state.phone_link_event(id, generation, event, cx);
                         cx.notify();
                     })
                     .is_err()
@@ -420,7 +462,13 @@ impl AppState {
         self.publish_phone_views();
     }
 
-    fn phone_link_event(&mut self, id: Uuid, generation: Uuid, event: LinkEvent) {
+    fn phone_link_event(
+        &mut self,
+        id: Uuid,
+        generation: Uuid,
+        event: LinkEvent,
+        cx: &mut Context<Self>,
+    ) {
         let Some(runtime) = self
             .phones
             .links
@@ -433,7 +481,16 @@ impl AppState {
             LinkEvent::Watch(thread) => {
                 runtime.watch = thread;
                 runtime.shown = None;
+                if let Some(thread) = thread {
+                    self.ensure_conversation(thread);
+                }
             }
+            LinkEvent::Prompt {
+                id: prompt,
+                thread,
+                text,
+                sent_at,
+            } => self.phone_prompt(id, prompt, thread, text, sent_at, cx),
             LinkEvent::Connection(connection) => runtime.connection = connection,
             LinkEvent::Position(position) => {
                 let mut phones = self.paired_phones();
@@ -449,6 +506,103 @@ impl AppState {
             LinkEvent::Revoked | LinkEvent::Closed => {
                 self.phones.links.remove(&id);
             }
+        }
+    }
+
+    fn phone_prompt(
+        &mut self,
+        phone: Uuid,
+        prompt: Uuid,
+        thread: ThreadId,
+        text: String,
+        sent_at: i64,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .phones
+            .links
+            .get(&phone)
+            .is_none_or(|runtime| runtime.prompts.answered(prompt))
+        {
+            return;
+        }
+        let refusal = late_prompt_reason(sent_at, unix_now())
+            .or_else(|| self.phone_prompt_refusal(thread, &text));
+        let outcome = match refusal {
+            Some(reason) => PromptOutcome::Refused(reason),
+            None => {
+                let name = self
+                    .paired_phones()
+                    .into_iter()
+                    .find(|paired| paired.id == phone)
+                    .map(|paired| paired.name)
+                    .unwrap_or_else(|| "A phone".into());
+                let title = self
+                    .snapshot
+                    .threads
+                    .iter()
+                    .find(|known| known.id == thread)
+                    .map(|known| known.title.clone())
+                    .unwrap_or_default();
+                self.submit_message(thread, text, Vec::new(), None, cx);
+                self.notice(
+                    NoticeLevel::Info,
+                    format!("{name} sent a prompt to “{title}”"),
+                );
+                PromptOutcome::Started
+            }
+        };
+        if let Some(runtime) = self.phones.links.get_mut(&phone) {
+            runtime.prompts.record(prompt, outcome);
+        }
+        self.publish_phone_views();
+    }
+
+    fn phone_prompt_refusal(&self, thread: ThreadId, text: &str) -> Option<String> {
+        if text.trim().is_empty() {
+            return Some("Enter a prompt".into());
+        }
+        if let Prompting::Closed(reason) = self.phone_prompting(thread) {
+            return Some(reason);
+        }
+        self.command_refusal(thread, text)
+    }
+
+    pub fn phone_prompting(&self, id: ThreadId) -> Prompting {
+        let Some(thread) = self.snapshot.threads.iter().find(|thread| thread.id == id) else {
+            return Prompting::Closed("This Thread is no longer on the computer".into());
+        };
+        if thread.kind != ThreadKind::Conversation {
+            return Prompting::Closed("Factory threads do not accept prompts".into());
+        }
+        let harness = crate::harness::display_name(&thread.harness);
+        if let Some(session) = self.conversations.get(&id) {
+            let reason = match session.state {
+                _ if session.preparing || self.active_threads.contains(&id) => Some(format!(
+                    "{harness} is working. Wait for this Turn to finish"
+                )),
+                ConversationState::Starting => Some(format!("Starting {harness}…")),
+                ConversationState::WaitingForInput => {
+                    Some("Answer the agent's question on the computer first".into())
+                }
+                ConversationState::Running | ConversationState::Interrupting => Some(format!(
+                    "{harness} is working. Wait for this Turn to finish"
+                )),
+                ConversationState::Disconnected | ConversationState::Failed => Some(format!(
+                    "{harness} is not connected. Reconnect it on the computer"
+                )),
+                ConversationState::Ready if thread.submission.is_some() => {
+                    Some("The last prompt needs a look on the computer before the next one".into())
+                }
+                ConversationState::Ready => None,
+            };
+            if let Some(reason) = reason {
+                return Prompting::Closed(reason);
+            }
+        }
+        match self.turn_reason(id, false) {
+            Some(reason) => Prompting::Closed(reason),
+            None => Prompting::Open,
         }
     }
 
@@ -576,6 +730,7 @@ impl AppState {
             threads,
             transcript: None,
             theme: self.phones.theme.clone(),
+            receipts: Vec::new(),
         }
     }
 
@@ -610,6 +765,12 @@ impl AppState {
     }
 
     fn phone_transcript(&mut self, thread: ThreadId) -> Option<Transcript> {
+        let mut transcript = self.phone_history(thread)?;
+        transcript.prompting = self.phone_prompting(thread);
+        Some(transcript)
+    }
+
+    fn phone_history(&mut self, thread: ThreadId) -> Option<Transcript> {
         let Some(session) = self.conversations.get(&thread) else {
             return self
                 .snapshot
@@ -620,8 +781,15 @@ impl AppState {
                     thread,
                     earlier: false,
                     items: Vec::new(),
+                    prompting: Prompting::default(),
                 });
         };
+        if session.state == ConversationState::Starting
+            && session.messages.is_empty()
+            && session.error.is_none()
+        {
+            return None;
+        }
         let key = (
             session.generation,
             session.transcript_revision,
@@ -664,6 +832,9 @@ impl AppState {
                 used.insert(thread);
                 view.transcript = self.phone_transcript(thread);
             }
+            if let Some(runtime) = self.phones.links.get(&id) {
+                view.receipts = runtime.prompts.receipts();
+            }
             if let Some(runtime) = self.phones.links.get_mut(&id)
                 && runtime.shown.as_ref() != Some(&view)
             {
@@ -691,10 +862,40 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::{
-        LinkRecord, PairedPhone, ThreadCondition, ThreadStatus, condition_status, http_origin,
+        LinkRecord, PROMPT_TTL_SECONDS, PairedPhone, PhonePrompts, PromptOutcome, RECEIPTS_KEPT,
+        ThreadCondition, ThreadStatus, condition_status, http_origin, late_prompt_reason,
         token_from,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn prompts_older_than_the_limit_are_refused() {
+        let now = 1_000_000;
+        assert_eq!(late_prompt_reason(now - PROMPT_TTL_SECONDS, now), None);
+        assert_eq!(late_prompt_reason(now + 30, now), None);
+        assert!(
+            late_prompt_reason(now - PROMPT_TTL_SECONDS - 1, now)
+                .unwrap()
+                .contains("too late")
+        );
+    }
+
+    #[test]
+    fn each_prompt_is_answered_once_and_only_recent_receipts_are_kept() {
+        let mut prompts = PhonePrompts::default();
+        prompts.record(Uuid::from_u128(0), PromptOutcome::Started);
+        prompts.record(
+            Uuid::from_u128(0),
+            PromptOutcome::Refused("a second answer".into()),
+        );
+        assert_eq!(prompts.receipts()[0].outcome, PromptOutcome::Started);
+        for n in 1..=RECEIPTS_KEPT as u128 {
+            prompts.record(Uuid::from_u128(n), PromptOutcome::Started);
+        }
+        assert_eq!(prompts.receipts().len(), RECEIPTS_KEPT);
+        assert!(!prompts.answered(Uuid::from_u128(0)));
+        assert!(prompts.answered(Uuid::from_u128(RECEIPTS_KEPT as u128)));
+    }
 
     #[test]
     fn a_seintje_host_suggests_its_https_origin_as_phone_server() {
@@ -750,5 +951,296 @@ mod tests {
         let value = serde_json::to_value(vec![phone.clone()]).unwrap();
         let back: Vec<PairedPhone> = serde_json::from_value(value).unwrap();
         assert_eq!(back, vec![phone]);
+    }
+}
+
+#[cfg(all(test, feature = "runtime-qa"))]
+mod app_tests {
+    use super::{LinkRecord, PROMPT_TTL_SECONDS, PairedPhone, PromptOutcome, Prompting, unix_now};
+    use crate::{
+        app::{AppState, Bootstrap, ConversationSession},
+        harness::{
+            ContentBlock, ConversationCommand, ConversationEvent, ConversationState, Message,
+        },
+        model::{Project, ProjectDefaults, ThreadId},
+        phone::{desktop_side::LinkEvent, view::ItemKind},
+        platform,
+        store::Store,
+    };
+    use gpui_kit::{AppContext as _, Entity, TestAppContext};
+    use std::{collections::BTreeMap, path::PathBuf};
+    use uuid::Uuid;
+
+    struct Directory(PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Fixture {
+        _directory: Directory,
+        state: Entity<AppState>,
+        thread: ThreadId,
+        phone: Uuid,
+        generation: Uuid,
+    }
+
+    fn fixture(cx: &mut TestAppContext, git: bool) -> Fixture {
+        cx.dispatcher.allow_parking();
+        let directory =
+            Directory(std::env::temp_dir().join(format!("drostje-phone-app-{}", Uuid::new_v4())));
+        let root = directory.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut repositories = BTreeMap::new();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "drost".into(),
+            root: root.clone(),
+            archived: false,
+            defaults: ProjectDefaults::default(),
+        };
+        if git {
+            let status = std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git init in the fixture");
+            repositories.insert(
+                project.id,
+                platform::inspect_repository(&root).map_err(|error| format!("{error:#}")),
+            );
+        }
+        let project_id = project.id;
+        let store = Store::open(directory.0.join("data")).unwrap();
+        smol::block_on(store.save_project(project)).unwrap();
+        let snapshot = smol::block_on(store.snapshot()).unwrap();
+        let state = cx.new(|cx| {
+            AppState::new(
+                Bootstrap {
+                    data_dir: directory.0.join("data"),
+                    store,
+                    snapshot,
+                    diagnostics: BTreeMap::new(),
+                    repositories,
+                    browser_tools: None,
+                },
+                cx,
+            )
+        });
+        let phone = PairedPhone {
+            id: Uuid::new_v4(),
+            name: "Pixel 9".into(),
+            paired_at: "2026-11-18T09:00:00Z".into(),
+            link: LinkRecord {
+                server: "http://127.0.0.1:9".into(),
+                down: crate::phone::Topic::random(),
+                up: crate::phone::Topic::random(),
+                key: crate::phone::LinkKey::from_bytes([4; 32]),
+            },
+            token_env: None,
+            up_since: None,
+        };
+        let phone_id = phone.id;
+        let (thread, generation) = state.update(cx, |state, cx| {
+            state.select_project(project_id);
+            state.new_conversation("claude-code").unwrap();
+            let thread = state.selected_thread.unwrap();
+            let mut named = state
+                .snapshot
+                .threads
+                .iter()
+                .find(|known| known.id == thread)
+                .cloned()
+                .unwrap();
+            named.title = "Fix the login redirect".into();
+            state.save_thread(named);
+            state.store_phones(std::slice::from_ref(&phone));
+            state.start_phone_link(phone, cx);
+            (thread, state.phones.links[&phone_id].generation)
+        });
+        Fixture {
+            _directory: directory,
+            state,
+            thread,
+            phone: phone_id,
+            generation,
+        }
+    }
+
+    fn send(f: &Fixture, event: LinkEvent, cx: &mut TestAppContext) {
+        f.state.update(cx, |state, cx| {
+            state.phone_link_event(f.phone, f.generation, event, cx)
+        });
+        cx.run_until_parked();
+    }
+
+    fn prompt(f: &Fixture, id: u128, text: &str, sent_at: i64, cx: &mut TestAppContext) {
+        let event = LinkEvent::Prompt {
+            id: Uuid::from_u128(id),
+            thread: f.thread,
+            text: text.into(),
+            sent_at,
+        };
+        send(f, event, cx);
+    }
+
+    fn receipts(f: &Fixture, cx: &mut TestAppContext) -> Vec<(u128, PromptOutcome)> {
+        f.state.read_with(cx, |state, _| {
+            state.phones.links[&f.phone]
+                .shown
+                .as_ref()
+                .expect("the phone was shown a view")
+                .receipts
+                .iter()
+                .map(|receipt| (receipt.id.as_u128(), receipt.outcome.clone()))
+                .collect()
+        })
+    }
+
+    #[gpui_kit::test]
+    fn a_phone_prompt_starts_one_turn_and_further_prompts_wait_for_it(cx: &mut TestAppContext) {
+        let f = fixture(cx, true);
+        let (commands, native) = async_channel::unbounded();
+        f.state.update(cx, |state, _| {
+            let mut session = ConversationSession::new(None);
+            session.commands = Some(commands);
+            session.state = ConversationState::Ready;
+            session.persisted = true;
+            state.conversations.insert(f.thread, session);
+            assert_eq!(state.phone_prompting(f.thread), Prompting::Open);
+        });
+
+        prompt(&f, 1, "Also cover the logout redirect", unix_now(), cx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while native.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+        match native.try_recv() {
+            Ok(ConversationCommand::Submit { text, images, .. }) => {
+                assert_eq!(text, "Also cover the logout redirect");
+                assert!(images.is_empty());
+            }
+            other => panic!("expected the prompt to start a Turn, got {other:?}"),
+        }
+        assert_eq!(receipts(&f, cx), vec![(1, PromptOutcome::Started)]);
+        f.state.read_with(cx, |state, _| {
+            assert_eq!(
+                state.phone_prompting(f.thread),
+                Prompting::Closed("Claude Code is working. Wait for this Turn to finish".into())
+            );
+            assert!(state.active_threads.contains(&f.thread));
+        });
+
+        prompt(&f, 1, "Also cover the logout redirect", unix_now(), cx);
+        prompt(&f, 2, "And the signup page", unix_now(), cx);
+        prompt(&f, 3, "Old news", unix_now() - PROMPT_TTL_SECONDS - 60, cx);
+        assert!(
+            native.try_recv().is_err(),
+            "a replay, a busy agent and a late prompt start nothing"
+        );
+        let answered = receipts(&f, cx);
+        assert_eq!(answered.len(), 3, "{answered:?}");
+        assert_eq!(answered[0], (1, PromptOutcome::Started));
+        assert_eq!(
+            answered[1],
+            (
+                2,
+                PromptOutcome::Refused(
+                    "Claude Code is working. Wait for this Turn to finish".into()
+                )
+            )
+        );
+        assert!(
+            matches!(&answered[2], (3, PromptOutcome::Refused(reason)) if reason.contains("too late"))
+        );
+    }
+
+    #[gpui_kit::test]
+    fn prompts_for_threads_that_cannot_take_them_are_refused_with_the_reason(
+        cx: &mut TestAppContext,
+    ) {
+        let f = fixture(cx, true);
+        prompt(&f, 1, "   ", unix_now(), cx);
+        prompt(&f, 2, "Hello", unix_now(), cx);
+        let answered = receipts(&f, cx);
+        assert_eq!(
+            answered[0],
+            (1, PromptOutcome::Refused("Enter a prompt".into()))
+        );
+        assert_eq!(
+            answered[1],
+            (
+                2,
+                PromptOutcome::Refused("Open the conversation harness first".into())
+            )
+        );
+        let factory = f.state.update(cx, |state, _| {
+            state.new_thread(crate::model::ThreadKind::Factory).unwrap();
+            state.selected_thread.unwrap()
+        });
+        f.state.read_with(cx, |state, _| {
+            assert_eq!(
+                state.phone_prompting(factory),
+                Prompting::Closed("Factory threads do not accept prompts".into())
+            );
+            assert_eq!(
+                state.phone_prompting(Uuid::new_v4()),
+                Prompting::Closed("This Thread is no longer on the computer".into())
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn watching_a_thread_opens_its_conversation_so_the_phone_gets_its_history(
+        cx: &mut TestAppContext,
+    ) {
+        let f = fixture(cx, false);
+        f.state.read_with(cx, |state, _| {
+            assert!(!state.conversations.contains_key(&f.thread));
+        });
+        f.state.update(cx, |state, cx| {
+            state.phone_link_event(f.phone, f.generation, LinkEvent::Watch(Some(f.thread)), cx);
+            assert!(
+                state.conversations.contains_key(&f.thread),
+                "the harness opens for the phone"
+            );
+            assert_eq!(
+                state.phone_transcript(f.thread),
+                None,
+                "the phone shows loading while the harness starts"
+            );
+            let message = |id: &str, role: &str, text: &str| Message {
+                id: id.into(),
+                role: role.into(),
+                content: vec![ContentBlock::Text(text.into())],
+                raw: None,
+                tool_call_id: None,
+                error: false,
+                exit_code: None,
+            };
+            state.receive_conversation(
+                f.thread,
+                ConversationEvent::History {
+                    messages: vec![
+                        message("u1", "user", "Why does login loop?"),
+                        message("a1", "assistant", "The return URL is read too early."),
+                    ],
+                    next_cursor: None,
+                },
+                cx,
+            );
+            let transcript = state
+                .phone_transcript(f.thread)
+                .expect("history makes a transcript");
+            let kinds: Vec<_> = transcript.items.iter().map(|item| &item.kind).collect();
+            assert_eq!(kinds, vec![&ItemKind::User, &ItemKind::Assistant]);
+            assert_eq!(
+                transcript.prompting,
+                Prompting::Closed("Starting Claude Code…".into())
+            );
+        });
     }
 }

@@ -162,6 +162,12 @@ fn run_pairing(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkEvent {
     Watch(Option<Uuid>),
+    Prompt {
+        id: Uuid,
+        thread: Uuid,
+        text: String,
+        sent_at: i64,
+    },
     Position(String),
     Connection(Connection),
     Unpaired,
@@ -299,6 +305,12 @@ fn run_link(
                         emit(LinkEvent::Watch(watch));
                     }
                     Some(Up::Watch { thread }) => emit(LinkEvent::Watch(thread)),
+                    Some(Up::Prompt { id, thread, text }) => emit(LinkEvent::Prompt {
+                        id,
+                        thread,
+                        text,
+                        sent_at: message.time,
+                    }),
                     Some(Up::Unpaired) => {
                         emit(LinkEvent::Unpaired);
                         return;

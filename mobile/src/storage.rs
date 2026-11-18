@@ -72,6 +72,7 @@ impl Storage {
     pub fn save_view(&self, view: &PhoneView) -> Result<()> {
         let mut cached = view.clone();
         cached.transcript = None;
+        cached.receipts.clear();
         self.write(VIEW_FILE, &cached)
     }
 
@@ -94,7 +95,11 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use drostje_phone::{LinkKey, Topic, link::LinkRecord, view::Transcript};
+    use drostje_phone::{
+        LinkKey, Topic,
+        link::LinkRecord,
+        view::{PromptOutcome, PromptReceipt, Prompting, Transcript},
+    };
 
     fn temp() -> Storage {
         let directory =
@@ -128,7 +133,12 @@ mod tests {
                 thread: uuid::Uuid::nil(),
                 earlier: false,
                 items: Vec::new(),
+                prompting: Prompting::Open,
             }),
+            receipts: vec![PromptReceipt {
+                id: uuid::Uuid::nil(),
+                outcome: PromptOutcome::Started,
+            }],
             ..PhoneView::default()
         };
         storage.save_view(&view).unwrap();
@@ -136,6 +146,10 @@ mod tests {
         let cached = storage.view().unwrap();
         assert_eq!(cached.desktop, "Studio");
         assert!(cached.transcript.is_none());
+        assert!(
+            cached.receipts.is_empty(),
+            "receipts belong to this run only"
+        );
         storage.save_pairing(None).unwrap();
         assert!(storage.pairing().is_none());
         assert!(storage.view().is_none());

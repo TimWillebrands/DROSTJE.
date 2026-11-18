@@ -134,11 +134,12 @@ Bij verbindingsverlies maakt een lopende turn zijn werk af. Na een Host-herstart
 
 ## Meekijken op je telefoon
 
-Met de Android-app volg je Spaces, Threads en de geopende Conversation, ook onderweg. Prompts sturen en vragen beantwoorden doe je op de computer. De app is er voor arm64-telefoons met Android 11 of nieuwer.
+Met de Android-app volg je Spaces, Threads en de geopende Conversation, ook onderweg, en stuur je die Conversation een prompt. Vragen van de agent beantwoord je op de computer. De app is er voor arm64-telefoons met Android 11 of nieuwer.
 
 1. Vul in **Settings → Phones** een ntfy-server in, bijvoorbeeld je SEINTJE of `https://ntfy.sh`. Heeft die een token nodig, dan geef je de naam van de omgevingsvariabele op.
 2. Kies **Pair phone…** op de computer en **Scan code** in de app. Scan de QR-code en vergelijk het getal van zes cijfers. Klopt het, kies dan **Allow phone**. De code is vijf minuten geldig.
-3. Open een Conversation op je telefoon om live mee te lezen. Als DROSTJE. uitstaat, zie je de laatst bekende stand. Oudere berichten blijven op de computer.
+3. Open een Conversation op je telefoon. Je ziet de laatste berichten, ook als de Conversation op de computer nog niet open stond, en leest live mee. Als DROSTJE. uitstaat, zie je de laatst bekende stand. Oudere berichten blijven op de computer.
+4. Typ onderaan een prompt en tik op de verzendknop. De computer start dan een Turn, net alsof je hem daar verstuurde. Werkt de agent nog, wacht hij op een antwoord of is de Conversation niet verbonden, dan zegt de app waarom verzenden nu niet kan. Krijgt de telefoon binnen een minuut geen bevestiging, dan meldt hij dat; kijk dan eerst in de Conversation voordat je opnieuw verstuurt. Een prompt die later dan twee minuten na verzenden aankomt, start niets.
 
 De app neemt het thema van de computer over: Delft, Ink, Cootje of je eigen thema, met accentkleur en papierkorrel. Kies je in **Settings → Appearance** voor System, dan volgt de telefoon zijn eigen lichte of donkere stand. Zolang de telefoon nog niet gekoppeld is, gebruikt hij Delft.
 

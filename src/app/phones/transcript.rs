@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::harness::{ContentBlock, Message, ToolActivity, UserRequest};
-use crate::phone::view::{ItemKind, ToolState, Transcript, TranscriptItem};
+use crate::phone::view::{ItemKind, Prompting, ToolState, Transcript, TranscriptItem};
 use uuid::Uuid;
 
 pub const TAIL_ITEMS: usize = 40;
@@ -156,6 +156,7 @@ pub fn transcript_tail<'a>(
         thread,
         earlier,
         items,
+        prompting: Prompting::default(),
     }
 }
 
