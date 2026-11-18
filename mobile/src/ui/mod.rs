@@ -298,8 +298,19 @@ pub fn open_window(
 
 pub fn open(storage: Storage, options: WindowOptions, cx: &mut App) {
     gpui_kit::init(cx);
-    if let Err(error) = open_window(storage, options, cx) {
-        log::error!("Opening the DROSTJE. window failed: {error:#}");
+    let drawn = storage.clone();
+    match open_window(storage, options, cx) {
+        Ok((handle, _)) => {
+            let watched = handle.update(cx, |_, window, _| {
+                window.on_next_frame(move |window, _| {
+                    window.on_next_frame(move |_, _| device::frame_drawn(&drawn));
+                });
+            });
+            if let Err(error) = watched {
+                log::warn!("Watching the first frame failed: {error:#}");
+            }
+        }
+        Err(error) => log::error!("Opening the DROSTJE. window failed: {error:#}"),
     }
     cx.activate(true);
 }

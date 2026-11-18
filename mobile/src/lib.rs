@@ -1,4 +1,5 @@
 pub mod device;
+pub mod graphics;
 pub mod links;
 pub mod look;
 pub mod state;
@@ -23,11 +24,13 @@ fn android_main(app: android_activity::AndroidApp) {
         log::error!("The Android platform did not start");
         return;
     };
+    let storage = storage::Storage::new(android::files_dir());
+    android::choose_graphics(&storage);
     gpui_kit::Application::with_platform(shared.into_rc())
         .with_assets(gpui_kit::assets::AllAssets::new(""))
-        .run(|cx| {
+        .run(move |cx| {
             ui::open(
-                storage::Storage::new(android::files_dir()),
+                storage,
                 gpui_kit::WindowOptions {
                     window_bounds: None,
                     ..Default::default()

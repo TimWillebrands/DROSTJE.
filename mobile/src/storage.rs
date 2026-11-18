@@ -8,8 +8,11 @@ use anyhow::{Context, Result};
 use drostje_phone::{phone_side::PairedDesktop, view::PhoneView};
 use serde::{Serialize, de::DeserializeOwned};
 
+use crate::graphics::GraphicsRecord;
+
 const PAIRING_FILE: &str = "paired-desktop.json";
 const VIEW_FILE: &str = "desktop-view.json";
+const GRAPHICS_FILE: &str = "graphics.json";
 
 #[derive(Clone, Debug)]
 pub struct Storage {
@@ -70,6 +73,17 @@ impl Storage {
         let mut cached = view.clone();
         cached.transcript = None;
         self.write(VIEW_FILE, &cached)
+    }
+
+    pub fn graphics(&self) -> Option<GraphicsRecord> {
+        self.read(GRAPHICS_FILE)
+    }
+
+    pub fn save_graphics(&self, record: Option<GraphicsRecord>) -> Result<()> {
+        match record {
+            Some(record) => self.write(GRAPHICS_FILE, &record),
+            None => self.remove(GRAPHICS_FILE),
+        }
     }
 
     pub fn directory(&self) -> &Path {
