@@ -565,6 +565,14 @@ impl Render for PromptEditor {
 }
 
 impl Workspace {
+    pub(in crate::ui) fn prompt_focus_handle(&self, id: ThreadId, cx: &App) -> Option<FocusHandle> {
+        let editor = self.editor.as_ref()?.read(cx);
+        (self.editor_override.is_none()
+            && editor.active_key() == Some(&DraftKey::Thread(id))
+            && self.can_edit_conversation(id, cx))
+        .then(|| editor.focus_handle(cx))
+    }
+
     fn can_edit_conversation(&self, id: ThreadId, cx: &App) -> bool {
         let state = self.state.read(cx);
         !state.shutting_down

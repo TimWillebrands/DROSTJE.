@@ -57,6 +57,25 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
     .await;
 
     let editor = cx.read(|cx| fixture.state.read(cx).editor.clone().unwrap());
+    press(cx, "left secondary-alt-left secondary-alt-l");
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("prompt-editor").focused(), Some(true));
+    })
+    .unwrap();
+    press(cx, "d");
+    until(
+        cx,
+        "continued typing after pane navigation",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == "abdc",
+    )
+    .await;
+    press(cx, "backspace");
+    until(cx, "restored draft text", Duration::from_secs(5), |cx| {
+        fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == "abc"
+    })
+    .await;
     let mut retained = None;
     for mode in ["light", "dark"] {
         fixture.state.update(cx, |state, cx| {

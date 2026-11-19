@@ -241,8 +241,23 @@ impl Workspace {
             .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)))
             .map(|(panel, _, _)| panel);
         if let Some((next, sidebar)) = next {
+            if sidebar_focus.is_none()
+                && let PanelKind::Thread(id) = current.read(cx).kind
+            {
+                let restore = self
+                    .prompt_focus_handle(id, cx)
+                    .is_some_and(|focus| focus.contains_focused(window, cx));
+                current.update(cx, |panel, _| panel.restore_prompt_focus = restore);
+            }
             let kind = next.read(cx).kind;
+            let restore_prompt = sidebar.is_none() && next.read(cx).restore_prompt_focus;
             self.focus_panel(next, window, cx);
+            if restore_prompt
+                && let PanelKind::Thread(id) = kind
+                && let Some(focus) = self.prompt_focus_handle(id, cx)
+            {
+                focus.focus(window, cx);
+            }
             if let (PanelKind::Thread(id), Some(tab)) = (kind, sidebar) {
                 match tab {
                     SidebarTab::Terminal => {
