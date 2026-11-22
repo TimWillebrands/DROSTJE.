@@ -87,6 +87,7 @@ impl ToolDetailText {
 struct DetailContent {
     owner: WeakEntity<Workspace>,
     key: SurfaceKey,
+    image: Option<Entity<crate::ui::conversation::ImagePreview>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -430,9 +431,14 @@ impl Workspace {
         let workspace_entity = cx.entity();
         let owner = workspace_entity.downgrade();
         let state = self.state.clone();
+        let image = matches!(key, SurfaceKey::Image(_))
+            .then(|| self.image_preview.clone())
+            .flatten()
+            .map(|image| cx.new(|cx| crate::ui::conversation::ImagePreview::new(image, cx)));
         let content = cx.new(|cx: &mut Context<DetailContent>| DetailContent {
             owner: owner.clone(),
             key: key.clone(),
+            image: image.clone(),
             _subscriptions: vec![
                 cx.observe(&workspace_entity, |_, _, cx| cx.notify()),
                 cx.observe(&state, |_, _, cx| cx.notify()),
@@ -532,6 +538,9 @@ impl Workspace {
                     });
                 })
         });
+        if let Some(image) = image {
+            image.read(cx).focus_handle().focus(window, cx);
+        }
     }
 
     fn detail_closed(&mut self, key: &SurfaceKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -564,33 +573,16 @@ impl Render for DetailContent {
         }
         match &self.key {
             SurfaceKey::Image(path) => {
-                let Some(image) = workspace
-                    .image_preview
-                    .as_ref()
-                    .filter(|image| &image.path == path)
-                else {
+                let Some(preview) = self.image.clone().filter(|preview| {
+                    &preview.read(cx).image().path == path
+                        && workspace
+                            .image_preview
+                            .as_ref()
+                            .is_some_and(|image| &image.path == path)
+                }) else {
                     return div().into_any_element();
                 };
-                v_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "{} × {} · {}",
-                                image.width, image.height, image.mime
-                            )),
-                    )
-                    .child(
-                        img(image.path.clone())
-                            .w_full()
-                            .max_h(
-                                (window.viewport_size().height * 0.65).min(window.rem_size() * 42.),
-                            )
-                            .object_fit(ObjectFit::Contain),
-                    )
-                    .into_any_element()
+                preview.into_any_element()
             }
             SurfaceKey::Extension(thread, request) => {
                 let Some(form) = workspace

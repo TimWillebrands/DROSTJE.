@@ -106,6 +106,10 @@ gpui_kit::actions!(
         SendQueuedNow,
         EditQueuedMessage,
         InsertSlashCommand,
+        ZoomImageIn,
+        ZoomImageOut,
+        FitImage,
+        ShowImageActualSize,
         NextCompletion,
         PreviousCompletion,
         AcceptCompletion,
@@ -135,6 +139,52 @@ gpui_kit::actions!(
 );
 
 pub const RESTART_NEOVIM_LABEL: &str = "Restart Neovim";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageCommand {
+    ZoomIn,
+    ZoomOut,
+    Fit,
+    ActualSize,
+}
+
+impl ImageCommand {
+    pub const ALL: [Self; 4] = [Self::ZoomIn, Self::ZoomOut, Self::Fit, Self::ActualSize];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ZoomIn => "Zoom in",
+            Self::ZoomOut => "Zoom out",
+            Self::Fit => "Fit to window",
+            Self::ActualSize => "Actual size",
+        }
+    }
+
+    pub fn action(self) -> Box<dyn Action> {
+        match self {
+            Self::ZoomIn => Box::new(ZoomImageIn),
+            Self::ZoomOut => Box::new(ZoomImageOut),
+            Self::Fit => Box::new(FitImage),
+            Self::ActualSize => Box::new(ShowImageActualSize),
+        }
+    }
+
+    pub(in crate::ui) fn disabled_reason(
+        self,
+        zoom: super::conversation::ImageZoom,
+        fit: f32,
+    ) -> Option<&'static str> {
+        match self {
+            Self::ZoomIn if zoom.zoomed_in(fit).is_none() => Some("Already at the largest zoom"),
+            Self::ZoomOut if zoom.zoomed_out(fit).is_none() => Some("Already at the smallest zoom"),
+            Self::Fit if zoom == super::conversation::ImageZoom::Fit => {
+                Some("The image already fits the window")
+            }
+            Self::ActualSize if zoom.is_actual_size(fit) => Some("The image is at actual size"),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Action)]
 #[action(no_json)]
@@ -919,7 +969,17 @@ pub fn bind_keys(cx: &mut App) {
         "(Thread || PromptEditor || FactoryThreadForm) && (!NativeSurface || PromptEditor) && !Terminal && !TerminalPane && !Browser && !BrowserPane && !Command && !PopupMenu && !Sheet && !Dialog",
     );
     let caret_popup = Some("PromptEditor && CaretPopup && !Command && !Sheet && !Dialog");
+    let image_preview = Some(super::conversation::IMAGE_PREVIEW_CONTEXT);
     cx.bind_keys(vec![
+        KeyBinding::new("=", ZoomImageIn, image_preview),
+        KeyBinding::new("+", ZoomImageIn, image_preview),
+        KeyBinding::new("shift-=", ZoomImageIn, image_preview),
+        KeyBinding::new(secondary!("="), ZoomImageIn, image_preview),
+        KeyBinding::new("-", ZoomImageOut, image_preview),
+        KeyBinding::new(secondary!("-"), ZoomImageOut, image_preview),
+        KeyBinding::new("0", FitImage, image_preview),
+        KeyBinding::new(secondary!("0"), FitImage, image_preview),
+        KeyBinding::new("1", ShowImageActualSize, image_preview),
         KeyBinding::new(secondary!("shift-p"), OpenPalette, workspace),
         KeyBinding::new(secondary!("alt-]"), NextSpace, navigation),
         KeyBinding::new(secondary!("alt-["), PreviousSpace, navigation),

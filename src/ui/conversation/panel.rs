@@ -1,6 +1,6 @@
 use super::{
     disclosure::{disclosure, is_expanded},
-    images::image_thumbnail,
+    images::{ThumbnailLayout, image_thumbnail},
     queue::{queued_messages, queued_messages_height},
     requests::request_card,
     sticky_dock::{dock_contents, sticky_dock},
@@ -432,7 +432,7 @@ fn render_content(
         previews = previews.child(
             v_flex()
                 .gap_1()
-                .child(image_thumbnail(image, owner, cx))
+                .child(image_thumbnail(image, ThumbnailLayout::Chip, owner, cx))
                 .child(
                     Button::new(SharedString::from(format!("remove-{attachment_id}")))
                         .small()

@@ -104,40 +104,39 @@ pub(super) fn message(
     let raw_key = format!("raw:{id}:{}", message.id);
     let raw_expanded = message.raw.is_some() && is_expanded(owner, &raw_key, cx);
     let group: SharedString = format!("message-group-{id}-{}", message.id).into();
-    let copy_message = message.clone();
+    let copy_text = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            ContentBlock::PeerMessage(peer) => Some(peer.body.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let mut actions = h_flex()
-        .absolute()
-        .top_0()
-        .right_0()
+        .flex_none()
+        .w(MESSAGE_ACTIONS_WIDTH)
+        .justify_end()
         .gap_1()
-        .rounded(cx.theme().radius)
-        .bg(cx.theme().background)
         .invisible()
         .group_hover(group.clone(), |style| style.visible())
-        .child(
-            Button::new(SharedString::from(format!(
-                "copy-message-{id}-{}",
-                message.id
-            )))
-            .xsmall()
-            .ghost()
-            .cursor_default()
-            .icon(IconName::Copy)
-            .tooltip("Copy message")
-            .on_click(move |_, _, cx| {
-                let copy = copy_message
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(text) => Some(text.as_str()),
-                        ContentBlock::PeerMessage(peer) => Some(peer.body.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
-                cx.write_to_clipboard(ClipboardItem::new_string(copy));
-            }),
-        );
+        .when(!copy_text.trim().is_empty(), |actions| {
+            actions.child(
+                Button::new(SharedString::from(format!(
+                    "copy-message-{id}-{}",
+                    message.id
+                )))
+                .xsmall()
+                .ghost()
+                .cursor_default()
+                .icon(IconName::Copy)
+                .tooltip("Copy message")
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                }),
+            )
+        });
     if message.raw.is_some() {
         actions = actions.child(
             Button::new(SharedString::from(format!(
@@ -283,22 +282,25 @@ pub(super) fn message(
         body
     };
     inset(
-        v_flex()
+        h_flex()
             .w_full()
             .min_w_0()
+            .items_start()
+            .gap_1()
             .id(SharedString::from(format!("message-{id}-{}", message.id)))
             .group(group)
-            .relative()
             .map(|row| match (user_message, run_expanded, head) {
                 (true, ..) => row.py_2(),
                 (false, true, true) => row.pt_1(),
                 (false, true, false) => row,
                 (false, false, _) => row.py_1(),
             })
-            .child(body)
+            .child(body.flex_1())
             .child(actions),
     )
 }
+
+const MESSAGE_ACTIONS_WIDTH: Rems = Rems(3.25);
 
 #[cfg(test)]
 mod tests {

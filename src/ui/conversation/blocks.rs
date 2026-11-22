@@ -1,6 +1,6 @@
 use super::{
     disclosure::{disclosure, is_expanded, toggle},
-    images::image_thumbnail,
+    images::{ThumbnailLayout, image_thumbnail},
     markdown::{Markdown, markdown_text},
     tools::{ToolCall, ToolResult, tool_card},
 };
@@ -244,7 +244,7 @@ pub(in crate::ui) fn block(
             }
             thinking_block(identity, display, owner, markdown, cx)
         }
-        ContentBlock::Image(image) => image_thumbnail(image, owner, cx),
+        ContentBlock::Image(image) => image_thumbnail(image, ThumbnailLayout::Card, owner, cx),
         ContentBlock::ImageError(error) => Alert::error(
             SharedString::from(identity),
             format!("Image unavailable: {error}"),

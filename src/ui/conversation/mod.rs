@@ -22,6 +22,7 @@ mod usage;
 mod welcome;
 
 pub(super) use blocks::block;
+pub(in crate::ui) use images::{IMAGE_PREVIEW_CONTEXT, ImagePreview, ImageZoom};
 pub use markdown::Markdown;
 pub(super) use markdown::file_references;
 pub(super) use panel::render;
