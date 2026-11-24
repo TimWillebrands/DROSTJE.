@@ -1,3 +1,4 @@
+use super::sidebar_tabs::SidebarFocus;
 use super::*;
 
 impl Workspace {
@@ -46,7 +47,7 @@ impl Workspace {
             Region::Thread => self.thread_target(cx),
         };
         if let Some(panel) = target {
-            self.focus_panel(panel, window, cx);
+            self.navigate_panel(panel, None, window, cx);
         }
     }
     pub(super) fn focus_panel(
@@ -58,6 +59,7 @@ impl Workspace {
         if self.navigation_blocked(window, cx) {
             return;
         }
+        self.pending_prompt_focus = None;
         let kind = panel.read(cx).kind;
         if kind == PanelKind::Projects {
             self.prepare_projects_cursor(cx);
@@ -123,6 +125,68 @@ impl Workspace {
         self.sync_terminal_visibility(window, cx);
         cx.notify();
     }
+
+    pub(super) fn navigate_panel(
+        &mut self,
+        panel: Entity<WorkspacePanel>,
+        sidebar: Option<SidebarFocus>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        if let Some(current) = self.focused_panel(window, cx) {
+            let kind = current.read(cx).kind;
+            if let PanelKind::Thread(id) = kind
+                && !self
+                    .sidebar_focus_target(id, cx)
+                    .is_some_and(|target| target.contains_focused(window, cx))
+            {
+                let restore = self
+                    .prompt_focus_handle(id, cx)
+                    .is_some_and(|focus| focus.contains_focused(window, cx));
+                let waiting = self
+                    .pending_prompt_focus
+                    .as_ref()
+                    .is_some_and(|(_, anchor)| anchor.is_focused(window));
+                current.update(cx, |panel, _| {
+                    panel.restore_prompt_focus = restore || waiting
+                });
+            }
+        }
+        let kind = panel.read(cx).kind;
+        let restore = panel.read(cx).restore_prompt_focus;
+        let anchor = panel.read(cx).focus.clone();
+        self.focus_panel(panel, window, cx);
+        if let Some(sidebar) = sidebar {
+            sidebar.focus(window, cx);
+        } else if restore && let PanelKind::Thread(id) = kind {
+            self.pending_prompt_focus = Some((id, anchor));
+            self.restore_pending_prompt_focus(window, cx);
+        }
+    }
+
+    pub(in crate::ui) fn restore_pending_prompt_focus(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some((id, anchor)) = self.pending_prompt_focus.clone() else {
+            return;
+        };
+        let blocked = self.navigation_blocked(window, cx);
+        if !anchor.is_focused(window)
+            || self.state.read(cx).selected_thread != Some(id)
+            || self.state.read(cx).editor_error.is_some()
+            || blocked
+        {
+            self.pending_prompt_focus = None;
+        } else if let Some(focus) = self.prompt_focus_handle(id, cx) {
+            self.pending_prompt_focus = None;
+            focus.focus(window, cx);
+        }
+    }
     pub fn spatial_focus(
         &mut self,
         direction: PaneDirection,
@@ -148,77 +212,44 @@ impl Workspace {
             .then_some(bounds)
         };
         let mut surfaces = Vec::new();
+        let mut origin_is_sidebar = false;
         for panel in self.all_panels() {
             let Some(mut bounds) = visible_bounds(&panel) else {
                 continue;
             };
             if let PanelKind::Thread(id) = panel.read(cx).kind
-                && self.state.read(cx).thread_sidebar_open(id)
+                && let Some(target) = self.sidebar_focus_target(id, cx)
+                && let Some(width) = self
+                    .sidebar_sizes
+                    .borrow()
+                    .get(&id)
+                    .and_then(|sizes| sizes.read(cx).sizes().get(1).copied())
             {
-                let tab = self.state.read(cx).thread_sidebar_tab(id);
-                let interactive = match tab {
-                    SidebarTab::Terminal => self.sidebar_terminal(id).is_some(),
-                    SidebarTab::Browser => self.sidebar_browser(id).is_some(),
-                    SidebarTab::Changes => self.state.read(cx).is_conversation(id),
-                    SidebarTab::Output
-                    | SidebarTab::Agents
-                    | SidebarTab::Review
-                    | SidebarTab::Details => false,
-                };
-                if interactive
-                    && let Some(width) = self
-                        .sidebar_sizes
-                        .borrow()
-                        .get(&id)
-                        .and_then(|sizes| sizes.read(cx).sizes().get(1).copied())
-                {
-                    let width = width.clamp(px(0.), bounds.size.width);
-                    let sidebar_bounds = Bounds::new(
-                        point(bounds.right() - width, bounds.top()),
-                        size(width, bounds.size.height),
-                    );
-                    bounds.size.width -= width;
-                    surfaces.push((panel.clone(), Some(tab), sidebar_bounds));
+                let width = width.clamp(px(0.), bounds.size.width);
+                let sidebar_bounds = Bounds::new(
+                    point(bounds.right() - width, bounds.top()),
+                    size(width, bounds.size.height),
+                );
+                bounds.size.width -= width;
+                if panel == current {
+                    origin_is_sidebar = target.contains_focused(window, cx);
                 }
+                surfaces.push((panel.clone(), Some(target), sidebar_bounds));
             }
             surfaces.push((panel, None, bounds));
         }
-        let sidebar_focus = if let PanelKind::Thread(id) = current.read(cx).kind
-            && self.state.read(cx).thread_sidebar_open(id)
-        {
-            match self.state.read(cx).thread_sidebar_tab(id) {
-                SidebarTab::Terminal => self
-                    .sidebar_terminal(id)
-                    .filter(|pane| pane.read(cx).focus_handle(cx).contains_focused(window, cx))
-                    .map(|_| SidebarTab::Terminal),
-                SidebarTab::Browser => self
-                    .sidebar_browser(id)
-                    .filter(|pane| pane.read(cx).contains_focused(window, cx))
-                    .map(|_| SidebarTab::Browser),
-                SidebarTab::Changes => self
-                    .changes_lists
-                    .borrow()
-                    .get(&id)
-                    .is_some_and(|list| list.contains_focused(window, cx))
-                    .then_some(SidebarTab::Changes),
-                SidebarTab::Output
-                | SidebarTab::Agents
-                | SidebarTab::Review
-                | SidebarTab::Details => None,
-            }
-        } else {
-            None
-        };
         let Some(origin) = surfaces
             .iter()
-            .find(|(panel, sidebar, _)| *panel == current && *sidebar == sidebar_focus)
+            .find(|(panel, sidebar, _)| *panel == current && sidebar.is_some() == origin_is_sidebar)
             .map(|(_, _, bounds)| *bounds)
         else {
             return;
         };
         let next = surfaces
             .into_iter()
-            .filter(|(panel, sidebar, _)| *panel != current || *sidebar != sidebar_focus)
+            .filter(|(panel, sidebar, _)| {
+                *panel != current || sidebar.is_some() != origin_is_sidebar
+            })
             .filter_map(|(panel, sidebar, bounds)| {
                 let overlap = origin.intersect(&bounds).size;
                 let delta = bounds.center() - origin.center();
@@ -241,42 +272,7 @@ impl Workspace {
             .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)))
             .map(|(panel, _, _)| panel);
         if let Some((next, sidebar)) = next {
-            if sidebar_focus.is_none()
-                && let PanelKind::Thread(id) = current.read(cx).kind
-            {
-                let restore = self
-                    .prompt_focus_handle(id, cx)
-                    .is_some_and(|focus| focus.contains_focused(window, cx));
-                current.update(cx, |panel, _| panel.restore_prompt_focus = restore);
-            }
-            let kind = next.read(cx).kind;
-            let restore_prompt = sidebar.is_none() && next.read(cx).restore_prompt_focus;
-            self.focus_panel(next, window, cx);
-            if restore_prompt
-                && let PanelKind::Thread(id) = kind
-                && let Some(focus) = self.prompt_focus_handle(id, cx)
-            {
-                focus.focus(window, cx);
-            }
-            if let (PanelKind::Thread(id), Some(tab)) = (kind, sidebar) {
-                match tab {
-                    SidebarTab::Terminal => {
-                        if let Some(pane) = self.sidebar_terminal(id) {
-                            pane.update(cx, |pane, cx| pane.focus(window, cx));
-                        }
-                    }
-                    SidebarTab::Browser => {
-                        if let Some(pane) = self.sidebar_browser(id) {
-                            pane.update(cx, |pane, cx| pane.focus(window, cx));
-                        }
-                    }
-                    SidebarTab::Changes => self.changes_focus(id, cx).focus(window, cx),
-                    SidebarTab::Output
-                    | SidebarTab::Agents
-                    | SidebarTab::Review
-                    | SidebarTab::Details => {}
-                }
-            }
+            self.navigate_panel(next, sidebar, window, cx);
         }
     }
 }

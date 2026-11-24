@@ -390,11 +390,11 @@ impl PromptEditor {
         }
         self.switch_task = Some(cx.spawn_in(window, async move |this, window| {
             let result = async {
-                let previous = if let Some(key) = previous { Some(editor.snapshot(key).await?) } else { None };
                 if let Some((key, text)) = &desired {
                     editor.open_draft(key.clone(), text.clone()).await?;
                     editor.focus_draft(key.clone()).await?;
                 }
+                let previous = if let Some(key) = previous { Some(editor.snapshot(key).await?) } else { None };
                 Ok::<_, anyhow::Error>(previous)
             }.await;
             let _ = this.update_in(window, |this, window, cx| {
@@ -567,7 +567,9 @@ impl Render for PromptEditor {
 impl Workspace {
     pub(in crate::ui) fn prompt_focus_handle(&self, id: ThreadId, cx: &App) -> Option<FocusHandle> {
         let editor = self.editor.as_ref()?.read(cx);
-        (self.editor_override.is_none()
+        (!editor.switching
+            && self.state.read(cx).editor_error.is_none()
+            && self.editor_override.is_none()
             && editor.active_key() == Some(&DraftKey::Thread(id))
             && self.can_edit_conversation(id, cx))
         .then(|| editor.focus_handle(cx))
@@ -616,6 +618,7 @@ impl Workspace {
                 window,
                 |workspace, _, _: &PromptEditorChanged, window, cx| {
                     workspace.sync_session(window, cx);
+                    workspace.restore_pending_prompt_focus(window, cx);
                     workspace.state.update(cx, |state, cx| {
                         if let Some(id) = state.selected_thread {
                             cx.emit(crate::app::PresentationChange::Draft(id));

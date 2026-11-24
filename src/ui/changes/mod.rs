@@ -39,12 +39,6 @@ pub(super) struct ChangesList {
     rows: RowList,
 }
 
-impl ChangesList {
-    pub(super) fn contains_focused(&self, window: &Window, cx: &App) -> bool {
-        self.focus.contains_focused(window, cx)
-    }
-}
-
 const ROW_ESTIMATE: f32 = 1.5;
 
 pub(super) struct RowList {
@@ -456,7 +450,7 @@ impl Workspace {
             .borrow()
             .get(&id)
             .map_or((None, false), |list| {
-                (list.rows.selected, list.contains_focused(window, cx))
+                (list.rows.selected, list.focus.contains_focused(window, cx))
             })
     }
 }

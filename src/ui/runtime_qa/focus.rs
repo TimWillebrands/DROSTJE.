@@ -76,6 +76,45 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
         fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == "abc"
     })
     .await;
+    press(cx, "secondary-1 secondary-2 e");
+    until(
+        cx,
+        "continued typing after direct navigation",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == "abec",
+    )
+    .await;
+    press(cx, "backspace");
+    until(
+        cx,
+        "draft after direct navigation",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(second)].text == "abc",
+    )
+    .await;
+    cx.dispatch_action(fixture.window.into(), commands::ShowThreadAgents);
+    cx.run_until_parked();
+    press(cx, "secondary-alt-h secondary-alt-l");
+    assert!(update_workspace(
+        cx,
+        fixture.window,
+        &fixture.workspace,
+        |workspace, window, cx| {
+            workspace
+                .network_sidebar(second, cx)
+                .unwrap()
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        }
+    ));
+    cx.dispatch_action(fixture.window.into(), commands::ToggleAgents);
+    cx.run_until_parked();
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("prompt-editor").focused(), Some(true));
+    })
+    .unwrap();
     let mut retained = None;
     for mode in ["light", "dark"] {
         fixture.state.update(cx, |state, cx| {
@@ -84,7 +123,7 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
         });
         for (width, height) in [(1440., 900.), (900., 600.)] {
             cx.simulate_window_resize(fixture.window.into(), size(px(width), px(height)));
-            press(cx, "secondary-2 i");
+            press(cx, "secondary-2");
             cx.run_until_parked();
             cx.update_window(fixture.window.into(), |_, window, cx| {
                 window.render_frame(cx);
@@ -151,7 +190,7 @@ async fn keyboard_focus_moves_visibly_between_draft_and_projects(cx: &mut TestAp
         }
     }
     let retained = retained.unwrap();
-    press(cx, "secondary-2 i");
+    press(cx, "secondary-2");
     let returned = editor.snapshot(DraftKey::Thread(second)).await.unwrap();
     assert_eq!(returned.text, "abc");
     assert_eq!(returned.text, retained.text);
@@ -284,6 +323,60 @@ async fn pane_navigation_reaches_projects_and_selects_a_thread(cx: &mut TestAppC
         threads.last().copied(),
         "the layout fixture must focus the rightmost thread before navigation"
     );
+    let right = threads[2];
+    let middle = threads[1];
+    press(cx, "i");
+    press(cx, "a");
+    until(cx, "draft in right split", Duration::from_secs(5), |cx| {
+        fixture
+            .state
+            .read(cx)
+            .drafts
+            .get(&DraftKey::Thread(right))
+            .is_some_and(|draft| draft.text == "a")
+    })
+    .await;
+    press(cx, "secondary-alt-h");
+    until(
+        cx,
+        "middle split draft activated",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .editor
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .active_key()
+                == Some(&DraftKey::Thread(middle))
+        },
+    )
+    .await;
+    press(cx, "secondary-alt-l");
+    until(
+        cx,
+        "right split draft activated",
+        Duration::from_secs(5),
+        |cx| {
+            fixture
+                .workspace
+                .read(cx)
+                .prompt_focus_handle(right, cx)
+                .is_some()
+        },
+    )
+    .await;
+    cx.run_until_parked();
+    press(cx, "b");
+    until(
+        cx,
+        "continued typing after a split switch",
+        Duration::from_secs(5),
+        |cx| fixture.state.read(cx).drafts[&DraftKey::Thread(right)].text == "ab",
+    )
+    .await;
     for keys in [
         "secondary-alt-l",
         "secondary-alt-right",

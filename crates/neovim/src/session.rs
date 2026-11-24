@@ -727,12 +727,23 @@ impl Session {
         Ok(self.marker(MarkerKind::Drain).await?.mode)
     }
     async fn snapshot_active(&mut self) -> Result<DraftSnapshot> {
+        self.capture_active(false).await
+    }
+
+    async fn capture_active(&mut self, preserve_insert_cursor: bool) -> Result<DraftSnapshot> {
         ensure!(
             !self.composition,
             "Complete or cancel native composition before submitting or switching drafts"
         );
         let key = self.active.clone().context("No active draft")?;
         let mode = self.drain().await?;
+        let insert_cursor = if preserve_insert_cursor && mode.starts_with('i') {
+            Some(parse_cursor(
+                &self.call("nvim_win_get_cursor", vec![0.into()]).await?,
+            )?)
+        } else {
+            None
+        };
         ensure!(
             !mode.starts_with('c') && !mode.starts_with('r'),
             "Complete or cancel the Neovim command line before submitting or switching drafts"
@@ -750,6 +761,13 @@ impl Session {
             snapshot.key == key && snapshot.generation == self.generation,
             "Snapshot draft/generation changed during input barrier"
         );
+        if let Some(cursor) = insert_cursor {
+            self.drafts
+                .get_mut(&key)
+                .context("Neovim draft is no longer available")?
+                .snapshot
+                .cursor = cursor;
+        }
         Ok(snapshot)
     }
     async fn create_draft(
@@ -836,7 +854,7 @@ impl Session {
             return Ok(());
         }
         if self.active.is_some() {
-            self.snapshot_active().await?;
+            self.capture_active(true).await?;
         }
         self.activate(key).await
     }
@@ -854,6 +872,7 @@ impl Session {
             col -= 1;
         }
         let insert = draft.insert || draft.snapshot.text.is_empty();
+        let at_end = col == line.len();
         self.call("nvim_set_current_buf", vec![handle]).await?;
         self.active = Some(key.clone());
         self.call(
@@ -865,8 +884,12 @@ impl Session {
         )
         .await?;
         if insert {
-            self.call("nvim_command", vec!["startinsert".into()])
-                .await?;
+            let command = if at_end {
+                "startinsert!"
+            } else {
+                "startinsert"
+            };
+            self.call("nvim_command", vec![command.into()]).await?;
         }
         let mut snapshot = self.drafts[&key].snapshot.clone();
         snapshot.cursor = (row, col);
