@@ -1,5 +1,6 @@
 mod blocks;
 mod composer;
+mod cootje;
 mod disclosure;
 pub mod editor;
 mod images;

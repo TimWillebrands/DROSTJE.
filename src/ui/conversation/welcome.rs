@@ -65,6 +65,7 @@ pub fn welcome(state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> Any
         .min_w_0()
         .min_h_0()
         .relative()
+        .overflow_hidden()
         .text_color(cx.theme().foreground)
         .children(crate::ui::theme::grain::layer(crate::ui::theme::grain(cx)))
         .items_center()
@@ -77,6 +78,17 @@ pub fn welcome(state: &AppState, owner: &WeakEntity<Workspace>, cx: &App) -> Any
                 .items_center()
                 .gap_3()
                 .text_center()
+                .relative()
+                .child(
+                    h_flex()
+                        .absolute()
+                        .bottom(relative(1.))
+                        .left_0()
+                        .w_full()
+                        .justify_center()
+                        .pb_3()
+                        .child(super::cootje::Cootje::new(super::cootje::Pose::Wave)),
+                )
                 .child(wordmark(cx))
                 .child(div().text_lg().child(if has_project {
                     "No thread selected"
