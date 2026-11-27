@@ -30,6 +30,7 @@ use gpui_kit::{
 };
 
 const WORDMARK: &str = "DROSTJE.";
+const TRANSCRIPT_BOTTOM_SLOP: Pixels = px(1.);
 
 fn wordmark(extras: &Extras, cx: &App) -> impl IntoElement {
     let stop = WORDMARK.len() - 1;
@@ -540,8 +541,7 @@ impl PhoneRoot {
             .view
             .transcript
             .as_ref()
-            .filter(|transcript| transcript.thread == thread.id)
-            .cloned();
+            .filter(|transcript| transcript.thread == thread.id);
         let attention = match thread.status {
             ThreadStatus::Waiting => Some(strip(banner(
                 "thread-waiting",
@@ -582,7 +582,7 @@ impl PhoneRoot {
             )
             .into_any_element(),
             (_, Some(transcript)) => self
-                .transcript_list(&transcript, thread, cx)
+                .transcript_list(transcript, thread, cx)
                 .into_any_element(),
         };
         div()
@@ -620,8 +620,7 @@ impl PhoneRoot {
             return None;
         }
         let id = thread.id;
-        let composer = self.composer(id, window, cx);
-        let empty = composer.read(cx).value().trim().is_empty();
+        let (composer, empty) = self.composer(id, window, cx);
         let muted = cx.theme().muted_foreground;
         let note = match linked.prompt_status(id, self.now) {
             Some(PromptStatus::Refused(reason)) => Some(banner(
@@ -727,7 +726,7 @@ impl PhoneRoot {
         transcript: &Transcript,
         thread: &ThreadView,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> impl IntoElement + use<> {
         let signature = (
             Some(transcript.thread),
             transcript.items.len(),
@@ -737,15 +736,15 @@ impl PhoneRoot {
                 .map(|item| item.text.len())
                 .unwrap_or_default(),
         );
-        let max = self.transcript.max_offset().y;
-        let offset = -self.transcript.offset().y;
+        let max = self.transcript.handle.max_offset().y;
+        let offset = -self.transcript.handle.offset().y;
         if signature.0 != self.transcript_signature.0 {
             self.follow_transcript = true;
         } else if max > px(0.) {
-            self.follow_transcript = offset >= max - px(48.);
+            self.follow_transcript = offset >= max - TRANSCRIPT_BOTTOM_SLOP;
         }
         if signature != self.transcript_signature && self.follow_transcript {
-            self.transcript.scroll_to_bottom();
+            self.transcript.handle.scroll_to_bottom();
         }
         self.transcript_signature = signature;
         let mut list = div()
@@ -753,10 +752,12 @@ impl PhoneRoot {
                 "transcript-{}",
                 transcript.thread
             )))
-            .track_scroll(&self.transcript)
+            .test_support()
+            .track_scroll(&self.transcript.handle)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .restrict_scroll_to_axis()
             .flex()
             .flex_col()
             .gap_3()
@@ -790,7 +791,14 @@ impl PhoneRoot {
                     .child(format!("{} is working…", harness_label(thread))),
             );
         }
-        list
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(list)
+            .child(self.transcript.limit_coasting())
     }
 
     fn tool_run(&mut self, item: &str, run: &ToolRunView, cx: &mut Context<Self>) -> AnyElement {

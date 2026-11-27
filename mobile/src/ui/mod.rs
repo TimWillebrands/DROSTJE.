@@ -1,5 +1,6 @@
 mod appearance;
 mod screens;
+mod transcript_scroll;
 mod widgets;
 
 use std::{
@@ -37,6 +38,11 @@ enum Persist {
     View(PhoneView),
 }
 
+struct PromptComposer {
+    input: Entity<TextareaState>,
+    empty: bool,
+}
+
 pub struct PhoneRoot {
     app: PhoneApp,
     persist: async_channel::Sender<Persist>,
@@ -45,7 +51,7 @@ pub struct PhoneRoot {
     pairing: Option<PhonePairing>,
     pairing_generation: u64,
     focus: FocusHandle,
-    transcript: ScrollHandle,
+    transcript: transcript_scroll::TranscriptScroll,
     follow_transcript: bool,
     transcript_signature: (Option<uuid::Uuid>, usize, usize),
     now: i64,
@@ -53,7 +59,7 @@ pub struct PhoneRoot {
     system_dark: bool,
     look: Option<Look>,
     extras: appearance::Extras,
-    composers: HashMap<Uuid, Entity<TextareaState>>,
+    composers: HashMap<Uuid, PromptComposer>,
     expanded_runs: HashSet<String>,
     sent: Vec<(Uuid, String)>,
     _composer_events: Vec<Subscription>,
@@ -96,7 +102,7 @@ impl PhoneRoot {
             pairing: None,
             pairing_generation: 0,
             focus,
-            transcript: ScrollHandle::new(),
+            transcript: transcript_scroll::TranscriptScroll::default(),
             follow_transcript: true,
             transcript_signature: (None, 0, 0),
             now: time::now(),
@@ -234,6 +240,7 @@ impl PhoneRoot {
                 }
                 Effect::Watch(thread) => {
                     self.follow_transcript = true;
+                    self.transcript.reset_gesture();
                     if let Some(link) = &self.link {
                         link.watch(thread);
                     }
@@ -274,9 +281,10 @@ impl PhoneRoot {
         thread: Uuid,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Entity<TextareaState> {
-        if let Some(composer) = self.composers.get(&thread) {
-            return composer.clone();
+    ) -> (Entity<TextareaState>, bool) {
+        if let Some(composer) = self.composers.get_mut(&thread) {
+            composer.empty = composer_is_empty(composer.input.read(cx));
+            return (composer.input.clone(), composer.empty);
         }
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -288,24 +296,38 @@ impl PhoneRoot {
         let events = cx.subscribe_in(
             &composer,
             window,
-            move |root, _, event: &InputEvent, _, cx| match event {
+            move |root, composer, event: &InputEvent, _, cx| match event {
                 InputEvent::PressEnter { shift: false, .. } => root.send_prompt(thread, cx),
-                InputEvent::Change => cx.notify(),
+                InputEvent::Change => {
+                    let empty = composer_is_empty(composer.read(cx));
+                    if let Some(composer) = root.composers.get_mut(&thread)
+                        && composer.empty != empty
+                    {
+                        composer.empty = empty;
+                        cx.notify();
+                    }
+                }
                 InputEvent::PressEnter { shift: true, .. }
                 | InputEvent::Focus
                 | InputEvent::Blur => {}
             },
         );
         self._composer_events.push(events);
-        self.composers.insert(thread, composer.clone());
-        composer
+        self.composers.insert(
+            thread,
+            PromptComposer {
+                input: composer.clone(),
+                empty: true,
+            },
+        );
+        (composer, true)
     }
 
     fn send_prompt(&mut self, thread: Uuid, cx: &mut Context<Self>) {
         let Some(composer) = self.composers.get(&thread) else {
             return;
         };
-        let text = composer.read(cx).value().to_string();
+        let text = composer.input.read(cx).value().to_string();
         self.input(
             Input::Prompt {
                 id: Uuid::new_v4(),
@@ -320,9 +342,11 @@ impl PhoneRoot {
     fn clear_sent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for (thread, text) in std::mem::take(&mut self.sent) {
             if let Some(composer) = self.composers.get(&thread)
-                && composer.read(cx).value().trim() == text
+                && composer.input.read(cx).value().trim() == text
             {
-                composer.update(cx, |composer, cx| composer.set_value("", window, cx));
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
             }
         }
     }
@@ -338,6 +362,10 @@ impl PhoneRoot {
             self.input(Input::Back, cx);
         }
     }
+}
+
+fn composer_is_empty(composer: &TextareaState) -> bool {
+    composer.text().chars().all(char::is_whitespace)
 }
 
 impl Render for PhoneRoot {
@@ -419,6 +447,6 @@ impl PhoneRoot {
     pub fn composer_text(&self, thread: Uuid, cx: &App) -> Option<String> {
         self.composers
             .get(&thread)
-            .map(|composer| composer.read(cx).value().to_string())
+            .map(|composer| composer.input.read(cx).value().to_string())
     }
 }

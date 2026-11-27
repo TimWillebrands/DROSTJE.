@@ -1,5 +1,7 @@
 use std::{
+    cell::Cell,
     path::PathBuf,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -22,9 +24,10 @@ use drostje_phone::{
 };
 use drostje_transcript::ToolOutcome;
 use gpui_kit::{
-    AnyWindowHandle, Bounds, Entity, HeadlessAppContext, WindowBounds, WindowOptions,
-    component::{Theme, ThemeMode},
-    px, size,
+    AnyWindowHandle, Bounds, Entity, EntityInputHandler, HeadlessAppContext, Pixels, PlatformInput,
+    ScrollDelta, ScrollEvent, ScrollSource, TouchPhase, WindowBounds, WindowOptions,
+    component::{Theme, ThemeMode, input::TextareaState},
+    point, px, size,
     test::TestWindowExt,
 };
 use uuid::Uuid;
@@ -40,6 +43,10 @@ struct Phone {
 
 impl Phone {
     fn open(storage: Storage) -> Self {
+        Self::open_at(storage, 412., 892.)
+    }
+
+    fn open_at(storage: Storage, width: f32, height: f32) -> Self {
         let mut cx = HeadlessAppContext::with_platform(
             gpui_kit::platform::current_platform(true).text_system(),
             Arc::new(gpui_kit::assets::AllAssets::new("")),
@@ -50,7 +57,7 @@ impl Phone {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
                 origin: Default::default(),
-                size: size(px(412.), px(892.)),
+                size: size(px(width), px(height)),
             })),
             focus: true,
             show: false,
@@ -139,6 +146,33 @@ impl Phone {
                 window.try_find(id).is_some_and(|element| element.visible())
             })
             .expect("window can be queried")
+    }
+
+    fn bounds(&mut self, id: &str) -> Bounds<Pixels> {
+        self.cx
+            .update_window(self.window, |_, window, _| {
+                window.find(id.to_owned()).bounds()
+            })
+            .expect("window can be measured")
+    }
+
+    fn scroll(&mut self, source: ScrollSource, phase: TouchPhase, dy: f32) {
+        let position = self.bounds(&format!("transcript-{}", id(1))).center();
+        self.cx
+            .update_window(self.window, |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::Scroll(ScrollEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                        touch_phase: phase,
+                        source,
+                        ..Default::default()
+                    }),
+                    cx,
+                );
+            })
+            .expect("scroll reaches the window");
+        self.settle();
     }
 
     fn shot(&mut self, name: &str) {
@@ -348,7 +382,10 @@ fn transcript() -> Transcript {
 }
 
 fn paired_phone(ntfy: &TestServer, data: &std::path::Path) -> (Phone, DesktopLink) {
-    let mut phone = Phone::open(Storage::new(data.to_path_buf()));
+    pair_phone(ntfy, Phone::open(Storage::new(data.to_path_buf())))
+}
+
+fn pair_phone(ntfy: &TestServer, mut phone: Phone) -> (Phone, DesktopLink) {
     let session = PairingSession::start(
         Server::new(ntfy.address(), None).unwrap(),
         None,
@@ -395,6 +432,145 @@ fn the_desktop_prompt(desktop: &DesktopLink) -> (Uuid, String) {
         LinkEvent::Prompt { id, text, .. } => Some((id, text)),
         _ => None,
     })
+}
+
+fn small_phone_with_long_transcript(
+    before_opening: impl FnOnce(&mut Phone),
+) -> (TestServer, PathBuf, Phone, DesktopLink) {
+    let ntfy = TestServer::start();
+    let data = std::env::temp_dir().join(format!("drostje-phone-{}", Uuid::new_v4()));
+    let (mut phone, desktop) = pair_phone(
+        &ntfy,
+        Phone::open_at(Storage::new(data.clone()), 320., 600.),
+    );
+    desktop.show(desktop_view(None));
+    phone.wait(
+        "sync",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.synced),
+    );
+    before_opening(&mut phone);
+    phone.click(&format!("space-{}", id(100)));
+    phone.click(&format!("thread-{}", id(1)));
+    next(&desktop.events, |event| {
+        (event == LinkEvent::Watch(Some(id(1)))).then_some(())
+    });
+    let mut transcript = transcript();
+    transcript.prompting = Prompting::Open;
+    let response = transcript.items[2].clone();
+    transcript.items.splice(
+        0..0,
+        (0..20).map(|ix| TranscriptItem {
+            id: format!("response-{ix}"),
+            ..response.clone()
+        }),
+    );
+    let mut view = desktop_view(Some(transcript));
+    view.threads.get_mut(&id(1)).unwrap().status = ThreadStatus::Idle;
+    desktop.show(view);
+    phone.wait(
+        "a long Conversation",
+        |phase| matches!(phase, Phase::Linked(linked) if linked.composer(id(1)) == Composer::Open),
+    );
+    (ntfy, data, phone, desktop)
+}
+
+fn a_short_swipe_stays_near_the_fingers_release() {
+    let (_ntfy, data, mut phone, desktop) = small_phone_with_long_transcript(|_| {});
+    let marker = "run-tool:c2";
+    let initial = phone.bounds(marker).top();
+    phone.scroll(ScrollSource::Touch, TouchPhase::Started, 9.);
+    phone.scroll(ScrollSource::Touch, TouchPhase::Moved, 10.);
+    phone.scroll(ScrollSource::Touch, TouchPhase::Ended, 1.);
+    let released = phone.bounds(marker).top();
+    assert_eq!(released - initial, px(20.), "the pan tracks the finger");
+    for (phase, delta) in [(TouchPhase::Moved, 100.), (TouchPhase::Ended, 50.)] {
+        phone.scroll(ScrollSource::Touch, phase, delta);
+    }
+    let settled = phone.bounds(marker).top();
+    assert!(
+        settled - released <= px(20.),
+        "a 20 px swipe coasted another {} px",
+        f32::from(settled - released),
+    );
+    let mut view = phone.linked(|linked| (*linked.view).clone());
+    let transcript = view.transcript.as_mut().unwrap();
+    transcript.items.push(TranscriptItem {
+        id: "new-response".into(),
+        ..transcript.items[0].clone()
+    });
+    let count = transcript.items.len();
+    desktop.show(view);
+    phone.wait("a new reply", |phase| {
+        matches!(phase, Phase::Linked(linked) if linked.view.transcript.as_ref().is_some_and(|transcript| transcript.items.len() == count))
+    });
+    assert_eq!(
+        phone.bounds(marker).top(),
+        settled,
+        "a new reply pulled the reader back to the bottom"
+    );
+    phone.scroll(ScrollSource::Pointer, TouchPhase::Moved, 100.);
+    assert_eq!(phone.bounds(marker).top() - settled, px(100.));
+    let _ = std::fs::remove_dir_all(data);
+}
+
+fn a_burst_of_prompt_edits_only_refreshes_the_screen_when_send_changes() {
+    let editor = Rc::new(Cell::new(None));
+    let mut watch_editor = None;
+    let (_ntfy, data, mut phone, _desktop) = small_phone_with_long_transcript(|phone| {
+        let editor = editor.clone();
+        watch_editor = Some(phone.cx.update(|cx| {
+            cx.observe_new::<TextareaState>(move |_, _, cx| editor.set(Some(cx.entity())))
+        }));
+    });
+    let editor = editor.take().expect("the Conversation opened a composer");
+    phone.click("prompt-input");
+    let updates = Rc::new(Cell::new(0));
+    let count = updates.clone();
+    let _subscription = phone
+        .cx
+        .update(|cx| cx.observe(&phone.root, move |_, _| count.set(count.get() + 1)));
+    assert_eq!(phone.disabled("send-prompt"), Some(true));
+    let words = [
+        "Révise ", "la ", "saisie ", "rapide ", "sur ", "Android ", "你好",
+    ];
+    for word in words {
+        phone
+            .cx
+            .update_window(phone.window, |_, window, cx| {
+                editor.update(cx, |input, cx| {
+                    for (idx, ch) in word.char_indices() {
+                        let preedit = &word[..idx + ch.len_utf8()];
+                        let cursor = preedit.encode_utf16().count();
+                        input.replace_and_mark_text_in_range(
+                            None,
+                            preedit,
+                            Some(cursor..cursor),
+                            window,
+                            cx,
+                        );
+                    }
+                    input.replace_text_in_range(None, word, window, cx);
+                    input.unmark_text(window, cx);
+                });
+            })
+            .expect("IME edits reach the editor");
+    }
+    phone.settle();
+    assert_eq!(
+        phone.composer_text(id(1)).as_deref(),
+        Some(words.concat().as_str())
+    );
+    assert_ne!(phone.disabled("send-prompt"), Some(true));
+    assert_eq!(
+        updates.get(),
+        1,
+        "the root was invalidated for ordinary edits"
+    );
+    phone.press("secondary-a");
+    phone.press("backspace");
+    assert_eq!(phone.disabled("send-prompt"), Some(true));
+    assert!(updates.get() <= 2);
+    let _ = std::fs::remove_dir_all(data);
 }
 
 fn a_phone_sends_prompts_and_learns_what_the_desktop_did_with_them() {
@@ -839,7 +1015,16 @@ fn main() {
         println!("screens: skipped; the offscreen phone renderer runs on macOS (Metal)");
         return;
     }
+    let filter = std::env::args().nth(1);
     for (name, scenario) in [
+        (
+            "a_short_swipe_stays_near_the_fingers_release",
+            a_short_swipe_stays_near_the_fingers_release as fn(),
+        ),
+        (
+            "a_burst_of_prompt_edits_only_refreshes_the_screen_when_send_changes",
+            a_burst_of_prompt_edits_only_refreshes_the_screen_when_send_changes,
+        ),
         (
             "a_phone_pairs_follows_spaces_and_threads_and_unpairs",
             a_phone_pairs_follows_spaces_and_threads_and_unpairs as fn(),
@@ -861,6 +1046,9 @@ fn main() {
             a_phone_folds_tool_runs_like_the_desktop,
         ),
     ] {
+        if filter.as_ref().is_some_and(|filter| !name.contains(filter)) {
+            continue;
+        }
         scenario();
         println!("screens: {name} ... ok");
     }
