@@ -810,6 +810,129 @@ fn render_content(
     )
 }
 
+struct WorkspaceEntry {
+    worktree: Option<uuid::Uuid>,
+    label: String,
+    current: bool,
+}
+
+fn workspace_entries(state: &AppState, thread: ThreadId) -> Vec<WorkspaceEntry> {
+    let Some(thread) = state.snapshot.threads.iter().find(|t| t.id == thread) else {
+        return Vec::new();
+    };
+    let checkout = match state.repositories.get(&thread.project_id) {
+        Some(Ok(repository)) => match &repository.branch {
+            Some(branch) => format!("Current checkout · {branch}"),
+            None => "Current checkout · detached".to_owned(),
+        },
+        _ => "Current checkout".to_owned(),
+    };
+    let mut entries = vec![WorkspaceEntry {
+        worktree: None,
+        label: checkout,
+        current: thread.worktree_id.is_none(),
+    }];
+    entries.extend(
+        state
+            .snapshot
+            .worktrees
+            .iter()
+            .filter(|worktree| worktree.project_id == thread.project_id && worktree.is_live())
+            .map(|worktree| WorkspaceEntry {
+                worktree: Some(worktree.id),
+                label: format!(
+                    "{} · {}",
+                    worktree.codename,
+                    state.worktree_branch_label(worktree)
+                ),
+                current: thread.worktree_id == Some(worktree.id),
+            }),
+    );
+    entries
+}
+
+fn workspace_menu(
+    mut menu: gpui_kit::component::menu::PopupMenu,
+    owner: &WeakEntity<Workspace>,
+    thread: ThreadId,
+    window: &mut Window,
+    cx: &mut Context<gpui_kit::component::menu::PopupMenu>,
+) -> gpui_kit::component::menu::PopupMenu {
+    let Some(workspace) = owner.upgrade() else {
+        return menu;
+    };
+    let state = workspace.read(cx).state.read(cx);
+    let entries = workspace_entries(state, thread);
+    let blocked = state
+        .worktree_request_pending()
+        .then_some("A worktree operation is in progress");
+    menu = menu.label("New conversation in");
+    for entry in &entries {
+        let target = entry.worktree;
+        let owner = owner.clone();
+        menu = menu.item(
+            PopupMenuItem::new(match blocked {
+                Some(reason) if !entry.current => format!("{} — {reason}", entry.label),
+                _ => entry.label.clone(),
+            })
+            .checked(entry.current)
+            .disabled(entry.current || blocked.is_some())
+            .on_click(move |_, window, cx| {
+                let _ = owner.update(cx, |workspace, cx| {
+                    workspace.open_conversation_in(target, window, cx)
+                });
+            }),
+        );
+    }
+    menu = menu.separator();
+    for command in [Command::NewConversationInWorktree, Command::SwitchBranch] {
+        let reason = command.disabled_reason(state);
+        menu = menu.item(
+            PopupMenuItem::new(match &reason {
+                Some(reason) => format!("{} — {reason}", command.label()),
+                None => command.label().to_owned(),
+            })
+            .action(command.action())
+            .disabled(reason.is_some()),
+        );
+    }
+    let removable: Vec<(uuid::Uuid, String, Option<String>)> = entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.worktree?;
+            Some((
+                id,
+                entry.label.clone(),
+                state.remove_worktree_reason_for(id),
+            ))
+        })
+        .collect();
+    if removable.is_empty() {
+        return menu;
+    }
+    let owner = owner.clone();
+    menu.separator()
+        .submenu("Remove worktree", window, cx, move |mut menu, _, _| {
+            for (id, label, reason) in &removable {
+                let id = *id;
+                let owner = owner.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(match reason {
+                        Some(reason) => format!("{label}… — {reason}"),
+                        None => format!("{label}…"),
+                    })
+                    .disabled(reason.is_some())
+                    .on_click(move |_, window, cx| {
+                        let _ = owner.update(cx, |workspace, cx| {
+                            workspace.confirm_remove_worktree(id, window, cx)
+                        });
+                    }),
+                );
+            }
+            menu
+        })
+}
+
 fn workspace_controls(
     thread: &crate::model::Thread,
     state: &AppState,
@@ -845,7 +968,7 @@ fn workspace_controls(
     let path = state.working_tree_of(thread).map(|(_, path)| path);
     let tooltip = match path {
         Some(path) => format!(
-            "{}\nStart a new conversation in another workspace; this conversation stays here",
+            "{}\nStart a conversation in another worktree or manage worktrees; this conversation stays here",
             path.display()
         ),
         None => "Project directory unavailable".into(),
@@ -862,7 +985,15 @@ fn workspace_controls(
         },
     };
     let menu_owner = owner.clone();
-    let has_worktree = worktree.is_some();
+    let thread_id = thread.id;
+    let switching = state.worktree_request.as_ref().is_some_and(|request| {
+        request.status == crate::app::WorktreeRequestStatus::Pending
+            && matches!(
+                request.kind,
+                crate::app::WorktreeRequestKind::Switch { tree, .. }
+                    if state.working_tree_of(thread).map(|(own, _)| own) == Some(tree)
+            )
+    });
     h_flex()
         .id("composer-workspace")
         .flex_shrink_0()
@@ -887,31 +1018,8 @@ fn workspace_controls(
                     } else {
                         "Select this conversation first".into()
                     })
-                    .dropdown_menu(move |mut menu, _, cx| {
-                        let Some(owner) = menu_owner.upgrade() else {
-                            return menu;
-                        };
-                        let state = owner.read(cx).state.read(cx);
-                        for command in [
-                            Command::NewConversationInWorkspace,
-                            Command::NewConversationInWorktree,
-                            Command::RemoveWorktree,
-                        ]
-                        .into_iter()
-                        .filter(|command| *command != Command::RemoveWorktree || has_worktree)
-                        {
-                            let reason = command.disabled_reason(state);
-                            let label = match &reason {
-                                Some(reason) => format!("{} — {reason}", command.label()),
-                                None => command.label().to_owned(),
-                            };
-                            menu = menu.item(
-                                PopupMenuItem::new(label)
-                                    .action(command.action())
-                                    .disabled(reason.is_some()),
-                            );
-                        }
-                        menu
+                    .dropdown_menu(move |menu, window, cx| {
+                        workspace_menu(menu, &menu_owner, thread_id, window, cx)
                     }),
             ),
         )
@@ -931,6 +1039,7 @@ fn workspace_controls(
                     .label(branch)
                     .icon(Lucide::GitBranch)
                     .dropdown_caret(true)
+                    .loading(switching)
                     .disabled(!selected || Command::SwitchBranch.disabled_reason(state).is_some())
                     .map(|button| {
                         if !selected {

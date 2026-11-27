@@ -92,73 +92,6 @@ pub(super) fn worktree_controls(
     }
 }
 
-pub(super) fn switch_branch_controls(
-    thread: &Uuid,
-    state: &mut AppState,
-    controls: &mut Controls,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    controls.field(
-        "new_branch",
-        "New branch from HEAD (optional)",
-        String::new(),
-        window,
-        cx,
-    );
-    let thread = state.snapshot.threads.iter().find(|t| t.id == *thread);
-    let repository = thread.and_then(|thread| {
-        state
-            .repositories
-            .get(&thread.project_id)
-            .and_then(|repository| repository.as_ref().ok())
-    });
-    let own = thread.and_then(|thread| thread.worktree_id);
-    let elsewhere: Vec<String> = thread
-        .map(|thread| {
-            let mut taken: Vec<String> = state
-                .snapshot
-                .worktrees
-                .iter()
-                .filter(|w| w.is_live() && w.project_id == thread.project_id && Some(w.id) != own)
-                .map(|w| state.worktree_branch_label(w))
-                .collect();
-            if own.is_some()
-                && let Some(branch) = repository.and_then(|r| r.branch.clone())
-            {
-                taken.push(branch);
-            }
-            taken
-        })
-        .unwrap_or_default();
-    let current = thread.and_then(|thread| match state.thread_worktree(thread) {
-        Some(worktree) => Some(state.worktree_branch_label(worktree)),
-        None => repository.and_then(|r| r.branch.clone()),
-    });
-    let branches: Vec<String> = repository
-        .map(|repository| repository.branches.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|branch| !elsewhere.contains(branch))
-        .collect();
-    if !branches.is_empty() {
-        controls.select(
-            "branch",
-            "Branch",
-            branches
-                .iter()
-                .map(|branch| Choice::new(branch.clone(), branch.clone()))
-                .collect(),
-            current
-                .as_deref()
-                .filter(|current| branches.iter().any(|b| b == current))
-                .unwrap_or(&branches[0]),
-            window,
-            cx,
-        );
-    }
-}
-
 impl SurfaceContent {
     pub(super) fn worktree_request_changed(&mut self, request: Uuid, cx: &mut Context<Self>) {
         if self.request != Some(request) {
@@ -243,56 +176,6 @@ impl SurfaceContent {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(Spinner::new().xsmall())
                                 .child("Creating worktree…"),
-                        )
-                    });
-        body
-    }
-
-    pub(super) fn switch_branch_body(
-        &self,
-        mut body: Stateful<Div>,
-        thread: Uuid,
-        state: &AppState,
-        readonly: bool,
-        cx: &App,
-    ) -> Stateful<Div> {
-        let pending = self.request.is_some();
-        let tree = state
-            .snapshot
-            .threads
-            .iter()
-            .find(|t| t.id == thread)
-            .map(|thread| match state.thread_worktree(thread) {
-                Some(worktree) => format!("worktree {}", worktree.codename),
-                None => "the project root".to_owned(),
-            })
-            .unwrap_or_else(|| "this working tree".to_owned());
-        body = body
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "Checks out a branch in {tree}. Uncommitted changes block the switch; commit or stash them first. Branches checked out in another worktree are not listed."
-                            )),
-                    )
-                    .child(
-                        Form::new()
-                            .when(self.select("branch").is_some(), |form| {
-                                form.child(self.form_field("branch", readonly || pending, cx))
-                            })
-                            .child(self.form_field("new_branch", readonly || pending, cx)),
-                    )
-                    .when(pending, |view| {
-                        view.child(
-                            h_flex()
-                                .id("worktree-pending")
-                                .gap_2()
-                                .items_center()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(Spinner::new().xsmall())
-                                .child("Switching branch…"),
                         )
                     });
         body

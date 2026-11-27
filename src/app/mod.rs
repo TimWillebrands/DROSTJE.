@@ -2,7 +2,9 @@ mod activity;
 mod artifacts;
 pub use artifacts::ArtifactReceipt;
 mod bootstrap;
+mod branches;
 pub use bootstrap::Bootstrap;
+pub use branches::{BranchAction, BranchChoice, BranchList, BranchListing, FetchStatus};
 mod commit;
 mod conversation;
 mod events;
@@ -127,6 +129,7 @@ pub struct AppState {
     pub worktree_request: Option<WorktreeRequest>,
     pub commit_subject: Option<commit::CommitSubjectRequest>,
     pub worktree_heads: HashMap<WorktreeId, Option<String>>,
+    branch_lists: HashMap<ProjectId, BranchList>,
     renaming_worktrees: HashSet<WorktreeId>,
     inspecting_worktrees: HashSet<WorktreeId>,
     writes: async_channel::Sender<Write>,
@@ -352,6 +355,7 @@ impl AppState {
             worktree_request: None,
             commit_subject: None,
             worktree_heads: HashMap::new(),
+            branch_lists: HashMap::new(),
             renaming_worktrees: HashSet::new(),
             inspecting_worktrees: HashSet::new(),
             active_threads: HashSet::new(),

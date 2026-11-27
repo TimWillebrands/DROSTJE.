@@ -22,6 +22,7 @@ pub enum AppEvent {
     WorktreeHeadRead(WorktreeId, Result<Option<String>, String>),
     BranchSwitched(Uuid, WorkingTree, Result<String, String>),
     Committed(Uuid, WorkingTree, Result<(String, String), String>),
+    Branches(branches::BranchListing),
 }
 
 impl AppState {
@@ -254,6 +255,7 @@ impl AppState {
                 self.branch_switched(request, tree, result, cx)
             }
             AppEvent::Committed(request, tree, result) => self.committed(request, tree, result, cx),
+            AppEvent::Branches(listing) => self.branches_received(listing, cx),
         }
         cx.notify();
     }

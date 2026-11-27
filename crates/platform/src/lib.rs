@@ -6,6 +6,8 @@ use std::{
     process::Command,
 };
 
+mod branches;
+pub use branches::{BranchStatus, FETCH_TIMEOUT, fetch_remotes, list_branches};
 mod shell_env;
 pub use shell_env::import_login_shell_environment;
 #[cfg(test)]
