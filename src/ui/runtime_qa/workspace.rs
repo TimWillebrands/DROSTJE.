@@ -41,6 +41,16 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
                 assert!(bounds.center().y > thread.origin.y + thread.size.height * 0.3);
                 assert!(bounds.center().y < thread.origin.y + thread.size.height * 0.7);
             }
+            let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+            let cootje = visual.debug_bounds("cootje").expect("the mascot renders");
+            let wordmark = visual
+                .debug_bounds("wordmark")
+                .expect("the wordmark renders");
+            assert!(cootje.bottom() <= wordmark.top(), "{cootje:?} {wordmark:?}");
+            assert!(
+                (cootje.center().x - wordmark.center().x).abs() < px(1.),
+                "{cootje:?} {wordmark:?}"
+            );
         }
     }
     cx.simulate_keystrokes(fixture.window.into(), "secondary-n");
@@ -51,6 +61,21 @@ async fn empty_workspace_actions_stay_compact(cx: &mut TestAppContext) {
         |cx| fixture.state.read(cx).conversation_thread().is_some(),
     )
     .await;
+    cx.run_until_parked();
+    cx.update_window(fixture.window.into(), |_, window, cx| {
+        window.refresh();
+        window.draw(cx).clear(cx);
+    })
+    .unwrap();
+    let mut visual = VisualTestContext::from_window(fixture.window.into(), cx);
+    assert!(
+        visual.debug_bounds("wordmark").is_none(),
+        "the Conversation replaced the empty workspace"
+    );
+    assert!(
+        visual.debug_bounds("cootje").is_some(),
+        "the mascot greets an untouched Conversation"
+    );
     cx.simulate_keystrokes(fixture.window.into(), commands::CLOSE_THREAD_KEY);
     until(
         cx,

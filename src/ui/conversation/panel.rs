@@ -179,14 +179,31 @@ fn render_content(
             ));
         }
         statuses = session.statuses.values().cloned().collect();
+        let untouched = state.is_untouched(thread);
         history = history.child(
-            div().relative().flex_1().min_h(rems(4.)).min_w_0().child(
-                transcript
-                    .clone()
-                    .cached(StyleRefinement::default().absolute().size_full()),
-            ),
+            div()
+                .relative()
+                .flex_1()
+                .min_h(rems(4.))
+                .min_w_0()
+                .when(untouched, |area| {
+                    area.child(
+                        h_flex()
+                            .absolute()
+                            .size_full()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .child(super::cootje::Cootje::new(super::cootje::Pose::Scribe)),
+                    )
+                })
+                .child(
+                    transcript
+                        .clone()
+                        .cached(StyleRefinement::default().absolute().size_full()),
+                ),
         );
-        if state.is_untouched(thread) && state.switch_harness_reason_for(id).is_none() {
+        if untouched && state.switch_harness_reason_for(id).is_none() {
             let switch = owner.clone();
             history = history.child(inset(
                 h_flex()
