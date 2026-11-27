@@ -585,28 +585,7 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
     .unwrap();
     cx.simulate_keystrokes(fixture.window.into(), "down enter");
     cx.run_until_parked();
-    assert!(cx.read(|cx| {
-        fixture
-            .workspace
-            .read(cx)
-            .dialog
-            .as_ref()
-            .is_some_and(|dialog| {
-                matches!(
-                    dialog.read(cx).kind,
-                    crate::ui::settings::DialogKind::NewWorkspaceConversation(_)
-                )
-            })
-    }));
-    cx.update_window(fixture.window.into(), |_, window, cx| {
-        window.render_frame(cx);
-        window.within("workspace-choice").click("input", cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(fixture.window.into(), "up enter");
-    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
-    cx.run_until_parked();
+    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
     let checkout = cx.read(|cx| {
         let state = fixture.state.read(cx);
         let selected = state.conversation_thread().unwrap();
@@ -672,52 +651,33 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
     })
     .unwrap();
     cx.run_until_parked();
-    assert!(cx.read(|cx| {
-        fixture
-            .workspace
-            .read(cx)
-            .dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.read(cx).hosted())
-    }));
+    assert!(cx.read(|cx| fixture.workspace.read(cx).palette.is_some()));
     cx.simulate_keystrokes(fixture.window.into(), "escape");
     cx.run_until_parked();
-    assert!(cx.read(|cx| {
-        fixture
-            .workspace
-            .read(cx)
-            .dialog
-            .as_ref()
-            .is_some_and(|dialog| !dialog.read(cx).hosted())
-    }));
+    assert!(cx.read(|cx| fixture.workspace.read(cx).palette.is_none()));
 
-    cx.dispatch_action(fixture.window.into(), commands::SwitchBranch);
-    cx.run_until_parked();
-    set_dialog(
-        cx,
-        fixture.window,
-        &fixture.workspace,
-        "new_branch",
-        "feature-x",
-    );
     let dirty = worktree.path.join("workspace-qa-uncommitted.txt");
     fs::write(
         &dirty,
         "Keep this change until the branch switch is refused\n",
     )
     .unwrap();
-    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    cx.dispatch_action(fixture.window.into(), commands::SwitchBranch);
+    cx.run_until_parked();
+    cx.simulate_input(fixture.window.into(), "feature-x");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(fixture.window.into(), "enter");
     until(
         cx,
         "dirty branch switch refusal",
         Duration::from_secs(20),
         |cx| {
             fixture
-                .workspace
+                .state
                 .read(cx)
-                .dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.read(cx).error.is_some())
+                .notices
+                .iter()
+                .any(|notice| notice.text.starts_with("Branch unchanged: "))
         },
     )
     .await;
@@ -732,7 +692,11 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
         "Keep this change until the branch switch is refused\n"
     );
     fs::remove_file(&dirty).unwrap();
-    cx.simulate_keystrokes(fixture.window.into(), "secondary-enter");
+    cx.dispatch_action(fixture.window.into(), commands::SwitchBranch);
+    cx.run_until_parked();
+    cx.simulate_input(fixture.window.into(), "feature-x");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(fixture.window.into(), "enter");
     until(cx, "branch switch", Duration::from_secs(20), |cx| {
         let state = fixture.state.read(cx);
         state
@@ -741,7 +705,7 @@ async fn worktree_conversation_is_created_inherited_and_removed(cx: &mut TestApp
             && state.worktree_heads.get(&worktree.id) == Some(&Some("feature-x".into()))
     })
     .await;
-    assert!(cx.read(|cx| fixture.workspace.read(cx).dialog.is_none()));
+    assert!(cx.read(|cx| fixture.workspace.read(cx).palette.is_none()));
     assert_eq!(
         platform::worktree_head_branch(&worktree.path)
             .unwrap()

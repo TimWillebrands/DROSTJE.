@@ -247,12 +247,16 @@ impl AppState {
                 };
                 if let Some(project) = project {
                     self.refresh_repository(project);
+                    self.relist_branches(project);
                 }
                 self.refresh_project_diff(tree, true, cx);
                 self.notice(NoticeLevel::Info, format!("Switched to branch {branch}"));
                 WorktreeRequestStatus::Done(None)
             }
-            Err(error) => WorktreeRequestStatus::Failed(error),
+            Err(error) => {
+                self.notice(NoticeLevel::Warning, format!("Branch unchanged: {error}"));
+                WorktreeRequestStatus::Failed(error)
+            }
         };
         if let Some(pending) = self
             .worktree_request
@@ -277,7 +281,7 @@ impl AppState {
             .collect()
     }
 
-    pub(super) fn worktree_request_pending(&self) -> bool {
+    pub fn worktree_request_pending(&self) -> bool {
         self.worktree_request
             .as_ref()
             .is_some_and(|request| request.status == WorktreeRequestStatus::Pending)
@@ -448,6 +452,7 @@ impl AppState {
                             worktree.codename, worktree.branch
                         );
                         self.save_worktree(worktree.clone());
+                        self.relist_branches(worktree.project_id);
                         self.worktree_heads
                             .insert(worktree.id, Some(worktree.branch.clone()));
                         let thread =
@@ -860,6 +865,7 @@ impl AppState {
                     ),
                 );
                 self.refresh_repository(worktree.project_id);
+                self.relist_branches(worktree.project_id);
                 WorktreeRequestStatus::Done(None)
             }
             Err(failure) => {

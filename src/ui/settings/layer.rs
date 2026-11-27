@@ -94,8 +94,6 @@ pub(super) fn footer(dialog: &SurfaceContent) -> AnyElement {
                         | DialogKind::NewWorkspaceConversation(_)
                 ) {
                     "Create conversation"
-                } else if matches!(dialog.kind, DialogKind::SwitchBranch(_)) {
-                    "Switch"
                 } else if matches!(dialog.kind, DialogKind::Commit(_)) {
                     "Commit"
                 } else if matches!(dialog.kind, DialogKind::RemoveWorktree(_)) {
@@ -239,10 +237,7 @@ pub(in crate::ui) fn open_surface(owner: WeakEntity<Workspace>, window: &mut Win
                 window.focus_next(cx);
                 return;
             }
-            let focus = if let Some(select) = dialog
-                .select("theme_mode")
-                .or_else(|| dialog.select("branch"))
-            {
+            let focus = if let Some(select) = dialog.select("theme_mode") {
                 Some(select.focus_handle(cx))
             } else if let Some(commit) = &dialog.commit {
                 Some(commit.message.focus_handle(cx))

@@ -24,6 +24,61 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(super) fn open_branch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((thread, project)) = self
+            .state
+            .read(cx)
+            .conversation_thread()
+            .map(|thread| (thread.id, thread.project_id))
+        else {
+            return;
+        };
+        self.dismiss(window, cx);
+        if self.navigation_blocked(window, cx) {
+            return;
+        }
+        self.state.update(cx, |state, cx| {
+            state.refresh_branches(project, true);
+            cx.notify();
+        });
+        self.palette = Some(Palette::open_branches(
+            cx.entity().downgrade(),
+            self.state.clone(),
+            thread,
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
+    pub(in crate::ui) fn open_conversation_in(
+        &mut self,
+        worktree: Option<uuid::Uuid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let created = self.state.update(cx, |state, cx| {
+            let result = state.new_conversation_in_workspace(worktree);
+            if let Err(error) = &result {
+                state.notice(crate::app::NoticeLevel::Error, format!("{error:#}"));
+            }
+            cx.notify();
+            result.is_ok()
+        });
+        if created {
+            self.focus_region(Region::Thread, window, cx);
+        }
+    }
+
+    pub(in crate::ui) fn confirm_remove_worktree(
+        &mut self,
+        worktree: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_dialog(DialogKind::RemoveWorktree(worktree), window, cx);
+    }
+
     pub(super) fn open_host_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self
             .state
@@ -497,11 +552,10 @@ impl Workspace {
                 .conversation_thread()
                 .and_then(|thread| thread.worktree_id)
                 .map(DialogKind::RemoveWorktree),
-            Command::SwitchBranch => self
-                .state
-                .read(cx)
-                .conversation_thread()
-                .map(|thread| DialogKind::SwitchBranch(thread.id)),
+            Command::SwitchBranch => {
+                self.open_branch_picker(window, cx);
+                None
+            }
             Command::CommitChanges => {
                 self.open_commit_panel(window, cx);
                 None

@@ -44,7 +44,6 @@ pub enum DialogKind {
     NewWorktreeConversation(Uuid),
     NewWorkspaceConversation(Uuid),
     RemoveWorktree(Uuid),
-    SwitchBranch(Uuid),
     Commit(Uuid),
     Settings(Option<Uuid>),
     PairPhone,
@@ -109,9 +108,6 @@ impl SurfaceContent {
                     worktrees::worktree_controls(project, state, &mut controls, window, cx)
                 }
                 DialogKind::RemoveWorktree(_) => {}
-                DialogKind::SwitchBranch(thread) => {
-                    worktrees::switch_branch_controls(thread, state, &mut controls, window, cx)
-                }
                 DialogKind::Settings(project) => {
                     page::settings_controls(project, &theme_names, state, &mut controls, window, cx)
                 }
@@ -301,27 +297,6 @@ impl SurfaceContent {
                     .remove_worktree(id, self.force)
                     .map(SurfaceOutcome::Pending);
             }
-            DialogKind::SwitchBranch(thread) => {
-                anyhow::ensure!(
-                    state.conversation_thread().is_some_and(|t| t.id == thread),
-                    "Thread selection changed; reopen Switch branch."
-                );
-                let new = self.value("new_branch", cx);
-                let (branch, create) = if new.is_empty() {
-                    (self.value("branch", cx), false)
-                } else {
-                    (new, true)
-                };
-                if branch.is_empty() {
-                    return Err(field_error(
-                        "new_branch",
-                        "Choose a branch or name a new one.",
-                    ));
-                }
-                return state
-                    .switch_branch(&branch, create)
-                    .map(SurfaceOutcome::Pending);
-            }
             DialogKind::Commit(thread) => {
                 let message = self
                     .commit
@@ -350,7 +325,6 @@ impl SurfaceContent {
             DialogKind::NewWorktreeConversation(_) => "New conversation in new worktree",
             DialogKind::NewWorkspaceConversation(_) => "New conversation in workspace",
             DialogKind::RemoveWorktree(_) => "Remove worktree",
-            DialogKind::SwitchBranch(_) => "Switch branch",
             DialogKind::Commit(_) => "Commit changes",
             DialogKind::Settings(_) => "Settings",
             DialogKind::PairPhone => "Pair phone",
@@ -369,9 +343,6 @@ impl SurfaceContent {
             }
             DialogKind::NewWorktreeConversation(project) => {
                 body = self.worktree_body(body, project, state, readonly, cx);
-            }
-            DialogKind::SwitchBranch(thread) => {
-                body = self.switch_branch_body(body, thread, state, readonly, cx);
             }
             DialogKind::Commit(thread) => {
                 body = self.commit_body(body, thread, state, owner, readonly, cx);

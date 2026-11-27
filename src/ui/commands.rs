@@ -12,6 +12,8 @@ use gpui_kit::{
 use std::rc::Rc;
 use uuid::Uuid;
 
+mod branches;
+
 gpui_kit::actions!(
     drostje,
     [
@@ -1196,6 +1198,7 @@ pub struct Palette {
     slash_commands: Option<Uuid>,
     harnesses: Option<Uuid>,
     hosts: Option<Uuid>,
+    branches: Option<Uuid>,
     files: Option<FilePicker>,
     _subscriptions: Vec<Subscription>,
 }
@@ -1317,6 +1320,7 @@ impl Palette {
                 closed: false,
                 hosted: false,
                 hosts: None,
+                branches: None,
                 spaces,
                 slash_commands,
                 harnesses,
@@ -1948,6 +1952,9 @@ impl Render for Palette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(thread) = self.hosts {
             return self.render_hosts(thread, cx);
+        }
+        if let Some(thread) = self.branches {
+            return self.render_branches(thread, cx);
         }
         if let Some(picker) = &self.spaces {
             return self.render_spaces(picker, cx);
